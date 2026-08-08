@@ -159,8 +159,12 @@ cargo fmt --all && cargo clippy --workspace --all-targets
 
 ## Current status
 
-Phase 0 (bootstrap): scaffold committed. **Next steps** (DESIGN.md §8 Phase 0): fork upstream Walnut → `walnut-java`;
-stand up JaCoCo coverage on the subset; classify the TO-CLASSIFY commands; run the **OTF empirical check** (do the
-real research queries need a non-`SC` `[strategy …]` to terminate? — DESIGN.md §9 F3); filter the golden corpus to the
-subset. Then Phase 1 spike: base-k DFA + `minimize` + one quantified `eval`, plus the `wr-core` equivalence oracle,
-differentially checked vs `walnut-java`.
+Phase 0, W7 items 1-5 **done** (see `walnut-java/phase0-artifacts/PROGRESS.md` for full history):
+TO-CLASSIFY commands classified (`docs/BOUNDARY-MAP.md` §6), JaCoCo scoped to the KEEP subset, baseline +
+characterization-test coverage driven to 98.2% line / 94.0% branch across three waves (incl. the
+trust-critical algorithmic files), test manifest exported (`walnut-java/phase0-artifacts/test-manifest.json`,
+675 fixtures). **Next: W7 items 6-7** — filter the golden corpus to the subset; run the **OTF empirical
+check** (DESIGN.md §9 F3). Kickoff prompt for a fresh session: `docs/PHASE0-CONTINUATION-DISPATCH.md`
+(supersedes the now-stale `docs/PHASE0-COVERAGE-DISPATCH.md` for handoff purposes). Then Phase 1 spike:
+base-k DFA + `minimize` + one quantified `eval`, plus the `wr-core` equivalence oracle, differentially
+checked vs `walnut-java`.
