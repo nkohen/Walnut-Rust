@@ -130,7 +130,22 @@ Ostrowski/Fibonacci/Pell are **not actually in this file** — Ostrowski lives s
 `Numeration/Ostrowski.java` (already cleanly DROP-able), and **Fibonacci/Pell numeration doesn't exist
 anywhere in this checkout** (only a stray Javadoc example mentioning "Fibonacci[n]" as a *word automaton*
 name, unrelated to numeration — DESIGN.md's premise here was slightly off, in the direction of less work
-than expected). What `NumberSystem.java` actually mixes is **positive-base with negative-base** (`msd_neg_10`
+than expected).
+
+**Correction (2026-08-08, discovered while building the Item 5 test manifest — see
+`walnut-java/phase0-artifacts/test-manifest.json`):** the statement above is true of the Ostrowski
+*algorithm* but is easy to misread as "Fibonacci-based number systems aren't used" — they are, heavily:
+`msd_fib`/`lsd_fib` appear in **121 of the 675** golden integration-test fixtures (~18%). This is NOT
+Ostrowski. `NumberSystem.normalizeNumberSystemToken` treats `"fib"` as an ordinary, unrecognized base-name
+string (no special-casing anywhere — verified by reading the method directly) that then resolves through
+the **generic custom-base mechanism** (`Session.getReadAddressForCustomBases` → `Custom Bases/msd_fib.txt`,
+`Custom Bases/msd_fib_addition.txt`, etc. — plain pre-supplied adder/comparison automaton files, read
+exactly like any user-invented custom base would be). Ostrowski.java (the continued-fraction algorithm
+that would *compute* such automata on the fly) is never in this path. **Net effect: no KEEP/DROP call
+changes** — the custom-base mechanism itself is already `NumberSystem.java`-KEEP, and Ostrowski.java stays
+DROP — but Item 6 (filtering the golden corpus) must **not** treat `msd_fib`/`lsd_fib` fixtures as
+"uses a dropped numeration system." They're KEEP-relevant custom-base fixtures that happen to be named
+after Fibonacci representation. What `NumberSystem.java` actually mixes is **positive-base with negative-base** (`msd_neg_10`
 etc., an `isNeg` boolean field). Negative-base logic is ~10-15% of the file: partly siloed in dedicated
 methods (`baseNegNAddition`, `baseNegNLessThan`, `validateNeg`), but `isNeg` also branches inside shared
 methods (`setLessThanAutomaton`, `setBaseChangeAutomaton`, `arithmetic()`).
