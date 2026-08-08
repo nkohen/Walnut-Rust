@@ -1,0 +1,20 @@
+walnut-rs
+=========
+
+walnut-rs is a Rust reimplementation of a subset of Walnut, and is a DERIVATIVE
+WORK of Walnut. It is therefore licensed under the GNU General Public License,
+version 3 or later (see LICENSE).
+
+Walnut is:
+    Copyright 2016 Hamoon Mousavi, and subsequent contributors
+    (Aseem Baranwal, Laindon C. Burnett, Kai Hsiang Yang, Anatoly Zavyalov,
+     John Nicol, and others).
+    https://github.com/firetto/Walnut  (upstream)
+    Licensed under GPLv3-or-later.
+
+New code in walnut-rs is:
+    Copyright 2026 Nadav Kohen and contributors.
+    Licensed under GPLv3-or-later.
+
+Ported source files carry an SPDX header and, where a file is a close
+transliteration of a specific Walnut source file, a note identifying it.

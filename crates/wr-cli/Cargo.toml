@@ -1,0 +1,16 @@
+[package]
+name = "wr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "walnut-rs"
+path = "src/main.rs"
+
+[dependencies]
+wr-core = { path = "../wr-core" }
+wr-numsys = { path = "../wr-numsys" }
+wr-logic = { path = "../wr-logic" }
+wr-io = { path = "../wr-io" }

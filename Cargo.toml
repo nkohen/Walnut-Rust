@@ -1,0 +1,23 @@
+# walnut-rs workspace — a research-driven Rust reimplementation of a subset of
+# the Walnut automatic-theorem-prover. See docs/DESIGN.md for the full plan and
+# CLAUDE.md for the operating discipline (correctness-first, mechanical port).
+[workspace]
+resolver = "2"
+members = [
+    "crates/wr-core",   # FA engine: DFA/NFA/DFAO, determinize, minimize, product, reverse, quotient, language-equivalence oracle
+    "crates/wr-numsys", # base-k msd/lsd number systems: adder, comparator, constant automata
+    "crates/wr-logic",  # formula lexer/parser (AST), quantifier elimination, boolean ops
+    "crates/wr-io",     # Walnut .txt automaton reader/writer (multi-track + NFA), Graphviz
+    "crates/wr-cli",    # Prover/Session command dispatch + REPL (binary)
+    "crates/wr-cts",    # thin adapter over RustConstantTermSequences primitives (see DESIGN.md §4)
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.75"
+
+# Keep the tree lean; add deps deliberately (each Java dep needs a justified Rust
+# answer — see DESIGN.md §6 dependency-replacement table).
+[workspace.dependencies]
