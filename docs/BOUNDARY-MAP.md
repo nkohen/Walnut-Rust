@@ -222,3 +222,37 @@ ported at all, per §4.1).
 ### 6.1 Resolved 2026-08-08
 `split`/`rsplit` are decided together with §4.1 (`NumberSystem.java` negative-base excision) — both DROP,
 confirmed. No longer an open item.
+
+---
+
+## 7. `Main/` package file inventory (Phase 0 W7 item 2 — JaCoCo scoping)
+
+Out of this doc's original stated scope (§0: "Covers every file in `Automata/`"), but needed to build a
+JaCoCo include/exclude list, since coverage scoping is codebase-wide, not `Automata/`-only. Classified by
+comparing against DESIGN.md §3's explicit KEEP list (`Main/Predicate` + `EvalComputations/{Token,
+Expressions}`, `Main/Prover`+`Session`, and the named `Main/Commands/*` classes) plus this session's Item-1
+findings, with one new file read to confirm (`Main/Commands/Ost.java`, below). Not a full per-file
+responsibility table like §2 — just the KEEP/DROP call needed for coverage scoping.
+
+**KEEP (everything under `Main/` except the two below):** `Prover.java`, `ProverHelper.java`,
+`Session.java`, `Predicate.java`, `HelpMessages.java`, `Logging.java`, `MetaCommands.java`,
+`TestCase.java`, `UtilityMethods.java`, `WalnutException.java`, all of `EvalComputations/{Token,
+Expressions}/*`, and all of `Commands/*` except `Ost.java`/`Split.java` (incl. `Join.java`, confirmed KEEP
+in §6, and `Test.java` — kept because it's the sole consumer of the already-KEEP `Search/ProductBFS.java`,
+§2). `MetaCommands.java` is worth a specific note: it implements the `[strategy …]`/`[export …]` bracket
+metacommand syntax (DESIGN.md §9 F3's subject) — the *mechanism* is KEEP (used for in-scope `SC`/`BRZ`
+strategy selection too), even though it can also select DEFERRED strategies (`CCL`/`CCLS`/OTF variants),
+same file-level-can't-cleanly-split situation as `DeterminizationStrategies.java` (§2).
+
+**DROP (new finding):** `Main/Commands/Ost.java` (confirmed by reading it — constructs `Ostrowski`
+representation/adder automata directly, no non-Ostrowski logic). Not previously listed anywhere (DESIGN.md
+§3's KEEP table doesn't mention it, and it's outside `Automata/` so §1-§5 didn't cover it) — it was found
+only because building the JaCoCo exclude list required enumerating all of `Main/Commands/`. Drops
+consistently with `Numeration/Ostrowski.java` (§2, already DROP).
+
+**JaCoCo excludes wired in `walnut-java/pom.xml`'s `code-coverage` profile** (`report` execution): the 8
+already-confirmed-DROP `Automata/` files (§2/§5) + `Main/Commands/Ost.java` + `Main/Commands/Split.java`
+(§6). **Deliberately NOT excluded** (can't be cleanly cut at file granularity, noise accepted per the
+dispatch mission's own instruction): `NumberSystem.java` (negative-base branches, §4.1) and
+`FA/DeterminizationStrategies.java` (deferred `CCL`/`CCLS`/OTF strategy paths, §2) — both will show
+less-than-100% coverage from code outside the subset; that's expected, not a gap to chase toward 100% on.
