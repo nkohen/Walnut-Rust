@@ -75,7 +75,7 @@ Walnut is 13,803 LOC of Java across 76 files in 11 packages. The subset keeps th
 | `Automata/Morphism`, `WordAutomaton`, `RichAlphabet`, `AutomatonDFA` | morphic-sequence support, multi-track alphabet, DFA specialization (~745 LOC) | **Added — missed by the first draft** (kit #2); `Image` (settled KEEP) imports `Automata/Morphism`. All → `wr-core` |
 | `AutomatonLogicalOps` | and/or/xor/imply/iff/not, reverse, quotient | Boolean layer over product |
 | `AutomatonQuantification` | ∃ = projection+determinize; ∀ = ¬∃¬ | The decision-procedure crux |
-| `FA/DeterminizationStrategies` | Subset construction (`SC` — the **default** strategy) + Brzozowski + opt-in OTF | **Ship `SC` (the default) + plain Brzozowski; defer the opt-in OTF variants.** Note Brz calls the minimizer mid-algorithm and its `BRZ_CCL/CCLS` variants route through OTF — so "ship Brz, defer OTF" separates cleanly only for *plain* Brz (§9 F4) |
+| `FA/DeterminizationStrategies` | Subset construction (`SC` — the **default** strategy) + Brzozowski + opt-in OTF | **Ship `SC` (the default) + plain Brzozowski; defer the opt-in OTF variants.** Note Brz calls the minimizer mid-algorithm and its `BRZ_CCL/CCLS` variants route through OTF — so "ship Brz, defer OTF" separates cleanly only for *plain* Brz (§9 F4). **Deferral decision confirmed 2026-08-08, no longer open — see §10.** |
 | `FA/ProductStrategies` | cross-product + minimize | Peak-memory-sensitive hotspot |
 | `FA/ValmariDFA` + `ValmariPartition` + `Trimmer` | Minimization (Valmari) | Near-linear; invoked constantly |
 | `Automata/NumberSystem` (base-*k* paths only) | msd/lsd base-*k* addition/comparison automata | **Slice out only base-*k***; drop Ostrowski/Fibonacci/Pell/negative |
@@ -204,7 +204,7 @@ walnut-rs/
 |---|---|---|---|
 | `fastutil` (primitive collections) | Pervasive hot data structures | `std` `Vec`/`BTreeMap`/`HashMap` | Low (mechanical) |
 | `dk.brics:automaton` | **two roles:** (a) regex → automaton for `reg`; (b) **the test-suite's automaton-equivalence oracle** (`EqualityUtils.faEqual` → Brics `.equals()` = language equivalence) | (a) `regex-automata` + converter; (b) a native `wr-core` semantic-equivalence check (product+complement+emptiness) — this is a **required deliverable**, not just a dep swap | Medium–High |
-| **`io.github.jn1z:otf`** (on-the-fly determinization) | `DeterminizationStrategies` OTF path | **Defer**: ship subset-construction + Brzozowski (both in-repo); reimplement OTF later only if scale demands | **Highest** — but avoidable in v1 |
+| **`io.github.jn1z:otf`** (on-the-fly determinization) | `DeterminizationStrategies` OTF path | **Defer** (confirmed 2026-08-08, §10): ship subset-construction + Brzozowski (both in-repo); reimplement OTF later only if scale demands. Sizing if ever revisited: full port ~4,000-5,200 LOC of an unproven TACAS 2026 algorithm; smallest cut (`CCL`/`BRZ_CCL` only) ~2,000-3,000 LOC | **Highest** — but avoidable in v1 |
 | `net.automatalib` | product BFS, serialization utils | Hand-roll over `wr-core` (or `petgraph` where a graph helps) | Medium |
 | `slf4j`/`logback` | logging | `tracing` | Trivial |
 
@@ -267,7 +267,7 @@ Each phase ends at a checkpoint you can stop and evaluate at.
 | Risk | Severity | Mitigation |
 |---|---|---|
 | An implementation bug produces a wrong math answer, undetected | High (goal-defining) | Tier 4 property invariants mandatory (Walnut-independent); treat every Tier-0 uncovered branch as a bug hunt; two independent minimizers must agree |
-| OTF opt-in determinization lib has no Rust equivalent — **is deferral a perf path or a capability cliff?** | **Medium, but UNVERIFIED** | `SC` is Walnut's *default* and handles ordinary queries, so most workloads never touch OTF. **But** OTF is the escape hatch for queries that blow up under `SC` — and this research program *has* hit ∀-determinization explosions (native memory `walnut-query-optimization`; `walnut-guard` exists for it). If any of your **actual** queries need a non-`SC` `[strategy …]` to *terminate*, deferring OTF is a functional regression, not a slowdown. **Resolve empirically in Phase 0** (grep this repo's Walnut usage for `[strategy`; run the heaviest queries under `walnut-guard` with `SC`) before betting on deferral. (F3) |
+| OTF opt-in determinization lib has no Rust equivalent — **is deferral a perf path or a capability cliff?** | **RESOLVED 2026-08-08 — deferral confirmed, see §10** | Phase 0 Item 7 ran the empirical check: no confirmed real case where `SC`+`BRZ` (both KEEP-scope) fail to *terminate*; the one real slow case found (`thm5`, a genuine Shallit-paper query) is ~300-700x faster under `BRZ` alone (already in scope) and `SC` still terminates (42s, not a hang). ct-research's real severe explosions (up to 2.06M states) were never once addressed with a `[strategy …]` directive — always query/numeration reformulation or a non-Walnut fallback instead. A follow-up scope-comparison (full detail: `walnut-java/phase0-artifacts/PROGRESS.md`'s OTF follow-up entry) sized the deferred cost — ~4,000-5,200 LOC of an unproven TACAS 2026 algorithm, no smaller cut under ~2,000-3,000 LOC — and the user decided to defer all of it, including that smaller cut. (F3) |
 | Hand-written parser edge cases hard to match exactly | Medium | Golden corpus + differential fuzzing of the parser pin exact semantics |
 | `NumberSystem` god-class messy to slice | Medium | Subset to base-*k* only; drop the exotic-numeration branches entirely |
 | Global mutable state resists a faithful port | Low–Med | Deliberately refactor to a `Session` context (the one sanctioned deviation) |
@@ -286,6 +286,22 @@ Each phase ends at a checkpoint you can stop and evaluate at.
 - *Cost control* — cheap-model-by-default with evidence-gated escalation; reviewer model ≠ author model for trust-critical code; deterministic correctness pipeline off the token budget (see §7).
 - *Formal verification* — out of scope; it targets algorithm correctness, which isn't the risk (see §5).
 - *Licensing (GPLv3)* — fully aligned with your open-source, freedom-to-modify intent; the mechanical-port approach carries **zero** licensing tension because staying GPL is exactly what you want. Ramifications, concretely: **you may** modify/extend/run/distribute/maintain your own fork freely (and even charge for copies); **you must** keep the clone GPLv3, provide source when you distribute, and preserve Walnut's copyright/license while adding your own; **you may not** relicense it permissively or make it closed — none of which you want. You own the copyright to the code you write; the combined work is GPL because it derives from Walnut. Simplest path: GPLv3 the whole `walnut-rs` workspace.
+- *OTF deferral (§9 F3)* — **decided 2026-08-08: defer the entire OTF-family determinization surface**
+  (`CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`/`OTF()`), confirming the original plan (KEEP only `SC`+`BRZ`) rather
+  than leaving it an unverified risk. Basis: Phase 0 Item 7's empirical check found no real case where
+  `SC`+`BRZ` fail to *terminate* (only a speed gap, and `BRZ` alone — already in scope — recovers nearly
+  all of it on the one real example tested); ct-research's genuine severe explosions were never once
+  addressed with a `[strategy …]` directive in practice. A follow-up scope comparison (prompted by the
+  fair objection that "never used" isn't the same as "never needed") found the deferred surface is a real
+  chunk of work either way — the full addition is ~4,000-5,200 LOC of an unproven **TACAS 2026** algorithm
+  (not a decades-trusted textbook one like `SC`/`BRZ`/Valmari), and the smallest useful cut
+  (`CCL`/`BRZ_CCL` only, skipping the simulation-relation machinery) is still ~2,000-3,000 LOC — no
+  genuinely "small and easy" subset exists (`CCL`/`CCLS` share one method with a single boolean
+  differentiating them; `BRZ_CCL`/`BRZ_CCLS` aren't separate algorithms, just Brzozowski's reverse step
+  routed through `CCL`/`CCLS`). Full evidence and the size breakdown: `walnut-java/phase0-artifacts/
+  PROGRESS.md`'s Item 7 entry + its same-day OTF follow-up entry. **Not permanently foreclosed** — if a
+  concrete real need ever emerges, it's a self-contained later port (same pattern as the negative-base
+  deletion decision, §3/BOUNDARY-MAP.md §4.1), not worse off for being deferred now.
 
 **My recommendation:** approve **Phase 0 + Phase 1** now. They are cheap, they produce durable value regardless (a hardened Java Walnut + a proven-out spike), and — crucially, given the adversarial pass below — Phase 0 now also *settles the open scope questions* (missing commands, OTF cliff, true corpus size) and Phase 1 stands up the semantic-equivalence oracle. Everything downstream is gated on the spike being green.
 
