@@ -125,7 +125,7 @@ DESIGN.md already documents, so DESIGN.md §6/§13 should be updated to record i
 
 ## 4. Items needing your call
 
-### 4.1 `NumberSystem.java` negative-base excision is not a clean cut
+### 4.1 `NumberSystem.java` negative-base excision — RESOLVED 2026-08-08
 Ostrowski/Fibonacci/Pell are **not actually in this file** — Ostrowski lives separately in
 `Numeration/Ostrowski.java` (already cleanly DROP-able), and **Fibonacci/Pell numeration doesn't exist
 anywhere in this checkout** (only a stray Javadoc example mentioning "Fibonacci[n]" as a *word automaton*
@@ -133,9 +133,20 @@ name, unrelated to numeration — DESIGN.md's premise here was slightly off, in 
 than expected). What `NumberSystem.java` actually mixes is **positive-base with negative-base** (`msd_neg_10`
 etc., an `isNeg` boolean field). Negative-base logic is ~10-15% of the file: partly siloed in dedicated
 methods (`baseNegNAddition`, `baseNegNLessThan`, `validateNeg`), but `isNeg` also branches inside shared
-methods (`setLessThanAutomaton`, `setBaseChangeAutomaton`, `arithmetic()`). **Your call:** delete negative-base
-code outright during the port, or port it structurally-present-but-`unimplemented!()` (cheaper to verify
-against Java behaviorally later if you ever want it back)?
+methods (`setLessThanAutomaton`, `setBaseChangeAutomaton`, `arithmetic()`).
+
+**Decision (user, 2026-08-08): delete negative-base code outright during the port** — do not port it
+structurally-present-but-`unimplemented!()`. Rationale (session discussion, not a re-derivable code fact,
+recorded here since it's the actual reasoning behind the call): the Java source in `walnut-java` is a
+permanent oracle regardless of when the Rust port happens, so a future revival starts from the same
+translation step either way — pre-translating now saves nothing there. The genuinely expensive part of
+"add negative-base support" is the correctness pipeline (coverage, golden corpus, differential testing,
+the mandatory two-reviewer adversarial loop for `wr-core`/`wr-logic` code) — a dormant stub skips none of
+that and, in the meantime, is untested/unreviewed dead code sitting in a trust-critical crate, which is
+exactly the "half-finished implementation" this project's own conventions say to avoid. If negative-base
+is ever wanted, it's a self-contained later port (read Java → translate → test → review), not worse off
+for having been deleted now. This also **confirms `split`/`rsplit` as DROP** (§6) rather than
+DROP-contingent — the coupling in §6.1 is now settled the same direction.
 
 ### 4.2 Split `AutomatonLogicalOps.java` across wr-core/wr-logic, or keep it monolithic in wr-core?
 Boolean connectives (`and/or/xor/imply/iff/not`) read as logic-layer semantics; quotient/reverse/`convertNS`/
@@ -197,19 +208,17 @@ DESIGN.md §6), backed by the `wr-core`/`wr-io` engine noted per row.
 | `fixtrailzero` | Same as above, for **lsd** trailing zeros | `AutomatonLogicalOps.fixTrailingZerosProblem` (already KEEP) | **KEEP** | wr-cli | Same reasoning as `fixleadzero`. |
 | `inf` | Decides whether an automaton accepts infinitely many inputs; if so, returns a `prefix(cycle)*suffix` witness regex | `ProverHelper.infFromAddress` → `Automata/FA/Infinite.java` (already KEEP, "closes a real DESIGN.md gap") | **KEEP** | wr-cli | CLI entry point for the already-KEEP `Infinite` engine. |
 | `export` | Exports an automaton/word-automaton to **Graphviz (`.gv`) or BA (`.ba`) format only** — `.txt` is refused as "redundant" | `ProverHelper.exportAutomata` → `Automata/Writer/AutomatonWriter.java` (already KEEP: `exportToBA`, `writeToGV`) | **KEEP — scope correction** | wr-cli | **Surprising finding:** this command is *not* the CAS-matrix export DESIGN.md's phrasing worried about. `ProverHelper.exportAutomata`'s `switch` has exactly 3 cases (`BA`, `GV`, and `TXT`→throws) — **no path to `AutomatonMatrixWriter`/the 4 CAS emitters at all**. Those are wired to a *different* trigger (`EvalDef.writeMatrices`, per §2's `AutomatonMatrixWriter.java` row) that isn't reachable from this `export` command. So DESIGN.md's TO-CLASSIFY listing of `export` alongside CAS concerns was imprecise — the inline `export` command is a plain already-KEEP-backed automaton writer, unrelated to the DROP-confirmed CAS path. |
-| `split` | Given a DFAO defined over a **negative base** (`msd_neg_k`), splits it into DFAO(s) over the corresponding **positive base**, handling signed inputs separately | new `Main/Commands/Split.java` (123 LOC) → `Automata/Automaton` + `EvalComputations.Token.ArithmeticOperator` | **DROP** — coupled to §4.1 | wr-cli (if kept) | Entirely negative-base-numeration machinery — the whole point of `split` is converting *out of* `msd_neg_k`. DESIGN.md's non-goals drop negative-base numeration (§2), and §4.1 already flags `NumberSystem.java`'s negative-base excision as your open call. **This is the same open call, not an independent one**: if §4.1 is resolved to keep negative-base support, `split`/`rsplit` flip to KEEP together; if negative-base is dropped, `split`/`rsplit` drop with it. Recommend resolving §4.1 and letting `split`/`rsplit` inherit that answer rather than deciding them separately. |
-| `rsplit` | Inverse of `split`: given a DFAO over a positive base, produces the corresponding negative-base DFAO | same `Main/Commands/Split.java` (`processSplitCommand(..., isReverse=true, ...)`) | **DROP** — coupled to §4.1 | wr-cli (if kept) | Same reasoning and same coupling as `split` — they share one implementation (`Split.processSplitCommand`) gated by an `isReverse` flag, so they are a single porting unit either way. |
+| `split` | Given a DFAO defined over a **negative base** (`msd_neg_k`), splits it into DFAO(s) over the corresponding **positive base**, handling signed inputs separately | new `Main/Commands/Split.java` (123 LOC) → `Automata/Automaton` + `EvalComputations.Token.ArithmeticOperator` | **DROP — confirmed** (§4.1) | N/A | Entirely negative-base-numeration machinery — the whole point of `split` is converting *out of* `msd_neg_k`. §4.1 resolved 2026-08-08: negative-base is deleted outright, not stubbed, so `split` has no positive-base-only purpose left and drops with it. |
+| `rsplit` | Inverse of `split`: given a DFAO over a positive base, produces the corresponding negative-base DFAO | same `Main/Commands/Split.java` (`processSplitCommand(..., isReverse=true, ...)`) | **DROP — confirmed** (§4.1) | N/A | Same reasoning as `split` — they share one implementation (`Split.processSplitCommand`) gated by an `isReverse` flag, so they were always a single porting/dropping unit. |
 
 **Net effect on DESIGN.md §3's "TO CLASSIFY" list:** 9 of 11 are KEEP (high confidence — `promote`/`join`/
 `minimize`/`convert`/`transduce`/`fixleadzero`/`fixtrailzero`/`inf`/`export`), all backed by engines
 already independently confirmed KEEP in §2 above (no new engine-level scope work, only CLI-dispatch
-porting). 2 of 11 (`split`/`rsplit`) are **DROP, contingent on §4.1** — they are not a new open question,
-just the negative-base call already on your plate, applied consistently. Two new `wr-cli`-target files
-(`Main/Commands/Split.java`, `Main/Commands/Join.java`) are recorded here since they live outside
-`Automata/` and so weren't in scope for §1-§5's file-by-file pass.
+porting). 2 of 11 (`split`/`rsplit`) are **DROP — confirmed**, per §4.1's resolution. Two new
+`wr-cli`-target files recorded here since they live outside `Automata/` and so weren't in scope for
+§1-§5's file-by-file pass: `Main/Commands/Join.java` (KEEP), `Main/Commands/Split.java` (DROP — not
+ported at all, per §4.1).
 
-### 6.1 Item needing your call (rolls into existing §4.1)
-`split`/`rsplit` should be decided **together with** §4.1 (`NumberSystem.java` negative-base excision),
-not separately — see the table above. No new decision is being asked for; flagging so the two don't get
-resolved inconsistently (e.g. dropping negative-base from `NumberSystem` while accidentally porting
-`split`/`rsplit`, which would have no positive-base-only purpose left).
+### 6.1 Resolved 2026-08-08
+`split`/`rsplit` are decided together with §4.1 (`NumberSystem.java` negative-base excision) — both DROP,
+confirmed. No longer an open item.
