@@ -1,9 +1,11 @@
 # walnut-rs — Agent Operating Guide
 
 A Rust reimplementation of a **research-driven subset** of the [Walnut](https://walnut-theorem-prover.github.io/)
-automatic-theorem-prover. This file tells Claude how to work here. **Read `docs/DESIGN.md` first** — it is the
-full plan (scope, correctness ladder, roadmap, and the adversarial-review record). This is a **derivative work of
-Walnut (GPLv3)**; keep it GPLv3 and preserve attribution (see `NOTICE`).
+automatic-theorem-prover. This file tells Claude how to work here. **Read [`docs/DESIGN.md`](docs/DESIGN.md) first**
+(the full plan), then [`PORTING.md`](PORTING.md) (Java→Rust idiom map) and
+[`docs/ROADMAP-TO-AUTONOMY.md`](docs/ROADMAP-TO-AUTONOMY.md) (how development is meant to run on a subscription —
+token efficiency, resumability, and how far to automate). This is a **derivative work of Walnut (GPLv3)**; keep it
+GPLv3 and preserve attribution (see `NOTICE`).
 
 ## Prime directive: correctness
 
@@ -74,21 +76,51 @@ projection→NFA→`determinize`). So:
 - **Reconciliation:** a single `correctness-fatal` or `correctness-risk` from **either** reviewer blocks the merge until
   resolved; "signed off" means **both** reviewers returned no unresolved correctness finding. If the two disagree on a
   load-bearing *fact* (not just wording), the coordinator adjudicates the math firsthand — do not average them.
-- **Model-tiering — cheap by default, escalate on evidence.** Cheap tier (Haiku) for mechanical transliteration,
-  boilerplate test replication, compiler-error batches; mid (Sonnet) for most implementation/review; expensive (Opus)
-  ONLY for the hard ~20%: the parser + `NumberSystem` edge cases, quantifier-elimination correctness, adversarial math
-  review, diagnosing differential-test divergences, **and any architecture / crate-boundary / mechanical-vs-refactor
-  judgment call** (e.g. resolving a coupling cycle — these need the *most* scrutiny, not the least).
+- **Model-tiering — but know the MECHANISM (it is not free per-unit).** A single session runs on ONE model; you
+  cannot cheaply switch it per unit — a mid-session model switch invalidates the prompt cache and re-sends the whole
+  accumulated context uncached (expensive). So tiering is done two ways, and you must pick deliberately:
+  (1) **run the session on the tier that fits the bulk of the current phase** (Haiku/Sonnet for a mechanical-port
+  stretch; you launched it, it stays); (2) **delegate a genuinely isolable large unit** (a whole file/test class, not
+  a single method) **to a fresh `Agent` subagent with a `model` override** — this avoids the cache tax but pays a
+  cold-start context cost, so it only pays off for units big enough that the cheaper per-token rate outweighs
+  re-establishing context. **Escalate in batches, not per-unit.** Reserve Opus for the hard ~20%: parser +
+  `NumberSystem` edge cases, quantifier-elimination correctness, adversarial math review, diagnosing differential
+  divergences, and architecture/crate-boundary calls. (Directionally, cheaper tiers stretch your session budget
+  further — but treat that as a tendency, not a measured multiplier for your account.)
 - **Compiler as work queue** — fix errors crate-by-crate, batch similar errors. Mechanical commits before idiomatic ones.
 - **THE MERGE GATE (hard rule):** never commit or merge with `cargo test --workspace` **red**, and never merge
   trust-critical-crate (`wr-core`/`wr-logic`) code without the two-reviewer loop having run. Zero tests deleted, ever
   (a failing ported test is a real signal — fix the port, don't delete the test).
-- **Cost control** — a hard per-phase token/$ ceiling; the deterministic correctness pipeline (running suites, corpus
+- **Cost control** — a per-phase budget ceiling; the deterministic correctness pipeline (running suites, corpus
   diffing, fuzzing) costs zero model tokens — keep it there.
 
-## Fleet git hygiene (mandatory when >1 agent runs concurrently)
+## Token efficiency & context management (this is a SUBSCRIPTION — tokens/session-limits, not $)
 
-At the target scale (dozens of parallel agents), git collisions corrupt work. Hard rules (learned the hard way in
+The constraint here is your subscription's token/session budget, not a dollar bill; session limits are *pauses*, not
+failures. The biggest avoidable cost is a **bloated main context re-sent every turn**. Keep the coordinator thin:
+
+- **Delegate heavy-in / small-out work to a fresh subagent and keep only the conclusion** — reading a 1000-line Java
+  file, running a coverage pass, sweeping the corpus. (This does not *reduce* total tokens — the subagent's tokens
+  count against the same subscription — but it keeps the *main* context small so it isn't re-sent every subsequent
+  turn, which is the real recurring cost.)
+- **Never read a large Java source file wholesale into the coordinator.** `Grep`/`Explore` to locate; read only the
+  slice you port. (`NumberSystem.java` is 1,027 lines — reading it whole is a large avoidable cost.)
+- **Route long output to files, not context** — test logs, coverage reports, diffs → disk; grep them.
+- **Trigger delegation on task SHAPE, not on "context feels large"** — by then you've already paid and re-pay each turn.
+- **MCP hygiene (a minor lever — do it, don't overrate it).** Tool *schemas* load on demand (deferred), so an unused
+  server does NOT cost per-turn schema tokens. What it *does* cost is a one-time per-session "instructions" block.
+  So: don't connect servers you won't use here (walnut-rs is Rust — it does NOT need ct-research's Lean `lean-lsp`
+  MCP), but this is hygiene, not a major lever — §the two bullets above dwarf it.
+
+Full treatment (incl. the resumability plan and the autonomy ladder) is in
+[`docs/ROADMAP-TO-AUTONOMY.md`](docs/ROADMAP-TO-AUTONOMY.md).
+
+## Fleet / concurrency hygiene
+
+On a **subscription**, concurrent agents share ONE quota — running N at once does not save tokens (spend is additive)
+and hits your session/rate limit ~N× faster; it only buys wall-clock. So prefer **in-session subagent delegation**
+and **modest** concurrency (a few agents), not a large fleet. Whenever >1 agent DOES run concurrently against a shared
+tree, git collisions corrupt work — hard rules (learned the hard way in
 the Bun rewrite AND in this operator's `ct-research` fleet):
 
 - **NEVER `git stash` or `git reset`** during fleet operation — they silently discard or rewrite another agent's work.
