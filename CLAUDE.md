@@ -62,18 +62,50 @@ projection→NFA→`determinize`). So:
 
 ## AI-orchestration (Bun-style adversarial loop)
 
+- **Follow [`PORTING.md`](PORTING.md)** — the reviewed Java→Rust idiom map. Its entries are defaults; deviations must
+  be justified in the diff. Hit a pattern it doesn't cover? Add the ruling there before porting the third occurrence.
 - **Loop:** implementer → **two split-context adversarial reviewers** (`.claude/agents/adversarial-reviewer.md`, given
-  only the diff, told "assume a mathematical/implementation bug exists; find it") → fixer. No code merges without its
-  Tier-2 test green and the subset golden corpus still passing.
+  only the diff, told "assume a mathematical/implementation bug exists; find it") → fixer.
+- **Protect the split context.** Dispatch each reviewer with **only the diff + file paths** — never the author's
+  commit message, rationale, or "why this is correct." Handing over the author's reasoning silently defeats
+  independent review (the Bun lesson).
 - **Reviewer model ≠ author model** for any trust-critical (math / decision-procedure) code — a same-model reviewer
   shares the author's blind spots.
+- **Reconciliation:** a single `correctness-fatal` or `correctness-risk` from **either** reviewer blocks the merge until
+  resolved; "signed off" means **both** reviewers returned no unresolved correctness finding. If the two disagree on a
+  load-bearing *fact* (not just wording), the coordinator adjudicates the math firsthand — do not average them.
 - **Model-tiering — cheap by default, escalate on evidence.** Cheap tier (Haiku) for mechanical transliteration,
   boilerplate test replication, compiler-error batches; mid (Sonnet) for most implementation/review; expensive (Opus)
   ONLY for the hard ~20%: the parser + `NumberSystem` edge cases, quantifier-elimination correctness, adversarial math
-  review, and diagnosing differential-test divergences.
+  review, diagnosing differential-test divergences, **and any architecture / crate-boundary / mechanical-vs-refactor
+  judgment call** (e.g. resolving a coupling cycle — these need the *most* scrutiny, not the least).
 - **Compiler as work queue** — fix errors crate-by-crate, batch similar errors. Mechanical commits before idiomatic ones.
+- **THE MERGE GATE (hard rule):** never commit or merge with `cargo test --workspace` **red**, and never merge
+  trust-critical-crate (`wr-core`/`wr-logic`) code without the two-reviewer loop having run. Zero tests deleted, ever
+  (a failing ported test is a real signal — fix the port, don't delete the test).
 - **Cost control** — a hard per-phase token/$ ceiling; the deterministic correctness pipeline (running suites, corpus
   diffing, fuzzing) costs zero model tokens — keep it there.
+
+## Fleet git hygiene (mandatory when >1 agent runs concurrently)
+
+At the target scale (dozens of parallel agents), git collisions corrupt work. Hard rules (learned the hard way in
+the Bun rewrite AND in this operator's `ct-research` fleet):
+
+- **NEVER `git stash` or `git reset`** during fleet operation — they silently discard or rewrite another agent's work.
+- **Atomic, pathspec-scoped commits** — `git commit -F - -- <explicit paths>`; never `git add -A` then a bare commit
+  (it can sweep a concurrent agent's staged files under your message). One logical change per commit.
+- **Each agent works in its own clone / worktree on an `agent/<name>` branch**; merge back deliberately. Do not share
+  a working tree between agents.
+- **Container agents run FOREGROUND, in-turn** — a `claude -p` run that backgrounds a job and ends its turn gets the
+  job killed when the `--rm` container tears down. Verify the *deliverable* (commit landed), not the exit code.
+- **Watch disk/IOPS** — many parallel `target/` builds + clones exhaust disk and I/O at scale; cap concurrency.
+
+## Guardrails to adapt (not yet mechanical)
+
+The rules above are enforced by convention until the hooks in [`.claude/hooks/README.md`](.claude/hooks/README.md) are
+ported from ct-research (a Phase-0 task): a commit gate on the trust-critical crates, a recursive-`rm`/backgrounded-job
+safety guard, and a pre-push `cargo test` check. Follow the AUTHORING discipline (self-test all branches, fail-diagnosable)
+when wiring them.
 
 ## Running the tools
 

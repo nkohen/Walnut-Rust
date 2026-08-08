@@ -19,6 +19,15 @@
 //!
 //! Port discipline: mechanical transliteration first, idiomatic later. Compare
 //! by SEMANTICS, never by exact state numbering.
+//!
+//! Scope note: `wr-core` ports the WHOLE `Automata/` Java package — `FA`,
+//! `Automaton`, `NumberSystem` (base-k, see [`numsys`]), plus `Morphism`,
+//! `WordAutomaton`, `RichAlphabet`, `AutomatonDFA` — because these are mutually
+//! coupled in one flat Java package and cannot be split across crates without
+//! breaking mechanical fidelity (kit-findings #1/#2). A full file-by-file
+//! KEEP/DROP + boundary map of `Automata/` is a Phase 0 deliverable.
+
+pub mod numsys;
 
 /// Placeholder so the crate compiles from the first commit; replace as the port lands.
 pub fn placeholder() {}

@@ -6,3 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+wr-core = { path = "../wr-core" }
+# The RustConstantTermSequences substrate (primitives: GF(p) linalg, ModInt/LaurentPoly).
+# Wire when ready — see DESIGN.md §4:
+# rust-constant-term-sequences = { git = "https://github.com/nkohen/RustConstantTermSequences.git" }

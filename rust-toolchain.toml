@@ -1,0 +1,5 @@
+# Pin the toolchain so every fleet container/agent builds identically over a
+# long multi-day run (kit-finding #15). Bump deliberately.
+[toolchain]
+channel = "1.83.0"
+components = ["rustfmt", "clippy"]

@@ -10,9 +10,9 @@
 //!
 //! NOTE: the substrate is deterministic single-track only; its DFAO/serializer are
 //! NOT drop-in for `wr-core`/`wr-io` (adversarial finding F6). Wire it as a Cargo
-//! git dependency when ready:
+//! git dependency when ready (URL from ct-research's `.gitmodules`):
 //!   # [dependencies]
-//!   # rust-constant-term-sequences = { git = "<substrate repo url>" }
+//!   # rust-constant-term-sequences = { git = "https://github.com/nkohen/RustConstantTermSequences.git" }
 
 /// Placeholder so the crate compiles from the first commit; replace as the port lands.
 pub fn placeholder() {}

@@ -70,7 +70,9 @@ Walnut is 13,803 LOC of Java across 76 files in 11 packages. The subset keeps th
 | `Main/Predicate` + `EvalComputations/{Token,Expressions}` | Formula lexer + shunting-yard parser → AST | Hand-written, no grammar file; reproduce exactly, pin with golden corpus |
 | `Main/Prover` (command dispatch) + `Session` | REPL / command router | Refactor `public static` globals into an explicit `Session` context struct |
 | `Main/Commands/{EvalDef, Reg, Combine, Concat, Intersect, Union, Reverse, Star, Quotient, Morphism, Image, Alphabet, Describe}` | The subset's commands | `eval`/`def`/`reg` are the core; morphism/`image` needed for building automatic sequences |
-| `Automata/Automaton` + `Automata/FA/FA` | Semantic wrapper + raw NFA/DFA/DFAO engine | Clean, mostly-`static` methods → maps cleanly to Rust free functions |
+| `Automata/Automaton` + `Automata/FA/FA` | Semantic wrapper + raw NFA/DFA/DFAO engine | `FA` is mostly-`static` (clean free-function port); **`Automaton` is genuinely instance-stateful** (holds `List<NumberSystem> NS`, `RichAlphabet`) — not a trivial free-function port (kit-finding #17) |
+| `Automata/NumberSystem` (base-*k* only) | base-*k* adder/comparator/constant automata | **Lives in `wr-core`, not a separate crate** — `Automaton`↔`NumberSystem` are bidirectionally coupled (kit #1) |
+| `Automata/Morphism`, `WordAutomaton`, `RichAlphabet`, `AutomatonDFA` | morphic-sequence support, multi-track alphabet, DFA specialization (~745 LOC) | **Added — missed by the first draft** (kit #2); `Image` (settled KEEP) imports `Automata/Morphism`. All → `wr-core` |
 | `AutomatonLogicalOps` | and/or/xor/imply/iff/not, reverse, quotient | Boolean layer over product |
 | `AutomatonQuantification` | ∃ = projection+determinize; ∀ = ¬∃¬ | The decision-procedure crux |
 | `FA/DeterminizationStrategies` | Subset construction (`SC` — the **default** strategy) + Brzozowski + opt-in OTF | **Ship `SC` (the default) + plain Brzozowski; defer the opt-in OTF variants.** Note Brz calls the minimizer mid-algorithm and its `BRZ_CCL/CCLS` variants route through OTF — so "ship Brz, defer OTF" separates cleanly only for *plain* Brz (§9 F4) |
@@ -80,6 +82,8 @@ Walnut is 13,803 LOC of Java across 76 files in 11 packages. The subset keeps th
 | `AutomatonReader` + `ParseMethods` + `Automata/Writer/AutomatonWriter` | `.txt` automaton format + Graphviz | The interop bridge — your Rust substrate *already emits this format* |
 
 **TO CLASSIFY — a set of commands the earlier draft missed** (adversarial pass, confirmed): `split`, `rsplit`, `join`, `transduce`, `convert`, `minimize`, `fixleadzero`, `fixtrailzero`, `promote`, `inf`, `export` are dispatched **inline in `Prover.java`** (regex-matched, no `Commands/` class each). They are *used by the golden corpus* and some look directly relevant to constant-term work — `convert` (msd↔lsd / base conversion) and `minimize` almost certainly **KEEP**; `transduce` (e.g. RUNSUM running-sum transduction) plausibly KEEP; `split`/`rsplit`/`join`/`fix*` need a decision. **These were absent from the 8–10k LOC estimate and the crate layout — a real scope gap to close in Phase 0** by classifying each against the research need. (This is adversarial-review finding F2/F9.)
+
+**Broader gap (kit-review #2):** the same "missed files" problem applies beyond `Prover.java` — the first draft enumerated only some of the `Automata/` package. **Phase 0 must run a file-by-file inventory of the *entire* `Automata/` directory** (and its subpackages), assigning each file KEEP/DROP and a crate, and produce a **verified Java-file → Rust-crate boundary map** (the walnut-rs analogue of Bun's `LIFETIMES.tsv`) — adversarially reviewed **before Phase 2**. This is the single highest-value pre-build artifact: a crate-boundary decision discovered mid-port forces rework across everything already built on the wrong boundary.
 
 **DROP (initially):** `Automata/Numeration/Ostrowski` (491 LOC) + `NodeState`; Fibonacci/Pell/negative-base branches of `NumberSystem`; CAS matrix writers (Maple/Mathematica/Matlab/Sage — ~28 golden files); `Transducer`-heavy paths *only if* `transduce` is dropped. This removes the messiest ~god-class surface and the exotic-numeration edge cases — the two hardest things to port *exactly*.
 
@@ -125,7 +129,7 @@ This is where the project succeeds or fails. The design principle: **stack indep
   1. produces the **executable specification** the Rust port is judged against;
   2. **surfaces latent Walnut bugs** (uncovered branches are where they hide) — each one is a decision point: replicate-the-quirk vs. fix-and-diverge (log every divergence explicitly);
   3. is itself independently valuable — a hardened Java Walnut.
-- Deliverable: a coverage report + a machine-readable test manifest (input script → expected output) that the Rust suite consumes.
+- Deliverable: a coverage report + a machine-readable test manifest that the Rust suite consumes. **Manifest schema (pin it in Phase 0, kit #11):** a directory of fixtures, each an entry `{ id, command_script (the .txt input), expected_kind: automaton|details|error, expected_path, number_system, commands_used[] }` as JSON/TSV — enough for the Tier-2 replicator to be near-mechanical and for the Tier-1 harness to filter by `number_system`/`commands_used` against the subset boundary.
 
 ### Tier 1 — Golden integration corpus as acceptance
 - Wire the **subset-relevant** slice of the corpus into the Rust build: feed identical command scripts, and compare emitted automata by **semantic language-equivalence** (the `faEqual`/Brics bar Walnut itself uses), with `details`/`error` text compared after normalizing timing/progress lines (exactly as `IntegrationTest.assertEqualMessages` does — it strips `\d+ms` and `Progress:` lines). Green corpus = the port reproduces real theorem-proving workloads. **This requires a semantic-DFA-equivalence oracle in `wr-core`** (product + complement + emptiness-of-symmetric-difference) — a first-class deliverable, not an afterthought (it's also reused by the decision procedure itself).
@@ -179,8 +183,9 @@ Walnut's decision procedure is worst-case **superexponential**, and the real dri
 ```
 walnut-rs/
   crates/
-    wr-core/        # FA engine: states, transitions, DFA/NFA/DFAO; determinize, minimize, product, reverse, quotient
-    wr-numsys/      # base-k msd/lsd number systems: adder, comparator, constant automata
+    wr-core/        # WHOLE Automata/ package: FA, Automaton, NumberSystem (::numsys), Morphism, WordAutomaton,
+                    # RichAlphabet; determinize, minimize, product, reverse, quotient, + language-equivalence oracle.
+                    # numsys is a MODULE not a crate — Automaton<->NumberSystem are coupled (kit #1).
     wr-logic/       # Token/Expression AST, shunting-yard parser, quantifier elimination, boolean ops
     wr-io/          # AutomatonReader/Writer: Walnut .txt format (+ Graphviz); interop bridge
     wr-cli/         # Prover/Session command dispatch, REPL
@@ -191,7 +196,7 @@ walnut-rs/
     properties/     # proptest invariants
 ```
 
-**Java package → Rust crate mapping:** `Automata/FA` → `wr-core`; `Automata/NumberSystem` (base-*k*) → `wr-numsys`; `Main/EvalComputations` + `Predicate` + `AutomatonQuantification` + `AutomatonLogicalOps` → `wr-logic`; `AutomatonReader/Writer` → `wr-io`; `Main/Prover` + `Commands` → `wr-cli`.
+**Java package → Rust crate mapping:** the entire `Automata/` package (`FA`, `Automaton`, `NumberSystem` base-*k*, `Morphism`, `WordAutomaton`, `RichAlphabet`, `AutomatonDFA`) → **`wr-core`** (one crate, because of the coupling in kit #1/#2); `Main/EvalComputations` + `Predicate` + `AutomatonQuantification` + `AutomatonLogicalOps` → `wr-logic`; `AutomatonReader/Writer` → `wr-io`; `Main/Prover` + `Commands` (incl. the inline `split`/`transduce`/… ) → `wr-cli`.
 
 **Dependency replacement table** (each Java dep needs a Rust answer — this is where port risk concentrates):
 
@@ -225,7 +230,7 @@ The [Bun rewrite](https://bun.com/blog/bun-in-rust) ported 535k LOC in 11 days v
 - **Sharding.** Use `bin/claude-box-agent` / the container-agent fleet: one isolated clone per agent on `agent/<name>`, merged back — the pattern in CLAUDE.md. The compiler is the work queue: fix errors crate-by-crate, batch similar errors.
 - **Mechanical-first discipline.** Faithful transliteration commits first; idiomatic refactors are separate, later commits — so a differential-test regression bisects cleanly to either "port bug" or "refactor bug," never both.
 - **The test suite is the safety rail** (Bun's central lesson): Tier 0's ~100%-covered Java fork means *every* ported unit has an oracle. No Rust code merges without its Tier-2 test green and the Tier-1 golden corpus still passing.
-- **Guardrails from this repo apply:** `guard.py` blocks the backgrounded-`-p` footgun; the commit-gate hooks; pathspec-scoped commits on shared trees. The container agents must run foreground-in-turn (CLAUDE.md).
+- **Fleet git hygiene + guardrails:** the concrete rules (no `git stash`/`reset`, atomic pathspec-scoped commits, foreground-only container runs, the merge gate) are stated in **this repo's `CLAUDE.md`** (§ "Fleet git hygiene"). The mechanical hooks that enforce them (commit gate, recursive-`rm`/backgrounded-job guard, pre-push `cargo test`) are **to be ported from ct-research** — a Phase 0 task; until then the rules hold by convention. *(Note: the ct-research `guard.py`/commit-gate hooks are not present in walnut-rs yet — do not assume mechanical enforcement.)*
 
 **Cost model** *(rough, scaled from Bun — a planning ballpark, not a measurement; the Phase 1 spike replaces these with real numbers):*
 
@@ -247,9 +252,9 @@ Each phase ends at a checkpoint you can stop and evaluate at.
 
 | Phase | Goal | Exit criterion | Rough effort* |
 |---|---|---|---|
-| **0. Fork & cover + scope-gap closure** | Fork Walnut; JaCoCo on subset; characterization tests toward ~100%; export test manifest; **classify the missing inline commands (`convert`/`transduce`/`split`/… — §3) KEEP/DROP**; **run the OTF empirical check (do your real queries need non-`SC`? — §9 F3)**; **filter the golden corpus against the subset boundary**; log every latent-bug/quirk decision | Coverage green on KEEP modules; command set finalized; OTF question answered; subset-corpus enumerated; manifest usable by Rust | **1–4 wks** (F7: ~100% on the 873-LOC regex-dispatch `Prover.java` alone is a real effort; "days" was optimistic) |
+| **0. Fork & cover + scope-gap closure** | Fork Walnut; JaCoCo on subset; characterization tests toward ~100%; export the **test manifest** (schema in §5 Tier 0); **classify the inline commands (`convert`/`transduce`/`split`/… — §3) KEEP/DROP**; **full `Automata/` file inventory → verified Java-file→crate boundary map** (kit #2, adversarially reviewed before Phase 2); **write + review `PORTING.md`** (Java→Rust idiom map, kit #6); **run the OTF empirical check (§9 F3)**; **filter the golden corpus to the subset**; **port the fleet hooks from ct-research** (commit gate, safety guard); log every latent-bug/quirk decision | Coverage green on KEEP modules; command set + crate boundary map finalized; `PORTING.md` reviewed; OTF question answered; subset-corpus enumerated; manifest usable by Rust | **1–4 wks** (F7: ~100% on the 873-LOC regex-dispatch `Prover.java` alone is a real effort; "days" was optimistic) |
 | **1. Spike** | Thin end-to-end: base-*k* DFA + `minimize` + one quantified `eval` query + **the `wr-core` semantic-equivalence oracle**; differentially tested vs Walnut. *(Optionally widen to one parser path + one divergence hunt to sample the expensive cost axis — F8.)* | One real query returns a **semantically-equivalent** result to Walnut (via the oracle), both ways | days |
-| **2. Core engine** | Mechanical port of `wr-core` + `wr-numsys` (base-*k*): FA, determinize (subset/Brz), Valmari minimize, product, reverse | Tier-2 tests + Tier-4 core invariants green | 2–4 wks |
+| **2. Core engine** | Mechanical port of `wr-core` (FA, Automaton, base-*k* `numsys`): determinize (subset/Brz), Valmari minimize, product, reverse, + the language-equivalence oracle | Tier-2 tests + Tier-4 core invariants green | 2–4 wks |
 | **3. Logic layer** | `wr-logic` (parser, quantifiers, boolean) + `wr-io` + `wr-cli`; the full FOL decider | **Golden corpus (Tier 1) green**; `eval`/`def`/`reg` work | 3–6 wks |
 | **4. Hardening** | Differential generator (Tier 3) + fuzzing (Tier 5) at scale; full property suite (Tier 4); performance vs JVM Walnut | No differential divergence over N≥10⁵ generated queries; property suite green; faster than Walnut on the research workloads | 2–4 wks |
 
@@ -323,6 +328,29 @@ A Sonnet subagent was run as a hostile reviewer against this proposal and the ac
 | **F10** | Pattern of slightly inflating asset sizes (LOC, corpus counts) | Corrected throughout; sizes now measured |
 
 **The three highest-value pre-Phase-0 changes** (all now reflected): (1) semantic-equivalence oracle, not byte-identity; (2) reconcile the golden corpus + command set against the subset boundary; (3) settle the OTF cliff empirically on *your* query corpus. None is fatal; F1–F3 are scope/design corrections that make the plan *more* accurate and, in F1's case, *cheaper*.
+
+---
+
+## 13. Kit-review record (bootstrap scaffold)
+
+A second Sonnet adversarial pass reviewed the **bootstrap kit itself** (CLAUDE.md, scaffold, agent def) as executable steering for the fleet, against the Bun methodology. Load-bearing findings were verified firsthand and applied to the repo.
+
+| # | Finding (verified) | Resolution |
+|---|---|---|
+| **#1** | `Automaton`↔`NumberSystem` are bidirectionally coupled (Automaton→NS 19 refs incl. a `List<NumberSystem>` field; NS→Automaton **121** refs) — a `wr-core`/`wr-numsys` crate split is an impossible Cargo cycle | **Folded `numsys` into `wr-core`** (module, not crate); updated workspace, mappings, docstrings |
+| **#2** | ~745 LOC of KEEP files missing from §3 (`Morphism`/`WordAutomaton`/`RichAlphabet`/`AutomatonDFA`); `Image` imports `Automata/Morphism` | Added to §3 KEEP → `wr-core`; made a **full `Automata/` inventory + boundary map** a Phase 0 deliverable |
+| **#3** | Cargo dependency edges empty; `wr-cts` (mandatory Tier-4 minimizer) wired to nothing | Wired real edges (`wr-logic`/`wr-io`/`wr-cts`→`wr-core`; `wr-cli`→ all incl. `wr-cts`) |
+| **#4** | CLAUDE.md lacked the fleet git-hygiene rules (no `stash`/`reset`, atomic commits, foreground containers); DESIGN falsely cited it as the enforcer | Added a **"Fleet git hygiene"** section to CLAUDE.md; corrected the §7 citation |
+| **#5** | No merge/commit gate stated as an operating rule | Added the hard **merge gate** to CLAUDE.md (never commit red; two-reviewer loop on trust-critical crates) |
+| **#6** | No `PORTING.md` (the top Bun prep artifact) | **Created `PORTING.md`** (Java→Rust idiom map incl. the HashMap iteration-order trap); made it a reviewed Phase 0 deliverable |
+| **#7** | Reviewer agent had Bash but no resource-guard, in a superexponential project | Added a small-input/`walnut-guard`-style bound to the agent def |
+| **#8/#9** | Split-context not protected; no two-reviewer reconciliation policy | CLAUDE.md: dispatch reviewers with diff-only; a single correctness finding from either blocks |
+| **#10/#15** | No CI; no toolchain pin | Added `.github/workflows/ci.yml` (fmt+clippy+test) and `rust-toolchain.toml` |
+| **#11** | No test-manifest schema | Pinned a schema in §5 Tier 0 |
+| **#13/#16** | `NOTICE` upstream URL stale (`firetto/Walnut`); `wr-cts` substrate URL a placeholder | Corrected to `Walnut-Theorem-Prover/Walnut`; filled the real substrate URL |
+| **#14/#17** | Architecture decisions unassigned to a model tier; `Automaton` "mostly-static" overclaim | Architecture/boundary calls → Opus tier; corrected the `Automaton` note |
+
+**Verdict (accepted):** **Phase 0 can start as-is** (it's Java-side). **Phase 1 was gated on #1/#2/#3/#4/#6** — all now fixed in this commit, so that gate is cleared.
 
 ---
 

@@ -9,7 +9,7 @@ Walnut is:
     Copyright 2016 Hamoon Mousavi, and subsequent contributors
     (Aseem Baranwal, Laindon C. Burnett, Kai Hsiang Yang, Anatoly Zavyalov,
      John Nicol, and others).
-    https://github.com/firetto/Walnut  (upstream)
+    https://github.com/Walnut-Theorem-Prover/Walnut  (canonical upstream)
     Licensed under GPLv3-or-later.
 
 New code in walnut-rs is:

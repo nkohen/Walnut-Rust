@@ -11,6 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 wr-core = { path = "../wr-core" }
-wr-numsys = { path = "../wr-numsys" }
 wr-logic = { path = "../wr-logic" }
 wr-io = { path = "../wr-io" }
+wr-cts = { path = "../wr-cts" }

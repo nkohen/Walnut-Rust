@@ -6,3 +6,4 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+wr-core = { path = "../wr-core" }

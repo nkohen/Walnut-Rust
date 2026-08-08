@@ -4,8 +4,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/wr-core",   # FA engine: DFA/NFA/DFAO, determinize, minimize, product, reverse, quotient, language-equivalence oracle
-    "crates/wr-numsys", # base-k msd/lsd number systems: adder, comparator, constant automata
+    # NB: base-k numeration lives INSIDE wr-core (module `numsys`), not a separate
+    # crate — Automaton<->NumberSystem are bidirectionally coupled (kit-finding #1).
+    "crates/wr-core",   # WHOLE Automata/ package: FA, Automaton, NumberSystem, Morphism, WordAutomaton, RichAlphabet; determinize/minimize/product/reverse/quotient + language-equivalence oracle
     "crates/wr-logic",  # formula lexer/parser (AST), quantifier elimination, boolean ops
     "crates/wr-io",     # Walnut .txt automaton reader/writer (multi-track + NFA), Graphviz
     "crates/wr-cli",    # Prover/Session command dispatch + REPL (binary)

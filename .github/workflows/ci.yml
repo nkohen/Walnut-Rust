@@ -1,0 +1,18 @@
+# Minimal CI gate (kit-finding #10): build + test + fmt + clippy on every push/PR.
+# The fleet produces many commits; this is the cheap mechanical backstop until the
+# richer differential/property/fuzz tiers exist.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace

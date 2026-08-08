@@ -7,9 +7,9 @@ name = "wr-cli"
 version = "0.0.0"
 dependencies = [
  "wr-core",
+ "wr-cts",
  "wr-io",
  "wr-logic",
- "wr-numsys",
 ]
 
 [[package]]
@@ -19,15 +19,20 @@ version = "0.0.0"
 [[package]]
 name = "wr-cts"
 version = "0.0.0"
+dependencies = [
+ "wr-core",
+]
 
 [[package]]
 name = "wr-io"
 version = "0.0.0"
+dependencies = [
+ "wr-core",
+]
 
 [[package]]
 name = "wr-logic"
 version = "0.0.0"
-
-[[package]]
-name = "wr-numsys"
-version = "0.0.0"
+dependencies = [
+ "wr-core",
+]

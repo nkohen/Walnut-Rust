@@ -36,7 +36,10 @@ your independence is the point. **Assume the code is wrong and find out how.**
   `walnut-java` repo (or the vendored `libs/Walnut` if present) when the change ports a specific Walnut method —
   verify the port against the *actual* source, not your memory of the algorithm.
 - Where cheap, construct a concrete falsifying input (a small automaton / formula) and reason through it by hand, or
-  run a quick `cargo test`-style check if a harness exists.
+  run a quick `cargo test`-style check if a harness exists. **Keep every probe SMALL and resource-bounded** — this
+  project is superexponential; a determinize/quantifier probe on a large input can explode your own review run. Use
+  tiny automata (few states, small base, shallow quantifier alternation) and a timeout/`walnut-guard`-style wrapper;
+  never run an unbounded query.
 - Do NOT rubber-stamp. "Looks fine" is only acceptable output after you have actually tried to break it and can say
   what you tried.
 
