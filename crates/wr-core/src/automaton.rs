@@ -70,6 +70,7 @@
 //! encoded ints) silently misaligns tracks.
 
 use crate::fa::Fa;
+use crate::util::{is_sorted, remove_indices};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// A multi-track automaton: the raw [`Fa`] plus enough track metadata to encode/decode
@@ -474,7 +475,7 @@ impl Automaton {
         if !self.is_bound() {
             return;
         }
-        let already_sorted = self.label.windows(2).all(|w| w[0] <= w[1]);
+        let already_sorted = is_sorted(&self.label);
         if already_sorted {
             return;
         }
@@ -645,23 +646,11 @@ impl Automaton {
         automaton.fa.d = new_d;
 
         same_label_indices.remove(0);
-        Self::remove_indices(&mut automaton.msd, &same_label_indices);
+        remove_indices(&mut automaton.msd, &same_label_indices);
         automaton.alphabet = new_alphabet;
         automaton.encoder = new_encoder;
         automaton.determine_alphabet_size();
-        Self::remove_indices(&mut automaton.label, &same_label_indices);
-    }
-
-    /// `UtilityMethods.removeIndices` (`UtilityMethods.java:95-103`): drops the elements
-    /// at the given positions, keeping the rest in their original relative order.
-    fn remove_indices<T: Clone>(items: &mut Vec<T>, indices: &[usize]) {
-        let mut kept = Vec::with_capacity(items.len());
-        for (i, item) in items.iter().enumerate() {
-            if !indices.contains(&i) {
-                kept.push(item.clone());
-            }
-        }
-        *items = kept;
+        remove_indices(&mut automaton.label, &same_label_indices);
     }
 
     /// `Automaton.determinizeAndMinimize()` (`Automaton.java:383-398`). Java's

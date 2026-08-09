@@ -292,6 +292,99 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-011 — `ParseMethods.parseMorphism` crashes on a bracketed symbol its own regex accepts
+
+- **Where:** `Automata/ParseMethods.java`, `parseMorphism` (`:166-193`), specifically the
+  `Integer.parseInt(input)` / `Integer.parseInt(imagePiece)` calls at `:187`/`:185` on text stripped
+  of its surrounding `[`/`]` by hand (`input.substring(1, input.length() - 1)`,
+  `imagePiece.substring(1, imagePiece.length() - 1)`) — NOT `UtilityMethods.parseInt`, which strips
+  whitespace before parsing (used everywhere else in this same file).
+- **What:** the bracket grammar shared by `MORPHISM_INPUT_SYMBOL`/`MORPHISM_IMAGE_SYMBOL`
+  (`MORPHISM_COMMON_SYMBOL = "\\[(?:[+\\-])?\\s*\\d+\\]|"`) explicitly permits whitespace between
+  the optional sign and the digits — e.g. `[+ 5]` matches the pattern. But the two call sites above
+  hand that raw (unstripped) inner text straight to plain `Integer.parseInt`, which does NOT accept
+  embedded whitespace and throws `NumberFormatException` on exactly the input the regex just
+  accepted. A self-contradiction between what the grammar allows and what the parser that consumes
+  its own capture can handle, not a mere quirk.
+- **Trigger (verified against the real regex, javac'd standalone):** `parseMorphism("[+ 5] -> 1")`
+  — the pattern matches `input = "[+ 5]"` cleanly (`m1.group(1)`), but
+  `Integer.parseInt("+ 5")` (after bracket-stripping) throws
+  `NumberFormatException: For input string: "+ 5"`, uncaught, aborting the whole call. Any morphism
+  definition using bracketed symbol notation with a space after the sign hits this. **Correction
+  (Phase 3a, U0b review pass):** an earlier version of this entry claimed no test anywhere exercises
+  bracket notation at all — that overclaimed. `ParseMethodsTest` (in `walnut-java`) indeed has no
+  bracket-notation coverage, but `Automata/MorphismTest.testBigAlphabet` (`:34-41`) DOES exercise
+  bracket notation directly (`new Morphism("0->01 [11]->012 [12]->02")`) — it just never happens to
+  hit THIS specific whitespace-after-sign shape (`[11]`/`[12]` have no sign at all, let alone a space
+  after one), so it doesn't cover this bug. The accurate claim is narrower: no existing test (in
+  `ParseMethodsTest`, `MorphismTest`, or any `Morphism Library/*.txt` fixture) exercises a bracketed
+  symbol with whitespace between its sign and digits — that specific shape has no coverage on either
+  side, but it is real, reproducible, user-triggerable syntax, not a contrived construction.
+- **Found:** Phase 3a, U0b (`wr-io::parse_methods` port), 2026-08-09, while porting `parseMorphism`.
+  Verified directly against the actual compiled Java `Pattern`/`Integer.parseInt` behavior (not just
+  read) via a standalone `javac`'d reproduction using the real regex strings copied from
+  `ParseMethods.java`.
+- **Rust port:** `ported verbatim (quirk)` — `wr_io::parse_methods::parse_morphism` reproduces the
+  same crash, surfaced as `Err(ParseMethodsError::IntegerParseFailure)` rather than Java's uncaught
+  `NumberFormatException` (a `Result` rather than a panic, following this port's convention of
+  keeping anything reachable straight from raw user-typed command text recoverable — see
+  `NumSysError::BaseNotAnI32` for the same convention applied elsewhere). Pinned by
+  `morphism_bracket_whitespace_quirk_wb_011` in `crates/wr-io/src/parse_methods.rs`.
+- **Upstream:** not filed. Fix in Java would be using `UtilityMethods.parseInt` (whitespace-stripping)
+  at both call sites, matching every other numeric-text-to-`int` conversion in the same file.
+- **Severity:** low — reachable only via bracket-notation morphism symbols with an internal space
+  after the sign, a narrow and untested corner of an already narrow (no golden-corpus coverage at
+  all, per the Phase-3a plan's gap #11) feature; flagged per `CLAUDE.md`'s bug-logging rule (a crash
+  on syntax the code's own grammar declares valid) rather than silently ported or silently "fixed."
+
+---
+
+## WB-012 — `UtilityMethods.commonRoot(a, 0)` recurses forever for negative `a`
+
+- **Where:** `Main/UtilityMethods.java`, `commonRoot` (`:123-134`), specifically the final branch:
+  `return (b % a == 0) ? commonRoot(a, b / a) : NO_COMMON_ROOT;`.
+- **What:** for `a < 0` and `b == 0` (reached either directly, or via the `a > b` swap one level up
+  for `a == 0, b < 0`), `b % a` is `0 % a == 0` for any nonzero `a` in Java, so the method recurses
+  into `commonRoot(a, b / a)` — and `0 / a == 0` for any nonzero `a`, so the recursive call is
+  `commonRoot(a, 0)`, i.e. **exactly the same arguments as the current call**. Every subsequent
+  recursion is identical to the one before it; there is no base case that terminates this shape.
+- **Trigger:** `commonRoot(-3, 0)` (or the symmetric `commonRoot(0, -3)`, which swaps into the same
+  shape via the `a > b` branch). In Java this recurses until `StackOverflowError` — a crash, and a
+  loud one, but not silent. The positive-`a`/`b == 0` shape (e.g. `commonRoot(3, 0)`) does NOT hang:
+  it swaps to `commonRoot(0, 3)`, then hits `3 % 0`, Java's integer `%` on a zero divisor, which
+  throws `ArithmeticException: / by zero` immediately — a different, non-hanging crash for what's
+  really the same "no coherent common root" input shape.
+- **Found:** Phase 3a, U0b review pass (`crates/wr-core/src/util.rs`'s `common_root`, the port of
+  this method), 2026-08-09. Confirmed by direct trace of the recursion (`0 % a == 0` and `0 / a ==
+  0` for any nonzero integer `a` in Java's semantics) — not yet run against a live
+  `StackOverflowError` reproduction, but the arithmetic is unambiguous.
+- **Rust port:** **deliberate divergence, not a verbatim port.** `wr_core::util::common_root` adds an
+  explicit `a == 0 || b == 0` guard (placed after the pre-existing `a == b` check, so
+  `commonRoot(0, 0) == 0` is unaffected and still matches Java) that returns `NO_COMMON_ROOT`
+  cleanly instead of recursing. This is the one function in this crate's Tier-4 discipline
+  (`CLAUDE.md`: "yields a `TIMEOUT`/`EXPLODED` verdict... instead of hanging") where faithfully
+  porting Java's behavior is not a coherent goal: Java's own `StackOverflowError` is a crash, but the
+  identical-arguments self-recursion is exactly the shape a Rust release build's tail-call
+  optimization turns into a **genuinely infinite loop with no stack growth at all** — a silent hang,
+  which this project's stated discipline treats as strictly worse than a crash. Reproducing either of
+  Java's two failure modes (a slow stack-overflow crash for negative `a`, an immediate
+  divide-by-zero crash for positive `a`) for what's really one degenerate input shape isn't worth it
+  either, so both guard the same way. Verified the guard changes nothing for any `(a, b)` pair where
+  neither operand is zero (provable by construction — the new check is a no-op unless
+  `a == 0 || b == 0` — and spot-checked directly against an unguarded reference reimplementation over
+  the full `[-6, 20]²` grid in `common_root_matches_unguarded_reference_away_from_zero`).
+- **Upstream:** not filed. Fix in Java would be an explicit `a == 0 || b == 0` early return (mirroring
+  the Rust guard), placed before the `a > b` swap so both the negative-`a` hang and the
+  positive-`a`/zero-`b` `ArithmeticException` are replaced with a clean, documented `NO_COMMON_ROOT`.
+- **Severity:** low in Java today — `commonRoot`'s only caller is
+  `AutomatonLogicalOps.java:482` inside `convertNS`, which is out of scope for this port
+  (`docs/BOUNDARY-MAP.md`), so this isn't reachable from any code path this port currently exposes.
+  Logged now (rather than deferred) because the Rust port's own `common_root` was being touched in
+  this same review pass and the divergence needed to be a deliberate, documented choice per
+  `CLAUDE.md`, not a silent one.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

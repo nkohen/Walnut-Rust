@@ -367,12 +367,13 @@ impl ArithmeticOp {
 // Name parsing / normalization helpers (all `static`, no file I/O)
 // ---------------------------------------------------------------------------
 
-/// `UtilityMethods.isNumber` (`UtilityMethods.java:42-44`) — matches `^\d+$`. Note
-/// this is deliberately NOT `str::parse::<i32>().is_ok()`: it accepts leading zeros
-/// and arbitrarily long digit strings (which `Integer.parseInt` then rejects — see
-/// [`NumSysError::BaseNotAnI32`]) and rejects a leading `+`/`-`.
+/// `UtilityMethods.isNumber` (`UtilityMethods.java:42-44`) — matches `^\d+$`.
+///
+/// This used to be a private copy of the same one-liner (added in U7, before
+/// `crate::util` existed); now delegates to the canonical port in [`crate::util`]
+/// (Phase 3a's U0b) so there is only one copy of this regex's semantics.
 fn is_number(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    crate::util::is_number(s)
 }
 
 /// `NumberSystem.determineBase(String)` (`:265-267`): everything after the FIRST `_`.

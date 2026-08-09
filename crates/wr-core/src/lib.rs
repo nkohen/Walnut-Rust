@@ -44,3 +44,4 @@ pub mod numsys;
 pub mod product;
 pub mod quantify;
 pub mod trim;
+pub mod util;

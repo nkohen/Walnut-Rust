@@ -19,4 +19,5 @@
 //! differential test (`.claude/plans/fluttering-foraging-spindle.md`) needs to ingest
 //! real `walnut-java` output; the writer is deferred.
 
+pub mod parse_methods;
 pub mod reader;
