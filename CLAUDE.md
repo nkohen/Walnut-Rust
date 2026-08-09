@@ -202,10 +202,19 @@ through the full implementer → two-independent-Opus-reviewer → fixer loop:
 - **U3** (`e220cda`): `product.rs` — the cross-product BFS behind the boolean connectives, via a local
   `BooleanOp` enum (not a full `Token`/`LogicalOperator` port) generic over the output-combining function
   so later units (`combine`/`join`/eval) can reuse the same primitives.
+- **U4** (`f12aea1`): Brzozowski double-reversal determinize (`BRZ`) in `determinize.rs`.
+- **U5** (`504acb8`): `logicalops.rs` — `AutomatonLogicalOps`'s boolean ops, quotients, zero-fixups,
+  `reverse` (Opus-authored — flagged as subtle as `NumberSystem`; found a genuine Walnut bug in
+  `leftQuotient`'s alphabet-subset guard, WB-010). `convertNS` stays out of scope (genuine, unconditional
+  `WordAutomaton` dependency, not a DFAO-only branch).
+- **U6** (`23c2e09`): an architecture unit — moved `AutomatonQuantification`'s ∃-projection primitive
+  from `wr-logic` down into `wr-core::quantify` (with `wr_logic::quantify::exists` now a thin wrapper),
+  because `wr-core`'s own `NumberSystem` needs to call it 10× and `wr-logic` must depend on `wr-core`, not
+  the reverse — a real incoming-edge coupling `docs/BOUNDARY-MAP.md`'s original analysis missed (now
+  corrected there and in `docs/DESIGN.md`'s crate-mapping table).
 
-Remaining Phase 2 units (see the plan doc for the full dependency-ordered list and rationale): U4
-(Brzozowski determinize), U5 (`AutomatonLogicalOps` — boolean ops/quotient/reverse/`convertNS`), U6 (an
-architecture unit resolving a wr-core↔wr-logic coupling `NumberSystem` needs), U7 (`NumberSystem`,
-base-*k*), U8/U9/U9a (equivalence-oracle hardening + the Tier-4 core property suite + a cross-oracle
-minimizer check against the `RustConstantTermSequences` substrate).
+Remaining Phase 2 units (see the plan doc for the full dependency-ordered list and rationale): U7
+(`NumberSystem`, base-*k* — the largest, hardest-reasoning file in this phase), U8/U9/U9a
+(equivalence-oracle hardening + the Tier-4 core property suite + a cross-oracle minimizer check against
+the `RustConstantTermSequences` substrate).
 per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
