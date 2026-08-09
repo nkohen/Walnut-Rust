@@ -188,5 +188,24 @@ panic), and a minimal `wr-io` `.txt` reader. **Exit criterion met**: `tests/diff
 checks `∃i (i<x)` over msd base-2 against real `walnut-java` output via the Rust-native equivalence
 oracle — green. `cargo test --workspace` is green throughout; `cargo fmt`/`clippy` clean.
 
-Not yet started: Phase 2 (mechanical port of the rest of `wr-core`) — needs the user's explicit go-ahead
+**Phase 2 in progress** (plan at `.claude/plans/toasty-napping-wall.md`, adversarially reviewed before
+execution — the first draft's unit ordering was dependency-backwards in several places, corrected before
+any code landed). Toolchain bumped to current stable first (U0, `206413a`). Units landed so far, each
+through the full implementer → two-independent-Opus-reviewer → fixer loop:
+- **U1** (`23e030d`): `fa.rs` completion — `reverse`, `star_states`/`concat_states`, `canonicalize`. Found
+  and logged two genuine Walnut bugs in `concatStates` (WB-008/WB-009, both confirmed live against the
+  real `walnut-java` CLI during review).
+- **U2** (`3524b95`): `automaton.rs`'s self-contained surface — `bind`/`sort_label`/`canonize`/
+  `determinize_and_minimize`/`AutomatonDFA`. Surfaced a live call site for WB-001 (the Phase-1
+  Valmari-minimize quirk) through `determinize_and_minimize`'s already-deterministic branch — faithfully
+  ported (not fixed), pinned by a dedicated test, WB-001's entry updated.
+- **U3** (`e220cda`): `product.rs` — the cross-product BFS behind the boolean connectives, via a local
+  `BooleanOp` enum (not a full `Token`/`LogicalOperator` port) generic over the output-combining function
+  so later units (`combine`/`join`/eval) can reuse the same primitives.
+
+Remaining Phase 2 units (see the plan doc for the full dependency-ordered list and rationale): U4
+(Brzozowski determinize), U5 (`AutomatonLogicalOps` — boolean ops/quotient/reverse/`convertNS`), U6 (an
+architecture unit resolving a wr-core↔wr-logic coupling `NumberSystem` needs), U7 (`NumberSystem`,
+base-*k*), U8/U9/U9a (equivalence-oracle hardening + the Tier-4 core property suite + a cross-oracle
+minimizer check against the `RustConstantTermSequences` substrate).
 per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
