@@ -47,13 +47,19 @@ bug costs a silent wrong answer somewhere downstream.
   commit `f9475e7`).
 - **Rust port:** `ported verbatim (quirk)` — `wr_core::minimize::minimize` reproduces this exactly
   (documented at length in that module's doc comment, pinned by
-  `minimize_q0_not_co_reachable_walnut_quirk`). **Does not manifest through this crate's actual
+  `minimize_q0_not_co_reachable_walnut_quirk`). **Was safe through the Phase-1 spike's own
   pipeline** (`trim` → `subset_construction` → `minimize`): `subset_construction`'s output only
   ever contains states forward-reachable from its own `q0` by construction, and `trim`'s own
-  postcondition is exactly `minimize`'s precondition — so every call site in the spike is safe.
-  **A future direct call to `minimize` on an untrimmed automaton is not safe** — no guard exists at
-  the `minimize` API boundary itself (flagged, not yet acted on, by the Phase-1 final integration
-  review, commit `52e0bcf`'s discussion).
+  postcondition is exactly `minimize`'s precondition. **Update (Phase 2, U2, 2026-08-09): a live
+  call site now exists** — `wr_core::automaton::Automaton::determinize_and_minimize` (faithfully
+  porting `Automaton.java:383-398`) skips `trim` entirely whenever its input is ALREADY
+  deterministic (matching Java's identical `!isDeterministic()` guard), so calling it on an
+  already-deterministic automaton with a state unreachable from `q0` reaches WB-001 exactly —
+  pinned by `determinize_and_minimize_reaches_wb_001_on_an_already_deterministic_input`
+  (`automaton.rs`). Faithful to Java (same bug, same call site), so ported verbatim, not fixed with
+  an undeclared extra `trim`. No guard exists at the `minimize` API boundary itself (flagged, not
+  yet acted on, by the Phase-1 final integration review, commit `52e0bcf`'s discussion) — this
+  finding makes that gap concretely reachable rather than hypothetical.
 - **Upstream:** not filed. A ~3-line guard (`if blocks.loc[q0] >= rr` after the reachability pass,
   route to the canonical dead-automaton case) would fix it in Java too.
 - **Severity:** **critical** — silent wrong answer (not a crash), in the automaton engine's most
