@@ -17,23 +17,54 @@
 //! Walnut's more general DFAO word-output value — matches this crate's current scope
 //! (predicate automata only); revisit when DFAO support lands.
 //!
-//! **Known gap, flagged by the Phase-1 spike's final integration review (not yet
-//! fixed): this module only checks [`Fa::alphabet_size`] (an integer), never symbol
-//! *content* or per-track *order*.** `Fa` is deliberately track-agnostic (symbols are
+//! **Former known gap, flagged by the Phase-1 spike's final integration review —
+//! PARTIALLY closed by [`automaton_language_equivalent`] below; read this carefully,
+//! it is narrower than an earlier version of this doc claimed.** The functions above
+//! (`complement`/`product_dfa`/`language_equivalent`) only ever operate on bare
+//! [`Fa`]s and only check [`Fa::alphabet_size`] (an integer), never symbol *content*
+//! or per-track *order* — `Fa` is deliberately track-agnostic (symbols are
 //! pre-encoded integers, see the `fa` module docs), so it has no way to know whether
-//! "symbol 1" means the same digit tuple on both sides being compared — that's a
-//! property of the `automaton::Automaton` layer (its `alphabet`/`encoder`), which
-//! this module never sees. A caller comparing two `Automaton`s built from
-//! *differently-ordered* alphabets could get a confidently wrong "equivalent" or
-//! "not equivalent" verdict with no diagnostic. Every call site so far (this crate's
-//! own tests, `wr-logic`'s, and `tests/differential`) happens to compare
-//! same-alphabet automata, so this hasn't produced a wrong answer yet — but nothing
-//! enforces it. `tests/differential/tests/spike_ei_i_lt_x.rs` works around this by
-//! asserting `Automaton::alphabet` equality explicitly before calling into here;
-//! that pattern (or a real content-aware check added to `Automaton`, since `Fa` alone
-//! can't express one) should be revisited before this oracle is used for genuinely
-//! multi-track differential testing (Phase 3+).
+//! "symbol 1" means the same digit tuple on both sides being compared. That is still
+//! true today and is not a defect in `Fa`'s design (see its own module docs) — but it
+//! made it easy for a caller working at the `automaton::Automaton` layer (which DOES
+//! carry `alphabet`/`label`) to accidentally call straight into the `Fa`-level oracle
+//! and get a confidently wrong verdict, with no diagnostic.
+//!
+//! [`automaton_language_equivalent`] closes this ONLY for a mismatched-`alphabet`
+//! shape (different arity, different per-track digit lists, or the same digits in a
+//! different per-track order) — it checks `a`/`b`'s `Automaton::alphabet` for exact
+//! positional equality and returns [`EquivError::MismatchedTrackStructure`] instead of
+//! silently delegating to a meaningless `Fa`-level comparison.
+//!
+//! **Still open, and NOT a narrow corner case — adversarial review confirmed this is
+//! a live, demonstrated wrong-answer path, not just a documented inconvenience:**
+//! `automaton_language_equivalent` does NOT compare `label`. Two `Automaton`s over
+//! DIFFERENT tracks that happen to share the same per-track alphabet CONTENT — e.g.
+//! labels `["i", "x"]` vs `["x", "i"]`, both tracks `[0,1]`, which is the *common*
+//! shape for same-base multi-track automata, not a rare one — pass the `alphabet`
+//! check trivially (`[[0,1],[0,1]] == [[0,1],[0,1]]`) and get compared positionally
+//! regardless of what each side's tracks actually mean. This silently returns a
+//! confidently WRONG verdict whenever the two automata's tracks are permuted relative
+//! to each other, with no error and no diagnostic — pinned deliberately (not just
+//! described) by `automaton_language_equivalent_does_not_detect_permuted_labels`
+//! below, so this gap cannot silently regress into an even-more-wrong assumption and
+//! cannot be forgotten.
+//!
+//! Why `label` isn't compared, despite that gap: `wr_io`'s `.txt` reader assigns
+//! placeholder numeric labels (`"0"`, `"1"`, …) to every automaton it reads (it has no
+//! way to recover semantic names from the file format), so a strict `a.label ==
+//! b.label` requirement would break exactly the differential-testing use case this
+//! function exists for (comparing a freshly-computed `Automaton` against one read
+//! back from a `walnut-java`-produced `.txt` file). Also not compared: `msd`
+//! (msd/lsd-ness) — an msd-base-*k* and an lsd-base-*k* automaton over an identical
+//! `alphabet` denote different numeric relations, and nothing here catches that
+//! either. Callers that need real semantic-track alignment (not just "same shape")
+//! must `canonize`/`sort_label` both operands to a shared label order themselves, or
+//! independently confirm `label`/`msd` agree, before calling in — this function
+//! checks structural COMPATIBILITY of the two symbol encodings, not that the two
+//! automata mean the same thing track-for-track.
 
+use crate::automaton::Automaton;
 use crate::fa::Fa;
 use std::collections::BTreeMap;
 
@@ -41,9 +72,18 @@ use std::collections::BTreeMap;
 pub enum EquivError {
     /// An input automaton was not deterministic-and-total.
     NotTotalDfa,
-    /// The two automata being combined have different alphabet sizes — the
-    /// comparison is meaningless without a shared symbol encoding.
+    /// The two `Fa`s being combined have different [`Fa::alphabet_size`] — the
+    /// comparison is meaningless without a shared symbol encoding. Raised by the
+    /// `Fa`-level functions ([`product_dfa`]/[`language_equivalent`]); see
+    /// [`MismatchedTrackStructure`](EquivError::MismatchedTrackStructure) for the
+    /// `Automaton`-level analogue.
     MismatchedAlphabet,
+    /// The two `Automaton`s passed to [`automaton_language_equivalent`] have
+    /// different track structure — a different number of tracks, or a track whose
+    /// alphabet (digit list, in order) doesn't match positionally. Raised BEFORE any
+    /// `Fa`-level comparison runs, since a mismatch here means the two automata's
+    /// raw transition symbols cannot be assumed to mean the same digit tuples.
+    MismatchedTrackStructure,
 }
 
 /// Complements a total DFA: flips every state's accept bit. `fa` must already be a
@@ -106,6 +146,56 @@ pub fn product_dfa(a: &Fa, b: &Fa, accept: impl Fn(bool, bool) -> bool) -> Resul
 pub fn language_equivalent(a: &Fa, b: &Fa) -> Result<bool, EquivError> {
     let sym_diff = product_dfa(a, b, |x, y| x != y)?;
     Ok(sym_diff.is_language_empty())
+}
+
+/// `Automaton`-level equivalence: like [`language_equivalent`], but takes
+/// [`Automaton`]s rather than bare [`Fa`]s and checks track structure FIRST — see this
+/// module's doc comment ("Former known gap... PARTIALLY closed") for the full picture,
+/// including a real gap this function does NOT close.
+///
+/// Requires `a.alphabet == b.alphabet` exactly: same number of tracks, and for each
+/// track the identical digit list in the identical order. This is deliberately
+/// stricter than "same digits as a set" — a transition symbol's meaning depends on
+/// each digit's *position* in its track's alphabet list (`automaton::Automaton`'s
+/// module docs, "Symbol encoding"), so two tracks that are set-equal but differently
+/// ORDERED (e.g. `[0, 1]` vs `[1, 0]`) encode the same digit to different integers
+/// and are correctly rejected here, not silently treated as comparable. On a
+/// mismatch, returns [`EquivError::MismatchedTrackStructure`] without ever touching
+/// `a.fa`/`b.fa`.
+///
+/// **Does NOT compare [`Automaton::label`] — and this is a real, demonstrated gap, not
+/// a benign simplification.** Two `Automaton`s whose tracks are PERMUTED relative to
+/// each other (e.g. `a.label = ["i","x"]`, `b.label = ["x","i"]`) but whose
+/// per-position `alphabet` lists happen to be identical (the common case for
+/// same-base multi-track automata, where every track's alphabet is the same `0..k`
+/// list) pass this check and get compared POSITIONALLY — silently answering a
+/// different, meaningless question ("is `a`'s track 0 vs `b`'s track 0 the same
+/// language slice") instead of the one the caller almost certainly wants ("do these
+/// automata denote the same relation once matching tracks are lined up by name"). This
+/// function makes no attempt to detect or correct for that; see this module's top doc
+/// comment for why (in short: `wr_io`'s reader can't recover real labels, so a strict
+/// label check would break the differential-testing use case this function was built
+/// for) and for what a caller needing real semantic alignment must do instead
+/// (`canonize`/`sort_label` both operands to a shared order first). Pinned explicitly
+/// by `automaton_language_equivalent_does_not_detect_permuted_labels` below.
+///
+/// Once track structure is confirmed to match POSITIONALLY, this delegates to
+/// [`language_equivalent`], which still enforces both `Fa`s be total DFAs (see this
+/// module's top doc comment) and still checks `Fa::alphabet_size` itself as a second,
+/// cheap line of defense (always redundant with the check here when `Automaton::new`'s
+/// own documented invariant — `Π alphabet[i].len() == fa.alphabet_size` — holds, but
+/// this function does not re-validate that invariant, matching `Automaton::new`'s own
+/// "callers are responsible" convention). Note also that this invariant is guarded by
+/// `Automaton::new`'s CALLER, not enforced continuously: a caller who mutates
+/// `a.alphabet` directly without calling `Automaton::setup_encoder` leaves `a`'s
+/// private `encoder` stale, at which point equal `alphabet` no longer implies equal
+/// symbol encoding either — this function trusts `Automaton`'s own invariant, it does
+/// not re-derive it from `encoder`.
+pub fn automaton_language_equivalent(a: &Automaton, b: &Automaton) -> Result<bool, EquivError> {
+    if a.alphabet != b.alphabet {
+        return Err(EquivError::MismatchedTrackStructure);
+    }
+    language_equivalent(&a.fa, &b.fa)
 }
 
 #[cfg(test)]
@@ -273,6 +363,134 @@ mod tests {
         assert_eq!(
             product_dfa(&a, &b, |x, y| x == y).unwrap_err(),
             EquivError::MismatchedAlphabet
+        );
+    }
+
+    // --- automaton_language_equivalent (U8: closes the Automaton-level alphabet gap
+    // named in this module's doc comment) ---
+
+    fn single_track_automaton(fa: Fa, alphabet: Vec<i32>) -> Automaton {
+        Automaton::new(fa, vec![alphabet], vec!["x".to_string()], vec![Some(true)])
+    }
+
+    #[test]
+    fn automaton_language_equivalent_matches_on_identical_track_structure() {
+        let a = single_track_automaton(contains_one_dfa(), vec![0, 1]);
+        // Different STATE numbering (mirrors `language_equivalent_ignores_state_numbering`
+        // above) but the same track structure -- the structural check must not itself
+        // reject this, only a genuine alphabet mismatch should.
+        let b = single_track_automaton(contains_one_dfa_relabeled(), vec![0, 1]);
+        assert_eq!(automaton_language_equivalent(&a, &b), Ok(true));
+    }
+
+    #[test]
+    fn automaton_language_equivalent_detects_a_real_language_difference() {
+        let a = single_track_automaton(contains_one_dfa(), vec![0, 1]);
+        let b = single_track_automaton(reject_all_dfa(), vec![0, 1]);
+        assert_eq!(automaton_language_equivalent(&a, &b), Ok(false));
+    }
+
+    #[test]
+    fn automaton_language_equivalent_rejects_mismatched_arity() {
+        let a = single_track_automaton(contains_one_dfa(), vec![0, 1]);
+        let b_fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 4,
+            o: vec![0],
+            d: vec![Map::new()],
+        };
+        let b = Automaton::new(
+            b_fa,
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            vec![Some(true), Some(true)],
+        );
+        assert_eq!(
+            automaton_language_equivalent(&a, &b),
+            Err(EquivError::MismatchedTrackStructure)
+        );
+    }
+
+    #[test]
+    fn automaton_language_equivalent_rejects_a_same_set_but_reordered_track_alphabet() {
+        // Both tracks have the SET {0, 1}, so a set-equality check would wrongly wave
+        // this through -- but symbol 0 means digit 0 on the `a` side and digit 1 on
+        // the `b` side (see `automaton::Automaton`'s "Symbol encoding" docs: encoding
+        // is by position-in-list, not literal digit value), so comparing their `Fa`s
+        // directly would be meaningless. This is exactly the gap this function closes.
+        let a = single_track_automaton(contains_one_dfa(), vec![0, 1]);
+        let b = single_track_automaton(contains_one_dfa(), vec![1, 0]);
+        assert_eq!(
+            automaton_language_equivalent(&a, &b),
+            Err(EquivError::MismatchedTrackStructure)
+        );
+    }
+
+    #[test]
+    fn automaton_language_equivalent_does_not_detect_permuted_labels() {
+        // Adversarial-review finding: `automaton_language_equivalent` only compares
+        // `alphabet` positionally, never `label` -- so two automata whose tracks are
+        // PERMUTED relative to each other, but whose per-position alphabets happen to
+        // coincide (the common same-base multi-track shape, not a rare corner case),
+        // are silently compared as if the tracks lined up. This test PINS that gap
+        // (a documented limitation, not a regression) so it can never be silently
+        // "fixed" into an even-more-wrong assumption, and so a future reader relying
+        // on label-based alignment here finds this test first.
+        //
+        // `a` accepts (as a length-1 word) iff its "i" track (position 0) is 1; `b`
+        // reuses the IDENTICAL `Fa`/`alphabet` but swaps which label names which
+        // position, so `b` actually means "x"==1, not "i"==1 -- a different relation
+        // over the shared variables {i, x}. `automaton_language_equivalent` cannot
+        // see this: it returns `Ok(true)`.
+        let mut d0 = Map::new();
+        // encoder [1,2]: symbol = d0 + 2*d1. Accept (move to state 1) iff d0 == 1:
+        // symbols 1 (d0=1,d1=0) and 3 (d0=1,d1=1).
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![1]);
+        d0.insert(2, vec![0]);
+        d0.insert(3, vec![1]);
+        let mut d1 = Map::new();
+        for sym in 0..4 {
+            d1.insert(sym, vec![0]);
+        }
+        let fa = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 4,
+            o: vec![0, 1],
+            d: vec![d0, d1],
+        };
+        let alphabet = vec![vec![0, 1], vec![0, 1]];
+        let a = Automaton::new(
+            fa.clone(),
+            alphabet.clone(),
+            vec!["i".to_string(), "x".to_string()],
+            vec![Some(true), Some(true)],
+        );
+        let b = Automaton::new(
+            fa,
+            alphabet,
+            vec!["x".to_string(), "i".to_string()],
+            vec![Some(true), Some(true)],
+        );
+        assert_eq!(a.label, vec!["i".to_string(), "x".to_string()]);
+        assert_eq!(b.label, vec!["x".to_string(), "i".to_string()]);
+
+        // The gap: reported equivalent purely because the underlying Fa/alphabet are
+        // byte-identical, even though `a` denotes "i==1" and `b` denotes "x==1".
+        assert_eq!(automaton_language_equivalent(&a, &b), Ok(true));
+    }
+
+    #[test]
+    fn automaton_language_equivalent_still_requires_total_dfas() {
+        let mut partial = contains_one_dfa();
+        partial.d[0].remove(&1);
+        let a = single_track_automaton(partial, vec![0, 1]);
+        let b = single_track_automaton(contains_one_dfa(), vec![0, 1]);
+        assert_eq!(
+            automaton_language_equivalent(&a, &b),
+            Err(EquivError::NotTotalDfa)
         );
     }
 }

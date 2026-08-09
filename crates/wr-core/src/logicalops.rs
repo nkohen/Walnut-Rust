@@ -1154,6 +1154,100 @@ mod tests {
         }
     }
 
+    // ------------------------------------- De Morgan's laws (U8; DESIGN.md §5 Tier 4:
+    // "De Morgan across product" is named explicitly as a mandatory property invariant)
+    //
+    // `assert_connective_matches_oracle`/`not_matches_the_complement_oracle` above
+    // already check each connective against an INDEPENDENTLY-computed ground truth
+    // (`equiv::product_dfa`/`equiv::complement`), not "the same truth table" — a real
+    // `and`/`or`/`not` bug is already caught there, since De Morgan holds for the true
+    // languages regardless. What these two properties add, narrowly: `not` here is
+    // fed a genuinely CROSS-PRODUCT-shaped input (the output of `and`, on the LHS of
+    // the first identity) — a distribution `not_matches_the_complement_oracle`'s
+    // standalone generator never produces — so they catch a `not` bug that happens to
+    // only manifest on that specific input shape. Concretely, in
+    // `de_morgan_not_and_equals_or_of_nots` below: the RHS's two `not` calls run on
+    // the RAW (trimmed, still possibly partial) `a_fa`/`b_fa` directly — `or`'s
+    // internal `totalize_cross_product` totalizes its operands, but that happens
+    // AFTER `not`, on the two `not` results, not before. So both identities still
+    // exercise `not` on a genuinely partial automaton (via the raw `a_fa`/`b_fa` on
+    // the RHS, and via the cross-product `and_ab`/`or_ab` on the LHS) — a `not` that
+    // silently skipped totalization would desync either identity, just not for the
+    // "individually-total operands" reason an earlier version of this comment claimed.
+
+    proptest! {
+        /// ¬(A ∧ B) ≡ ¬A ∨ ¬B, computed with the real `and`/`or`/`not` from this file.
+        ///
+        /// `a_fa`/`b_fa` are TRIMMED first, deliberately -- same rationale as
+        /// `not_matches_the_complement_oracle` above: `not_a`/`not_b` below call `not`
+        /// directly on `a_fa`/`b_fa`, and `not`'s `justMinimize` step establishes none
+        /// of `minimize`'s `q0`-reachability precondition (faithfully -- see
+        /// `just_minimize`'s doc comment). A randomly-generated automaton with a state
+        /// unreachable from `q0` can legitimately hit `docs/WALNUT-BUGS.md` WB-001 and
+        /// produce a "wrong" complement there. That is ported behavior, not a port
+        /// defect (confirmed by first reproducing the untrimmed failure and matching
+        /// it to WB-001's documented trigger shape -- a non-accepting, unreachable-
+        /// from-nothing-else q0 plus a separate unreachable accepting state -- rather
+        /// than assuming it away), so the generator is constrained to the shape where
+        /// WB-001 provably cannot fire rather than the property being weakened to
+        /// accommodate an unrelated bug.
+        #[test]
+        fn de_morgan_not_and_equals_or_of_nots(
+            a_fa in arb_partial_dfa(4, 2),
+            b_fa in arb_partial_dfa(4, 2),
+        ) {
+            let a_fa = crate::trim::trim(&a_fa);
+            let b_fa = crate::trim::trim(&b_fa);
+            let build = |fa: &Fa| single_track(fa.clone(), Some(true));
+
+            // LHS: ¬(A ∧ B). `and` does not mutate its operands, so fresh clones
+            // aren't strictly needed here, but built the same way as the RHS for
+            // symmetry/readability.
+            let and_ab = and(&build(&a_fa), &build(&b_fa));
+            let lhs = not(and_ab);
+
+            // RHS: ¬A ∨ ¬B. `or` totalizes its operands in place, so each side needs
+            // its own fresh automaton -- these are one-shot, not reused afterward.
+            let mut not_a = not(build(&a_fa).as_dfa()).into_automaton();
+            let mut not_b = not(build(&b_fa).as_dfa()).into_automaton();
+            let rhs = or(&mut not_a, &mut not_b);
+
+            let mut lhs_fa = lhs.automaton().fa.clone();
+            lhs_fa.totalize(0);
+            let mut rhs_fa = rhs.automaton().fa.clone();
+            rhs_fa.totalize(0);
+            prop_assert_eq!(equiv::language_equivalent(&lhs_fa, &rhs_fa), Ok(true));
+        }
+
+        /// ¬(A ∨ B) ≡ ¬A ∧ ¬B, computed with the real `and`/`or`/`not` from this file.
+        /// `a_fa`/`b_fa` are trimmed first for the same WB-001 reason documented on
+        /// `de_morgan_not_and_equals_or_of_nots` above.
+        #[test]
+        fn de_morgan_not_or_equals_and_of_nots(
+            a_fa in arb_partial_dfa(4, 2),
+            b_fa in arb_partial_dfa(4, 2),
+        ) {
+            let a_fa = crate::trim::trim(&a_fa);
+            let b_fa = crate::trim::trim(&b_fa);
+            let build = |fa: &Fa| single_track(fa.clone(), Some(true));
+
+            // LHS: ¬(A ∨ B).
+            let or_ab = or(&mut build(&a_fa), &mut build(&b_fa));
+            let lhs = not(or_ab);
+
+            // RHS: ¬A ∧ ¬B (`and` doesn't mutate, so no extra `mut` needed here).
+            let not_a = not(build(&a_fa).as_dfa()).into_automaton();
+            let not_b = not(build(&b_fa).as_dfa()).into_automaton();
+            let rhs = and(&not_a, &not_b);
+
+            let mut lhs_fa = lhs.automaton().fa.clone();
+            lhs_fa.totalize(0);
+            let mut rhs_fa = rhs.automaton().fa.clone();
+            rhs_fa.totalize(0);
+            prop_assert_eq!(equiv::language_equivalent(&lhs_fa, &rhs_fa), Ok(true));
+        }
+    }
+
     // ----------------------------------------------------------------- reverse
 
     #[test]

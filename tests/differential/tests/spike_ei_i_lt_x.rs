@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use wr_core::equiv::language_equivalent;
+use wr_core::equiv::automaton_language_equivalent;
 use wr_core::numsys::less_than_msd;
 use wr_logic::quantify::exists;
 
@@ -27,39 +27,27 @@ fn ei_i_lt_x_matches_real_walnut_output() {
     exists(&mut ours, &labels).expect("quantifying a real free variable must succeed");
 
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/spike_ei_i_lt_x.txt");
-    let ground_truth =
+    let mut ground_truth =
         wr_io::reader::read_automaton_txt(&fixture).expect("fixture must parse cleanly");
 
     // Sanity on the reduced automaton's shape before the language check, so a
-    // failure here doesn't get misdiagnosed as an oracle bug. Critically, this
-    // includes `alphabet` equality, not just `alphabet_size`: `wr_core::equiv` works
-    // on raw `Fa` (bare integer symbols) and only checks alphabet_size, never track
-    // content or order — it has no way to know "symbol 1" means the same digit on
-    // both sides. That's true here only because both automata happen to be built
-    // from an identical single [0, 1] track; asserting it explicitly turns a future
-    // silent track-order mismatch (e.g. a multi-track differential case) into a
-    // clear failure here rather than a wrong "equivalent" from the oracle.
+    // failure here doesn't get misdiagnosed as an oracle bug.
     assert_eq!(ours.label, vec!["x".to_string()]);
     assert_eq!(ground_truth.alphabet, vec![vec![0, 1]]);
-    assert_eq!(
-        ours.alphabet, ground_truth.alphabet,
-        "the oracle below only compares alphabet_size, not content/order — this \
-         assertion is what actually guarantees symbol ids mean the same digit on both sides"
-    );
 
-    let ours_total = {
-        let mut fa = ours.fa.clone();
-        fa.totalize(0);
-        fa
-    };
-    let ground_truth_total = {
-        let mut fa = ground_truth.fa.clone();
-        fa.totalize(0);
-        fa
-    };
+    // `wr_core::equiv::automaton_language_equivalent` (U8) checks `Automaton::alphabet`
+    // for exact positional equality itself before ever touching the underlying `Fa`s —
+    // this used to be a manual `assert_eq!(ours.alphabet, ground_truth.alphabet, ...)`
+    // work-around here (see git history), needed because the raw `Fa`-level oracle
+    // (`language_equivalent`) only ever checks `alphabet_size`, never track content or
+    // order. That work-around is no longer needed: the oracle call below now enforces
+    // the same guarantee (returning `Err(MismatchedTrackStructure)` instead of a
+    // confidently wrong verdict) as an integral part of the comparison itself.
+    ours.fa.totalize(0);
+    ground_truth.fa.totalize(0);
 
     assert_eq!(
-        language_equivalent(&ours_total, &ground_truth_total),
+        automaton_language_equivalent(&ours, &ground_truth),
         Ok(true),
         "the Rust pipeline's result must be language-equivalent to real walnut-java's \
          output for `eval spike \"?msd_2 Ei i<x\";` (see ../CAPTURE.md)"
