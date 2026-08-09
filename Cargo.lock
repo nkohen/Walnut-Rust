@@ -355,6 +355,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wr-differential"
+version = "0.0.0"
+dependencies = [
+ "wr-core",
+ "wr-io",
+ "wr-logic",
+]
+
+[[package]]
 name = "wr-io"
 version = "0.0.0"
 dependencies = [
