@@ -1,316 +1,64 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.).
 
-//! Existential quantification (∃-elimination) — the decision procedure's crux.
+//! Existential quantification (∃-elimination) — the logic layer's entry point.
 //!
-//! Ports `Automata/AutomatonQuantification.java`'s `quantify`/`quantifyHelper` plus the
-//! msd half of its follow-up fixup, `Automata/AutomatonLogicalOps.java`'s
-//! `fixLeadingZerosProblem`/`zeroReachableStates`.
+//! # What this module is, after U6
 //!
-//! The pipeline, exactly as Java sequences it:
+//! The Phase-1 spike implemented the whole ∃-projection pipeline here, because
+//! `docs/BOUNDARY-MAP.md` §4.3 recommended porting `Automata/AutomatonQuantification.java`
+//! into `wr-logic` — that recommendation only traced `AutomatonQuantification`'s
+//! OUTGOING calls. The U6 architecture unit found the missing INCOMING edge that
+//! overturns it (not previously recorded anywhere): `wr-core`'s `NumberSystem` calls
+//! `AutomatonQuantification.quantify` ten times to build its base-*k* adder/comparator
+//! automata by quantifying carry variables away, so a `wr-logic`-resident implementation
+//! would force `wr-core` to depend on `wr-logic` — a genuine Cargo cycle, since
+//! `wr-logic` must depend on `wr-core`. `docs/BOUNDARY-MAP.md` §4.3 and `docs/DESIGN.md`'s
+//! crate-mapping table are updated to record this as superseding the original
+//! recommendation.
 //!
-//! 1. **Project.** Decode every transition symbol into its per-track digit tuple, delete
-//!    the quantified tracks from the tuple *and* from the alphabet/label/msd lists,
-//!    re-encode the reduced tuple. Distinct old symbols routinely collapse onto the same
-//!    new symbol — that collapse is precisely what introduces nondeterminism, and is the
-//!    whole mathematical content of ∃-elimination.
-//! 2. **Determinize + minimize** (`Automaton.determinizeAndMinimize()`, the no-arg
-//!    overload).
-//! 3. **Fix leading zeros** (`fixLeadingZerosProblem`), so the result accepts `0*x`
-//!    whenever it used to accept `x` — necessary because projecting a track away can
-//!    strand a representation behind a run that only existed for the quantified track's
-//!    longer representation.
+//! The projection primitive therefore now lives in [`wr_core::quantify`] (read that
+//! module's docs for the full argument and for every ported quirk/divergence), and
+//! [`exists`] is a thin delegation to it. Nothing was lost in the move: the Phase-1
+//! implementation contained no formula/AST-level logic at all — no `Token`, no
+//! `Predicate`, no parser state — only "delete these tracks from every symbol,
+//! determinize, fix up leading zeros", which is automaton theory over
+//! [`wr_core::automaton::Automaton`].
 //!
-//! # Deliberate divergences from a literal transliteration
+//! What will give this module its own content is the formula-level quantifier
+//! elimination that is still to come: `∀ = ¬∃¬`, and the quantifier bookkeeping over a
+//! parsed `Predicate` that decides *which* labels to hand [`exists`] in the first place.
 //!
-//! * **Destination merging is set union, not Java's order-preserving
-//!   `addAllWithoutRepetition`.** When two old symbols collapse onto one new symbol their
-//!   destination lists are merged; Java appends the second list's new elements to the
-//!   first, preserving insertion order. Order of an NFA destination list is not
-//!   observable in any language-level sense, and `CLAUDE.md`'s prime directive #1 is to
-//!   compare by language equivalence, never by structure — so a [`BTreeSet`] union is
-//!   used, which is simpler and obviously dedup-correct.
-//! * **Step 2 always trims.** Java's no-arg `determinizeAndMinimize()` trims *only* when
-//!   the freshly-rebuilt table is not already deterministic; this port trims
-//!   unconditionally, so the two differ exactly on the (rare) projection that happens to
-//!   come out deterministic. Trimming is always language-preserving, so the divergence is
-//!   invisible to the correctness bar, and it is the *safer* choice: it establishes
-//!   [`wr_core::minimize::minimize`]'s documented precondition (every state reachable from
-//!   `q0`; violate it and the "q0 aliasing quirk" silently flips the language) rather than
-//!   leaving it resting on the separate argument that subset construction from `{q0}`
-//!   already emits only reachable states. It also shrinks the input to the exponential
-//!   subset construction.
-//! * **`TRUE_FALSE_AUTOMATON` is not modeled.** `wr_core::automaton::Automaton` has no
-//!   such variant (Phase-1 spike scope, see its module docs), so the Java branch that
-//!   collapses an all-tracks-quantified automaton to a true/false automaton becomes a
-//!   hard [`QuantifyError::AllTracksQuantified`] instead of a silently-wrong encoding.
-//! * **The lsd fixup is out of scope.** `fixTrailingZerosProblem` is genuinely different
-//!   logic (it mutates only the final-state set and re-minimizes, without
-//!   re-determinizing) and no lsd numeration system exists in this crate yet, so an lsd
-//!   automaton yields [`QuantifyError::UnsupportedLsdFixup`] rather than a wrong answer.
-//!
-//! # Faithfully-ported quirks (not divergences)
-//!
-//! * `quantify` runs the leading-zero fixup **even when `quantifyHelper` short-circuits**
-//!   (empty label set, or an automaton with no labels at all): Java's `quantify` calls
-//!   the helper for effect and then unconditionally consults `determineMsd`. So
-//!   `exists(a, &{})` is *not* a no-op — see `empty_label_set_still_runs_the_zero_fixup`.
-//! * A label that appears on more than one track is resolved by `List.indexOf`, i.e. only
-//!   its **first** occurrence is quantified away.
-//! * `zeroReachableStates` mutates the automaton it inspects — see
-//!   [`zero_reachable_states`].
+//! U6 also removed this module's ad-hoc copy of `AutomatonLogicalOps`'s
+//! `fixLeadingZerosProblem`/`zeroReachableStates`: [`wr_core::logicalops`] carries the
+//! general port, and [`wr_core::quantify::quantify`] calls it. The regression tests
+//! written here against those helpers (and against `NumberSystem.determineMsd`, now
+//! [`wr_core::numsys::determine_msd`]) were deliberately left in place, unchanged, since
+//! they exist to protect *this* pipeline.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use wr_core::automaton::Automaton;
-use wr_core::determinize::subset_construction;
-use wr_core::fa::Fa;
-use wr_core::minimize::{minimize, MinimizeError};
-use wr_core::trim::trim;
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum QuantifyError {
-    /// A requested label is not one of the automaton's track labels. Ports
-    /// `WalnutException.notFreeVariable` (thrown from
-    /// `AutomatonQuantification.validateLabels`).
-    NotFreeVariable(String),
-    /// Every track was quantified away. Java collapses this to a TRUE/FALSE automaton
-    /// (true iff the language was non-empty); this crate does not model that variant, so
-    /// the out-of-scope precondition is reported instead of guessed at.
-    AllTracksQuantified,
-    /// The surviving tracks are lsd, which would need `fixTrailingZerosProblem` — not
-    /// ported (see module docs).
-    UnsupportedLsdFixup,
-    /// Propagated from [`wr_core::minimize::minimize`]. Both variants should be
-    /// unreachable here (subset construction always yields a deterministic automaton),
-    /// but they are surfaced rather than `unwrap`ped: `PORTING.md`'s error-mapping rule
-    /// is that a "can't happen" is still a `Result`, never a panic or a `debug_assert!`.
-    Minimize(MinimizeError),
-}
+pub use wr_core::quantify::QuantifyError;
 
-impl From<MinimizeError> for QuantifyError {
-    fn from(e: MinimizeError) -> Self {
-        QuantifyError::Minimize(e)
-    }
-}
-
-/// Existentially quantifies `labels` out of `a`, in place.
-///
-/// Ports `AutomatonQuantification.quantify(Automaton, Set<String>)`: project the labelled
-/// tracks away, determinize + minimize, then apply the numeration-system-dependent
-/// leading-zero fixup. `labels` must be a subset of `a.label` (else
-/// [`QuantifyError::NotFreeVariable`]) and must not name *every* track (else
-/// [`QuantifyError::AllTracksQuantified`]).
-///
-/// On success `a.alphabet` / `a.label` / `a.msd` have had the quantified tracks removed,
-/// `a.fa` is a minimal (generally *partial* — `minimize` drops non-co-reachable states)
-/// DFA over the reduced alphabet, and state numbering bears no relation to Walnut's.
+/// Existentially quantifies `labels` out of `a`, in place — `wr-logic`'s entry point to
+/// [`wr_core::quantify::quantify`], which is where the algorithm, its error contract and
+/// its ported-quirk documentation all live.
 pub fn exists(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
-    quantify_helper(a, labels)?;
-
-    // `quantify`'s tail: consult the surviving tracks' numeration direction. Note this
-    // runs even when `quantify_helper` short-circuited — a faithfully-ported quirk, see
-    // the module docs.
-    match determine_msd(&a.msd) {
-        None => Ok(()),
-        Some(true) => fix_leading_zeros(a),
-        Some(false) => Err(QuantifyError::UnsupportedLsdFixup),
-    }
-}
-
-/// Ports `NumberSystem.determineMsd(List<NumberSystem>)`: `None` ("skip the fixup") if any
-/// track is non-arithmetic or if the arithmetic tracks disagree on direction; otherwise
-/// the shared direction.
-///
-/// Java's loop leaves `isMsd = true` untouched for an *empty* list, so zero tracks
-/// defaults to msd. This IS reachable through [`exists`] — not by quantifying away
-/// every track (`quantify_helper` rejects that as [`QuantifyError::AllTracksQuantified`]
-/// before ever reaching this function), but by calling [`exists`] on an automaton that
-/// already has zero tracks: `quantify_helper`'s `a.label.is_empty()` early return leaves
-/// `a.msd` empty and unchanged, and `exists` still unconditionally consults
-/// `determine_msd` afterward (see the module docs on this faithfully-ported quirk). See
-/// `empty_label_set_still_runs_the_zero_fixup` for the analogous (but importantly
-/// different — that test starts from a *populated* automaton) case.
-fn determine_msd(msd: &[Option<bool>]) -> Option<bool> {
-    let mut is_msd = true;
-    let mut seen_any = false;
-    for entry in msd {
-        let v = (*entry)?;
-        if seen_any && v != is_msd {
-            return None;
-        }
-        is_msd = v;
-        seen_any = true;
-    }
-    Some(is_msd)
-}
-
-/// Ports `AutomatonQuantification.quantifyHelper`: the projection itself, followed by
-/// determinize + minimize. Leaves `a` untouched on any `Err`.
-fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
-    // Java: `if (labelsToQuantify.isEmpty() || A.getLabel() == null ||
-    // A.getLabel().isEmpty()) return;` — note this precedes `validateLabels`, so asking to
-    // quantify a name out of a *label-less* automaton is silently accepted, not an error.
-    if labels.is_empty() || a.label.is_empty() {
-        return Ok(());
-    }
-
-    // `validateLabels`.
-    for l in labels {
-        if !a.label.contains(l) {
-            return Err(QuantifyError::NotFreeVariable(l.clone()));
-        }
-    }
-
-    // Java: `if (labelsToQuantify.size() == A.richAlphabet.getA().size())` — every track
-    // quantified. See `QuantifyError::AllTracksQuantified`.
-    if labels.len() == a.alphabet.len() {
-        return Err(QuantifyError::AllTracksQuantified);
-    }
-
-    // A 0-state automaton (labels present, but no states — legal to construct via this
-    // crate's API even though a real Walnut `Automaton` never reaches it) has nothing
-    // for the projection to do. Without this guard, `trim`/`subset_construction` below
-    // would index the stale `q0` into an empty `fa.d` and panic — `fix_leading_zeros`
-    // has the identical guard for the identical reason; this mirrors it for parity.
-    if a.fa.q == 0 {
-        return Ok(());
-    }
-
-    // `A.getLabel().indexOf(l)` for each label: first occurrence only.
-    let dropped: BTreeSet<usize> = labels
-        .iter()
-        .map(|l| {
-            a.label
-                .iter()
-                .position(|x| x == l)
-                .expect("label presence was just validated")
-        })
-        .collect();
-    let kept: Vec<usize> = (0..a.alphabet.len())
-        .filter(|i| !dropped.contains(i))
-        .collect();
-
-    // `allInputs`: decode every OLD symbol before the alphabet shrinks.
-    let old_alphabet_size = a.fa.alphabet_size;
-    let all_inputs: Vec<Vec<i32>> = (0..old_alphabet_size as i32).map(|s| a.decode(s)).collect();
-
-    // `removeIndices` on A / NS / label — order of the survivors is preserved.
-    let new_alphabet: Vec<Vec<i32>> = kept.iter().map(|&i| a.alphabet[i].clone()).collect();
-    let new_label: Vec<String> = kept.iter().map(|&i| a.label[i].clone()).collect();
-    let new_msd: Vec<Option<bool>> = kept.iter().map(|&i| a.msd[i]).collect();
-    let new_alphabet_size: usize = new_alphabet.iter().map(|t| t.len()).product();
-
-    // Building the reduced `Automaton` here (rather than mutating `a` in place) is what
-    // rebuilds the mixed-radix encoder — Java's `richAlphabet.setEncoder(null)` +
-    // `determineAlphabetSize()`, which force a lazy recompute on the next `encode`.
-    let mut projected = Automaton::new(a.fa.clone(), new_alphabet, new_label, new_msd);
-    projected.fa.alphabet_size = new_alphabet_size;
-
-    // `permutation[old] = new`: re-encode each decoded tuple minus the quantified tracks.
-    // Many old symbols map to one new symbol — that collapse is the projection.
-    let permutation: Vec<i32> = all_inputs
-        .iter()
-        .map(|digits| {
-            let reduced: Vec<i32> = kept.iter().map(|&i| digits[i]).collect();
-            projected.encode(&reduced)
-        })
-        .collect();
-
-    // Rebuild the transition table under the new symbol ids, unioning the destinations of
-    // old symbols that collapsed together (see the module docs on why union, not Java's
-    // order-preserving append). Indexing `permutation` panics on an out-of-range symbol,
-    // exactly as Java's `permutation.get(...)` throws — a corrupt table is a caller bug.
-    let mut merged: Vec<BTreeMap<i32, BTreeSet<usize>>> = vec![BTreeMap::new(); a.fa.d.len()];
-    for (q, row) in a.fa.d.iter().enumerate() {
-        for (&sym, dests) in row {
-            let mapped = permutation[sym as usize];
-            merged[q]
-                .entry(mapped)
-                .or_default()
-                .extend(dests.iter().copied());
-        }
-    }
-    projected.fa.d = merged
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|(sym, dests)| (sym, dests.into_iter().collect::<Vec<usize>>()))
-                .collect()
-        })
-        .collect();
-
-    // `A.determinizeAndMinimize()` — with the unconditional trim described in the module
-    // docs (Java trims only when the rebuilt table is nondeterministic).
-    let trimmed = trim(&projected.fa);
-    let initial: BTreeSet<usize> = [trimmed.q0].into_iter().collect();
-    projected.fa = minimize(&subset_construction(&trimmed, &initial))?;
-
-    *a = projected;
-    Ok(())
-}
-
-/// Ports `AutomatonLogicalOps.fixLeadingZerosProblem`: make `a` accept `0*x` whenever it
-/// accepted `x`, by re-running subset construction from the *set* of states reachable
-/// from `q0` on `0*` instead of from `{q0}`.
-///
-/// Java's `determinizeAndMinimize(IntSet)` overload does **not** trim (unlike the no-arg
-/// one), and neither does this — faithfully. It is safe: subset construction from a
-/// metastate only ever emits states reachable from that metastate, so `minimize`'s
-/// all-states-reachable precondition already holds.
-fn fix_leading_zeros(a: &mut Automaton) -> Result<(), QuantifyError> {
-    // Java would dereference `q0`'s transition row unconditionally; a 0-state automaton
-    // has none. Nothing to fix in that degenerate case (this crate's `trim`/`minimize`
-    // both pass 0-state automata through untouched too).
-    if a.fa.q == 0 {
-        return Ok(());
-    }
-    let zero = a.determine_zero();
-    let initial = zero_reachable_states(&mut a.fa, zero);
-    a.fa = minimize(&subset_construction(&a.fa, &initial))?;
-    Ok(())
-}
-
-/// Ports `AutomatonLogicalOps.zeroReachableStates`: the states reachable from `q0` by
-/// reading the all-zero symbol zero-or-more times.
-///
-/// **This mutates `fa`, and the mutation is the point.** Before the BFS, Java force-adds
-/// a literal `(q0, zero) -> q0` self-loop to the *real* transition table if it is not
-/// already there. That does not change the returned set (`q0` is added to the BFS result
-/// unconditionally), but it persists — and the caller's next step, subset construction,
-/// reads the mutated table. So the self-loop is Walnut's mechanism for making "one more
-/// leading zero, from the very start, is a no-op" a structural invariant of the automaton
-/// going forward, not merely a fact about this one computation. Replicating only the
-/// returned set would silently drop that.
-fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
-    let q0 = fa.q0;
-    let dests = fa.d[q0].entry(zero).or_default();
-    if !dests.contains(&q0) {
-        dests.push(q0);
-    }
-
-    let mut result: BTreeSet<usize> = BTreeSet::new();
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    queue.push_back(q0);
-    while let Some(q) = queue.pop_front() {
-        // Java: `if (result.add(q))` — only expand a state the first time it is seen.
-        if result.insert(q) {
-            if let Some(next) = fa.d[q].get(&zero) {
-                for &p in next {
-                    if !result.contains(&p) {
-                        queue.push_back(p);
-                    }
-                }
-            }
-        }
-    }
-    result
+    wr_core::quantify::quantify(a, labels)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use wr_core::numsys::less_than_msd;
+    // U6: these four used to be module-level items/imports of this file. The tests below
+    // are byte-for-byte what they were before the move, so the names they reference are
+    // re-imported here rather than the test bodies being rewritten.
+    use std::collections::BTreeMap;
+    use wr_core::fa::Fa;
+    use wr_core::logicalops::zero_reachable_states;
+    use wr_core::numsys::{determine_msd, less_than_msd};
 
     fn labels(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()

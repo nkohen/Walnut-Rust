@@ -196,7 +196,7 @@ walnut-rs/
     properties/     # proptest invariants
 ```
 
-**Java package → Rust crate mapping:** the entire `Automata/` package (`FA`, `Automaton`, `NumberSystem` base-*k*, `Morphism`, `WordAutomaton`, `RichAlphabet`, `AutomatonDFA`) → **`wr-core`** (one crate, because of the coupling in kit #1/#2); `Main/EvalComputations` + `Predicate` + `AutomatonQuantification` + `AutomatonLogicalOps` → `wr-logic`; `AutomatonReader/Writer` → `wr-io`; `Main/Prover` + `Commands` (incl. the inline `split`/`transduce`/… ) → `wr-cli`.
+**Java package → Rust crate mapping:** the entire `Automata/` package (`FA`, `Automaton`, `NumberSystem` base-*k*, `Morphism`, `WordAutomaton`, `RichAlphabet`, `AutomatonDFA`) → **`wr-core`** (one crate, because of the coupling in kit #1/#2); `Main/EvalComputations` + `Predicate` → `wr-logic`; `AutomatonReader/Writer` → `wr-io`; `Main/Prover` + `Commands` (incl. the inline `split`/`transduce`/… ) → `wr-cli`. **Updated during Phase 2** (superseding this table's original `AutomatonQuantification`/`AutomatonLogicalOps` → `wr-logic` call, `docs/BOUNDARY-MAP.md` §4.2/§4.3): both landed in **`wr-core`** instead — `AutomatonQuantification` because `wr-core`'s own `NumberSystem` calls its `quantify` 10× (an incoming edge that would otherwise force `wr-core`→`wr-logic`, a cycle; `wr_logic::quantify::exists` is a thin wrapper over `wr_core::quantify::quantify`), and `AutomatonLogicalOps` because BOUNDARY-MAP §4.2's split-vs-monolithic question was settled in favor of keeping it monolithic in `wr-core` for the mechanical port.
 
 **Dependency replacement table** (each Java dep needs a Rust answer — this is where port risk concentrates):
 

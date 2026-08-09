@@ -28,6 +28,41 @@ use crate::automaton::Automaton;
 use crate::fa::Fa;
 use std::collections::BTreeMap;
 
+/// Ports `NumberSystem.determineMsd(List<NumberSystem>)` (`NumberSystem.java:197-209`,
+/// package-private `static Boolean`): `None` ("skip the zero fixup") if any track is
+/// non-arithmetic (Java: `ns == null`) or if the arithmetic tracks disagree on
+/// direction; otherwise the shared direction.
+///
+/// `msd: &[Option<bool>]` is this crate's stand-in for Java's per-track
+/// `List<NumberSystem>` (see [`crate::automaton::Automaton`]'s struct doc comment on
+/// `msd`), so `None` plays the `null` role and `Some(b)` plays `ns.isMsd() == b`.
+///
+/// Java's loop leaves `isMsd = true` untouched for an *empty* list, so zero tracks
+/// defaults to msd. This IS reachable through [`crate::quantify::quantify`] — not by
+/// quantifying away every track (that is rejected as
+/// [`crate::quantify::QuantifyError::AllTracksQuantified`] before this function is ever
+/// reached), but by quantifying on an automaton that already has zero tracks: the
+/// `a.label.is_empty()` early return leaves `a.msd` empty and unchanged, and `quantify`
+/// still unconditionally consults this function afterward (a faithfully-ported quirk —
+/// see `quantify`'s module docs).
+///
+/// Lives here rather than next to `quantify` because it is a `NumberSystem` method in
+/// Java, and because `NumberSystem`'s own base-*k* constructions are the other consumer
+/// once they land.
+pub fn determine_msd(msd: &[Option<bool>]) -> Option<bool> {
+    let mut is_msd = true;
+    let mut seen_any = false;
+    for entry in msd {
+        let v = (*entry)?;
+        if seen_any && v != is_msd {
+            return None;
+        }
+        is_msd = v;
+        seen_any = true;
+    }
+    Some(is_msd)
+}
+
 /// Builds the 2-state lexicographic-less-than automaton over base `base`, msd-first
 /// (`NumberSystem.lexicographicLessThan`, called with `isMsd = true`; the lsd
 /// direction is `AutomatonLogicalOps.reverse` of this — not built here, see module

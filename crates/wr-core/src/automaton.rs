@@ -4,8 +4,9 @@
 //! A minimal multi-track automaton wrapper.
 //!
 //! Ports the pieces of `Automata/Automaton` + `Automata/RichAlphabet` that ∃-projection
-//! ([`crate` sibling `wr-logic`'s `quantify`, not yet landed at the time of writing —
-//! see `docs/BOUNDARY-MAP.md` §4.3]) structurally requires: per-track alphabets,
+//! structurally requires (originally written against `wr-logic`'s `quantify`, per
+//! `docs/BOUNDARY-MAP.md` §4.3; the U6 architecture unit moved that primitive down into
+//! [`crate::quantify`] — see its module docs for why): per-track alphabets,
 //! labels, msd/lsd-ness, and the mixed-radix symbol encoder/decoder. **This is
 //! deliberately NOT full Java parity** — no `NumberSystem` objects attached per track,
 //! no DFAO/`combine` bookkeeping, no `TRUE_FALSE_AUTOMATON` modeling (see

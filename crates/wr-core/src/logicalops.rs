@@ -70,14 +70,19 @@
 //! is not ported (the same judgment `product.rs`'s module docs already recorded for
 //! `not`'s call to it).
 //!
-//! # Deliberate duplication with `wr-logic`'s `quantify.rs`
+//! # The former duplication with `wr-logic`'s `quantify.rs` — resolved (U6)
 //!
-//! `wr_logic::quantify` (landed in the Phase-1 spike, before this unit) carries its own
-//! ad-hoc copy of `fixLeadingZerosProblem`/`zeroReachableStates`, specialized to the
-//! ∃-projection call site. This unit ports the GENERAL version — the one
-//! `AutomatonLogicalOps.reverse`'s siblings and (later) `NumberSystem` also need.
-//! Reconciling the two is explicitly a later architecture unit's job; nothing here
-//! touches `quantify.rs`.
+//! `wr_logic::quantify` (landed in the Phase-1 spike, before this unit) used to carry
+//! its own ad-hoc copy of `fixLeadingZerosProblem`/`zeroReachableStates`, specialized to
+//! the ∃-projection call site; this unit ported the GENERAL version. The U6 architecture
+//! unit then moved ∃-projection itself down into [`crate::quantify`] (see that module's
+//! docs for why `NumberSystem`'s ten `quantify` call sites force it into `wr-core`), and
+//! deleted the ad-hoc copy: [`crate::quantify::quantify`] now calls
+//! [`fix_leading_zeros_problem`] below. The two copies were compared line by line first
+//! and agreed — same forced `(q0, zero) -> q0` self-loop, same `if (result.add(q))`
+//! BFS, same `determinizeAndMinimize(IntSet)` follow-up — differing only in that the
+//! `wr-logic` copy surfaced `minimize`'s (unreachable) errors as a `Result` where this
+//! one lets [`crate::automaton::Automaton::determinize_and_minimize_from`] panic.
 //!
 //! # Not ported (investigated, with the exact blocker)
 //!
@@ -526,16 +531,18 @@ fn reverse_and_canonize(a: &Automaton) -> Automaton {
 ///
 /// Re-runs subset construction from the *set* of states reachable from `q0` by reading
 /// the all-zero symbol zero-or-more times, instead of from `{q0}`
-/// (`Automaton.determinizeAndMinimize(IntSet)`, `:278`). The general counterpart of the
-/// ad-hoc copy in `wr_logic::quantify` — see this module's docs on why both exist.
+/// (`Automaton.determinizeAndMinimize(IntSet)`, `:278`). Since U6 this is also the
+/// ∃-projection pipeline's fixup step, called from [`crate::quantify::quantify`] — see
+/// this module's docs on the duplicate it replaced.
 ///
 /// The `fa.q == 0` guard has no Java counterpart: Java would dereference `q0`'s
 /// (nonexistent) transition row inside `zeroReachableStates` and throw
 /// `IndexOutOfBoundsException`, but a real Walnut `Automaton` never reaches this method
 /// with zero states (only the TRUE/FALSE automata are zero-state, and they are
 /// short-circuited at `:269`). This crate's `Automaton` *can* express that shape, so
-/// the degenerate case is a no-op here — mirroring the identical guard, added for the
-/// identical reason, in `wr_logic::quantify::fix_leading_zeros`.
+/// the degenerate case is a no-op here — matching the identical guard, added for the
+/// identical reason, in `crate::quantify`'s private `quantify_helper` (at its
+/// `a.fa.q == 0` early return).
 pub fn fix_leading_zeros_problem(a: &mut Automaton) {
     if a.fa.q == 0 {
         return;
@@ -558,7 +565,14 @@ pub fn fix_leading_zeros_problem(a: &mut Automaton) {
 ///
 /// Note Java's `if (result.add(q))` guard (`:304`): a state is expanded only the first
 /// time it is popped.
-fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
+///
+/// **Visibility note.** This is `private` in Java and has exactly one production caller
+/// here ([`fix_leading_zeros_problem`]). It is `pub` only so that the Phase-1
+/// regression tests written against it — which live in `wr_logic::quantify`'s test
+/// module, alongside the ∃-projection tests they were written to protect, and which U6
+/// deliberately left in place unchanged — can still reach it. Treat it as an internal
+/// detail, not intended public surface.
+pub fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
     let q0 = fa.q0;
     let dests = fa.d[q0].entry(zero).or_default();
     if !dests.contains(&q0) {

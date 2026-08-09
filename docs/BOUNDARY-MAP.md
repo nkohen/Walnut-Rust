@@ -37,7 +37,7 @@ the raw import data, not taken on faith.
 | `Automaton.java` | 741 | Core automaton type: NFA/DFA/DFAO representation, `RichAlphabet` + `List<NumberSystem>` fields, clone/star/concat/join/bind/canonize, file I/O entry points | KEEP | wr-core | `Main.Prover` (op-mode constants `COMBINE`/`FIRST_OP`/`IF_OTHER_OP`, `TXT_EXTENSION`/`GV_EXTENSION`), `Main.Session` (`getAddressForResult`/`getReadFileForAutomataLibrary` — file path resolution), `Main.EvalComputations.Token.{ArithmeticOperator,LogicalOperator}` | **Yes** — see §3 |
 | `AutomatonDFA.java` | 75 | `Automaton` subtype for (by-convention, unenforced) deterministic automata; builds from regex+alphabet via `BricsConverter` | KEEP | wr-core | `Automata.FA.BricsConverter` (in-crate), `Main.UtilityMethods`/`WalnutException` (benign) | No — but Rust can enforce the determinism invariant statically where Java only TODOs it; a PORTING.md note, not a scope question |
 | `AutomatonLogicalOps.java` | 774 | Static ops: and/or/xor/imply/iff/not, left/right quotient, reverse, `convertNS` (msd↔lsd/base-power conversion, confirmed base-k only), leading/trailing-zero fixups, `combine` | KEEP | wr-core (bulk); boolean connectives arguably wr-logic | `Main.EvalComputations.Token.{LogicalOperator,Operator}`, `Main.Prover` (`COMBINE` constant), `Main.Logging`/`UtilityMethods`/`WalnutException` | **Yes** — DESIGN.md itself flags this file as possibly wr-logic-conceptual; content confirms a real split is plausible (and/or/xor/imply/iff/not = logic layer; quotient/reverse/convertNS/combine = automaton-algorithm layer) — human call on split-vs-monolithic |
-| `AutomatonQuantification.java` | 126 | ∃-elimination: removes quantified tracks, permutes/collapses transitions, re-determinizes/minimizes, applies zero-fixup | KEEP | **wr-logic** (physically in package `Automata`, but content is pure ∃-projection semantics — matches DESIGN.md's own hint) | `Main.Logging`/`UtilityMethods`/`WalnutException` only (benign); calls `Automaton`, `AutomatonLogicalOps`, `NumberSystem` — if moved to wr-logic these become a normal forward wr-logic→wr-core dependency, not a cycle | No on KEEP; flag placement (recommend wr-logic, confirmed by content not just DESIGN's hint) |
+| `AutomatonQuantification.java` | 126 | ∃-elimination: removes quantified tracks, permutes/collapses transitions, re-determinizes/minimizes, applies zero-fixup | KEEP | **wr-core** (RESOLVED 2026-08-09, §4.3 — `NumberSystem` calls `quantify` 10×, a `wr-core`→`wr-logic` incoming edge this row's original "wr-logic, no cycle" call missed; superseded, see §4.3) | `Main.Logging`/`UtilityMethods`/`WalnutException` only (benign); calls `Automaton`, `AutomatonLogicalOps`, `NumberSystem` | Resolved, see §4.3 |
 | `AutomatonReader.java` | 294 | Parses the `.txt` automaton format + transducer format + comments; zero Ostrowski/Fibonacci/Pell/negative-base references | KEEP | wr-io | `Main.Logging`/`UtilityMethods`/`WalnutException` (benign), `Automata.ParseMethods` (in-crate) | Mild — `readTransducer`'s `Transducer`-object construction is arguably wr-core domain vs. wr-io's line-tokenizing; same split pattern as reader/writer elsewhere |
 | `Morphism.java` | 196 | Parses `k→k*` letter-to-word morphism maps, builds resulting `WordAutomaton`/`Automaton` image, validates "image morphism" | KEEP — core to `morphism`/`image` | wr-core | `Main.UtilityMethods`/`WalnutException` (benign) | No |
 | `NumberSystem.java` | 1027 | base-k (msd/lsd, **incl. negative-base**) numeration: addition/less-than/equality/base-change/constant automata; exposes op enums for eval | KEEP the positive-base msd/lsd machinery; **DROP negative-base** (`baseNegN*`, `isNeg`-gated branches) | wr-core | `Main.*` wildcard (`Prover.TXT_EXTENSION`), `Main.EvalComputations.Token.{ArithmeticOperator,RelationalOperator}` | **Yes** — see §4.1 (negative-base excision is not a clean file-level cut) and §3 (Token coupling) |
@@ -171,10 +171,26 @@ stage — my instinct is **keep it monolithic in wr-core for the mechanical port
 refactor pass, but this is your call since it's a crate-boundary decision (CLAUDE.md routes those to Opus-tier
 review either way).
 
-### 4.3 `AutomatonQuantification.java` — move to wr-logic now, or leave in wr-core with DESIGN.md just noting the conceptual mismatch?
-Content-confirmed as pure ∃-projection logic despite its `Automata` package location. Recommend actually
-targeting `wr-logic` for the port (not just noting it) since it only imports benign utilities from `Main` and
-calls forward into `Automaton`/`AutomatonLogicalOps`/`NumberSystem` — a clean forward dependency, no cycle.
+### 4.3 `AutomatonQuantification.java` — RESOLVED 2026-08-09 (Phase 2, U6): targets `wr-core`, not `wr-logic`
+Content-confirmed as pure ∃-projection logic despite its `Automata` package location — that part of this
+section's original analysis (below, kept for the record) still holds. **What it missed: this only traced
+`AutomatonQuantification`'s OUTGOING calls.** Phase 2's U6 (an architecture unit, triggered by
+`NumberSystem`'s own port needing this functionality) found the INCOMING edge that overturns the "clean
+forward dependency, no cycle" conclusion: `NumberSystem.java` — itself pinned inside `wr-core` by the
+already-documented `Automaton`↔`NumberSystem` coupling (kit-finding #1, §2 above) — calls
+`AutomatonQuantification.quantify` **ten times** (`NumberSystem.java:720, 821, 874, 923, 951, 965, 993,
+1010, 1016, 1053`) to build its base-*k* adder/comparator automata by quantifying carry variables away. A
+`wr-logic`-resident `quantify` that `wr-core::NumberSystem` must call would be a genuine Cargo dependency
+cycle (`wr-logic` already must depend on `wr-core`). **Decided: ported into `wr-core` instead**
+(`wr-core::quantify`, same "push the shared primitive down" pattern as kit-finding #1), with
+`wr_logic::quantify::exists` as a thin delegating wrapper. Supersedes this section's original recommendation
+below. See `wr-core/src/quantify.rs`'s module docs for the full argument.
+
+Original analysis (superseded, kept for context): "Content-confirmed as pure ∃-projection logic despite its
+`Automata` package location. Recommend actually targeting `wr-logic` for the port (not just noting it) since
+it only imports benign utilities from `Main` and calls forward into
+`Automaton`/`AutomatonLogicalOps`/`NumberSystem` — a clean forward dependency, no cycle." — this reasoning
+was correct as far as it went; it just never checked for an incoming edge from the `wr-core` side.
 
 ### 4.4 `FA/BricsConverter.java`'s regex→automaton engine
 Confirms `reg` needs a real regex-to-automaton conversion, not just a test-oracle nicety. DESIGN.md's
