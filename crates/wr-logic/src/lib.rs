@@ -13,13 +13,4 @@
 //! quantifier ALTERNATION (each ∃ is a projection→NFA→determinize); see
 //! DESIGN.md §5.
 
-/// Placeholder so the crate compiles from the first commit; replace as the port lands.
-pub fn placeholder() {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        super::placeholder();
-    }
-}
+pub mod quantify;
