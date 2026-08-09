@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+num-bigint.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

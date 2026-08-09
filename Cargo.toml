@@ -25,3 +25,9 @@ rust-version = "1.75"
 [workspace.dependencies]
 # DESIGN.md §5 Tier 4 (mandatory, Walnut-independent property invariants).
 proptest = "1"
+# PORTING.md's `java.math.BigInteger` -> `num-bigint` mapping. Added in Phase 2 U7:
+# `NumberSystem.getConstant`/`multiplication`/`division` are keyed on `BigInteger`
+# constants coming straight out of a user's query, so a fixed width would be a real
+# (if unlikely-to-bite) behavioral divergence rather than a provably-safe narrowing.
+# `default-features = false` + `std` keeps `rand`/`serde`/`quickcheck` out of the tree.
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
