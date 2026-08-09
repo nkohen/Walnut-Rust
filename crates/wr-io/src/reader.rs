@@ -1,0 +1,554 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.).
+
+//! Reader for Walnut's `.txt` automaton format.
+//!
+//! Ports `Automata/AutomatonReader.java` + the alphabet/state/transition regexes of
+//! `Automata/ParseMethods.java` — the parsing half only (see `Automata/Writer/
+//! AutomatonWriter.java` for the writer, not yet ported: the Phase-1 spike only needs
+//! to read real `walnut-java` output for differential comparison, see
+//! `.claude/plans/fluttering-foraging-spindle.md`).
+//!
+//! # Grammar, verified against `ParseMethods`'s actual regexes (not guessed)
+//!
+//! - Comments (`^\s*#.*$`) and blank lines are skippable anywhere.
+//! - A **trivial** file is just `true` or `false` and nothing else (except
+//!   comments/whitespace) — **not supported by this reader**: [`crate::automaton`]
+//!   (this crate re-exports `wr_core::automaton::Automaton`) has no
+//!   `TRUE_FALSE_AUTOMATON` variant, matching that type's own documented Phase-1
+//!   scope, so a trivial file is [`ReadError::UnsupportedTrivialAutomaton`] rather
+//!   than a misrepresentation.
+//! - The **header** line declares one token per track: either an explicit set
+//!   `{v1, v2, ...}`, or a numeration spec. **This reader supports only `msd_<k>`,
+//!   `lsd_<k>`, bare `msd` (= `msd_2`), and bare `lsd` (= `lsd_2`)** — real Walnut
+//!   also accepts custom-base names (`msd_fib`, ...) via `NumberSystem.
+//!   getComputeIfAbsent`, which constructs a whole `NumberSystem` (adder/comparator
+//!   automata and all); out of scope here, so any other token is
+//!   [`ReadError::UnsupportedNumeration`], never silently misread.
+//! - Then repeated state blocks: `<id> <output>` (first declared block's `id` becomes
+//!   `q0`, **not necessarily `0`**), each followed by zero or more transition lines
+//!   `<sym1> <sym2> ... -> <dest1> [<dest2> ...]` (one token per track, each a signed
+//!   integer or `*`; multiple dest ids, or repeated identical inputs across lines,
+//!   both encode NFA nondeterminism via destination accumulation).
+//! - **Declared state ids must be exactly the dense range `0..Q`** (some permutation
+//!   of it — `FA.setFieldsFromFile` indexes `stateOutput.get(q)` for `q` in `0..Q`
+//!   directly, so a real Walnut file satisfies this even though no single regex
+//!   enforces it) — checked explicitly here as [`ReadError::NonDenseStateIds`]
+//!   rather than inherited as a silent Java `NullPointerException`.
+//! - Every destination id used in a transition must have its own state block
+//!   ([`ReadError::UndeclaredDestState`]); every transition's input arity must equal
+//!   the header's track count ([`ReadError::ArityMismatch`]).
+//! - On load, if the parsed transition table is nondeterministic, Walnut
+//!   auto-determinizes + minimizes (`AutomatonReader.readAutomaton`, mirrored here);
+//!   this reader has no DFAO concept yet (see `wr_core::automaton` docs) so the
+//!   corresponding Java "nondeterministic DFAO is a hard error" branch does not
+//!   apply — every parsed automaton is a plain predicate automaton.
+//!
+//! # A deliberate grammar simplification
+//!
+//! Java's number regexes (`(\+|\-)?\s*\d+`) tolerate whitespace *between* a sign and
+//! its digits (`"+  5"`). This reader does not — every real Walnut-*emitted* file
+//! (the only files this spike's differential test reads) never inserts such
+//! whitespace, so this is a gap only for hand-written files with unusual spacing, not
+//! for round-tripping real output.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::path::Path;
+
+use wr_core::automaton::Automaton;
+use wr_core::determinize::subset_construction;
+use wr_core::fa::Fa;
+use wr_core::minimize::{minimize, MinimizeError};
+use wr_core::trim::trim;
+
+#[derive(Debug)]
+pub enum ReadError {
+    Io(std::io::Error),
+    /// The file contained nothing but comments/whitespace.
+    EmptyFile,
+    /// A `true`/`false` trivial file — not representable by this crate's `Automaton`
+    /// yet (see module docs).
+    UnsupportedTrivialAutomaton,
+    /// The header line couldn't be tokenized (unbalanced `{`, non-integer set element).
+    MalformedHeader,
+    /// A header token isn't `msd_<k>` / `lsd_<k>` / bare `msd` / bare `lsd`.
+    UnsupportedNumeration(String),
+    /// A line was neither a state declaration, a transition, blank, nor a comment.
+    UnexpectedLine(usize),
+    /// A transition line appeared before any state was declared.
+    TransitionBeforeState(usize),
+    /// A transition's input arity didn't match the header's track count.
+    ArityMismatch {
+        line: usize,
+        expected: usize,
+        got: usize,
+    },
+    /// A transition named a destination state with no `<id> <output>` block.
+    UndeclaredDestState(usize),
+    /// Declared state ids weren't exactly `0..Q` (see module docs).
+    NonDenseStateIds,
+    /// Propagated from the auto-determinize-on-load step.
+    Minimize(MinimizeError),
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+impl From<std::io::Error> for ReadError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::Io(e)
+    }
+}
+
+impl From<MinimizeError> for ReadError {
+    fn from(e: MinimizeError) -> Self {
+        ReadError::Minimize(e)
+    }
+}
+
+/// Reads a Walnut `.txt` automaton file into an [`Automaton`]. Track labels default to
+/// placeholders (`"0"`, `"1"`, ...) — the file format itself carries no variable
+/// names, matching Java (labels are a `Prover`/query-binding concept, not part of the
+/// `.txt` grammar); relabel via `automaton.label` after loading if needed.
+pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadError> {
+    let content = std::fs::read_to_string(path)?;
+
+    let mut lines = content.lines().enumerate();
+    let (_, header_line) = lines
+        .by_ref()
+        .find(|(_, l)| !should_skip(l))
+        .ok_or(ReadError::EmptyFile)?;
+
+    let trimmed_header = header_line.trim();
+    if trimmed_header == "true" || trimmed_header == "false" {
+        return Err(ReadError::UnsupportedTrivialAutomaton);
+    }
+    let (alphabet, msd) = parse_header(trimmed_header)?;
+    let num_tracks = alphabet.len();
+    let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
+    let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
+
+    // Placeholder `Fa`, replaced once every line is parsed — lets us reuse
+    // `Automaton::encode` (mixed-radix, position-in-alphabet indexed) instead of
+    // duplicating that formula here.
+    let mut automaton = Automaton::new(
+        Fa {
+            q0: 0,
+            q: 0,
+            alphabet_size,
+            o: vec![],
+            d: vec![],
+        },
+        alphabet.clone(),
+        label,
+        msd,
+    );
+
+    let mut output: BTreeMap<usize, i32> = BTreeMap::new();
+    let mut transitions: BTreeMap<usize, BTreeMap<i32, Vec<usize>>> = BTreeMap::new();
+    let mut declaration_order: Vec<usize> = Vec::new();
+    let mut current_state: Option<usize> = None;
+    let mut dest_states_used: BTreeSet<usize> = BTreeSet::new();
+
+    for (i, raw_line) in lines {
+        let lineno = i + 1;
+        if should_skip(raw_line) {
+            continue;
+        }
+
+        if let Some((id, out)) = try_parse_state_decl(raw_line) {
+            output.insert(id, out);
+            transitions.entry(id).or_default();
+            declaration_order.push(id);
+            current_state = Some(id);
+        } else if let Some((input_tokens, dests)) = try_parse_transition(raw_line) {
+            let cur = current_state.ok_or(ReadError::TransitionBeforeState(lineno))?;
+            if input_tokens.len() != num_tracks {
+                return Err(ReadError::ArityMismatch {
+                    line: lineno,
+                    expected: num_tracks,
+                    got: input_tokens.len(),
+                });
+            }
+            dest_states_used.extend(dests.iter().copied());
+            for digits in expand_wildcards(&input_tokens, &alphabet) {
+                let sym = automaton.encode(&digits);
+                transitions
+                    .get_mut(&cur)
+                    .expect("current_state always has a transitions entry")
+                    .entry(sym)
+                    .or_default()
+                    .extend(dests.iter().copied());
+            }
+        } else {
+            return Err(ReadError::UnexpectedLine(lineno));
+        }
+    }
+
+    for &d in &dest_states_used {
+        if !output.contains_key(&d) {
+            return Err(ReadError::UndeclaredDestState(d));
+        }
+    }
+
+    let q = declaration_order.len();
+    if output.len() != q || (0..q).any(|i| !output.contains_key(&i)) {
+        return Err(ReadError::NonDenseStateIds);
+    }
+    let q0 = declaration_order[0];
+
+    let mut o = vec![0i32; q];
+    let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); q];
+    for (id, out) in output {
+        o[id] = out;
+    }
+    for (id, row) in transitions {
+        d[id] = row;
+    }
+    automaton.fa = Fa {
+        q0,
+        q,
+        alphabet_size,
+        o,
+        d,
+    };
+
+    // `AutomatonReader.readAutomaton`: auto-determinize + minimize non-deterministic
+    // input (no DFAO branch here, see module docs).
+    if !automaton.fa.is_deterministic() {
+        let trimmed = trim(&automaton.fa);
+        let initial: BTreeSet<usize> = [trimmed.q0].into_iter().collect();
+        automaton.fa = minimize(&subset_construction(&trimmed, &initial))?;
+    }
+
+    Ok(automaton)
+}
+
+fn should_skip(line: &str) -> bool {
+    let t = line.trim_start();
+    t.is_empty() || t.starts_with('#')
+}
+
+enum HeaderToken {
+    Set(Vec<i32>),
+    Ns { msd: bool, base: i32 },
+}
+
+/// Per-track alphabet, and per-track msd/lsd (`None` for an explicit-set track).
+type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>);
+
+fn parse_header(line: &str) -> Result<HeaderSpec, ReadError> {
+    let mut alphabet = Vec::new();
+    let mut msd = Vec::new();
+    let mut rest = line.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        let token = if let Some(after_brace) = rest.strip_prefix('{') {
+            let end = after_brace.find('}').ok_or(ReadError::MalformedHeader)?;
+            let inner = &after_brace[..end];
+            let mut values = Vec::new();
+            for part in inner.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    return Err(ReadError::MalformedHeader);
+                }
+                values.push(
+                    part.parse::<i32>()
+                        .map_err(|_| ReadError::MalformedHeader)?,
+                );
+            }
+            rest = &after_brace[end + 1..];
+            HeaderToken::Set(values)
+        } else {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '{')
+                .unwrap_or(rest.len());
+            let word = &rest[..end];
+            rest = &rest[end..];
+            parse_ns_token(word)?
+        };
+        match token {
+            HeaderToken::Set(values) => {
+                alphabet.push(values);
+                msd.push(None);
+            }
+            HeaderToken::Ns { msd: is_msd, base } => {
+                alphabet.push((0..base).collect());
+                msd.push(Some(is_msd));
+            }
+        }
+    }
+    if alphabet.is_empty() {
+        return Err(ReadError::MalformedHeader);
+    }
+    Ok((alphabet, msd))
+}
+
+fn parse_ns_token(word: &str) -> Result<HeaderToken, ReadError> {
+    if let Some(rest) = word.strip_prefix("msd_") {
+        return rest
+            .parse::<i32>()
+            .map(|base| HeaderToken::Ns { msd: true, base })
+            .map_err(|_| ReadError::UnsupportedNumeration(word.to_string()));
+    }
+    if let Some(rest) = word.strip_prefix("lsd_") {
+        return rest
+            .parse::<i32>()
+            .map(|base| HeaderToken::Ns { msd: false, base })
+            .map_err(|_| ReadError::UnsupportedNumeration(word.to_string()));
+    }
+    match word {
+        "msd" => Ok(HeaderToken::Ns { msd: true, base: 2 }),
+        "lsd" => Ok(HeaderToken::Ns {
+            msd: false,
+            base: 2,
+        }),
+        _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
+    }
+}
+
+/// `<id> <output>`, both integers, output optionally signed, nothing else on the
+/// line — `ParseMethods.PATTERN_FOR_STATE_DECLARATION`.
+fn try_parse_state_decl(line: &str) -> Option<(usize, i32)> {
+    let mut parts = line.split_whitespace();
+    let id_tok = parts.next()?;
+    let out_tok = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let id: usize = id_tok.parse().ok()?;
+    let out: i32 = out_tok.parse().ok()?;
+    Some((id, out))
+}
+
+/// `<sym-or-*> ... -> <dest> ...` — `ParseMethods.PATTERN_FOR_TRANSITION`.
+fn try_parse_transition(line: &str) -> Option<(Vec<Option<i32>>, Vec<usize>)> {
+    let (lhs, rhs) = line.trim().split_once("->")?;
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    let mut input = Vec::new();
+    for tok in lhs.split_whitespace() {
+        if tok == "*" {
+            input.push(None);
+        } else {
+            input.push(Some(tok.parse::<i32>().ok()?));
+        }
+    }
+    let mut dest = Vec::new();
+    for tok in rhs.split_whitespace() {
+        dest.push(tok.parse::<usize>().ok()?);
+    }
+    if dest.is_empty() {
+        return None;
+    }
+    Some((input, dest))
+}
+
+/// `RichAlphabet.expandWildcard`: cross-product-expands every `None` (`*`) position
+/// against its own track's alphabet, one wildcard position at a time.
+fn expand_wildcards(input: &[Option<i32>], alphabet: &[Vec<i32>]) -> Vec<Vec<i32>> {
+    let mut results: Vec<Vec<i32>> = vec![input
+        .iter()
+        .map(|d| d.unwrap_or_default())
+        .collect::<Vec<i32>>()];
+    for (i, digit) in input.iter().enumerate() {
+        if digit.is_some() {
+            continue;
+        }
+        let mut expanded = Vec::with_capacity(results.len() * alphabet[i].len());
+        for partial in &results {
+            for &v in &alphabet[i] {
+                let mut next = partial.clone();
+                next[i] = v;
+                expanded.push(next);
+            }
+        }
+        results = expanded;
+    }
+    results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn reads_automaton572_explicit_set_alphabet() {
+        // {0, 1}; state 0 (q0, accepting) self-loops on both symbols to state 0.
+        let a = read_automaton_txt(fixture("automaton572.txt")).unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.msd, vec![None]);
+        assert_eq!(a.fa.q, 1);
+        assert!(a.fa.is_accepting(a.fa.q0));
+        assert!(a
+            .fa
+            .accepts_word(&[a.encode(&[0]), a.encode(&[1]), a.encode(&[0])]));
+    }
+
+    #[test]
+    fn reads_automaton2_msd3_four_track() {
+        let a = read_automaton_txt(fixture("automaton2.txt")).unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1, 2]; 4]);
+        assert_eq!(a.msd, vec![Some(true); 4]);
+        assert_eq!(a.fa.q, 4);
+        assert!(a.fa.is_deterministic());
+        // Accepts exactly the one 3-transition path the file spells out:
+        // state0 --(0,0,0,1)--> state1 --(1,1,2,2)--> state2 --(1,2,0,2)--> state3 (accept).
+        let word = [
+            a.encode(&[0, 0, 0, 1]),
+            a.encode(&[1, 1, 2, 2]),
+            a.encode(&[1, 2, 0, 2]),
+        ];
+        assert!(a.fa.accepts_word(&word));
+        // The self-loop on state0 alone never reaches an accepting state.
+        let wrong = [a.encode(&[0, 0, 0, 0])];
+        assert!(!a.fa.accepts_word(&wrong));
+    }
+
+    #[test]
+    fn bare_msd_defaults_to_base_2() {
+        let (alphabet, msd) = parse_header("msd").unwrap();
+        assert_eq!(alphabet, vec![vec![0, 1]]);
+        assert_eq!(msd, vec![Some(true)]);
+    }
+
+    #[test]
+    fn bare_lsd_defaults_to_base_2() {
+        let (alphabet, msd) = parse_header("lsd").unwrap();
+        assert_eq!(alphabet, vec![vec![0, 1]]);
+        assert_eq!(msd, vec![Some(false)]);
+    }
+
+    #[test]
+    fn msd_k_and_lsd_k_parse_explicit_bases() {
+        let (alphabet, msd) = parse_header("msd_5 lsd_3").unwrap();
+        assert_eq!(alphabet, vec![vec![0, 1, 2, 3, 4], vec![0, 1, 2]]);
+        assert_eq!(msd, vec![Some(true), Some(false)]);
+    }
+
+    #[test]
+    fn unsupported_numeration_is_explicit_not_silent() {
+        assert!(matches!(
+            parse_header("msd_fib"),
+            Err(ReadError::UnsupportedNumeration(_))
+        ));
+        assert!(matches!(
+            parse_header("msd5"), // no-underscore form — deliberately unsupported
+            Err(ReadError::UnsupportedNumeration(_))
+        ));
+    }
+
+    #[test]
+    fn trivial_automaton_is_explicit_not_silent() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("true.txt");
+        std::fs::write(&path, "true\n").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::UnsupportedTrivialAutomaton)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undeclared_destination_state_is_an_error() {
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-undeclared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.txt");
+        std::fs::write(&path, "{0, 1}\n\n0 0\n0 -> 5\n1 -> 0\n").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::UndeclaredDestState(5))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn arity_mismatch_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-arity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.txt");
+        std::fs::write(&path, "msd_2 msd_2\n\n0 0\n0 -> 0\n").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::ArityMismatch {
+                expected: 2,
+                got: 1,
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wildcard_expands_to_every_track_value() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-wildcard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wc.txt");
+        // `*` on the only track from state 0 must reach state 1 on EVERY symbol.
+        std::fs::write(&path, "msd_3\n\n0 0\n* -> 1\n\n1 1\n").unwrap();
+        let a = read_automaton_txt(&path).unwrap();
+        for digit in 0..3 {
+            assert!(a.fa.accepts_word(&[a.encode(&[digit])]));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nondeterministic_input_is_auto_determinized() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-nfa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfa.txt");
+        // Two destinations for symbol 1 from state 0 — genuine nondeterminism.
+        std::fs::write(
+            &path,
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+        let a = read_automaton_txt(&path).unwrap();
+        assert!(a.fa.is_deterministic());
+        // Recognizes "contains a 1", same language as the hand-written NFA.
+        assert!(!a.fa.accepts_word(&[a.encode(&[0]), a.encode(&[0])]));
+        assert!(a
+            .fa
+            .accepts_word(&[a.encode(&[0]), a.encode(&[1]), a.encode(&[0])]));
+    }
+
+    #[test]
+    fn non_dense_state_ids_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-dense-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gap.txt");
+        // States 0 and 2 declared, but not 1 — not a dense 0..Q range.
+        std::fs::write(
+            &path,
+            "msd_2\n\n0 0\n0 -> 2\n1 -> 2\n\n2 1\n0 -> 2\n1 -> 2\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::NonDenseStateIds)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

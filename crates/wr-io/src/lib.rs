@@ -12,14 +12,11 @@
 //! File-format fidelity is load-bearing: the clone must READ existing Walnut files
 //! and WRITE files Walnut can load. (Comparison, however, is by semantic
 //! equivalence in `wr-core`, not by textual identity.)
+//!
+//! # Phase 1 spike scope
+//!
+//! Only [`reader::read_automaton_txt`] so far — a reader is what the spike's
+//! differential test (`.claude/plans/fluttering-foraging-spindle.md`) needs to ingest
+//! real `walnut-java` output; the writer is deferred.
 
-/// Placeholder so the crate compiles from the first commit; replace as the port lands.
-pub fn placeholder() {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        super::placeholder();
-    }
-}
+pub mod reader;
