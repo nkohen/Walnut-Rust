@@ -8,5 +8,12 @@ rust-version.workspace = true
 [dependencies]
 wr-core = { path = "../wr-core" }
 # The RustConstantTermSequences substrate (primitives: GF(p) linalg, ModInt/LaurentPoly).
-# Wire when ready — see DESIGN.md §4:
+# NOT wired: the Tier-4 independent minimizer it was meant to supply turned out not to be
+# reusable (single-track / DFAO<ModInt,S>-specific, no usable minimize entry point), so
+# `src/moore.rs` is a standalone implementation instead — see the crate docs and
+# DESIGN.md §4. Still a candidate for the numeric primitives:
 # rust-constant-term-sequences = { git = "https://github.com/nkohen/RustConstantTermSequences.git" }
+
+[dev-dependencies]
+# DESIGN.md §5 Tier 4 property invariants (the Valmari-vs-Moore cross-check).
+proptest.workspace = true
