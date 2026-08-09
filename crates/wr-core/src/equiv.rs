@@ -13,6 +13,36 @@
 //! class). A silently-wrong oracle is the single highest-severity defect class in this
 //! crate: every other tier of testing is judged against it.
 //!
+//! # Trivial (TRUE/FALSE) automata — U0, and why this was a live wrong-answer path
+//!
+//! Walnut's own oracle handles them explicitly, and [`language_equivalent`] now ports
+//! that logic verbatim from `src/test/java/Main/EqualityUtils.java`'s `faEqual`:
+//!
+//! ```text
+//! if (a.isTRUE_FALSE_AUTOMATON() != b.isTRUE_FALSE_AUTOMATON()) return false;
+//! if (a.isTRUE_FALSE_AUTOMATON() && b.isTRUE_FALSE_AUTOMATON()) {
+//!   return a.isTRUE_AUTOMATON() == b.isTRUE_AUTOMATON();
+//! }
+//! // ...otherwise Brics language equivalence
+//! ```
+//!
+//! Note what that means and does not mean: a trivial automaton is compared **only**
+//! against another trivial automaton. `faEqual(TRUE, Σ*-over-some-alphabet)` is `false`
+//! in Walnut even though the two accept the same words — the flag is part of the
+//! compared value, not just an encoding of the language. This port keeps that,
+//! deliberately: the golden corpus (85 trivial `automaton*` fixtures) is judged by
+//! exactly this predicate, so a "smarter" oracle here would diverge from the bar Tier 1
+//! is measured against.
+//!
+//! Without these branches the check was not merely incomplete, it was **wrong**: a
+//! trivial `Fa` has `q == 0` and an empty `d`, on which
+//! [`Fa::is_deterministic_and_total`] answers `true` vacuously (both `all()`s range
+//! over empty iterators), so [`product_dfa`] would have built a 0-state product whose
+//! symmetric difference is trivially empty — reporting the TRUE automaton and the FALSE
+//! automaton *equivalent*. [`product_dfa`] therefore also rejects trivial inputs
+//! outright now ([`EquivError::TrivialAutomaton`]) rather than relying on every caller
+//! to pre-filter.
+//!
 //! Scope note: acceptance is treated as a plain 0/1 bit here (`Fa::is_accepting`), not
 //! Walnut's more general DFAO word-output value — matches this crate's current scope
 //! (predicate automata only); revisit when DFAO support lands.
@@ -84,15 +114,26 @@ pub enum EquivError {
     /// `Fa`-level comparison runs, since a mismatch here means the two automata's
     /// raw transition symbols cannot be assumed to mean the same digit tuples.
     MismatchedTrackStructure,
+    /// A TRUE/FALSE automaton was handed to [`product_dfa`], whose construction is
+    /// meaningless for it (it has no alphabet and no states — see this module's docs
+    /// on why this must be an error rather than a vacuous success).
+    TrivialAutomaton,
 }
 
 /// Complements a total DFA: flips every state's accept bit. `fa` must already be a
 /// total DFA (see module docs on the 0/1-acceptance scope limit).
+///
+/// A trivial automaton is complemented by flipping its truth value, matching
+/// `AutomatonLogicalOps.not`'s own short-circuit (`:146-149`).
 pub fn complement(fa: &Fa) -> Result<Fa, EquivError> {
+    if fa.is_true_false_automaton() {
+        return Ok(Fa::trivial(!fa.is_true_automaton()));
+    }
     if !fa.is_deterministic_and_total() {
         return Err(EquivError::NotTotalDfa);
     }
     Ok(Fa {
+        true_false: None,
         q0: fa.q0,
         q: fa.q,
         alphabet_size: fa.alphabet_size,
@@ -103,8 +144,16 @@ pub fn complement(fa: &Fa) -> Result<Fa, EquivError> {
 
 /// Cross-product of two total DFAs over the same alphabet size, with acceptance of a
 /// combined state `(i, j)` decided by `accept(a.is_accepting(i), b.is_accepting(j))`.
-/// Both inputs must already be total DFAs.
+/// Both inputs must already be total DFAs, and neither may be a trivial (TRUE/FALSE)
+/// automaton.
+///
+/// The trivial check must come FIRST: a trivial `Fa` passes
+/// [`Fa::is_deterministic_and_total`] vacuously (see this module's docs), so without it
+/// this would silently return a 0-state product instead of erroring.
 pub fn product_dfa(a: &Fa, b: &Fa, accept: impl Fn(bool, bool) -> bool) -> Result<Fa, EquivError> {
+    if a.is_true_false_automaton() || b.is_true_false_automaton() {
+        return Err(EquivError::TrivialAutomaton);
+    }
     if !a.is_deterministic_and_total() || !b.is_deterministic_and_total() {
         return Err(EquivError::NotTotalDfa);
     }
@@ -131,6 +180,7 @@ pub fn product_dfa(a: &Fa, b: &Fa, accept: impl Fn(bool, bool) -> bool) -> Resul
         }
     }
     Ok(Fa {
+        true_false: None,
         q0: pair_id(a.q0, b.q0),
         q,
         alphabet_size,
@@ -139,11 +189,21 @@ pub fn product_dfa(a: &Fa, b: &Fa, accept: impl Fn(bool, bool) -> bool) -> Resul
     })
 }
 
-/// True iff `a` and `b` recognize the same language. Both must be total DFAs. Computed
-/// as emptiness of the symmetric difference (`product_dfa` with `accept = XOR`) — the
-/// same construction named in `docs/DESIGN.md` §5 Tier 1 as the required `wr-core`
-/// deliverable.
+/// True iff `a` and `b` recognize the same language. Both must be total DFAs (or both
+/// trivial). Computed as emptiness of the symmetric difference (`product_dfa` with
+/// `accept = XOR`) — the same construction named in `docs/DESIGN.md` §5 Tier 1 as the
+/// required `wr-core` deliverable.
+///
+/// The two leading branches are `EqualityUtils.faEqual`'s, ported verbatim (U0) — see
+/// this module's docs, including why a trivial automaton is deliberately NOT compared
+/// against a language-equal ordinary one.
 pub fn language_equivalent(a: &Fa, b: &Fa) -> Result<bool, EquivError> {
+    if a.is_true_false_automaton() != b.is_true_false_automaton() {
+        return Ok(false);
+    }
+    if a.is_true_false_automaton() {
+        return Ok(a.is_true_automaton() == b.is_true_automaton());
+    }
     let sym_diff = product_dfa(a, b, |x, y| x != y)?;
     Ok(sym_diff.is_language_empty())
 }
@@ -192,6 +252,15 @@ pub fn language_equivalent(a: &Fa, b: &Fa) -> Result<bool, EquivError> {
 /// symbol encoding either — this function trusts `Automaton`'s own invariant, it does
 /// not re-derive it from `encoder`.
 pub fn automaton_language_equivalent(a: &Automaton, b: &Automaton) -> Result<bool, EquivError> {
+    // The trivial cases are decided BEFORE the track-structure check (U0), matching
+    // `EqualityUtils.faEqual`'s own ordering. Doing it the other way round would be
+    // wrong in both directions: a trivial automaton has an EMPTY `alphabet`, so
+    // `TRUE` vs `FALSE` would pass the `[] == []` structure check and fall through to
+    // the `Fa` layer, while `TRUE` vs any ordinary automaton would report
+    // `MismatchedTrackStructure` instead of the plain `false` Walnut's oracle gives.
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        return language_equivalent(&a.fa, &b.fa);
+    }
     if a.alphabet != b.alphabet {
         return Err(EquivError::MismatchedTrackStructure);
     }
@@ -224,6 +293,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -257,6 +327,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -276,6 +347,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![0]);
         Fa {
+            true_false: None,
             q0: 1,
             q: 2,
             alphabet_size: 2,
@@ -289,6 +361,7 @@ mod tests {
         d0.insert(0, vec![0]);
         d0.insert(1, vec![0]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 2,
@@ -353,6 +426,7 @@ mod tests {
         d0.insert(1, vec![0]);
         d0.insert(2, vec![0]);
         let b = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 3,
@@ -394,6 +468,7 @@ mod tests {
     fn automaton_language_equivalent_rejects_mismatched_arity() {
         let a = single_track_automaton(contains_one_dfa(), vec![0, 1]);
         let b_fa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 4,
@@ -455,6 +530,7 @@ mod tests {
             d1.insert(sym, vec![0]);
         }
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 4,
@@ -480,6 +556,99 @@ mod tests {
         // The gap: reported equivalent purely because the underlying Fa/alphabet are
         // byte-identical, even though `a` denotes "i==1" and `b` denotes "x==1".
         assert_eq!(automaton_language_equivalent(&a, &b), Ok(true));
+    }
+
+    // --- trivial (TRUE/FALSE) automata: EqualityUtils.faEqual, ported (U0) ---
+
+    /// A total DFA over `{0,1}` accepting EVERYTHING — the ordinary automaton whose
+    /// language coincides with the TRUE automaton's. Used to pin the deliberate
+    /// "`faEqual` compares the flag, not just the language" behavior below.
+    fn accept_all_dfa() -> Fa {
+        let mut d0 = Map::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![0]);
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![1],
+            d: vec![d0],
+        }
+    }
+
+    #[test]
+    fn trivial_automata_compare_by_truth_value() {
+        let t = Fa::trivial(true);
+        let f = Fa::trivial(false);
+        assert_eq!(language_equivalent(&t, &t), Ok(true));
+        assert_eq!(language_equivalent(&f, &f), Ok(true));
+        assert_eq!(language_equivalent(&t, &f), Ok(false));
+        assert_eq!(language_equivalent(&f, &t), Ok(false));
+    }
+
+    #[test]
+    fn trivial_vs_ordinary_is_unequal_in_both_argument_orders() {
+        // `faEqual`'s first line: `if (a.isTRUE_FALSE_AUTOMATON() !=
+        // b.isTRUE_FALSE_AUTOMATON()) return false;`. Deliberately `false` even when the
+        // LANGUAGES agree (`accept_all_dfa` accepts everything, like the TRUE
+        // automaton) -- see this module's docs on why the port keeps that.
+        let t = Fa::trivial(true);
+        let all = accept_all_dfa();
+        assert_eq!(language_equivalent(&t, &all), Ok(false));
+        assert_eq!(language_equivalent(&all, &t), Ok(false));
+
+        let f = Fa::trivial(false);
+        let none = reject_all_dfa();
+        assert_eq!(language_equivalent(&f, &none), Ok(false));
+        assert_eq!(language_equivalent(&none, &f), Ok(false));
+    }
+
+    #[test]
+    fn without_the_faequal_short_circuit_the_oracle_would_answer_wrongly() {
+        // Regression guard for the specific wrong-answer path U0 closes: a trivial `Fa`
+        // has `q == 0` and an empty `d`, so `is_deterministic_and_total()` is VACUOUSLY
+        // true and the raw product construction would have produced a 0-state (hence
+        // "empty symmetric difference") result -- reporting TRUE == FALSE. Pinning both
+        // halves here means neither the vacuous-totality quirk nor the short-circuit
+        // can be quietly removed without this failing.
+        let t = Fa::trivial(true);
+        assert!(
+            t.is_deterministic_and_total(),
+            "vacuously total -- this is exactly why the short-circuit is required"
+        );
+        assert_eq!(
+            product_dfa(&t, &Fa::trivial(false), |x, y| x != y).unwrap_err(),
+            EquivError::TrivialAutomaton
+        );
+        assert_eq!(
+            product_dfa(&accept_all_dfa(), &t, |x, y| x != y).unwrap_err(),
+            EquivError::TrivialAutomaton
+        );
+    }
+
+    #[test]
+    fn complement_of_a_trivial_automaton_flips_its_truth_value() {
+        let c = complement(&Fa::trivial(true)).unwrap();
+        assert!(c.is_true_false_automaton() && !c.is_true_automaton());
+        let c = complement(&Fa::trivial(false)).unwrap();
+        assert!(c.is_true_false_automaton() && c.is_true_automaton());
+    }
+
+    #[test]
+    fn automaton_level_oracle_decides_trivial_cases_before_checking_track_structure() {
+        let t = Automaton::true_false(true);
+        let f = Automaton::true_false(false);
+        assert_eq!(automaton_language_equivalent(&t, &t), Ok(true));
+        // Both have an EMPTY `alphabet`, so an ordering that ran the structure check
+        // first would fall through to the `Fa` layer here rather than answering.
+        assert_eq!(automaton_language_equivalent(&t, &f), Ok(false));
+
+        // Trivial vs ordinary must be a plain `false`, NOT `MismatchedTrackStructure`
+        // (which is what the structure check would have produced, since `[]` != `[[0,1]]`).
+        let ordinary = single_track_automaton(accept_all_dfa(), vec![0, 1]);
+        assert_eq!(automaton_language_equivalent(&t, &ordinary), Ok(false));
+        assert_eq!(automaton_language_equivalent(&ordinary, &t), Ok(false));
     }
 
     #[test]

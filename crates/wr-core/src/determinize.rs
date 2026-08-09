@@ -64,6 +64,7 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
         .collect();
 
     Fa {
+        true_false: None,
         q0: 0,
         q: metastate_list.len(),
         alphabet_size: fa.alphabet_size,
@@ -179,6 +180,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -208,6 +210,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0]);
         let nfa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 2,
@@ -255,6 +258,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -322,6 +326,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![1]);
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -347,6 +352,7 @@ mod tests {
         d0.insert(0, vec![0]);
         d0.insert(1, vec![0]);
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 2,

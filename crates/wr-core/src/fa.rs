@@ -15,6 +15,53 @@
 //! Symbols are pre-encoded integers (mixed-radix multi-track digit tuples, matching
 //! Java's `FA`/`Transitions` layering) — `Fa` itself is track-agnostic; track
 //! encode/decode lives in `crate::automaton`.
+//!
+//! # The trivial (TRUE/FALSE) automaton — [`Fa::true_false`] (U0)
+//!
+//! Walnut has two *special* automata that are not really automata at all: the TRUE
+//! automaton (accepts everything) and the FALSE automaton (accepts nothing). Java tags
+//! them with **two** private `boolean` fields on `FA` itself (`FA.java:52-53`,
+//! documented at `FA.java:593-617`):
+//!
+//! | `TRUE_FALSE_AUTOMATON` | `TRUE_AUTOMATON` | meaning |
+//! |---|---|---|
+//! | `false` | (ignored) | an ordinary automaton |
+//! | `true`  | `false`   | the FALSE automaton |
+//! | `true`  | `true`    | the TRUE automaton |
+//!
+//! This port collapses that pair into ONE `Option<bool>` field ([`Fa::true_false`]):
+//! `None` / `Some(false)` / `Some(true)`, matching the three rows above in order.
+//! That is a *representation* choice, not a behavior change, and it was verified
+//! exhaustively rather than assumed — the fourth combination (`TRUE_FALSE_AUTOMATON ==
+//! false && TRUE_AUTOMATON == true`) is both unreachable and unobservable in Walnut:
+//!
+//! * **Every writer of `TRUE_AUTOMATON` also sets `TRUE_FALSE_AUTOMATON = true`** (all
+//!   five sites, from grepping the whole `src/main/java` tree): `Automaton.java:108-109`
+//!   and `AutomatonDFA.java:23-24` (the boolean constructors),
+//!   `AutomatonReader.java:143-144` (the `true`/`false` file path),
+//!   `AutomatonQuantification.java:61-62` (the all-tracks-quantified path — note it
+//!   writes `TRUE_AUTOMATON` *first*, so the invalid combination does exist *between*
+//!   those two statements, but nothing reads it in between), and `FA.clone()`
+//!   (`FA.java:450-451`, copies both). `AutomatonLogicalOps.java:147`'s
+//!   `setTRUE_AUTOMATON(!isTRUE_AUTOMATON())` runs only *inside* an
+//!   `isTRUE_FALSE_AUTOMATON()` branch, so it cannot create the combination either.
+//! * **Every reader of `isTRUE_AUTOMATON()` is already guarded by
+//!   `isTRUE_FALSE_AUTOMATON()`** — including the one that looks unguarded at a glance,
+//!   `AutomatonLogicalOps.java:103` (`imply`), which sits under the enclosing
+//!   `A.fa.isTRUE_FALSE_AUTOMATON() || B.fa.isTRUE_FALSE_AUTOMATON()` test *after* the
+//!   `A`-side case has already returned, so `B` is necessarily the trivial one there.
+//!
+//! [`Fa::is_true_false_automaton`], [`Fa::is_true_automaton`] and
+//! [`Fa::true_false_string`] mirror Java's getters one-for-one, so ported call sites
+//! read the same as their Java originals.
+//!
+//! A trivial `Fa` carries **no** meaningful `q`/`o`/`d`. Two distinct shapes occur in
+//! Walnut and every `Fa`-level method has to tolerate both:
+//! * the fresh one from `new Automaton(boolean)` — `Q == 0`, empty `O`/`d`
+//!   ([`Fa::trivial`] builds exactly this);
+//! * the one `AutomatonQuantification`'s all-tracks-quantified path leaves behind,
+//!   where `Automaton.clear()` -> `FA.clear()` (`FA.java:90-94`) empties `O`/`d` but
+//!   **leaves `Q` stale and non-zero** (see [`Fa::clear`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -35,9 +82,72 @@ pub struct Fa {
     /// allowed); `is_deterministic()` distinguishes DFA use at the call site rather
     /// than the type system, mirroring Java's runtime `Transitions.isDeterministic()`.
     pub d: Vec<BTreeMap<i32, Vec<usize>>>,
+    /// Walnut's `FA.TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON` pair, collapsed into one
+    /// `Option` — `None` for an ordinary automaton, `Some(true)` for the TRUE
+    /// automaton, `Some(false)` for the FALSE automaton. See this module's docs for
+    /// the exhaustive justification that this loses nothing, and for the two `q`/`o`/`d`
+    /// shapes a trivial `Fa` can have.
+    ///
+    /// When this is `Some(..)`, `q`/`o`/`d`/`alphabet_size` are **meaningless** and must
+    /// not be interpreted; use [`Fa::is_true_automaton`] instead.
+    pub true_false: Option<bool>,
 }
 
 impl Fa {
+    /// `new Automaton(boolean)`'s `FA` half (`Automaton.java:106-110` +
+    /// `FA()`/`FA.java:55-58`): the trivial TRUE (`truth == true`) or FALSE
+    /// (`truth == false`) automaton — zero states, no transitions, no alphabet.
+    pub fn trivial(truth: bool) -> Fa {
+        Fa {
+            q0: 0,
+            q: 0,
+            alphabet_size: 0,
+            o: Vec::new(),
+            d: Vec::new(),
+            true_false: Some(truth),
+        }
+    }
+
+    /// `FA.isTRUE_FALSE_AUTOMATON()` (`FA.java:599-601`).
+    pub fn is_true_false_automaton(&self) -> bool {
+        self.true_false.is_some()
+    }
+
+    /// `FA.isTRUE_AUTOMATON()` (`FA.java:607-609`). Only meaningful when
+    /// [`Fa::is_true_false_automaton`] holds — see this module's docs on why Java's
+    /// "`TRUE_AUTOMATON` without `TRUE_FALSE_AUTOMATON`" combination is unreachable
+    /// and unread.
+    pub fn is_true_automaton(&self) -> bool {
+        self.true_false == Some(true)
+    }
+
+    /// `FA.trueFalseString()` (`FA.java:611-613`): `Boolean.toString(TRUE_AUTOMATON)`.
+    /// This is what `Writer/AutomatonWriter.writeTxtFormatToStream` (`:49-50`) writes
+    /// as the ENTIRE body of a trivial automaton's `.txt` file — the string the 85
+    /// trivial golden fixtures consist of.
+    pub fn true_false_string(&self) -> &'static str {
+        if self.is_true_automaton() {
+            "true"
+        } else {
+            "false"
+        }
+    }
+
+    /// `FA.clear()` (`FA.java:90-94`): empties `O` and the transition table and clears
+    /// the `canonized` memo (which `Fa` doesn't carry — see [`Fa::canonicalize`]).
+    ///
+    /// **Faithfully leaves `q`, `q0`, `alphabet_size` and `true_false` untouched**, so
+    /// its one Java caller (`Automaton.clear()`, itself only called from
+    /// `AutomatonQuantification`'s all-tracks-quantified path) leaves behind a trivial
+    /// automaton with a stale, non-zero `q` — the second of the two trivial shapes this
+    /// module's docs describe. Not "tidied up" here: `Fa::canonicalize`/`crate::trim`
+    /// both branch on `true_false` exactly where Java does, so the stale value is never
+    /// interpreted, and normalizing it would be an undeclared divergence.
+    pub fn clear(&mut self) {
+        self.o.clear();
+        self.d.clear();
+    }
+
     pub fn is_accepting(&self, s: usize) -> bool {
         self.o[s] != 0
     }
@@ -347,9 +457,10 @@ impl Fa {
     ///
     /// Java memoizes behind a `canonized` flag and a `TRUE_FALSE_AUTOMATON`
     /// short-circuit — both are private fields **on `FA` itself** (`FA.java:47-50`,
-    /// checked at `FA.java:149`), not `Automaton`/command-level state as an earlier
-    /// draft of this doc claimed. This crate's `Fa` carries neither, so this always
-    /// recomputes — safe (idempotent: re-running on an already-BFS-ordered automaton is
+    /// checked at `FA.java:149`). U0 added the `TRUE_FALSE_AUTOMATON` half to this
+    /// crate ([`Fa::true_false`]) and the guard below now reproduces it exactly; the
+    /// `canonized` memo is still absent, so this always recomputes — safe (idempotent:
+    /// re-running on an already-BFS-ordered automaton is
     /// a no-op transitions-and-output-wise) but behaviorally NOT identical: Java's
     /// `canonized` guard means a stale-flagged `FA` is left un-renumbered even if its
     /// actual state order has changed underneath it (pinned upstream by
@@ -364,14 +475,17 @@ impl Fa {
     /// transition row and throws `IndexOutOfBoundsException`. That path is simply
     /// unreachable in practice: the *only* `Q == 0` automata Walnut ever builds are the
     /// TRUE/FALSE automata (`Automaton.java`'s boolean constructor), and those hit the
-    /// `TRUE_FALSE_AUTOMATON` short-circuit before `canonizeInternal`'s body ever runs —
-    /// making it a genuine no-op, matching the guard below. The guard also covers a shape
-    /// Java's `TRUE_FALSE_AUTOMATON` flag guards against but `Fa` cannot express: a
-    /// `Q > 0` automaton with empty `o`/`d` (Java's `FA.clear()` leaves `Q` untouched
-    /// while emptying storage; `AutomatonQuantification`'s to-TRUE_FALSE path does
-    /// exactly this). Not yet constructible by anything in this crate, but cheap to
-    /// guard against now rather than panicking once it is.
+    /// `TRUE_FALSE_AUTOMATON` short-circuit before `canonizeInternal`'s body ever runs.
+    /// U0 added that short-circuit here too, as the FIRST guard below, so this crate now
+    /// matches Java branch-for-branch; the `q == 0 || d.is_empty()` guard is kept behind
+    /// it as defence in depth for the same shapes reached WITHOUT the flag set (nothing
+    /// in this crate constructs one, but `Fa`'s fields are `pub`).
     pub fn canonicalize(&mut self) {
+        // `FA.canonizeInternal`'s `if (this.canonized || this.isTRUE_FALSE_AUTOMATON())
+        // return;` (`FA.java:149`), minus the absent `canonized` memo.
+        if self.is_true_false_automaton() {
+            return;
+        }
         if self.q == 0 || self.d.is_empty() {
             return;
         }
@@ -452,6 +566,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -478,6 +593,7 @@ mod tests {
     #[test]
     fn zero_state_automaton_is_empty() {
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size: 2,
@@ -580,6 +696,7 @@ mod tests {
         d1.insert(0, vec![0]);
         d1.insert(1, vec![1]);
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -635,6 +752,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -681,6 +799,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0,
                     q,
                     alphabet_size,
@@ -735,6 +854,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![2]);
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 1,
@@ -810,6 +930,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![1]);
         let a = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -838,6 +959,7 @@ mod tests {
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -847,6 +969,7 @@ mod tests {
         let mut d_other0 = BTreeMap::new();
         d_other0.insert(1, vec![1]);
         let other = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -886,6 +1009,7 @@ mod tests {
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -895,6 +1019,7 @@ mod tests {
         let mut d_other0 = BTreeMap::new();
         d_other0.insert(1, vec![1]);
         let other = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -940,6 +1065,7 @@ mod tests {
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -951,6 +1077,7 @@ mod tests {
         let mut d_other1 = BTreeMap::new();
         d_other1.insert(0, vec![0]); // real: q0=1 --0--> state 0 (accepting)
         let other = Fa {
+            true_false: None,
             q0: 1,
             q: 2,
             alphabet_size: 2,
@@ -1039,6 +1166,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![]); // state 1 --0--> {} (empty destination list)
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 1,
@@ -1069,6 +1197,7 @@ mod tests {
         let mut d2 = BTreeMap::new();
         d2.insert(0, vec![1]);
         let mut fa = Fa {
+            true_false: None,
             q0: 1,
             q: 3,
             alphabet_size: 1,
@@ -1086,6 +1215,7 @@ mod tests {
     #[test]
     fn canonicalize_is_a_noop_on_a_zero_state_automaton() {
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size: 2,
@@ -1094,6 +1224,94 @@ mod tests {
         };
         fa.canonicalize();
         assert_eq!(fa.q, 0);
+    }
+
+    // --- the trivial (TRUE/FALSE) automaton (U0, FA.java:52-53/90-94/149/593-617) ---
+
+    #[test]
+    fn trivial_constructs_a_stateless_flagged_automaton() {
+        let t = Fa::trivial(true);
+        assert!(t.is_true_false_automaton());
+        assert!(t.is_true_automaton());
+        assert_eq!(t.true_false_string(), "true");
+        assert_eq!((t.q, t.q0, t.alphabet_size), (0, 0, 0));
+        assert!(t.o.is_empty() && t.d.is_empty());
+
+        let f = Fa::trivial(false);
+        assert!(f.is_true_false_automaton());
+        assert!(!f.is_true_automaton());
+        assert_eq!(f.true_false_string(), "false");
+    }
+
+    #[test]
+    fn an_ordinary_automaton_is_not_a_trivial_one() {
+        let fa = contains_one_dfa();
+        assert!(!fa.is_true_false_automaton());
+        assert!(!fa.is_true_automaton());
+    }
+
+    #[test]
+    fn clone_carries_the_trivial_flag() {
+        // `FA.clone()` explicitly copies BOTH flags (`FA.java:450-451`); `derive(Clone)`
+        // must do the same or every `Automaton::clone`-based call path silently
+        // downgrades a trivial automaton to an ordinary 0-state one.
+        for truth in [true, false] {
+            let c = Fa::trivial(truth).clone();
+            assert!(c.is_true_false_automaton());
+            assert_eq!(c.is_true_automaton(), truth);
+        }
+    }
+
+    #[test]
+    fn clear_empties_storage_but_faithfully_leaves_q_stale_and_the_flag_set() {
+        // Replicates the exact sequence `AutomatonQuantification.quantifyHelper:61-63`
+        // produces: flags set, then `FA.clear()`. Java leaves `Q` untouched, and that
+        // stale value is what every downstream guard has to tolerate.
+        let mut fa = contains_one_dfa();
+        fa.true_false = Some(true);
+        fa.clear();
+
+        assert_eq!(fa.q, 2, "Q is deliberately NOT reset -- matches FA.clear()");
+        assert!(fa.o.is_empty());
+        assert!(fa.d.is_empty());
+        assert!(fa.is_true_false_automaton() && fa.is_true_automaton());
+    }
+
+    #[test]
+    fn canonicalize_short_circuits_on_a_trivial_automaton_with_a_stale_q() {
+        // The `q == 0 || d.is_empty()` guard would also catch this shape, but the
+        // TRUE/FALSE guard is what Java uses (`FA.java:149`) and what must fire first;
+        // the assertion here is that nothing panics and nothing is renumbered.
+        let mut fa = contains_one_dfa();
+        fa.true_false = Some(false);
+        fa.clear();
+        fa.canonicalize();
+        assert_eq!(fa.q, 2);
+        assert!(fa.is_true_false_automaton() && !fa.is_true_automaton());
+    }
+
+    #[test]
+    fn canonicalize_short_circuits_even_when_the_flagged_automaton_is_renumberable() {
+        // The sharper version of the test above: a fully-formed, renumberable automaton
+        // that merely CARRIES the flag must still be left completely untouched, which
+        // only the flag guard can achieve (`q`/`d` are both non-degenerate here). This
+        // shape is not constructible through this crate's own APIs, but it is the only
+        // way to observe the guard independently of the emptiness fallbacks.
+        let mut fa = Fa {
+            true_false: Some(true),
+            q0: 1,
+            q: 2,
+            alphabet_size: 1,
+            o: vec![0, 1],
+            d: vec![BTreeMap::new(), BTreeMap::new()],
+        };
+        let before = format!("{fa:?}");
+        fa.canonicalize();
+        assert_eq!(
+            format!("{fa:?}"),
+            before,
+            "the TRUE/FALSE guard must suppress BFS renumbering entirely"
+        );
     }
 
     proptest! {

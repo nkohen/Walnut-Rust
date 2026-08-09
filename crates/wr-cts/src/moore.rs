@@ -296,6 +296,7 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MooreError> {
     }
 
     Ok(Fa {
+        true_false: None,
         q0: class[fa.q0],
         q: new_q,
         alphabet_size: fa.alphabet_size,
@@ -392,6 +393,7 @@ mod tests {
         // The oracle is only trustworthy if it is itself right on cases derived by hand.
         // "contains at least one 1" is minimal (2 classes: seen-a-1 vs not).
         let contains_one = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -402,6 +404,7 @@ mod tests {
 
         // Three states, two of them equivalent accepting sinks: 2 classes.
         let two_sinks = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -416,6 +419,7 @@ mod tests {
 
         // Everything equivalent: 1 class.
         let all_reject = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 1,
@@ -433,6 +437,7 @@ mod tests {
         // structurally distinct. L = Σ⁺, whose minimal complete DFA has exactly 2
         // states (ε is rejected, every nonempty word accepted; no dead class).
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -458,6 +463,7 @@ mod tests {
         // "contains at least one 1": ε is rejected and `1` accepted, so the two states
         // are distinguishable — a correct minimizer must not merge them.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -472,6 +478,7 @@ mod tests {
     #[test]
     fn single_state_automaton_survives_unchanged() {
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 2,
@@ -492,6 +499,7 @@ mod tests {
         // accepts). If unreachable states were refined along with the rest, they would
         // survive as a third, unreachable block and the result would have 3 states.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -515,6 +523,7 @@ mod tests {
         // Same automaton, but entered at state 1 — L = Σ* here, so everything reachable
         // collapses to one accepting state. Exercises `class[fa.q0]` with `q0 != 0`.
         let fa = Fa {
+            true_false: None,
             q0: 1,
             q: 3,
             alphabet_size: 2,
@@ -537,6 +546,7 @@ mod tests {
         // dead sink. (`wr_core::minimize::minimize` would return only 1, having dropped
         // the dead state — the documented difference, see the module docs.)
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -570,6 +580,7 @@ mod tests {
         // A single-pass implementation would answer 3; stopping one round early would
         // answer 4. Only a genuine fixpoint iteration answers 5.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 8,
             alphabet_size: 2,
@@ -610,6 +621,7 @@ mod tests {
         // Degenerate but constructible: with no symbols, only `q0` is reachable and the
         // language is {ε} or ∅ depending on `o[q0]`.
         let fa = Fa {
+            true_false: None,
             q0: 1,
             q: 2,
             alphabet_size: 0,
@@ -637,6 +649,7 @@ mod tests {
         // The cross-check property test below therefore MUST scope its inputs to where
         // WB-001 cannot fire; see its doc comment.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 1,
@@ -678,6 +691,7 @@ mod tests {
         //     `totalize` therefore re-adds a sink and yields 2 — hence the cross-check
         //     property compares raw state counts with a `max(1, ..)`, not totalized ones.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 2,
@@ -708,6 +722,7 @@ mod tests {
     #[test]
     fn rejects_nondeterministic_input() {
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -721,6 +736,7 @@ mod tests {
     #[test]
     fn rejects_partial_input() {
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -735,6 +751,7 @@ mod tests {
     #[test]
     fn rejects_zero_state_automaton() {
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size: 2,
@@ -747,6 +764,7 @@ mod tests {
     #[test]
     fn rejects_structurally_inconsistent_input() {
         let bad_lengths = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 1,
@@ -759,6 +777,7 @@ mod tests {
         ));
 
         let bad_q0 = Fa {
+            true_false: None,
             q0: 5,
             q: 2,
             alphabet_size: 1,
@@ -771,6 +790,7 @@ mod tests {
         ));
 
         let bad_dest = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 1,
@@ -809,6 +829,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0,
                     q,
                     alphabet_size,

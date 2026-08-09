@@ -75,6 +75,7 @@ mod tests {
     fn two_track(q: usize, o: Vec<i32>, edges: &[((usize, i32, i32), usize)]) -> Automaton {
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q,
                 alphabet_size: 4,
@@ -143,14 +144,66 @@ mod tests {
         assert_eq!(a.fa.q, 2);
     }
 
+    /// U0 changed this behavior: quantifying away EVERY track used to be a hard
+    /// `QuantifyError::AllTracksQuantified` (the Phase-1 stand-in for a representation
+    /// this crate lacked), and now produces Java's real answer, a TRUE/FALSE automaton
+    /// — `AutomatonQuantification.java:58-65`. The test is kept (not deleted) and
+    /// re-pointed at the new contract, which is strictly stronger: it checks the truth
+    /// VALUE, not just that the call succeeded.
     #[test]
-    fn quantifying_every_track_is_out_of_scope() {
+    fn quantifying_every_track_yields_a_true_false_automaton() {
+        // `∃i ∃x (i < x)` over msd base-2: satisfiable (e.g. i=0, x=1), so TRUE.
         let mut a = less_than_msd(2);
         a.label = vec!["i".to_string(), "x".to_string()];
-        assert_eq!(
-            exists(&mut a, &labels(&["i", "x"])),
-            Err(QuantifyError::AllTracksQuantified)
-        );
+        assert!(!a.is_empty(), "sanity: L(i < x) is non-empty");
+
+        exists(&mut a, &labels(&["i", "x"])).unwrap();
+
+        assert!(a.is_true_false_automaton());
+        assert!(a.is_true_automaton(), "∃i ∃x (i < x) is TRUE");
+        // `Automaton.clear()` wiped the track metadata (`AutomatonQuantification:63`).
+        assert!(a.alphabet.is_empty());
+        assert!(a.label.is_empty());
+        assert!(a.msd.is_empty());
+        assert_eq!(a.get_arity(), 0);
+        assert!(!a.is_empty(), "the TRUE automaton's language is not empty");
+    }
+
+    /// The FALSE half of the same branch: an empty-language input must quantify to the
+    /// FALSE automaton, not the TRUE one. Without this, a `!A.isEmpty()` accidentally
+    /// written as `A.isEmpty()` (or evaluated AFTER the flag is set, which would make
+    /// `isEmpty` take its own trivial branch and always answer "empty") would pass the
+    /// test above.
+    #[test]
+    fn quantifying_every_track_of_an_empty_language_yields_false() {
+        // Two tracks, no accepting state at all: L = ∅.
+        let mut a = two_track(2, vec![0, 0], &[((0, 0, 0), 1)]);
+        assert!(a.is_empty(), "sanity: this automaton accepts nothing");
+
+        exists(&mut a, &labels(&["y", "x"])).unwrap();
+
+        assert!(a.is_true_false_automaton());
+        assert!(!a.is_true_automaton(), "∃y ∃x (false) is FALSE");
+        assert!(a.is_empty());
+    }
+
+    /// Quantifying anything out of an ALREADY-trivial automaton is a no-op that leaves
+    /// it trivial — Java's `quantifyHelper` bails at its `A.getLabel().isEmpty()` check
+    /// (`:50-52`) and `quantify` then returns at `:39` without consulting
+    /// `determineMsd` or running any zero fixup.
+    #[test]
+    fn quantifying_an_already_trivial_automaton_is_a_noop() {
+        for truth in [true, false] {
+            let mut a = Automaton::true_false(truth);
+            exists(&mut a, &labels(&["anything"])).unwrap();
+            assert!(a.is_true_false_automaton());
+            assert_eq!(a.is_true_automaton(), truth);
+
+            let mut a = Automaton::true_false(truth);
+            exists(&mut a, &BTreeSet::new()).unwrap();
+            assert!(a.is_true_false_automaton());
+            assert_eq!(a.is_true_automaton(), truth);
+        }
     }
 
     #[test]
@@ -188,6 +241,7 @@ mod tests {
         // trim -> subset_construction.
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 0,
                 alphabet_size: 4,
@@ -254,6 +308,7 @@ mod tests {
     fn quantifying_a_middle_track_preserves_survivor_order() {
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 8,
@@ -286,6 +341,7 @@ mod tests {
     fn zero_reachable_states_forces_a_q0_self_loop() {
         // q0 has no zero-transition at all going in.
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -305,6 +361,7 @@ mod tests {
     fn zero_reachable_states_is_a_multi_step_closure_and_does_not_duplicate() {
         // 0 -0-> 1 -0-> 2, and 0 already self-loops on zero.
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 1,
@@ -406,6 +463,7 @@ mod tests {
                     .collect();
                 let mut a = Automaton::new(
                     Fa {
+                        true_false: None,
                         q0: 0,
                         q,
                         alphabet_size: 4,

@@ -135,13 +135,15 @@ use std::collections::{BTreeMap, BTreeSet};
 /// `msd`), so `None` plays the `null` role and `Some(b)` plays `ns.isMsd() == b`.
 ///
 /// Java's loop leaves `isMsd = true` untouched for an *empty* list, so zero tracks
-/// defaults to msd. This IS reachable through [`crate::quantify::quantify`] — not by
-/// quantifying away every track (that is rejected as
-/// [`crate::quantify::QuantifyError::AllTracksQuantified`] before this function is ever
-/// reached), but by quantifying on an automaton that already has zero tracks: the
-/// `a.label.is_empty()` early return leaves `a.msd` empty and unchanged, and `quantify`
-/// still unconditionally consults this function afterward (a faithfully-ported quirk —
-/// see `quantify`'s module docs).
+/// defaults to msd. This IS reachable through [`crate::quantify::quantify`] — but NOT
+/// by quantifying away every track: that path turns the automaton into a TRUE/FALSE
+/// automaton and `quantify` returns at its `isTRUE_FALSE_AUTOMATON` guard before this
+/// function is ever reached (U0; it used to be a hard `AllTracksQuantified` error, and
+/// the conclusion is unchanged either way). What *does* reach it is quantifying on an
+/// automaton that already has zero tracks (and so no labels either, and no TRUE/FALSE
+/// flag): the `a.label.is_empty()` early return leaves `a.msd` empty and unchanged, and
+/// `quantify` still consults this function afterward (a faithfully-ported quirk — see
+/// `quantify`'s module docs).
 ///
 /// Lives here rather than next to `quantify` because it is a `NumberSystem` method in
 /// Java, and because `NumberSystem`'s own base-*k* constructions are the other consumer
@@ -192,6 +194,7 @@ pub fn less_than_msd(base: i32) -> Automaton {
 
     let mut automaton = Automaton::new(
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size,
@@ -517,6 +520,7 @@ fn init_basic_automaton(
     let q = o.len();
     let mut a = Automaton::new(
         Fa {
+            true_false: None,
             q0: 0,
             q,
             alphabet_size: 1,
@@ -1159,6 +1163,7 @@ impl NumberSystem {
         d0.insert(0, vec![0usize]);
         self.make_constant(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 1,
@@ -1178,6 +1183,7 @@ impl NumberSystem {
             d0.insert(0, vec![0usize]);
             d0.insert(1, vec![1usize]);
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 1,
@@ -1192,6 +1198,7 @@ impl NumberSystem {
             let mut d1 = BTreeMap::new();
             d1.insert(0, vec![1usize]);
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 1,

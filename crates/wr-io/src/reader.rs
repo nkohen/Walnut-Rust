@@ -13,11 +13,15 @@
 //!
 //! - Comments (`^\s*#.*$`) and blank lines are skippable anywhere.
 //! - A **trivial** file is just `true` or `false` and nothing else (except
-//!   comments/whitespace) — **not supported by this reader**: [`crate::automaton`]
-//!   (this crate re-exports `wr_core::automaton::Automaton`) has no
-//!   `TRUE_FALSE_AUTOMATON` variant, matching that type's own documented Phase-1
-//!   scope, so a trivial file is [`ReadError::UnsupportedTrivialAutomaton`] rather
-//!   than a misrepresentation.
+//!   comments/whitespace), and yields the TRUE/FALSE automaton
+//!   (`wr_core::automaton::Automaton::true_false`). Supported as of U0; it used to be
+//!   a hard `UnsupportedTrivialAutomaton` error because `Automaton` had no such
+//!   variant. **13% of Walnut's own golden `automaton*` corpus (85 of 638 fixtures)
+//!   consists of exactly this**, so it is a mainline shape, not a curiosity.
+//!   Anything other than comments/whitespace after the `true`/`false` line is
+//!   [`ReadError::FileHasConflict`], matching `AutomatonReader.firstParse`
+//!   (`:146-151`) — the trivial line is NOT merely a header the rest of the file may
+//!   extend.
 //! - The **header** line declares one token per track: either an explicit set
 //!   `{v1, v2, ...}`, or a numeration spec. **This reader supports only `msd_<k>`,
 //!   `lsd_<k>`, bare `msd` (= `msd_2`), and bare `lsd` (= `lsd_2`)** — real Walnut
@@ -67,9 +71,11 @@ pub enum ReadError {
     Io(std::io::Error),
     /// The file contained nothing but comments/whitespace.
     EmptyFile,
-    /// A `true`/`false` trivial file — not representable by this crate's `Automaton`
-    /// yet (see module docs).
-    UnsupportedTrivialAutomaton,
+    /// A `true`/`false` trivial file had further non-comment, non-blank content after
+    /// the truth-value line. Ports `WalnutException.fileHasConflict`, thrown from
+    /// `AutomatonReader.firstParse` (`:146-151`); the payload is the 1-based line
+    /// number of the offending line, as in Java's message.
+    FileHasConflict(usize),
     /// The header line couldn't be tokenized (unbalanced `{`, non-integer set element).
     MalformedHeader,
     /// A header token isn't `msd_<k>` / `lsd_<k>` / bare `msd` / bare `lsd`.
@@ -91,7 +97,7 @@ pub enum ReadError {
     /// `Fa::is_language_empty` all pass it through — but this reader has no `q0` to
     /// report for it, since Walnut's own file format has no way to declare one; the
     /// closest real Walnut behavior would be a file containing just `false`, which
-    /// this reader already reports as [`ReadError::UnsupportedTrivialAutomaton`]).
+    /// this reader now reads as the FALSE automaton).
     NoStates,
     /// Declared state ids weren't exactly `0..Q` (see module docs).
     NonDenseStateIds,
@@ -132,10 +138,24 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
         .find(|(_, l)| !should_skip(l))
         .ok_or(ReadError::EmptyFile)?;
 
-    let trimmed_header = header_line.trim();
-    if trimmed_header == "true" || trimmed_header == "false" {
-        return Err(ReadError::UnsupportedTrivialAutomaton);
+    // `AutomatonReader.firstParse`'s trivial branch (`:141-153`): the `true`/`false`
+    // test runs BEFORE the alphabet-declaration parse, and once it matches nothing but
+    // comments/whitespace may follow.
+    if let Some(truth) = parse_true_false(header_line) {
+        for (i, raw_line) in lines {
+            if !should_skip(raw_line) {
+                return Err(ReadError::FileHasConflict(i + 1));
+            }
+        }
+        // Java's result additionally carries `alphabetSize == 1` here, from the
+        // unconditional `A.setAlphabetSize(1)` at `AutomatonReader.readAutomaton:23`
+        // that runs before parsing; `Automaton::true_false` leaves it `0`. Not
+        // replicated because nothing may read a trivial automaton's `alphabet_size`
+        // (see `wr_core::fa`'s module docs) — noting it rather than leaving it silent.
+        return Ok(Automaton::true_false(truth));
     }
+
+    let trimmed_header = header_line.trim();
     let (alphabet, msd) = parse_header(trimmed_header)?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
@@ -146,6 +166,7 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
     // duplicating that formula here.
     let mut automaton = Automaton::new(
         Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size,
@@ -226,6 +247,7 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
         d[id] = row;
     }
     automaton.fa = Fa {
+        true_false: None,
         q0,
         q,
         alphabet_size,
@@ -247,6 +269,31 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
 fn should_skip(line: &str) -> bool {
     let t = line.trim_start();
     t.is_empty() || t.starts_with('#')
+}
+
+/// `ParseMethods.parseTrueFalse(String, Boolean[])` (`ParseMethods.java:74-81`) against
+/// `PATTERN_FOR_TRUE_FALSE = ^\s*(true|false)\s*$` (`:43`) — returns the parsed truth
+/// value, or `None` when the line isn't a bare `true`/`false`.
+///
+/// Implemented inline here rather than as part of a `ParseMethods` port on purpose:
+/// **`ParseMethods.java` as a whole is a separate, independently-landing unit (U0b),
+/// which will eventually own all of this file's `.txt` grammar.** Keeping this as one
+/// small private helper with the same name/semantics as the Java method means that
+/// refactor is a mechanical "delete this and call `ParseMethods`" step with no merge
+/// conflict against U0's other changes.
+///
+/// Regex-free by design: the pattern is anchored at both ends with only `\s*` padding,
+/// so `str::trim` + equality is *exactly* equivalent — Java's `\s` and Rust's
+/// `char::is_whitespace` differ on a handful of exotic code points, but the pattern
+/// permits only whitespace there in either reading, so no input can be classified
+/// differently. (Java uses `Matcher.find()`, not `matches()`, which is likewise
+/// equivalent here because the pattern is `^...$`-anchored.)
+fn parse_true_false(line: &str) -> Option<bool> {
+    match line.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 enum HeaderToken {
@@ -470,17 +517,84 @@ mod tests {
         ));
     }
 
+    // --- trivial (TRUE/FALSE) automaton files (U0) ---
+    //
+    // Before U0 this shape was a hard `UnsupportedTrivialAutomaton` error; the test that
+    // pinned that (`trivial_automaton_is_explicit_not_silent`) is retained below in
+    // updated form, now asserting the real read, since the behavior it pinned was a
+    // documented scope cut that this unit deliberately closes.
+
+    #[test]
+    fn reads_the_real_golden_true_fixture() {
+        // `automaton189.txt` — the literal word `true`, no trailing newline, copied
+        // byte-for-byte from walnut-java's corpus.
+        let a = read_automaton_txt(fixture("automaton189.txt")).unwrap();
+        assert!(a.is_true_false_automaton());
+        assert!(a.is_true_automaton());
+        assert!(!a.is_empty(), "the TRUE automaton's language is not empty");
+        assert_eq!(a.get_arity(), 0);
+        assert!(a.alphabet.is_empty());
+        assert!(a.label.is_empty());
+        assert!(a.msd.is_empty());
+    }
+
+    #[test]
+    fn reads_the_real_golden_false_fixture() {
+        let a = read_automaton_txt(fixture("automaton214.txt")).unwrap();
+        assert!(a.is_true_false_automaton());
+        assert!(!a.is_true_automaton());
+        assert!(a.is_empty(), "the FALSE automaton's language is empty");
+        assert_eq!(a.get_arity(), 0);
+    }
+
     #[test]
     fn trivial_automaton_is_explicit_not_silent() {
         let dir = std::env::temp_dir().join(format!("wr-io-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+
+        // Trailing newline, leading/trailing whitespace and comment lines are all
+        // tolerated -- `PATTERN_FOR_TRUE_FALSE` is `^\s*(true|false)\s*$` and
+        // `firstParse` skips comments/blanks both before and after the match.
         let path = dir.join("true.txt");
-        std::fs::write(&path, "true\n").unwrap();
+        std::fs::write(&path, "# a comment\n\n   true  \n\n# trailing comment\n").unwrap();
+        let a = read_automaton_txt(&path).unwrap();
+        assert!(a.is_true_false_automaton() && a.is_true_automaton());
+
+        let path = dir.join("false.txt");
+        std::fs::write(&path, "false\n").unwrap();
+        let a = read_automaton_txt(&path).unwrap();
+        assert!(a.is_true_false_automaton() && !a.is_true_automaton());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn content_after_a_trivial_line_is_a_conflict_not_a_silent_ignore() {
+        // `AutomatonReader.firstParse:146-151` — `WalnutException.fileHasConflict`.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-conflict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conflict.txt");
+        std::fs::write(&path, "true\n{0, 1}\n\n0 1\n").unwrap();
         assert!(matches!(
             read_automaton_txt(&path),
-            Err(ReadError::UnsupportedTrivialAutomaton)
+            // Line 2 (1-based) is the first offending line.
+            Err(ReadError::FileHasConflict(2))
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_true_like_word_that_is_not_a_bare_truth_value_is_not_trivial() {
+        // Guards against a sloppier `starts_with`/`contains` implementation of
+        // `PATTERN_FOR_TRUE_FALSE`: `true_2` is a header token, not a truth value, and
+        // must fall through to the (rejecting) numeration parser.
+        assert_eq!(parse_true_false("true"), Some(true));
+        assert_eq!(parse_true_false("  false\t"), Some(false));
+        assert_eq!(parse_true_false("true_2"), None);
+        assert_eq!(parse_true_false("truefalse"), None);
+        assert_eq!(parse_true_false("true false"), None);
+        assert_eq!(parse_true_false("TRUE"), None);
+        assert_eq!(parse_true_false("{0, 1}"), None);
     }
 
     #[test]

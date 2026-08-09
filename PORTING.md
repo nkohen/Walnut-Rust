@@ -35,6 +35,7 @@ be justified in the diff.
 | checked/unchecked exception (`WalnutException`) | `Result<T, WalnutError>` with a real error enum | Do **not** stringly-type errors; the Java code sometimes does — improve it here. |
 | `int`/`long` state & digit indices | `usize`/`u32`/`i64` chosen per range | Watch for silent `as` truncation; Walnut assumes wide ints in places. |
 | `java.math.BigInteger` | `num-bigint` (add deliberately) or bounded int if provably small | Confirm the value can't overflow before choosing a fixed width. |
+| two coupled `boolean` fields where one gates the other (`FA.TRUE_FALSE_AUTOMATON` gating `FA.TRUE_AUTOMATON`) | a single `Option<bool>` | **Only after proving the fourth combination is unreachable AND unread** — enumerate every writer and every reader in the Java tree and record the audit in the field's doc comment (see `wr-core`'s `fa.rs` for the worked example). If any reader consults the gated flag without checking the gate, keep two `bool`s instead. |
 | `boolean[]`/bitset outputs | `Vec<bool>` / a bitset crate | |
 
 ## Collections — and the ITERATION-ORDER CORRECTNESS TRAP

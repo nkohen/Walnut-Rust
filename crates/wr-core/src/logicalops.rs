@@ -48,12 +48,45 @@
 //! would compute AND while logging "or"); nothing does, and this port makes that
 //! unrepresentable.
 //!
-//! # `TRUE`/`FALSE` automata: every short-circuit branch is skipped
+//! # `TRUE`/`FALSE` automata: every short-circuit branch is ported (U0)
 //!
 //! `and`/`or`/`xor`/`imply`/`iff`/`not`/`reverse`/`fixLeadingZerosProblem` each open
-//! with an `isTRUE_FALSE_AUTOMATON()` short-circuit. This crate does not model that
-//! variant at all (see `automaton.rs`'s module docs), so those branches have no analog
-//! here — the ported functions correspond to Java's `else` path in every case.
+//! with an `isTRUE_FALSE_AUTOMATON()` short-circuit. Phase 1/2 skipped all of them
+//! because the variant wasn't modeled; U0 added it ([`crate::fa::Fa::true_false`]) and
+//! every branch is now ported verbatim, including the details it is easy to get wrong:
+//!
+//! * **The connectives' short-circuits recurse with the operands SWAPPED** for the four
+//!   symmetric ones (`and`/`or`/`xor` `:49`/`:72`/`:89`) rather than duplicating the
+//!   trivial-`B` case; [`imply`] is asymmetric and spells both cases out (`:100-107`).
+//! * **They bypass totalization entirely** — the trivial branch returns before
+//!   `totalizeCrossProduct` runs, so unlike the ordinary path, [`or`]/[`xor`]/[`imply`]/
+//!   [`iff`] do NOT mutate their operands when one side is trivial.
+//! * **[`iff`]'s trivial branch is defined by recursion**, `and(imply(A,B), imply(B,A))`
+//!   (`:132-136`), not by a truth table of its own.
+//! * **[`not`]'s trivial branch mutates in place and returns the same object** (`:146-149`)
+//!   — flipping only `TRUE_AUTOMATON`, leaving `TRUE_FALSE_AUTOMATON` set.
+//!
+//! ## `asDFA()` aliasing: a declared, unobservable divergence
+//!
+//! Java's short-circuits return `AutomatonDFA`, so several of them call `B.asDFA()` on
+//! the non-trivial operand. `Automaton.asDFA` is documented as returning "a DFA copy"
+//! (`Automaton.java:152-158`) — but `AutomatonDFA.from` short-circuits
+//! `if (automaton instanceof AutomatonDFA dfa) return dfa;` (`AutomatonDFA.java:75-78`),
+//! so when the operand is *already* an `AutomatonDFA` (which it usually is — every
+//! connective here RETURNS one) the "copy" is the operand itself. Two branches then
+//! mutate it: `xor`'s `not(result)` (`:85`) and `imply`'s `not(A.asDFA())` (`:106`),
+//! since `not` "is mutated and returned" (`:142`). So in Java, `xor(TRUE, B)` can turn
+//! the caller's own `B` into `¬B`.
+//!
+//! This port cannot reproduce that: [`crate::automaton::Automaton::as_dfa`] takes
+//! `&self` and clones unconditionally. The divergence is **declared rather than
+//! replicated**, on the grounds that it is unobservable in Walnut — every caller of
+//! these connectives (`LogicalOperator.act` and friends) pops its operands off the
+//! postfix stack and never reads them again, so no code path observes the aliased
+//! mutation. Recorded here rather than logged to `docs/WALNUT-BUGS.md`, since nothing
+//! reachable produces a wrong answer or a crash from it. Pinned indirectly by
+//! `the_trivial_branches_never_totalize_their_operands`, which asserts operands come
+//! back unmutated.
 //!
 //! # `applyAllRepresentations` — inert, not ported
 //!
@@ -109,11 +142,13 @@
 //! - **`removeLeadingZeros` (`:343-367`) + `removeLeadingZerosHelper` (`:375-405`).**
 //!   Not a CLI-display concern — its callers are `ProverHelper.java:52`,
 //!   `LogicalOperator.java:151` (the `I` quantifier) and `Test.java:43`, i.e. the
-//!   evaluation pipeline (`wr-logic` scope). It is blocked here for a concrete
-//!   representational reason: it builds `new Automaton(false)` as the fold's identity
-//!   (`:356`) and `removeLeadingZerosHelper` returns `new AutomatonDFA(true)` for a
-//!   non-arithmetic track (`:381-383`) — both are TRUE/FALSE automata, which this crate
-//!   does not model (see above). It also needs
+//!   evaluation pipeline (`wr-logic` scope). Its ORIGINAL blocker — it builds
+//!   `new Automaton(false)` as the fold's identity (`:356`) and
+//!   `removeLeadingZerosHelper` returns `new AutomatonDFA(true)` for a non-arithmetic
+//!   track (`:381-383`), both TRUE/FALSE automata — **is removed by U0**; both are now
+//!   expressible ([`crate::automaton::Automaton::true_false`]). It stays unported here
+//!   only because it belongs to the `I`-quantifier unit that consumes it (see the
+//!   Phase-3 plan's U10), and it still needs
 //!   `AutomatonQuantification.validateLabels`.
 //!
 //! # `fa.setCanonized(false)`
@@ -308,7 +343,23 @@ fn flip_ns(msd: &mut [Option<bool>]) {
 /// [`or`]/[`xor`]/[`imply`]/[`iff`], this leaves both operands untouched — Java's
 /// `crossProductAndMinimize(Automaton, Automaton, String)` (`ProductStrategies.java:220-222`)
 /// goes through `A.asDFA()`, which copies rather than retyping in place.
+///
+/// The TRUE/FALSE short-circuit (`:45-50`) is ported exactly, including its
+/// swap-and-recurse for the trivial-`b` case ("and is symmetric"). Note that when `a`
+/// is the TRUE automaton the result is `b.as_dfa()` — which for a trivial `b` is
+/// `b` itself, so `and(TRUE, TRUE) == TRUE` and `and(TRUE, FALSE) == FALSE` fall out
+/// without a separate both-trivial case, exactly as in Java.
 pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        if a.fa.is_true_false_automaton() {
+            return if a.fa.is_true_automaton() {
+                b.as_dfa()
+            } else {
+                AutomatonDFA::true_false(false)
+            };
+        }
+        return and(b, a); // and is symmetric
+    }
     cross_product_and_minimize(a, b, |p, q| BooleanOp::And.combine(p, q))
 }
 
@@ -324,36 +375,96 @@ fn totalize_cross_product(a: &mut Automaton, b: &mut Automaton, op: BooleanOp) -
 }
 
 /// `AutomatonLogicalOps.or` (`:67-75`) — `L(A) ∪ L(B)`. Totalizes both operands in
-/// place first; see [`totalize_cross_product`].
+/// place first; see [`totalize_cross_product`]. The TRUE/FALSE short-circuit
+/// (`:68-73`) runs first and does NOT totalize (see this module's docs).
 pub fn or(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        if a.fa.is_true_false_automaton() {
+            return if a.fa.is_true_automaton() {
+                AutomatonDFA::true_false(true)
+            } else {
+                b.as_dfa()
+            };
+        }
+        return or(b, a); // or is symmetric
+    }
     totalize_cross_product(a, b, BooleanOp::Or)
 }
 
 /// `AutomatonLogicalOps.xor` (`:80-92`) — symmetric difference. Totalizes both operands
-/// in place first; see [`totalize_cross_product`].
+/// in place first; see [`totalize_cross_product`]. The TRUE/FALSE short-circuit
+/// (`:81-90`) runs first and does NOT totalize (see this module's docs).
 pub fn xor(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        if a.fa.is_true_false_automaton() {
+            // Java: `result = B.asDFA(); if (A.isTRUE) return not(result); return result;`
+            // — i.e. `TRUE xor B == not(B)`, `FALSE xor B == B`. When `b` is trivial too,
+            // `not` takes its own trivial branch and just flips the truth value.
+            let result = b.as_dfa();
+            if a.fa.is_true_automaton() {
+                return not(result);
+            }
+            return result;
+        }
+        return xor(b, a); // xor is symmetric
+    }
     totalize_cross_product(a, b, BooleanOp::Xor)
 }
 
 /// `AutomatonLogicalOps.imply` (`:97-110`) — `¬L(A) ∪ L(B)`. **Asymmetric**: the
 /// operand order matters. Totalizes both operands in place first; see
 /// [`totalize_cross_product`].
+///
+/// The TRUE/FALSE short-circuit (`:98-108`) is the one connective that cannot
+/// swap-and-recurse, so Java spells out both sides; ported verbatim. Note the second
+/// half reads `B.isTRUE_AUTOMATON()` with no enclosing `B.isTRUE_FALSE_AUTOMATON()`
+/// check — sound only because reaching it means `a` is NOT trivial while the outer
+/// disjunction held, so `b` must be (see `crate::fa`'s module docs, which cite this
+/// exact line).
 pub fn imply(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        // not a or b
+        if a.fa.is_true_false_automaton() {
+            return if a.fa.is_true_automaton() {
+                b.as_dfa()
+            } else {
+                AutomatonDFA::true_false(true)
+            };
+        }
+        return if b.fa.is_true_automaton() {
+            AutomatonDFA::true_false(true)
+        } else {
+            not(a.as_dfa())
+        };
+    }
     totalize_cross_product(a, b, BooleanOp::Imply)
 }
 
 /// `AutomatonLogicalOps.iff` (`:131-139`) — the complement of [`xor`]. Totalizes both
 /// operands in place first; see [`totalize_cross_product`].
+///
+/// The TRUE/FALSE short-circuit (`:132-136`) is defined by RECURSION rather than by a
+/// truth table: `and(imply(A, B), imply(B, A))`. Ported verbatim. This terminates and
+/// never reaches [`crate::product`]: with at least one operand trivial, each `imply`
+/// takes its own short-circuit, and at least one of the two results is itself trivial,
+/// so the closing [`and`] short-circuits too.
 pub fn iff(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+    if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
+        let c = imply(a, b);
+        let d = imply(b, a);
+        return and(c.automaton(), d.automaton());
+    }
     totalize_cross_product(a, b, BooleanOp::Iff)
 }
 
 /// `AutomatonLogicalOps.not(AutomatonDFA)` (`:144-170`) — complementation.
 ///
 /// Java's working sequence is `totalize()` (`:160`), `flipOutput()` (`:161`),
-/// `justMinimize()` (`:162`) — all three ported below; the surrounding
-/// `applyAllRepresentations()`/`convertNFAtoDFA()`/`isTRUE_FALSE_AUTOMATON` steps are
-/// the ones with no analog here (see this module's docs). Totalization is what makes
+/// `justMinimize()` (`:162`) — all three ported below, preceded by the
+/// `isTRUE_FALSE_AUTOMATON` short-circuit (`:146-149`, U0), which flips only
+/// `TRUE_AUTOMATON` and returns the same (still-trivial) automaton. Only
+/// `applyAllRepresentations()`/`convertNFAtoDFA()` have no analog here (see this
+/// module's docs). Totalization is what makes
 /// this a genuine complement rather than a mere output flip — without it, a word that
 /// runs off the end of a partial transition table would be rejected by BOTH the
 /// automaton and its "negation".
@@ -373,6 +484,15 @@ pub fn iff(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
 /// two-destination transition, which module privacy rules out here.
 pub fn not(a: AutomatonDFA) -> AutomatonDFA {
     let mut m = a.into_automaton();
+    if m.fa.is_true_false_automaton() {
+        // Java mutates in place: `setTRUE_AUTOMATON(!isTRUE_AUTOMATON())`, leaving
+        // `TRUE_FALSE_AUTOMATON` set, and returns the SAME object — so any stale
+        // `q`/alphabet the argument was carrying survives. Rebuilding a fresh trivial
+        // automaton here instead is the one difference, and it is unobservable: every
+        // reader of a trivial automaton consults only `true_false` (see `crate::fa`'s
+        // module docs).
+        return AutomatonDFA::true_false(!m.fa.is_true_automaton());
+    }
     totalize(&mut m.fa);
     flip_output(&mut m.fa);
     m.fa = just_minimize(&m.fa);
@@ -535,15 +655,22 @@ fn reverse_and_canonize(a: &Automaton) -> Automaton {
 /// ∃-projection pipeline's fixup step, called from [`crate::quantify::quantify`] — see
 /// this module's docs on the duplicate it replaced.
 ///
-/// The `fa.q == 0` guard has no Java counterpart: Java would dereference `q0`'s
-/// (nonexistent) transition row inside `zeroReachableStates` and throw
-/// `IndexOutOfBoundsException`, but a real Walnut `Automaton` never reaches this method
-/// with zero states (only the TRUE/FALSE automata are zero-state, and they are
-/// short-circuited at `:269`). This crate's `Automaton` *can* express that shape, so
-/// the degenerate case is a no-op here — matching the identical guard, added for the
-/// identical reason, in `crate::quantify`'s private `quantify_helper` (at its
-/// `a.fa.q == 0` early return).
+/// The trivial-automaton guard below IS Java's (`:269`, added by U0). The `fa.q == 0`
+/// guard behind it has no Java counterpart: Java would dereference `q0`'s (nonexistent)
+/// transition row inside `zeroReachableStates` and throw `IndexOutOfBoundsException`,
+/// but a real Walnut `Automaton` never reaches this method with zero states AND the
+/// flag unset (only the TRUE/FALSE automata are zero-state). This crate's `Automaton`
+/// *can* express that flagless shape, so the degenerate case is a no-op here — matching
+/// the identical guard, added for the identical reason, in `crate::quantify`'s private
+/// `quantify_helper` (at its `a.fa.q == 0` early return).
 pub fn fix_leading_zeros_problem(a: &mut Automaton) {
+    // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:269`, U0). Load-bearing, not
+    // cosmetic: `determine_zero()` on a trivial automaton's empty alphabet returns 0,
+    // and `zero_reachable_states` would then index `fa.d[fa.q0]` — out of bounds for
+    // both trivial shapes.
+    if a.fa.is_true_false_automaton() {
+        return;
+    }
     if a.fa.q == 0 {
         return;
     }
@@ -606,6 +733,20 @@ pub fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
 /// since all that was altered was final states". The `justMinimize` step runs only when
 /// [`set_states_reachable_to_final_states_by_zeros`] reports an actual change (`:322`);
 /// otherwise this is a complete no-op, and in particular does NOT minimize.
+///
+/// # No TRUE/FALSE short-circuit — faithfully, unlike its leading-zeros sibling
+///
+/// Java gives this method NO `isTRUE_FALSE_AUTOMATON()` guard, and U0 does not invent
+/// one. That asymmetry with `fixLeadingZerosProblem` (`:269`) is real but harmless:
+/// its only two callers are `AutomatonQuantification.quantify` (`:46`), which already
+/// returned at `:39` if the automaton became trivial, and `Prover`'s `fixtrailzero`
+/// command, which reads its operand from a `.txt` file — and a trivial file yields the
+/// `Q == 0` shape, on which both engines are a silent no-op (Java's loops don't run;
+/// neither do this port's). The only shape that WOULD fault (trivial with a stale
+/// non-zero `q`) exists solely inside `quantify`, behind that guard. So the missing
+/// guard is unreachable in both engines and is left unported rather than "fixed".
+/// Confirmed live during U0 against `Walnut-all.jar`: `fixtrailzero fz $t` on a `true`
+/// automaton writes `true` back out, no exception (as do `fixleadzero` and `reverse`).
 pub fn fix_trailing_zeros_problem(a: &mut Automaton) {
     let zero = a.determine_zero();
     if set_states_reachable_to_final_states_by_zeros(&mut a.fa, zero) {
@@ -635,6 +776,12 @@ pub fn fix_trailing_zeros_problem(a: &mut Automaton) {
 /// The result is a DFA (Java's `:412` note: "the output of this is a DFA"), even though
 /// the input may be an NFA.
 pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
+    // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:415`, U0). Note this returns
+    // BEFORE the `flipNS` step, so reversing a trivial automaton does not flip its
+    // (empty) msd list either — faithful, and vacuous since the list is empty.
+    if a.fa.is_true_false_automaton() {
+        return;
+    }
     let initial: BTreeSet<usize> = [a.fa.q0].into_iter().collect();
     let set_of_final_states = a.fa.reverse(&initial);
     a.determinize_and_minimize_from(&set_of_final_states);
@@ -692,6 +839,7 @@ mod tests {
         d1.insert(0, vec![0]);
         d1.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -708,6 +856,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -762,6 +911,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![0, 1]);
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -1049,6 +1199,7 @@ mod tests {
         d[2].insert(1, vec![2]);
         let a = single_track(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 2,
@@ -1093,6 +1244,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -1275,6 +1427,7 @@ mod tests {
         // itself is observable in the same test.
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 4,
@@ -1332,6 +1485,7 @@ mod tests {
         d[QD].insert(1, vec![QD]);
         let mut a = single_track(
             Fa {
+                true_false: None,
                 q0: Q0,
                 q: 4,
                 alphabet_size: 2,
@@ -1365,6 +1519,7 @@ mod tests {
         // q0 has no zero-transition at all going in; the forced `(q0, zero) -> q0`
         // edge is what makes multiple leading zeros absorbable downstream.
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -1378,6 +1533,7 @@ mod tests {
     #[test]
     fn zero_reachable_states_is_transitive_and_does_not_duplicate_an_existing_loop() {
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 1,
@@ -1400,6 +1556,7 @@ mod tests {
     fn fix_leading_zeros_problem_is_a_noop_on_a_zero_state_automaton() {
         let mut a = single_track(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 0,
                 alphabet_size: 2,
@@ -1425,6 +1582,7 @@ mod tests {
         d[2].insert(0, vec![2]);
         let mut a = single_track(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 2,
@@ -1460,6 +1618,7 @@ mod tests {
         d[2].insert(1, vec![2]);
         let mut a = single_track(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 2,
@@ -1485,6 +1644,7 @@ mod tests {
         //   state1 --0--> state0 (output 0: removed)
         //   state2 --0--> state2 (output 0, self-loop: removed)
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 1,
@@ -1514,6 +1674,7 @@ mod tests {
         // FIRST destination survives is kept whole even though its second destination
         // is removable, and vice versa.
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -1548,6 +1709,7 @@ mod tests {
         d[1].insert(1, vec![2]);
         single_track(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 2,
@@ -1568,6 +1730,7 @@ mod tests {
         let a = single_track(exactly_one(), Some(true));
         let b = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 4,
@@ -1594,6 +1757,7 @@ mod tests {
         let a = single_track(exactly_one(), Some(true));
         let b = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 3,
@@ -1622,6 +1786,7 @@ mod tests {
         let a = word_01();
         let b = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 3,
@@ -1658,6 +1823,7 @@ mod tests {
         let a = word_01();
         let b = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 2,
@@ -1700,6 +1866,7 @@ mod tests {
             d[0].insert(1, vec![1]);
             single_track(
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q: 2,
                     alphabet_size: 2,
@@ -1728,6 +1895,7 @@ mod tests {
         // Replicates AutomatonLogicalOpsTest.testLeftQuotientThrowsWhenFirstAlphabetNotSubset.
         let a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 4,
@@ -1752,6 +1920,7 @@ mod tests {
         // only `isSubsetA(A, B)` (AutomatonLogicalOps.java:242) rejects it.
         let a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 3,
@@ -1779,6 +1948,7 @@ mod tests {
             d[0].insert(0, vec![1]);
             single_track(
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q: 2,
                     alphabet_size: 2,
@@ -1828,6 +1998,7 @@ mod tests {
         // catch it, unlike the two direction-only tests above.
         let a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 2,
@@ -1848,6 +2019,7 @@ mod tests {
         // (non-accepting, initial) --2--> state1 (accepting, dead end).
         let b = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 3,
@@ -1868,5 +2040,281 @@ mod tests {
              (B subset A) does NOT hold"
         );
         let _ = left_quotient(&a, &b);
+    }
+
+    // ------------------------------------------------------------------------
+    // The TRUE/FALSE short-circuits (U0) — `AutomatonLogicalOps.java:45-149`.
+    //
+    // These are pinned as full truth tables rather than sampled, because the
+    // short-circuits are where an asymmetry mistake (`imply`), a missed swap-recursion
+    // (`and`/`or`/`xor`), or an inverted truth value hides without any language-level
+    // property test noticing: none of the Tier-4 properties in this crate generate a
+    // trivial operand at all.
+    //
+    // `P` throughout is `exactly_one()` — deliberately the NON-total fixture, so that
+    // "the trivial branch returned `B.asDFA()` verbatim, without totalizing" is
+    // observable as a state count as well as a language.
+    //
+    // # Cross-checked against the real walnut-java CLI
+    //
+    // Every entry of these tables was additionally confirmed end-to-end against
+    // `target/Walnut-all.jar` (v8.0-alpha) during U0, using `Ei Ex i<x` as the TRUE
+    // automaton, `Ei Ex (i<x & x<i)` as FALSE, and `x=0` as `P`:
+    //
+    // | query                                    | Walnut's output            |
+    // |------------------------------------------|----------------------------|
+    // | `Ei Ex i<x`                              | `TRUE` (file: `true`)      |
+    // | `Ei Ex (i<x & x<i)`                      | `FALSE` (file: `false`)    |
+    // | `(Ei Ex i<x) & (x=x)`                    | the accept-all DFA (`= P`) |
+    // | `(Ei Ex i<x) ^ (x=0)`                    | "contains a 1" (`= ¬P`)    |
+    // | `(Ei Ex (i<x & x<i)) ^ (x=0)`            | `x=0` verbatim (`= P`)     |
+    // | `(x=0) => (Ei Ex i<x)`                   | `TRUE`                     |
+    // | `(x=0) => (Ei Ex (i<x & x<i))`           | `¬P`                       |
+    // | `(Ei Ex (i<x & x<i)) => (x=0)`           | `TRUE`                     |
+    // | `(Ei Ex i<x) <=> (x=0)`                  | `x=0` verbatim (`= P`)     |
+    // | `(Ei Ex (i<x & x<i)) <=> (x=0)`          | `¬P`                       |
+    //
+    // Note the two rows whose output is `x=0` *verbatim* — i.e. still non-total, with
+    // no sink state — which is the live evidence that the trivial branches really do
+    // bypass `totalizeCrossProduct`, not merely that they happen to agree on language.
+    // ------------------------------------------------------------------------
+
+    /// What a short-circuit is expected to produce.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expect {
+        Trivial(bool),
+        /// The ordinary operand `P`, unchanged.
+        P,
+        /// The complement of `P`.
+        NotP,
+    }
+
+    fn p_automaton() -> Automaton {
+        single_track(exactly_one(), Some(true))
+    }
+
+    fn check(result: &AutomatonDFA, expected: Expect, case: &str) {
+        let m = result.automaton();
+        match expected {
+            Expect::Trivial(truth) => {
+                assert!(
+                    m.is_true_false_automaton(),
+                    "{case}: expected a TRUE/FALSE automaton, got {m:?}"
+                );
+                assert_eq!(m.is_true_automaton(), truth, "{case}: wrong truth value");
+            }
+            Expect::P | Expect::NotP => {
+                assert!(
+                    !m.is_true_false_automaton(),
+                    "{case}: expected an ordinary automaton"
+                );
+                for word in WORDS {
+                    let p = exactly_one().accepts_word(word);
+                    let want = if expected == Expect::P { p } else { !p };
+                    assert_eq!(
+                        m.fa.accepts_word(word),
+                        want,
+                        "{case}: wrong language on word={word:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn and_short_circuits_on_trivial_operands() {
+        for t in [true, false] {
+            // TRUE and X == X; FALSE and X == FALSE (`:45-50`).
+            check(
+                &and(&Automaton::true_false(t), &p_automaton()),
+                if t { Expect::P } else { Expect::Trivial(false) },
+                &format!("and({t}, P)"),
+            );
+            // The swap-recursion arm (`:49`, "and is symmetric").
+            check(
+                &and(&p_automaton(), &Automaton::true_false(t)),
+                if t { Expect::P } else { Expect::Trivial(false) },
+                &format!("and(P, {t})"),
+            );
+            for u in [true, false] {
+                check(
+                    &and(&Automaton::true_false(t), &Automaton::true_false(u)),
+                    Expect::Trivial(t && u),
+                    &format!("and({t}, {u})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn or_short_circuits_on_trivial_operands() {
+        for t in [true, false] {
+            check(
+                &or(&mut Automaton::true_false(t), &mut p_automaton()),
+                if t { Expect::Trivial(true) } else { Expect::P },
+                &format!("or({t}, P)"),
+            );
+            check(
+                &or(&mut p_automaton(), &mut Automaton::true_false(t)),
+                if t { Expect::Trivial(true) } else { Expect::P },
+                &format!("or(P, {t})"),
+            );
+            for u in [true, false] {
+                check(
+                    &or(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    Expect::Trivial(t || u),
+                    &format!("or({t}, {u})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xor_short_circuits_on_trivial_operands() {
+        for t in [true, false] {
+            check(
+                &xor(&mut Automaton::true_false(t), &mut p_automaton()),
+                if t { Expect::NotP } else { Expect::P },
+                &format!("xor({t}, P)"),
+            );
+            check(
+                &xor(&mut p_automaton(), &mut Automaton::true_false(t)),
+                if t { Expect::NotP } else { Expect::P },
+                &format!("xor(P, {t})"),
+            );
+            for u in [true, false] {
+                check(
+                    &xor(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    Expect::Trivial(t != u),
+                    &format!("xor({t}, {u})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn imply_short_circuits_on_trivial_operands_asymmetrically() {
+        for t in [true, false] {
+            // TRUE -> X == X; FALSE -> X == TRUE (`:100-102`).
+            check(
+                &imply(&mut Automaton::true_false(t), &mut p_automaton()),
+                if t { Expect::P } else { Expect::Trivial(true) },
+                &format!("imply({t}, P)"),
+            );
+            // X -> TRUE == TRUE; X -> FALSE == not X (`:103-107`). This is the arm that
+            // cannot be reached by swapping, and the one whose `B.isTRUE_AUTOMATON()`
+            // read has no enclosing `isTRUE_FALSE_AUTOMATON()` check in Java.
+            check(
+                &imply(&mut p_automaton(), &mut Automaton::true_false(t)),
+                if t {
+                    Expect::Trivial(true)
+                } else {
+                    Expect::NotP
+                },
+                &format!("imply(P, {t})"),
+            );
+            for u in [true, false] {
+                check(
+                    &imply(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    Expect::Trivial(!t || u),
+                    &format!("imply({t}, {u})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn iff_short_circuits_via_its_double_imply_recursion() {
+        for t in [true, false] {
+            check(
+                &iff(&mut Automaton::true_false(t), &mut p_automaton()),
+                if t { Expect::P } else { Expect::NotP },
+                &format!("iff({t}, P)"),
+            );
+            check(
+                &iff(&mut p_automaton(), &mut Automaton::true_false(t)),
+                if t { Expect::P } else { Expect::NotP },
+                &format!("iff(P, {t})"),
+            );
+            for u in [true, false] {
+                check(
+                    &iff(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    Expect::Trivial(t == u),
+                    &format!("iff({t}, {u})"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_trivial_branches_never_totalize_their_operands() {
+        // The ordinary `or`/`xor`/`imply`/`iff` path mutates both operands in place
+        // (`totalizeCrossProduct`, `:117-118`); the trivial branches return before it.
+        // `exactly_one()` grows from 2 states to 3 when totalized, so a state count is
+        // a sufficient witness.
+        for t in [true, false] {
+            for op in [
+                or as fn(&mut Automaton, &mut Automaton) -> AutomatonDFA,
+                xor,
+                imply,
+                iff,
+            ] {
+                let mut p = p_automaton();
+                let mut triv = Automaton::true_false(t);
+                let _ = op(&mut triv, &mut p);
+                assert_eq!(p.fa.q, 2, "operand was totalized in a trivial branch");
+
+                let mut p = p_automaton();
+                let mut triv = Automaton::true_false(t);
+                let _ = op(&mut p, &mut triv);
+                assert_eq!(p.fa.q, 2, "operand was totalized in a trivial branch");
+            }
+        }
+    }
+
+    #[test]
+    fn not_flips_a_trivial_automatons_truth_value_and_stays_trivial() {
+        // `:146-149`.
+        for t in [true, false] {
+            let n = not(AutomatonDFA::true_false(t));
+            assert!(n.automaton().is_true_false_automaton());
+            assert_eq!(n.automaton().is_true_automaton(), !t);
+        }
+        // Involution, for good measure.
+        let n = not(not(AutomatonDFA::true_false(true)));
+        assert!(n.automaton().is_true_automaton());
+    }
+
+    #[test]
+    fn reverse_is_a_noop_on_a_trivial_automaton() {
+        // `:415`. Uses the stale-`q` shape, where the un-guarded body would panic
+        // inside `Fa::reverse` / `determinize_and_minimize_from`.
+        for t in [true, false] {
+            let mut a = p_automaton();
+            a.fa.true_false = Some(t);
+            a.clear();
+            reverse(&mut a, true);
+            assert!(a.is_true_false_automaton());
+            assert_eq!(a.is_true_automaton(), t);
+            assert!(a.msd.is_empty(), "nothing to flip");
+        }
+    }
+
+    #[test]
+    fn fix_leading_zeros_problem_is_a_noop_on_a_trivial_automaton() {
+        // `:269`. Again the stale-`q` shape: `determine_zero()` returns 0 for the empty
+        // alphabet and `zero_reachable_states` would then index an empty `fa.d`.
+        for t in [true, false] {
+            let mut a = p_automaton();
+            a.fa.true_false = Some(t);
+            a.clear();
+            fix_leading_zeros_problem(&mut a);
+            assert!(a.is_true_false_automaton());
+            assert_eq!(a.is_true_automaton(), t);
+        }
+        // ...and on the freshly-constructed shape too.
+        let mut a = Automaton::true_false(true);
+        fix_leading_zeros_problem(&mut a);
+        assert!(a.is_true_automaton());
     }
 }

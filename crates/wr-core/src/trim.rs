@@ -19,7 +19,27 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 /// canonical 1-state non-accepting automaton — matching Java's "make Walnut happy"
 /// special case, since a 0-state automaton isn't supported elsewhere in this port
 /// either.
+///
+/// # The TRUE/FALSE short-circuit (U0)
+///
+/// Java's guard is `if (a.isTRUE_FALSE_AUTOMATON() || a.getQ() <= 1) return;`
+/// (`Trimmer.java:31-33`). Only the **first half** is added here, and it is genuinely
+/// load-bearing rather than decorative: a trivial automaton left behind by
+/// `AutomatonQuantification`'s all-tracks-quantified path has a stale non-zero `q` with
+/// an EMPTY `d` (see `crate::fa`'s module docs), so without this guard
+/// `forward_reachable` would index `fa.d[fa.q0]` out of bounds and panic — exactly the
+/// `IndexOutOfBoundsException` Java's own guard prevents.
+///
+/// The `getQ() <= 1` half is deliberately NOT added: this crate has always run the full
+/// algorithm on 1-state automata, which is language-preserving but not
+/// structure-identical (a 1-state automaton whose language is empty is rebuilt as the
+/// canonical fully-self-looping 1-state sink instead of being returned untouched).
+/// That is a pre-existing, already-reviewed divergence; changing it is out of this
+/// unit's scope and would silently perturb every existing `trim` call site.
 pub fn trim(fa: &Fa) -> Fa {
+    if fa.is_true_false_automaton() {
+        return fa.clone();
+    }
     if fa.q == 0 {
         return fa.clone();
     }
@@ -35,6 +55,7 @@ pub fn trim(fa: &Fa) -> Fa {
             d0.insert(sym, vec![0]);
         }
         return Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: fa.alphabet_size,
@@ -67,6 +88,7 @@ pub fn trim(fa: &Fa) -> Fa {
         .collect();
 
     Fa {
+        true_false: None,
         // Safe: keep.is_empty() was handled above, and if keep is nonempty then q0
         // must be in it — any forward-reachable state that's also backward-reachable
         // proves q0 itself can reach acceptance (via q0 -> ... -> that state -> ... ->
@@ -148,6 +170,7 @@ mod tests {
         d3.insert(0, vec![3]);
         d3.insert(1, vec![3]);
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 4,
             alphabet_size: 2,
@@ -165,6 +188,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0]);
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size: 1,
@@ -177,8 +201,28 @@ mod tests {
     }
 
     #[test]
+    fn trivial_automaton_passes_through_untouched() {
+        // `Trimmer.trimAutomaton:31` (U0). Uses the STALE-`q` shape specifically --
+        // `q > 0` with an empty `d` -- because that is the one the guard actually saves
+        // from an out-of-bounds index in `forward_reachable`; the `q == 0` shape below
+        // is already handled by the next guard down.
+        let fa = Fa {
+            true_false: Some(true),
+            q0: 0,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![],
+            d: vec![],
+        };
+        let trimmed = trim(&fa);
+        assert!(trimmed.is_true_false_automaton() && trimmed.is_true_automaton());
+        assert_eq!(trimmed.q, 3, "left exactly as-is, stale q included");
+    }
+
+    #[test]
     fn zero_state_automaton_passes_through() {
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size: 2,
@@ -217,6 +261,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,

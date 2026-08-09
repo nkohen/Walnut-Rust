@@ -392,6 +392,7 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
         .collect();
 
     Ok(Fa {
+        true_false: None,
         q0: new_q0,
         q: new_q,
         alphabet_size: fa.alphabet_size,
@@ -425,6 +426,7 @@ mod tests {
         // language-equivalent but structurally distinct, so a correct minimizer must
         // merge them. Minimal result: 2 states (recognizing "any nonempty word").
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -450,6 +452,7 @@ mod tests {
         // "contains at least one 1" — 2 states, provably minimal (ε is rejected, `1` is
         // accepted, so the two states are distinguishable).
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -467,6 +470,7 @@ mod tests {
     #[test]
     fn rejects_nondeterministic_input() {
         let mut fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -480,6 +484,7 @@ mod tests {
     #[test]
     fn no_accepting_states_collapses_to_one_dead_state() {
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -503,6 +508,7 @@ mod tests {
         // Valmari's own pre-pass removes it (and its transitions) even though `minimize`
         // does no q0-reachability pruning of its own.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 3,
             alphabet_size: 2,
@@ -532,6 +538,7 @@ mod tests {
         // language flips from ∅ to Σ*. Ported verbatim (mechanical-port discipline);
         // pinned here so the deviation is visible rather than latent.
         let fa = Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 1,
@@ -572,6 +579,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -605,6 +613,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,

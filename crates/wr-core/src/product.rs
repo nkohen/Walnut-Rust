@@ -97,6 +97,44 @@
 //! op` becomes the typed [`BooleanOp`] enum — there is no "unknown" variant to
 //! reach).
 //!
+//! # State-discovery order vs. Java — audited, matches (U0 Part B)
+//!
+//! Walnut's `details*` golden fixtures assert *intermediate* state counts
+//! (`computing cross product:4 states - 16 states`, `Minimizing:…`) and the Phase-3
+//! plan's second sign-off decision is to chase **exact parity** on them rather than
+//! normalizing them away. That makes this file's BFS state-discovery order part of the
+//! observable contract, not just its final language, so U0 audited it against
+//! `ProductStrategies.java` line by line. **Result: it already matches; no code change
+//! was needed.** Recorded here so the audit isn't repeated, and pinned by
+//! `state_discovery_order_matches_javas_hand_traced_bfs` /
+//! `nondeterministic_destination_lists_are_visited_in_javas_nesting_order` below.
+//!
+//! What Java actually iterates (read, not assumed):
+//!
+//! | Java | ordered? | Rust counterpart |
+//! |---|---|---|
+//! | `statesList` — `ArrayList<IntIntPair>`, indexed by a monotonically increasing `currentState` cursor (`:42`, `:115`) | yes, FIFO | `states_list: Vec<(usize, usize)>` + `current_state` cursor |
+//! | `statesHash` — `Object2IntOpenHashMap` (`:36`, `:108`) | **irrelevant**: only ever `getInt`/`put`, never iterated | `states_hash: HashMap<..>`, likewise lookup-only |
+//! | outer symbol loop — `A.getT().getEntriesNfaD(p)` (`:63`) | yes: `Int2ObjectRBTreeMap.int2ObjectEntrySet()`, ascending key | `&a.d[p]`, a `BTreeMap`, ascending key |
+//! | inner symbol loop — `B.getT().getEntriesNfaD(q)` (`:65`) | yes, same | `&b.d[q]` |
+//! | destination loops — `for destA ... for destB ...` over `IntList`s (`:72-73`) | yes, insertion order, A outer | `for &dest_a in a_dests { for &dest_b in b_dests { … } }` |
+//!
+//! Two subtleties the audit specifically confirmed rather than assumed:
+//! * **Both storage backends give ascending symbol order.** `TransitionsDFA` does not
+//!   leak `Int2IntOpenHashMap`'s (unordered) key order: `getEntriesNfaD` goes through
+//!   `convertRowToNfa`, which rebuilds an `Int2ObjectRBTreeMap`
+//!   (`TransitionsDFA.java:69-79`), and the DFA-specialized BFS uses
+//!   `getDfaStateKeySet`, an `IntRBTreeSet` (`:107-109`). So Java is ordered on every
+//!   path, and this crate's single `BTreeMap`-backed table matches both.
+//! * **The `z == -1` skip happens BEFORE any destination pair is looked up** (`:66-69`),
+//!   so a disallowed symbol pair cannot register a state. Same here.
+//!
+//! The audit also confirms a weaker but useful fact: the *set* of reachable pairs — and
+//! hence the state COUNT the `details*` fixtures print — is order-independent anyway.
+//! Order only fixes the numbering. Parity is therefore belt-and-braces for those
+//! fixtures specifically, but genuinely load-bearing for any future comparison that
+//! reads exact state ids (e.g. `.gv`/`.txt` output diffed against Walnut's).
+//!
 //! # `crossProductInternalDFA` — not ported as a separate function
 //!
 //! Java keeps a second, DFA-storage-specialized BFS (`crossProductInternalDFA`,
@@ -249,6 +287,7 @@ where
     }
 
     Fa {
+        true_false: None,
         q0: 0,
         q: states_list.len(),
         alphabet_size: axb_alphabet_size,
@@ -391,11 +430,18 @@ fn compute_all_inputs_of_axb(
     all_inputs
 }
 
-/// `ProductStrategies.createBasicAutomaton` (`ProductStrategies.java:246-267`). The
-/// `isTRUE_FALSE_AUTOMATON` guard is not replicated (TRUE/FALSE automata aren't
-/// modeled by this crate's `Automaton` — see `automaton.rs`'s module docs).
+/// `ProductStrategies.createBasicAutomaton` (`ProductStrategies.java:246-267`).
 ///
 /// # Panics
+///
+/// If either `a` or `b` is a TRUE/FALSE automaton (`:248-251`, U0) — the cross product
+/// is undefined for them and every real caller
+/// (`AutomatonLogicalOps.and`/`or`/`xor`/`imply`/`iff`) short-circuits on them first.
+/// Message ported verbatim from `WalnutException`: "Invalid use of the crossProduct
+/// method: the automata for this method cannot be true or false automata." Note this
+/// guard must come FIRST, before the `is_bound` check below, because a trivial
+/// automaton has zero tracks and zero labels and so passes `is_bound()` vacuously —
+/// matching Java's own ordering.
 ///
 /// If either `a` or `b` is unbound (`!is_bound()`) — ports the combined Java check
 /// `aLabel == null || bLabel == null || aLabel.size() != aA.size() || bLabel.size()
@@ -405,6 +451,10 @@ fn compute_all_inputs_of_axb(
 /// verbatim from `WalnutException`: "Invalid use of the crossProduct method: the
 /// automata for this method must have labeled inputs."
 fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>) {
+    assert!(
+        !a.fa.is_true_false_automaton() && !b.fa.is_true_false_automaton(),
+        "Invalid use of the crossProduct method: the automata for this method cannot be true or false automata."
+    );
     assert!(
         a.is_bound() && b.is_bound(),
         "Invalid use of the crossProduct method: the automata for this method must have labeled inputs."
@@ -435,6 +485,7 @@ fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>)
 
     let mut axb = Automaton::new(
         Fa {
+            true_false: None,
             q0: 0,
             q: 0,
             alphabet_size: 1,
@@ -545,6 +596,7 @@ mod tests {
 
     fn one_state_fa(alphabet_size: usize, output: i32) -> Fa {
         Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size,
@@ -560,6 +612,7 @@ mod tests {
         // track with zero labels is the actual mismatch shape.
         Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 2,
@@ -577,6 +630,7 @@ mod tests {
         let msd = vec![None; alphabet.len()];
         Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size,
@@ -722,6 +776,7 @@ mod tests {
         // opposite-direction mismatch from `cross_product_panics_when_a_is_unbound`.
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 1,
@@ -750,6 +805,7 @@ mod tests {
     fn one_track_automaton(msd: Option<bool>) -> Automaton {
         Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 2,
@@ -795,6 +851,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![0]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -812,6 +869,7 @@ mod tests {
         d1.insert(0, vec![0]);
         d1.insert(1, vec![1]);
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 2,
@@ -900,6 +958,7 @@ mod tests {
             d1.insert(sym, vec![if sym == 3 { 1 } else { 0 }]);
         }
         Fa {
+            true_false: None,
             q0: 0,
             q: 2,
             alphabet_size: 4,
@@ -1018,6 +1077,7 @@ mod tests {
                     d.insert(sym, vec![0]);
                 }
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q: 1,
                     alphabet_size: 6,
@@ -1041,6 +1101,7 @@ mod tests {
                     }
                 }
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q: 1,
                     alphabet_size: 30,
@@ -1113,6 +1174,7 @@ mod tests {
                     })
                     .collect();
                 Fa {
+                    true_false: None,
                     q0: 0,
                     q,
                     alphabet_size,
@@ -1150,5 +1212,221 @@ mod tests {
             let expected = equiv::product_dfa(&a_fa, &b_fa, |p, q| p && q).unwrap();
             prop_assert_eq!(equiv::language_equivalent(&result_fa, &expected), Ok(true));
         }
+    }
+    // ------------------------------------------------------------------------
+    // State-discovery order (U0 Part B) — see this module's "State-discovery order
+    // vs. Java" section for the audit these two tests pin.
+    //
+    // Technique: give each operand's states DISTINCT output values and combine them
+    // with `|p, q| p + q`, so every product state's output is a unique tag naming the
+    // `(p, q)` pair it came from. The result's `o` vector is then LITERALLY the
+    // discovery order, in order — a much sharper assertion than final-language
+    // equivalence, and the thing a `HashMap`-keyed symbol loop or a swapped loop
+    // nesting would break.
+    // ------------------------------------------------------------------------
+
+    /// `10*(p+1) + (q+1)` — a unique, human-readable tag per `(p, q)` pair.
+    fn tag(p: usize, q: usize) -> i32 {
+        (10 * (p + 1) + (q + 1)) as i32
+    }
+
+    /// Single-track automaton over `{0, 1}` with the given per-state outputs and
+    /// explicit transition rows, labeled `name` (distinct labels on the two operands
+    /// keep every `(a_sym, b_sym)` pair legal, so the joint symbol never comes back
+    /// `-1` and the trace stays purely about ORDER).
+    fn traced_operand(name: &str, o: Vec<i32>, rows: Vec<Vec<(i32, Vec<usize>)>>) -> Automaton {
+        let d: Vec<BTreeMap<i32, Vec<usize>>> = rows
+            .into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect();
+        Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: o.len(),
+                alphabet_size: 2,
+                o,
+                d,
+            },
+            vec![vec![0, 1]],
+            vec![name.to_string()],
+            vec![None],
+        )
+    }
+
+    #[test]
+    fn state_discovery_order_matches_javas_hand_traced_bfs() {
+        // A: 2 states, outputs 10/20.   B: 3 states, outputs 1/2/3.
+        //   A.d[0] = {0 -> 1, 1 -> 0}      B.d[0] = {0 -> 2, 1 -> 1}
+        //   A.d[1] = {0 -> 0, 1 -> 1}      B.d[1] = {0 -> 0, 1 -> 2}
+        //                                  B.d[2] = {0 -> 1, 1 -> 0}
+        //
+        // Hand-tracing `ProductStrategies.crossProductInternal` (`:42-89`) — outer loop
+        // over A's symbols ascending, inner over B's symbols ascending, appending each
+        // newly-seen destination pair to `statesList`:
+        //
+        //   cursor 0, (0,0): a0->1 x b0->2 = (1,2) NEW #1
+        //                    a0->1 x b1->1 = (1,1) NEW #2
+        //                    a1->0 x b0->2 = (0,2) NEW #3
+        //                    a1->0 x b1->1 = (0,1) NEW #4
+        //   cursor 1, (1,2): ... a1->1 x b1->0 = (1,0) NEW #5
+        //   cursors 2-5:     no further new pairs.
+        //
+        // => discovery order (0,0), (1,2), (1,1), (0,2), (0,1), (1,0).
+        //
+        // The two most plausible ways to get this wrong both produce a DIFFERENT
+        // vector, so this is a real discriminator: swapping the loop nesting (B outer)
+        // would discover (1,2), (0,2), (1,1), (0,1); iterating symbols in descending
+        // key order would discover (0,2), (0,1), (1,2), (1,1).
+        let a = traced_operand(
+            "x",
+            vec![10, 20],
+            vec![
+                vec![(0, vec![1]), (1, vec![0])],
+                vec![(0, vec![0]), (1, vec![1])],
+            ],
+        );
+        let b = traced_operand(
+            "y",
+            vec![1, 2, 3],
+            vec![
+                vec![(0, vec![2]), (1, vec![1])],
+                vec![(0, vec![0]), (1, vec![2])],
+                vec![(0, vec![1]), (1, vec![0])],
+            ],
+        );
+
+        let axb = cross_product(&a, &b, |p, q| p + q);
+
+        assert_eq!(
+            axb.fa.o,
+            vec![
+                tag(0, 0),
+                tag(1, 2),
+                tag(1, 1),
+                tag(0, 2),
+                tag(0, 1),
+                tag(1, 0)
+            ],
+            "product state i must be the i-th pair Java's BFS discovers"
+        );
+        assert_eq!(axb.fa.q, 6);
+        assert_eq!(axb.fa.q0, 0, "`AxB.setQ0(0)` (`ProductStrategies.java:38`)");
+
+        // The joint alphabet is [A's track "x", B's track "y"] with encoder [1, 2], so
+        // the product symbol for (a_sym, b_sym) is `a_sym + 2*b_sym`. Asserting the full
+        // transition table pins the numbering a second, independent way (every
+        // destination id below is a discovery-order index).
+        assert_eq!(axb.alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(axb.label, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(axb.fa.alphabet_size, 4);
+        let z = |a_sym: i32, b_sym: i32| a_sym + 2 * b_sym;
+        let expected: Vec<Vec<(i32, Vec<usize>)>> = vec![
+            // 0 = (0,0)
+            vec![
+                (z(0, 0), vec![1]),
+                (z(0, 1), vec![2]),
+                (z(1, 0), vec![3]),
+                (z(1, 1), vec![4]),
+            ],
+            // 1 = (1,2)
+            vec![
+                (z(0, 0), vec![4]),
+                (z(0, 1), vec![0]),
+                (z(1, 0), vec![2]),
+                (z(1, 1), vec![5]),
+            ],
+            // 2 = (1,1)
+            vec![
+                (z(0, 0), vec![0]),
+                (z(0, 1), vec![3]),
+                (z(1, 0), vec![5]),
+                (z(1, 1), vec![1]),
+            ],
+            // 3 = (0,2)
+            vec![
+                (z(0, 0), vec![2]),
+                (z(0, 1), vec![5]),
+                (z(1, 0), vec![4]),
+                (z(1, 1), vec![0]),
+            ],
+            // 4 = (0,1)
+            vec![
+                (z(0, 0), vec![5]),
+                (z(0, 1), vec![1]),
+                (z(1, 0), vec![0]),
+                (z(1, 1), vec![3]),
+            ],
+            // 5 = (1,0)
+            vec![
+                (z(0, 0), vec![3]),
+                (z(0, 1), vec![4]),
+                (z(1, 0), vec![1]),
+                (z(1, 1), vec![2]),
+            ],
+        ];
+        let expected: Vec<BTreeMap<i32, Vec<usize>>> = expected
+            .into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect();
+        assert_eq!(axb.fa.d, expected);
+    }
+
+    #[test]
+    fn nondeterministic_destination_lists_are_visited_in_javas_nesting_order() {
+        // The other half of the discovery order, invisible to the DFA trace above:
+        // `for (int destA : entryA.getValue()) for (int destB : entryB.getValue())`
+        // (`ProductStrategies.java:72-73`) — A's destination list is the OUTER loop, and
+        // each list is visited in its own insertion order, NOT sorted.
+        //
+        // A.d[0] = {0 -> [0, 1]}, B.d[0] = {0 -> [1, 0]} (note B's list is deliberately
+        // NOT ascending). Java therefore discovers, from (0,0):
+        //   destA=0 x destB=1 -> (0,1) NEW #1
+        //   destA=0 x destB=0 -> (0,0) already #0
+        //   destA=1 x destB=1 -> (1,1) NEW #2
+        //   destA=1 x destB=0 -> (1,0) NEW #3
+        // and writes the destination list [1, 0, 2, 3] in exactly that order.
+        let a = traced_operand("x", vec![10, 20], vec![vec![(0, vec![0, 1])], vec![]]);
+        let b = traced_operand("y", vec![1, 2], vec![vec![(0, vec![1, 0])], vec![]]);
+
+        let axb = cross_product(&a, &b, |p, q| p + q);
+
+        assert_eq!(axb.fa.o, vec![tag(0, 0), tag(0, 1), tag(1, 1), tag(1, 0)]);
+        assert_eq!(
+            axb.fa.d[0].get(&0),
+            Some(&vec![1, 0, 2, 3]),
+            "destination-list order is A-outer/B-inner, each list in insertion order"
+        );
+        for q in 1..4 {
+            assert!(
+                axb.fa.d[q].is_empty(),
+                "states {q} reached only dead ends in one operand or the other"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // The TRUE/FALSE guard (U0) — `ProductStrategies.createBasicAutomaton:248-251`.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(
+        expected = "Invalid use of the crossProduct method: the automata for this method cannot be true or false automata."
+    )]
+    fn cross_product_rejects_a_trivial_first_operand() {
+        let b = traced_operand("y", vec![1, 2], vec![vec![(0, vec![1])], vec![]]);
+        let _ = cross_product(&Automaton::true_false(true), &b, |p, q| p + q);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Invalid use of the crossProduct method: the automata for this method cannot be true or false automata."
+    )]
+    fn cross_product_rejects_a_trivial_second_operand() {
+        // Must panic with the TRIVIAL message, not the "labeled inputs" one: a trivial
+        // automaton is vacuously `is_bound()` (0 labels, 0 tracks), so ordering the two
+        // guards the other way round would report the wrong error here.
+        let a = traced_operand("x", vec![10, 20], vec![vec![(0, vec![1])], vec![]]);
+        let _ = cross_product(&a, &Automaton::true_false(false), |p, q| p + q);
     }
 }

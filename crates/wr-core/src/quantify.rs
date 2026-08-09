@@ -81,13 +81,6 @@
 //!   (ported in U2) reproduces Java's conditional trim faithfully and is *not* used here,
 //!   precisely so this pre-existing Phase-1 divergence is not silently altered by the U6
 //!   refactor. Reconciling the two is a deliberate later decision, not this unit's.
-//! * **`TRUE_FALSE_AUTOMATON` is not modeled.** [`crate::automaton::Automaton`] has no
-//!   such variant (see its module docs), so the Java branch that collapses an
-//!   all-tracks-quantified automaton to a true/false automaton
-//!   (`AutomatonQuantification.java:60-65`) becomes a hard
-//!   [`QuantifyError::AllTracksQuantified`] instead of a silently-wrong encoding. The
-//!   `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` guard between the helper and the
-//!   fixup (`:39`) likewise has no analog.
 //! * **The lsd fixup is not wired up here.** Java's `:46` calls
 //!   `AutomatonLogicalOps.fixTrailingZerosProblem`, and this crate *does* now have that
 //!   function ([`crate::logicalops::fix_trailing_zeros_problem`], landed in U5) — but
@@ -97,6 +90,35 @@
 //!   [`QuantifyError::UnsupportedLsdFixup`], and enabling it stays an explicit,
 //!   separately-reviewed change (no lsd numeration system exists in
 //!   [`crate::numsys`] to exercise it against yet either).
+//!
+//! # U0 behavior change: all-tracks-quantified now yields a TRUE/FALSE automaton
+//!
+//! Phase 1/2 reported [`QuantifyError`]`::AllTracksQuantified` when the caller asked to
+//! quantify away *every* track, because [`crate::automaton::Automaton`] had no way to
+//! express Java's answer. U0 added that representation
+//! ([`crate::fa::Fa::true_false`]), and this module now ports
+//! `AutomatonQuantification.java:58-65` exactly:
+//!
+//! ```text
+//! if (labelsToQuantify.size() == A.richAlphabet.getA().size()) {
+//!     A.fa.setTRUE_AUTOMATON(!A.isEmpty());
+//!     A.fa.setTRUE_FALSE_AUTOMATON(true);
+//!     A.clear();
+//!     return;
+//! }
+//! ```
+//!
+//! i.e. **`∃x₁…∃xₙ φ` over all `n` tracks is TRUE iff `L(φ) ≠ ∅`**, and the automaton is
+//! then wiped by [`crate::automaton::Automaton::clear`]. Two details in that sequence
+//! are load-bearing and are reproduced, not paraphrased:
+//! * `!A.isEmpty()` is evaluated **before** the flags are set, so it takes
+//!   `Automaton.isEmpty`'s ordinary `fa.isLanguageEmpty()` branch rather than its own
+//!   new trivial branch. Reversing the order would make every result FALSE.
+//! * `A.clear()` leaves `fa.q` **stale** (see [`crate::fa::Fa::clear`]); the shape is
+//!   tolerated by `Fa::canonicalize`/`crate::trim`, which both branch on the flag.
+//!
+//! [`quantify`] then honours Java's `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:39`)
+//! and skips the numeration-direction fixup entirely.
 //!
 //! # Faithfully-ported quirks (not divergences)
 //!
@@ -124,10 +146,6 @@ pub enum QuantifyError {
     /// `WalnutException.notFreeVariable` (thrown from
     /// `AutomatonQuantification.validateLabels`, `:110-116`).
     NotFreeVariable(String),
-    /// Every track was quantified away. Java collapses this to a TRUE/FALSE automaton
-    /// (true iff the language was non-empty); this crate does not model that variant, so
-    /// the out-of-scope precondition is reported instead of guessed at.
-    AllTracksQuantified,
     /// The surviving tracks are lsd, which would need
     /// [`crate::logicalops::fix_trailing_zeros_problem`] — not wired up (see module
     /// docs).
@@ -151,14 +169,24 @@ impl From<MinimizeError> for QuantifyError {
 /// Ports `AutomatonQuantification.quantify(Automaton, Set<String>)` (`:37-47`): project
 /// the labelled tracks away, determinize + minimize, then apply the
 /// numeration-system-dependent leading-zero fixup. `labels` must be a subset of `a.label`
-/// (else [`QuantifyError::NotFreeVariable`]) and must not name *every* track (else
-/// [`QuantifyError::AllTracksQuantified`]).
+/// (else [`QuantifyError::NotFreeVariable`]).
+///
+/// Naming *every* track is legal and turns `a` into a TRUE/FALSE automaton — see this
+/// module's "U0 behavior change" section.
 ///
 /// On success `a.alphabet` / `a.label` / `a.msd` have had the quantified tracks removed,
 /// `a.fa` is a minimal (generally *partial* — `minimize` drops non-co-reachable states)
 /// DFA over the reduced alphabet, and state numbering bears no relation to Walnut's.
 pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
     quantify_helper(a, labels)?;
+
+    // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:39`): a trivial automaton has no
+    // tracks and no numeration direction, so the fixup is skipped entirely. Note this
+    // also fires when `a` was ALREADY trivial on entry (the helper short-circuits on an
+    // empty label list), matching Java.
+    if a.fa.is_true_false_automaton() {
+        return Ok(());
+    }
 
     // `quantify`'s tail: consult the surviving tracks' numeration direction. Note this
     // runs even when `quantify_helper` short-circuited — a faithfully-ported quirk, see
@@ -213,10 +241,21 @@ fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Q
         }
     }
 
-    // Java: `if (labelsToQuantify.size() == A.richAlphabet.getA().size())` (`:60`) —
-    // every track quantified. See `QuantifyError::AllTracksQuantified`.
+    // Java: `if (labelsToQuantify.size() == A.richAlphabet.getA().size())` (`:60-65`) —
+    // every track quantified, so the result is the TRUE automaton iff the language was
+    // non-empty. See this module's "U0 behavior change" section for why the two
+    // statements below must stay in this order and why `clear` leaves `fa.q` stale.
+    //
+    // NOTE the comparison Java actually makes: `labelsToQuantify.size()` is the size of
+    // the deduplicated label SET, compared against the TRACK count — so an automaton
+    // with a repeated label (`f(a,a)`-shaped, two tracks both named "a") takes the
+    // ordinary projection path here, not this one. `BTreeSet<String>` reproduces the
+    // same deduplication.
     if labels.len() == a.alphabet.len() {
-        return Err(QuantifyError::AllTracksQuantified);
+        let truth = !a.is_empty();
+        a.fa.true_false = Some(truth);
+        a.clear();
+        return Ok(());
     }
 
     // A 0-state automaton (labels present, but no states — legal to construct via this
@@ -329,6 +368,7 @@ mod tests {
         let sym = |a: &Automaton, y: i32, x: i32| a.encode(&[y, x]);
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 4,
@@ -382,6 +422,48 @@ mod tests {
             a.fa.accepts_word(&word(&a, &[(0, 0), (0, 1)])),
             "the fixup ran despite nothing being quantified"
         );
+    }
+
+    #[test]
+    fn quantifying_every_track_collapses_to_a_true_false_automaton() {
+        // `AutomatonQuantification.java:58-65` (U0). `two_track_y_x` accepts the single
+        // symbol `(y=0, x=1)`, so its language is non-empty and `∃y ∃x φ` is TRUE.
+        let mut a = two_track_y_x();
+        assert!(!a.is_empty(), "sanity");
+        quantify(&mut a, &labels(&["y", "x"])).unwrap();
+        assert!(a.is_true_false_automaton() && a.is_true_automaton());
+        assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+        assert_eq!(
+            a.fa.q, 2,
+            "`Automaton.clear()` leaves `q` stale -- FA.clear() never resets it"
+        );
+
+        // The FALSE side. This is the case that catches the two easiest ways to get the
+        // ported sequence wrong: negating `isEmpty` the wrong way, or evaluating it
+        // AFTER setting the flag (at which point `Automaton::is_empty` takes its own
+        // trivial branch and would answer "empty" unconditionally).
+        let mut a = two_track_y_x();
+        a.fa.o = vec![0, 0];
+        assert!(a.is_empty(), "sanity");
+        quantify(&mut a, &labels(&["y", "x"])).unwrap();
+        assert!(a.is_true_false_automaton() && !a.is_true_automaton());
+    }
+
+    #[test]
+    fn quantifying_a_repeated_label_is_not_the_all_tracks_case() {
+        // Java compares the deduplicated label SET's size against the TRACK count
+        // (`:60`), so a two-track automaton whose tracks share one label takes the
+        // ordinary projection path even though `{"y"}` "covers" both tracks. Pinned
+        // because `labels.len() == a.alphabet.len()` is easy to misread as
+        // "every track is named".
+        let mut a = two_track_y_x();
+        a.label = vec!["y".to_string(), "y".to_string()];
+        quantify(&mut a, &labels(&["y"])).unwrap();
+        assert!(
+            !a.is_true_false_automaton(),
+            "one label, two tracks -> ordinary projection"
+        );
+        assert_eq!(a.label, vec!["y".to_string()], "one track survives");
     }
 
     #[test]
@@ -540,6 +622,7 @@ mod tests {
             (o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1).prop_map(
                 move |(o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1)| {
                     let fa = Fa {
+                        true_false: None,
                         q0: 0,
                         q,
                         alphabet_size: 4,

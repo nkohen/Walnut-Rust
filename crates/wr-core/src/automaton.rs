@@ -9,8 +9,24 @@
 //! [`crate::quantify`] — see its module docs for why): per-track alphabets,
 //! labels, msd/lsd-ness, and the mixed-radix symbol encoder/decoder. **This is
 //! deliberately NOT full Java parity** — no `NumberSystem` objects attached per track,
-//! no DFAO/`combine` bookkeeping, no `TRUE_FALSE_AUTOMATON` modeling (see
-//! `docs/DESIGN.md` §8 Phase 1's spike scope; widen in Phase 2).
+//! no DFAO/`combine` bookkeeping (see `docs/DESIGN.md` §8 Phase 1's spike scope).
+//!
+//! # U0 addition: the trivial (TRUE/FALSE) automaton
+//!
+//! Java's `TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON` short-circuit IS modeled as of U0 —
+//! the state itself lives on [`Fa`] (see `crate::fa`'s module docs for the
+//! representation and its exhaustive justification), and this file ports every
+//! `Automaton`-level branch on it: [`Automaton::true_false`] (Java's
+//! `Automaton(boolean)` constructor, `Automaton.java:106-110`), [`Automaton::clear`]
+//! (`:506-512`), and the guards in [`Automaton::get_arity`] (`:499`),
+//! [`Automaton::is_empty`] (`:515-517`), [`Automaton::sort_label`] (`:351`),
+//! [`Automaton::bind`] (`:439`), plus [`AutomatonDFA`]'s own
+//! (`AutomatonDFA.java:21-25`, `:79-81`, `:88-90`, `:102-104`).
+//!
+//! A trivial `Automaton` has NO tracks: `alphabet`/`label`/`msd` are all empty, so its
+//! arity is 0 and `is_bound()` is vacuously true. Nothing may `encode`/`decode` against
+//! it — call sites must check [`Automaton::is_true_false_automaton`] first, exactly as
+//! their Java originals do.
 //!
 //! # U2 additions: `bind`/`sortLabel`/`canonize`/`determinizeAndMinimize`/`AutomatonDFA`
 //!
@@ -103,6 +119,55 @@ impl Automaton {
             encoder,
             label_sorted: false,
         }
+    }
+
+    /// `Automaton(boolean truthValue)` (`Automaton.java:99-110`): "a true automaton is
+    /// an automaton that accepts everything; a false automaton is an automaton that
+    /// accepts nothing. Therefore, `M and false` is false for every automaton `M`, and
+    /// `M or true` is true for every automaton `M`."
+    ///
+    /// No tracks at all — `alphabet`/`label`/`msd` are empty, matching Java (`this()`
+    /// initializes `richAlphabet`/`NS`/`label` to empties before the flags are set).
+    pub fn true_false(truth: bool) -> Self {
+        Automaton {
+            fa: Fa::trivial(truth),
+            alphabet: Vec::new(),
+            label: Vec::new(),
+            msd: Vec::new(),
+            encoder: Vec::new(),
+            label_sorted: false,
+        }
+    }
+
+    /// `FA.isTRUE_FALSE_AUTOMATON()`, reached through `Automaton`'s public `fa` field in
+    /// Java (`A.fa.isTRUE_FALSE_AUTOMATON()`); a convenience delegate here.
+    pub fn is_true_false_automaton(&self) -> bool {
+        self.fa.is_true_false_automaton()
+    }
+
+    /// `FA.isTRUE_AUTOMATON()`, as a delegate — see
+    /// [`Automaton::is_true_false_automaton`].
+    pub fn is_true_automaton(&self) -> bool {
+        self.fa.is_true_automaton()
+    }
+
+    /// `Automaton.clear()` (`Automaton.java:503-512`, package-private) — its only Java
+    /// caller is `AutomatonQuantification`'s all-tracks-quantified path, immediately
+    /// after that path sets the TRUE/FALSE flags.
+    ///
+    /// Faithful, including the parts that look like oversights: [`Fa::clear`] empties
+    /// `o`/`d` but leaves `fa.q`/`fa.q0`/`fa.alphabet_size` **stale**, and the flags
+    /// themselves are deliberately untouched (Java clears neither). Java sets `NS` and
+    /// `label` to literal `null`; this crate's convention is that an empty `Vec` plays
+    /// the `null` role for both (see [`Automaton::is_bound`]/[`Automaton::unlabel`]), so
+    /// they are emptied instead.
+    pub fn clear(&mut self) {
+        self.fa.clear();
+        self.alphabet.clear();
+        self.encoder.clear();
+        self.msd.clear();
+        self.label.clear();
+        self.label_sorted = false;
     }
 
     /// `RichAlphabet.determineEncoder` (`RichAlphabet.java:100-108`). Panics on overflow
@@ -201,17 +266,31 @@ impl Automaton {
         self.label.len() == self.alphabet.len()
     }
 
-    /// `Automaton.getArity` (`Automaton.java:498-501`). The `isTRUE_FALSE_AUTOMATON` ->
-    /// `0` short-circuit is not replicated: TRUE/FALSE automata aren't modeled by this
-    /// crate (see module docs), so every `Automaton` here takes the `else` branch —
-    /// arity is always the track count.
+    /// `Automaton.getArity` (`Automaton.java:498-501`), including its
+    /// `isTRUE_FALSE_AUTOMATON -> 0` short-circuit (U0). Redundant in practice — a
+    /// trivial automaton's `alphabet` is empty anyway — but ported so the branch
+    /// structure matches Java's, and so the stale-field trivial shape (see `crate::fa`'s
+    /// module docs) can never report a non-zero arity.
     pub fn get_arity(&self) -> usize {
+        if self.fa.is_true_false_automaton() {
+            return 0;
+        }
         self.alphabet.len()
     }
 
-    /// `Automaton.isEmpty` (`Automaton.java:514-519`), minus its `isTRUE_FALSE_AUTOMATON`
-    /// branch (not modeled, see module docs).
+    /// `Automaton.isEmpty` (`Automaton.java:514-519`), including its
+    /// `isTRUE_FALSE_AUTOMATON` branch (U0): the FALSE automaton's language is empty,
+    /// the TRUE automaton's is not.
+    ///
+    /// The branch is **load-bearing, not cosmetic**: a trivial `Fa` has zero (or stale,
+    /// but output-less) states, so [`Fa::is_language_empty`] would report `true` for the
+    /// TRUE automaton too. `AutomatonQuantification`'s all-tracks-quantified path calls
+    /// this to decide which trivial automaton to produce, which is exactly why Java
+    /// evaluates `!A.isEmpty()` BEFORE setting `TRUE_FALSE_AUTOMATON`.
     pub fn is_empty(&self) -> bool {
+        if self.fa.is_true_false_automaton() {
+            return !self.fa.is_true_automaton();
+        }
         self.fa.is_language_empty()
     }
 
@@ -378,17 +457,20 @@ impl Automaton {
             .collect()
     }
 
-    /// `Automaton.sortLabel` (`Automaton.java:348-381`). The `isTRUE_FALSE_AUTOMATON`
-    /// short-circuit is not replicated (not modeled, see module docs); every other
-    /// branch is ported faithfully, including the [`Automaton::permute`] quirk above,
-    /// and with `msd` standing in for Java's per-track `NumberSystem` list (this
-    /// crate's already-established simplification — see the struct doc comment on
-    /// `msd`).
+    /// `Automaton.sortLabel` (`Automaton.java:348-381`), every branch ported faithfully
+    /// — including the [`Automaton::permute`] quirk above, the `isTRUE_FALSE_AUTOMATON`
+    /// short-circuit (U0), and Java's ORDER: `labelSorted` is set to `true` BEFORE the
+    /// trivial/unbound early returns, so even a bailed-out call memoizes.  `msd` stands
+    /// in for Java's per-track `NumberSystem` list (this crate's already-established
+    /// simplification — see the struct doc comment on `msd`).
     pub fn sort_label(&mut self) {
         if self.label_sorted {
             return;
         }
         self.label_sorted = true;
+        if self.fa.is_true_false_automaton() {
+            return;
+        }
         if !self.is_bound() {
             return;
         }
@@ -444,14 +526,20 @@ impl Automaton {
         self.canonize();
     }
 
-    /// `Automaton.bind` (`Automaton.java:438-444`). The `isTRUE_FALSE_AUTOMATON` half of
-    /// Java's guard clause is not replicated (not modeled, see module docs); the arity
-    /// mismatch half becomes a panic (message matches `WalnutException.invalidBind`:
+    /// `Automaton.bind` (`Automaton.java:438-444`). BOTH halves of Java's guard clause
+    /// are ported as of U0 — binding names to a TRUE/FALSE automaton is an error, not a
+    /// no-op — and both become a panic (message matches `WalnutException.invalidBind`:
     /// "invalid use of method bind") rather than a `Result`, matching this file's
     /// existing convention for caller-contract violations (see [`Automaton::encode`]'s
-    /// doc comment). `fa.setCanonized(false)` has no equivalent (see
-    /// [`Automaton::force_canonize`]'s doc comment).
+    /// doc comment). Note the trivial half is NOT subsumed by the arity half:
+    /// `bind(vec![])` on a trivial automaton passes the `0 == 0` arity check.
+    /// `fa.setCanonized(false)` has no equivalent (see [`Automaton::force_canonize`]'s
+    /// doc comment).
     pub fn bind(&mut self, names: Vec<String>) {
+        assert!(
+            !self.fa.is_true_false_automaton(),
+            "invalid use of method bind"
+        );
         assert_eq!(
             self.alphabet.len(),
             names.len(),
@@ -664,8 +752,22 @@ impl Automaton {
 pub struct AutomatonDFA(Automaton);
 
 impl AutomatonDFA {
-    /// `AutomatonDFA.requireDfaStorage` (`AutomatonDFA.java:87-98`).
+    /// `AutomatonDFA(boolean truthValue)` (`AutomatonDFA.java:21-25`) — the DFA-typed
+    /// trivial automaton. Note Java's constructor deliberately skips
+    /// `requireDfaStorage()` (a trivial automaton is vacuously deterministic); so does
+    /// this.
+    pub fn true_false(truth: bool) -> Self {
+        AutomatonDFA(Automaton::true_false(truth))
+    }
+
+    /// `AutomatonDFA.requireDfaStorage` (`AutomatonDFA.java:87-98`), including its
+    /// `isTRUE_FALSE_AUTOMATON -> return` short-circuit (U0, `:88-90`). That guard is
+    /// load-bearing: `determinize_and_minimize` below would otherwise run subset
+    /// construction over a trivial automaton's meaningless (possibly stale) state set.
     fn require_dfa_storage(mut automaton: Automaton) -> Automaton {
+        if automaton.fa.is_true_false_automaton() {
+            return automaton;
+        }
         if !automaton.fa.is_deterministic() {
             if automaton.is_fao() {
                 // WalnutException.nonDeterministicO()'s exact message (double period is
@@ -693,10 +795,18 @@ impl AutomatonDFA {
 
     /// `AutomatonDFA.from` (`AutomatonDFA.java:74-85`). The `instanceof AutomatonDFA`
     /// short-circuit doesn't apply: the input here is always a plain [`Automaton`],
-    /// never already an `AutomatonDFA` (Rust's type system rules that call shape out);
-    /// the `isTRUE_FALSE_AUTOMATON` short-circuit is not replicated (not modeled, see
-    /// module docs).
+    /// never already an `AutomatonDFA` (Rust's type system rules that call shape out).
+    /// The `isTRUE_FALSE_AUTOMATON` short-circuit (`:79-81`) IS ported as of U0, and
+    /// faithfully returns a FRESH trivial automaton rather than the argument — Java's
+    /// `new AutomatonDFA(automaton.fa.isTRUE_AUTOMATON())` discards any stale
+    /// `Q`/alphabet the argument was carrying (the shape `Automaton.clear()` leaves
+    /// behind, see `crate::fa`'s module docs). Same for
+    /// [`Automaton::as_dfa`]/`Automaton.clone()`'s trivial branch (`:102-104`), which
+    /// route through here.
     pub fn from(automaton: Automaton) -> Self {
+        if automaton.fa.is_true_false_automaton() {
+            return AutomatonDFA::true_false(automaton.fa.is_true_automaton());
+        }
         AutomatonDFA(Self::require_dfa_storage(automaton))
     }
 
@@ -721,6 +831,7 @@ mod tests {
 
     fn trivial_fa(alphabet_size: usize) -> Fa {
         Fa {
+            true_false: None,
             q0: 0,
             q: 1,
             alphabet_size,
@@ -847,6 +958,7 @@ mod tests {
     fn is_empty_matches_fa_language_emptiness() {
         let accepting = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 2,
@@ -1045,6 +1157,7 @@ mod tests {
         d2.insert(0, vec![1]);
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 1,
                 q: 3,
                 // Must be the true product of the two 2-symbol tracks (4), not 1 --
@@ -1085,6 +1198,7 @@ mod tests {
     fn diagonal_two_track_automaton() -> Automaton {
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size: 4,
@@ -1138,6 +1252,7 @@ mod tests {
         let alphabet_size = 2 * 3 * 2; // a(2) * b(3) * a(2), a fastest-varying.
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 1,
                 alphabet_size,
@@ -1225,6 +1340,7 @@ mod tests {
         d1.insert(1, vec![1]);
         Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 2,
@@ -1265,6 +1381,7 @@ mod tests {
         d1.insert(0, vec![1]);
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 2,
                 alphabet_size: 1,
@@ -1308,6 +1425,7 @@ mod tests {
         d1.insert(0, vec![2]);
         let mut a = Automaton::new(
             Fa {
+                true_false: None,
                 q0: 0,
                 q: 3,
                 alphabet_size: 2,
@@ -1436,5 +1554,106 @@ mod tests {
         // for b=1 (index 0 in `[1, 0]`), not the old alphabet's index-of-value (1).
         let new_sym = Automaton::encode_with(&[0, 1], &new_alphabet, &new_encoder);
         assert_eq!(new_d[0].get(&new_sym), Some(&vec![0]));
+    }
+
+    // --- the trivial (TRUE/FALSE) automaton at the `Automaton` layer (U0) ---
+
+    #[test]
+    fn true_false_constructor_has_no_tracks() {
+        for truth in [true, false] {
+            let a = Automaton::true_false(truth);
+            assert!(a.is_true_false_automaton());
+            assert_eq!(a.is_true_automaton(), truth);
+            assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+            assert_eq!(a.get_arity(), 0, "Automaton.java:499");
+            // Vacuously bound (0 labels for 0 tracks) -- worth pinning, because it is
+            // exactly why `bind`'s and `create_basic_automaton`'s trivial guards cannot
+            // be folded into their arity/`is_bound` checks.
+            assert!(a.is_bound());
+        }
+    }
+
+    #[test]
+    fn is_empty_reads_the_truth_value_not_the_state_set() {
+        // `Automaton.java:514-517`. Both trivial automata have ZERO states, so
+        // `Fa::is_language_empty` alone would answer `true` for both.
+        assert!(!Automaton::true_false(true).is_empty());
+        assert!(Automaton::true_false(false).is_empty());
+        assert!(
+            Automaton::true_false(true).fa.is_language_empty(),
+            "the underlying Fa really does look empty -- the branch is load-bearing"
+        );
+    }
+
+    #[test]
+    fn clear_wipes_track_metadata_but_leaves_the_flag_and_a_stale_q() {
+        // `Automaton.clear()` (`:506-512`), as invoked by
+        // `AutomatonQuantification.quantifyHelper:63`.
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 4,
+                o: vec![0, 1],
+                d: vec![BTreeMap::new(), BTreeMap::new()],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["y".into(), "x".into()],
+            vec![Some(true), Some(true)],
+        );
+        a.fa.true_false = Some(true);
+        a.clear();
+
+        assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+        assert!(a.fa.o.is_empty() && a.fa.d.is_empty());
+        assert_eq!(a.fa.q, 2, "stale, faithfully -- see FA.clear()");
+        assert!(a.is_true_false_automaton() && a.is_true_automaton());
+        assert_eq!(a.get_arity(), 0);
+    }
+
+    #[test]
+    fn canonize_is_a_noop_on_a_trivial_automaton() {
+        let mut a = Automaton::true_false(true);
+        a.canonize();
+        assert!(a.is_true_false_automaton() && a.is_true_automaton());
+        assert!(a.label.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid use of method bind")]
+    fn bind_rejects_a_trivial_automaton_even_with_a_matching_zero_arity() {
+        // `Automaton.java:439`'s FIRST disjunct. `bind(vec![])` passes the arity half
+        // (`0 == 0`), so only the trivial guard can reject it.
+        Automaton::true_false(true).bind(Vec::new());
+    }
+
+    #[test]
+    fn as_dfa_returns_a_fresh_trivial_dfa_discarding_stale_fields() {
+        // `AutomatonDFA.from`'s `:79-81` branch. Built from the stale-`q` shape so the
+        // "fresh, not a copy" part is observable.
+        let mut a = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![Some(true)],
+        );
+        a.fa.true_false = Some(false);
+        a.clear();
+        assert_eq!(a.fa.q, 1, "sanity: the input carries a stale q");
+
+        let dfa = a.as_dfa();
+        assert!(dfa.automaton().is_true_false_automaton());
+        assert!(!dfa.automaton().is_true_automaton());
+        assert_eq!(dfa.automaton().fa.q, 0, "rebuilt, not copied");
+    }
+
+    #[test]
+    fn automaton_dfa_true_false_constructor_skips_the_determinism_machinery() {
+        for truth in [true, false] {
+            let dfa = AutomatonDFA::true_false(truth);
+            assert!(dfa.automaton().is_true_false_automaton());
+            assert_eq!(dfa.automaton().is_true_automaton(), truth);
+        }
     }
 }
