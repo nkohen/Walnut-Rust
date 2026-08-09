@@ -22,6 +22,13 @@ we test.** Two rules dominate everything else:
    code verbatim), idiomatic Rust later in **separate** commits — so a differential regression bisects cleanly to
    "port bug" vs "refactor bug."
 
+**When you find a genuine Walnut (Java) bug while porting — wrong output, a crash on a plausible input, not just a
+quirk or dead code — do NOT silently fix or silently replicate it. Log it in [`docs/WALNUT-BUGS.md`](docs/WALNUT-BUGS.md)**
+(location, trigger, how it's currently handled in the Rust port, upstream-fix status), then port it verbatim per rule
+2 above unless the user has explicitly signed off on a deliberate divergence for that specific entry. This is what
+makes "fix it upstream in walnut-java AND decide how to handle it in walnut-rs" a deliberate, scheduled decision
+instead of something an agent quietly resolves mid-port.
+
 ## The three-repo world
 
 - **`walnut-java`** (sibling repo, a fork of upstream Walnut) — the **oracle**: the source of the ~100%-coverage Java

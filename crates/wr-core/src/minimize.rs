@@ -47,7 +47,9 @@
 //! accepting self-loop, minimizes to a 1-state *accepting* automaton (language `∅`
 //! becomes `Σ*`). This cannot happen when every state is reachable from `q0`: a final
 //! state then exists only if `q0` can reach it. Pinned by
-//! `minimize_q0_not_co_reachable_walnut_quirk`.
+//! `minimize_q0_not_co_reachable_walnut_quirk`. Cataloged as `docs/WALNUT-BUGS.md` WB-001
+//! (upstream fix status, severity, full verification history — this doc comment covers
+//! only the Rust-port-relevant summary).
 //!
 //! # Scope note
 //!
