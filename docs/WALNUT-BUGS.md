@@ -177,6 +177,76 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-008 — `FA.concatStates` uses the second operand's state index 0, not its `q0`
+
+- **Where:** `Automata/FA/FA.java`, `concatStates(FA other, FA N, int originalQ)` —
+  `N.t.getEntriesNfaD(originalQ)` (the line that fetches "the second operand's initial-state
+  transitions" to graft onto the first operand's final states).
+- **What:** the intent is clearly "graft `other`'s initial state's outgoing transitions onto every
+  final state of the first operand" (the epsilon-transition simulation a Kleene-style concatenation
+  construction needs), but the code reads `other`'s transitions at shifted index `originalQ + 0`
+  (state index 0), not `originalQ + other.q0`. This is silently correct only when `other.q0 == 0`
+  — true for every automaton that's been round-tripped through Walnut's `.txt` writer (which always
+  canonizes, forcing `q0` to `0`, before writing), but not guaranteed for an automaton built or
+  mutated in-memory without an intervening canonicalize/write. Contrast `starStates` in the same
+  file, which correctly uses `automaton.q0` (not a hardcoded `0`) for the analogous graft.
+- **Trigger:** `concat(A, B)` where `B.q0 != 0` at the time of the call — the concatenation grafts
+  the wrong state's transitions, producing a language that doesn't match either operand's actual
+  continuation behavior at the seam. **This is reachable from the plain CLI, not just an in-memory
+  corner case**: `AutomatonReader` sets `q0` to whichever state is declared FIRST in a `.txt` file,
+  not necessarily state `0` — a hand-authored `.txt` with a non-zero state listed first reads back
+  with `q0 != 0` with no canonicalize step in between. (An earlier version of this entry claimed
+  every `.txt`-sourced automaton is `q0 == 0`-canonical; that's wrong — canonicalization only happens
+  on *write*, via `Writer/AutomatonWriter`, not on read.)
+- **Found:** Phase 2, U1 (`fa.rs`'s `FA` port), 2026-08-09, while porting `concatStates`. Confirmed
+  by direct reading of `FA.java:107-124`, then **confirmed live** against the real `walnut-java` CLI
+  (`Walnut-all.jar`) during adversarial review of the port: a hand-authored `.txt` with `q0 = 1`
+  reproduces exactly the predicted wrong result end-to-end.
+- **Rust port:** `ported verbatim (quirk)` — `wr_core::fa::Fa::concat_states` reproduces this exactly
+  (documented in its doc comment), pinned by
+  `concat_states_quirk_uses_others_state_zero_not_others_q0`.
+- **Upstream:** not filed. Fix in Java would be reading `other`'s entries at its actual `q0`
+  (shifted by `originalQ`), matching `starStates`'s pattern.
+- **Severity:** moderate-to-significant (raised from "moderate" after live confirmation) — silent
+  wrong answer, reachable via a real CLI workflow (hand-authored or externally-generated `.txt`
+  files with a non-zero first-declared state are not exotic), not just a theoretical in-memory shape.
+
+---
+
+## WB-009 — `FA.concatStates` never clears the first operand's own accepting flags
+
+- **Where:** `Automata/FA/FA.java`, `concatStates(FA other, FA N, int originalQ)`, via its reuse of
+  the shared `mergeInTransitions` helper (also used by `starStates`, where this behavior is
+  correct).
+- **What:** `concatStates` grafts `other`'s (index-0, see WB-008) transitions onto every state of
+  the first operand that's currently accepting — but never un-marks those states as accepting
+  afterward. For Kleene-star (`starStates`), leaving the old final states accepting is exactly right
+  (the starred language includes the empty repetition). For concatenation, it's wrong: whenever ε is
+  **not** in `L(other)`, the raw NFA `concatStates` builds accepts `L(first) ∪ L(first)·L(other)`,
+  not the documented `L(first)·L(other)` (`Help Documentation/Commands/Automata/concat.txt`:
+  "accepts the concatenation of the inputs"). The first operand's language leaks into the result
+  as spurious extra accepted strings.
+- **Trigger:** `concat(A, B)` where `ε ∉ L(B)` and `L(A)` is nonempty — the result accepts every
+  string in `L(A)` in addition to the intended `L(A)·L(B)`.
+- **Found:** Phase 2, U1 (`fa.rs`'s `FA` port), 2026-08-09, alongside WB-008. Confirmed by direct
+  reading of `FA.java`'s `concatStates`/`mergeInTransitions`, then **confirmed live** against the
+  real `walnut-java` CLI during adversarial review of the port: `concat` of `reg "0"` and `reg "1"`
+  (a plain, non-starred pair — the only such case in Walnut's own `IntegrationTest.java`,
+  `test603`, asserts no language, so this never got caught upstream) produces a result whose second
+  state is wrongly accepting, i.e. `L = {"0", "01"}` instead of the documented `{"01"}`.
+- **Rust port:** `ported verbatim (quirk)` — `wr_core::fa::Fa::concat_states` reproduces this exactly
+  (documented in its doc comment), pinned by
+  `concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon`.
+- **Upstream:** not filed. Fix in Java would un-mark the first operand's states as accepting inside
+  `concatStates` itself (or in a dedicated concat-only merge helper, not the shared
+  `mergeInTransitions`) before/after the graft.
+- **Severity:** significant — silent wrong answer on a very common shape (any `concat` whose second
+  operand doesn't accept the empty string, which is the common case for non-star automata); worth
+  prioritizing for upstream confirmation given how central `concat` is to word-automaton/morphism
+  construction.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

@@ -16,7 +16,7 @@
 //! Java's `FA`/`Transitions` layering) — `Fa` itself is track-agnostic; track
 //! encode/decode lives in `crate::automaton`.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 /// A nondeterministic finite automaton with per-state integer output.
 ///
@@ -137,11 +137,310 @@ impl Fa {
         }
         self.d.push(sink_map);
     }
+
+    /// Appends `destination` onto `transitions[state]`'s per-`symbol` destination list,
+    /// creating that list on the first insertion. Ports the small generic
+    /// transition-table-mutation helper `FA.addTransition` (`FA.java:305-313`), used
+    /// directly by [`Fa::reverse`] below.
+    ///
+    /// This is also the closest thing `FA.java` has to a reusable per-symbol
+    /// "product-transition" primitive for a LATER unit's `FA/ProductStrategies.java`
+    /// port to build on: see [`Fa::reverse`]'s doc comment and this module's test for
+    /// why the *actual* cross-product BFS
+    /// (`ProductStrategies.crossProductInternal`/`crossProductInternalDFA`) is not
+    /// itself portable yet at this layer — it is not, in fact, built out of this helper
+    /// even in Java (it builds destination lists inline), but it is the same shape of
+    /// building block a Rust product implementation would still want.
+    pub fn add_transition(
+        transitions: &mut [BTreeMap<i32, Vec<usize>>],
+        state: usize,
+        symbol: i32,
+        destination: usize,
+    ) {
+        transitions[state]
+            .entry(symbol)
+            .or_default()
+            .push(destination);
+    }
+
+    /// Reverses every transition and swaps the initial/accepting roles (Walnut's
+    /// `FA.reverseToNFAInternal`, `FA.java:274-303`) — the basis for Brzozowski
+    /// determinization (`DeterminizationStrategies.Brz`) in a later unit.
+    /// `old_initial_states` is the set of states to treat as "the" initial states for
+    /// this reversal (ordinarily just `{self.q0}`, matching
+    /// `AutomatonLogicalOps.reverse`'s call site; Brzozowski's algorithm and
+    /// `DeterminizationStrategies`'s generalized entry points can pass a genuine
+    /// multi-state seed, since subset construction — unlike `Fa` itself — has no
+    /// restriction to a single initial state).
+    ///
+    /// Mutates `self` in place (transitions reversed; outputs updated so old accepting
+    /// states become non-accepting and `old_initial_states` become accepting) and
+    /// returns the set of states that were accepting BEFORE the call — these are the
+    /// new automaton's initial *states* (plural). `Fa` has no multi-initial-state
+    /// field, so unlike Java's `FA` object this does not attempt to stash them into
+    /// `self.q0`; pass the returned set directly as the `initial` argument to
+    /// [`crate::determinize::subset_construction`], exactly mirroring the Java call
+    /// sites, which immediately feed `reverseToNFAInternal`'s return value into
+    /// `SC`/`OTF`. `self.q0` is left completely unmodified — Java doesn't touch its
+    /// `q0` field here either; it is stale until the caller re-determinizes, which
+    /// always resets `q0` to the fresh DFA's `0`.
+    ///
+    /// Java also calls `t.reduceMemory()` after reassigning transitions — a
+    /// capacity-trimming memory optimization with no behavioral effect, and a no-op for
+    /// this crate's `BTreeMap`-backed storage, so it is not replicated.
+    ///
+    /// # Invariant: `self` is not a usable automaton until re-determinized
+    ///
+    /// After this call, `self.q0` is stale (unchanged, but meaningless — Java has the
+    /// identical staleness). Do not call [`Fa::accepts_word`] or
+    /// [`Fa::is_language_empty`] on `self` directly afterward; both would silently read
+    /// the wrong start state and give a wrong-but-not-panicking answer. The only
+    /// supported next step is feeding the returned set into
+    /// [`crate::determinize::subset_construction`], which produces a fresh `Fa` with
+    /// its own correct `q0`.
+    pub fn reverse(&mut self, old_initial_states: &BTreeSet<usize>) -> BTreeSet<usize> {
+        let mut new_d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); self.q];
+        for q in 0..self.q {
+            for (&sym, dests) in &self.d[q] {
+                for &dest in dests {
+                    Fa::add_transition(&mut new_d, dest, sym, q);
+                }
+            }
+        }
+        self.d = new_d;
+
+        let mut new_initial_states = BTreeSet::new();
+        for q in 0..self.q {
+            if self.is_accepting(q) {
+                new_initial_states.insert(q);
+                self.o[q] = 0;
+            }
+        }
+        for &init_state in old_initial_states {
+            self.o[init_state] = 1;
+        }
+        new_initial_states
+    }
+
+    /// Builds the raw (possibly-nondeterministic) Kleene-star state/transition
+    /// additions onto `n`, which the caller must already have set to a clone of
+    /// `automaton` (mirrors Java's `FA.starStates(FA automaton, FA N)`,
+    /// `FA.java:97-104`, a mutating two-argument "out-param" static method — kept as
+    /// the same shape here rather than a `&mut self` method, since `n` starts as a
+    /// distinct clone rather than `automaton` itself; see the call site in
+    /// `Main.Commands.Star`, which is NOT in scope for this unit).
+    ///
+    /// Adds one new state, makes it both the new initial state and accepting, and
+    /// gives every already-accepting state of `n` (the new one included) a copy of
+    /// `automaton.q0`'s outgoing transitions. This simulates the epsilon transitions
+    /// "new q0 -> old q0" and "old final -> old q0" that a textbook epsilon-NFA
+    /// Kleene-star construction would use — Walnut's `FA` has no representation for an
+    /// actual epsilon edge, so instead of adding one, the target's outgoing
+    /// transitions are copied directly onto the source. The new state being marked
+    /// accepting handles the "new q0 -> old q0" edge (so old q0's own acceptance, if
+    /// any, is inherited); copying old q0's transitions onto every old-and-new
+    /// accepting state handles both "new q0 -> old q0" and "old final -> old q0"
+    /// continuations in one pass. The result is often nondeterministic; callers must
+    /// determinize+minimize afterward (out of scope here).
+    pub fn star_states(automaton: &Fa, n: &mut Fa) {
+        // Java: `N.q0 = N.Q++` — assigns the OLD length to q0, then bumps the count.
+        let new_state = n.q;
+        n.q0 = new_state;
+        n.q += 1;
+        n.o.push(1); // The newly added state is a final (accepting) state.
+        n.d.push(BTreeMap::new());
+
+        let source_entries = automaton.d[automaton.q0].clone();
+        Fa::merge_in_transitions(n, n.q, &source_entries);
+    }
+
+    /// Builds the raw (possibly-nondeterministic) concatenation state/transition
+    /// additions onto `n`, which the caller must already have set to a clone of the
+    /// FIRST operand automaton (mirrors Java's
+    /// `FA.concatStates(FA other, FA N, int originalQ)`, `FA.java:107-124`; see the
+    /// call site in `Main.Commands.Concat`, NOT in scope for this unit).
+    ///
+    /// Appends every state of `other`, shifting its transition destinations by
+    /// `original_q` (the first operand's original state count — `other`'s states now
+    /// live at indices `[original_q, original_q + other.q)` in `n`), then gives every
+    /// state that was accepting in the FIRST operand a copy of `other`'s initial
+    /// state's outgoing transitions — the concatenation NFA's "old final -> other's
+    /// q0" epsilon transition, again simulated by direct duplication (see
+    /// [`Fa::star_states`]'s doc comment for why).
+    ///
+    /// # Two genuine Walnut (Java) bugs, ported verbatim
+    ///
+    /// 1. **Wrong source state when `other.q0 != 0`.** The "other's initial state's
+    ///    outgoing transitions" above is, in Java, literally `N.t.getEntriesNfaD(originalQ)`
+    ///    — i.e. `other`'s state at *index* `0` (shifted), not `other.q0`. This is
+    ///    silently correct only when `other.q0 == 0` — true whenever `other` was
+    ///    round-tripped through `Writer/AutomatonWriter.java` (which canonizes before
+    ///    writing), but **not guaranteed in general**: `AutomatonReader.java` sets
+    ///    `q0` to whichever state is declared FIRST in a `.txt` file, so a hand-authored
+    ///    file that lists a non-zero state first reads back with `q0 != 0` with no
+    ///    canonicalize step in between — confirmed reproducible against the real
+    ///    Walnut CLI this way (`docs/WALNUT-BUGS.md` WB-008), not merely an in-memory
+    ///    corner case. Contrast [`Fa::star_states`] above, which correctly uses
+    ///    `automaton.q0` (not a hardcoded `0`). Pinned by
+    ///    `concat_states_quirk_uses_others_state_zero_not_others_q0`.
+    /// 2. **`first`'s old final states are never un-marked accepting.** The shared
+    ///    `merge_in_transitions` helper is correct for `star_states` (a starred
+    ///    automaton's old final states SHOULD remain accepting), but reusing it here
+    ///    means `first`'s pre-existing accepting states keep their accepting flag
+    ///    after concatenation, too. Whenever ε is NOT in `other`'s language, the raw
+    ///    concatenation automaton's language is `L(first) ∪ L(first)·L(other)`, not
+    ///    the documented `L(first)·L(other)` (`Help Documentation/Commands/Automata/concat.txt`:
+    ///    "accepts the concatenation of the inputs"). Pinned by
+    ///    `concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon`.
+    ///
+    /// Both are cataloged for `docs/WALNUT-BUGS.md` (not this crate's job to fix per
+    /// `CLAUDE.md`'s mechanical-port rule) and ported exactly as Java has them.
+    pub fn concat_states(other: &Fa, n: &mut Fa, original_q: usize) {
+        // To access `other`'s states, just use `q`. To access them within `n`, use
+        // `original_q + q`.
+        for q in 0..other.q {
+            n.o.push(other.o[q]);
+            let mut new_row = BTreeMap::new();
+            for (&sym, dests) in &other.d[q] {
+                let shifted: Vec<usize> = dests.iter().map(|&i| original_q + i).collect();
+                new_row.insert(sym, shifted);
+            }
+            n.d.push(new_row);
+        }
+
+        // See bug #1 above: this should arguably be `n.d[original_q + other.q0]`.
+        let source_entries = n.d[original_q].clone();
+        Fa::merge_in_transitions(n, original_q, &source_entries);
+
+        n.q = original_q + other.q;
+    }
+
+    /// Shared by [`Fa::star_states`]/[`Fa::concat_states`]: for every state `q` in
+    /// `0..bound` that is currently accepting in `n`, merges `source_entries` into
+    /// `n.d[q]` (appending to any existing destination list for a shared symbol rather
+    /// than overwriting it). Ports `FA.mergeInTransitions` (`FA.java:130-142`).
+    fn merge_in_transitions(n: &mut Fa, bound: usize, source_entries: &BTreeMap<i32, Vec<usize>>) {
+        for q in 0..bound {
+            if !n.is_accepting(q) {
+                continue;
+            }
+            for (&sym, dests) in source_entries {
+                n.d[q].entry(sym).or_default().extend(dests.iter().copied());
+            }
+        }
+    }
+
+    /// Renumbers states into breadth-first order from `q0`, mutating `self` in place
+    /// (Walnut's `FA.canonizeInternal`, `FA.java:148-191`, plus its
+    /// `determinePermutationMap` helper at `FA.java:196-214`). As a side effect, drops
+    /// any state BFS never reaches from `q0` — an unreached state has no entry in the
+    /// permutation map, so it (and any transition into it) is silently dropped; an
+    /// entry all of whose destinations were dropped is removed from its source
+    /// state's row entirely rather than kept as an empty destination list
+    /// (`FA.java:183-187`: `if (!newDestination.isEmpty()) set-the-remapped-list; else
+    /// remove-the-entry` — note the condition, not its negation).
+    ///
+    /// This is a DIFFERENT reachability notion from [`crate::trim::trim`]:
+    /// canonicalize checks only FORWARD reachability from `q0`, never backward
+    /// co-reachability to acceptance, so a dead-end branch that can never lead to an
+    /// accepting state survives canonicalize untouched (only `trim` removes that).
+    ///
+    /// Java memoizes behind a `canonized` flag and a `TRUE_FALSE_AUTOMATON`
+    /// short-circuit — both are private fields **on `FA` itself** (`FA.java:47-50`,
+    /// checked at `FA.java:149`), not `Automaton`/command-level state as an earlier
+    /// draft of this doc claimed. This crate's `Fa` carries neither, so this always
+    /// recomputes — safe (idempotent: re-running on an already-BFS-ordered automaton is
+    /// a no-op transitions-and-output-wise) but behaviorally NOT identical: Java's
+    /// `canonized` guard means a stale-flagged `FA` is left un-renumbered even if its
+    /// actual state order has changed underneath it (pinned upstream by
+    /// `FATest.canonizeInternal_alreadyCanonized_isNoOp`, not replicated here — the flag
+    /// doesn't exist on `Fa`). Language-preserving either way, so no differential/golden
+    /// comparison can observe it, but a future exact-state-numbering comparison would.
+    ///
+    /// The zero-state guard below agrees with Java on every input Java can actually
+    /// construct, but for a different reason than an earlier draft of this doc claimed:
+    /// Java does NOT "corrupt the automaton" on a nonexistent `q0` — `determinePermutationMap`
+    /// seeds `permutationMap.put(q0, 0)` then immediately dereferences `q0`'s (nonexistent)
+    /// transition row and throws `IndexOutOfBoundsException`. That path is simply
+    /// unreachable in practice: the *only* `Q == 0` automata Walnut ever builds are the
+    /// TRUE/FALSE automata (`Automaton.java`'s boolean constructor), and those hit the
+    /// `TRUE_FALSE_AUTOMATON` short-circuit before `canonizeInternal`'s body ever runs —
+    /// making it a genuine no-op, matching the guard below. The guard also covers a shape
+    /// Java's `TRUE_FALSE_AUTOMATON` flag guards against but `Fa` cannot express: a
+    /// `Q > 0` automaton with empty `o`/`d` (Java's `FA.clear()` leaves `Q` untouched
+    /// while emptying storage; `AutomatonQuantification`'s to-TRUE_FALSE path does
+    /// exactly this). Not yet constructible by anything in this crate, but cheap to
+    /// guard against now rather than panicking once it is.
+    pub fn canonicalize(&mut self) {
+        if self.q == 0 || self.d.is_empty() {
+            return;
+        }
+        let permutation = self.determine_permutation_map();
+        let new_q = permutation.len();
+
+        let mut new_o = vec![0i32; new_q];
+        let mut new_d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); new_q];
+        for q in 0..self.q {
+            if let Some(&new_id) = permutation.get(&q) {
+                new_o[new_id] = self.o[q];
+                new_d[new_id] = self.d[q].clone();
+            }
+        }
+
+        for row in new_d.iter_mut() {
+            let mut pruned = BTreeMap::new();
+            for (&sym, dests) in row.iter() {
+                let remapped: Vec<usize> = dests
+                    .iter()
+                    .filter_map(|d| permutation.get(d).copied())
+                    .collect();
+                if !remapped.is_empty() {
+                    pruned.insert(sym, remapped);
+                }
+            }
+            *row = pruned;
+        }
+
+        self.q0 = permutation[&self.q0];
+        self.q = new_q;
+        self.o = new_o;
+        self.d = new_d;
+    }
+
+    /// BFS assigns each state reachable from `q0` a dense id in visit order (Walnut's
+    /// `FA.determinePermutationMap`, `FA.java:196-214`). `HashMap` is safe here
+    /// (`PORTING.md`'s iteration-order rule notwithstanding): the numbering is fully
+    /// determined by BFS visit order (queue-pop order, each state's `BTreeMap`-sorted
+    /// transition table, and each destination list's insertion order), and this map is
+    /// never iterated for that numbering — only looked up by key (`get`/vacancy check)
+    /// — so no Rust-`HashMap`-seed-per-process nondeterminism can leak into the
+    /// result. (Matches `trim.rs`'s `old_to_new`, which makes the identical judgment
+    /// call for the same reason.)
+    fn determine_permutation_map(&self) -> HashMap<usize, usize> {
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        queue.push_back(self.q0);
+        let mut permutation: HashMap<usize, usize> = HashMap::new();
+        permutation.insert(self.q0, 0);
+        let mut next_id = 1usize;
+        while let Some(q) = queue.pop_front() {
+            for dests in self.d[q].values() {
+                for &p in dests {
+                    if let std::collections::hash_map::Entry::Vacant(e) = permutation.entry(p) {
+                        e.insert(next_id);
+                        next_id += 1;
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+        permutation
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// 2-state total DFA over a 2-symbol alphabet accepting words containing at
     /// least one `1` (symbol 1); mirrors the hand-derived spike result shape.
@@ -238,5 +537,587 @@ mod tests {
         let mut fa = contains_one_dfa();
         fa.totalize(0);
         assert_eq!(fa.q, 2, "already-total automaton should not grow");
+    }
+
+    // --- add_transition ---
+
+    #[test]
+    fn add_transition_appends_to_existing_and_creates_new_entries() {
+        let mut table = vec![BTreeMap::new(), BTreeMap::new()];
+        Fa::add_transition(&mut table, 0, 5, 2);
+        Fa::add_transition(&mut table, 0, 5, 3);
+        assert_eq!(table[0].get(&5), Some(&vec![2, 3]));
+        assert!(table[1].is_empty());
+    }
+
+    // --- reverse (FA.java:274-303) ---
+
+    #[test]
+    fn reverse_reverses_transitions_and_swaps_initial_and_accepting() {
+        let mut fa = contains_one_dfa();
+        let old_initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+        let new_initial = fa.reverse(&old_initial);
+
+        // State 1 was the only accepting state before the call.
+        assert_eq!(new_initial, [1].into_iter().collect::<BTreeSet<_>>());
+        // old_initial_states (={0}) are now accepting; old accepting states (={1}) are not.
+        assert_eq!(fa.o, vec![1, 0]);
+        // Original: 0--0-->0, 0--1-->1, 1--0-->1, 1--1-->1.
+        // Reversed: 0--0-->0, 1--1-->0, 1--0-->1, 1--1-->1 (merged with the previous line).
+        assert_eq!(fa.d[0].get(&0), Some(&vec![0]));
+        assert_eq!(fa.d[0].get(&1), None);
+        assert_eq!(fa.d[1].get(&0), Some(&vec![1]));
+        assert_eq!(fa.d[1].get(&1), Some(&vec![0, 1]));
+    }
+
+    #[test]
+    fn reverse_of_reachability_only_dfa_is_the_reverse_language() {
+        // "ends with symbol 1" over {0,1}.
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![0]);
+        d1.insert(1, vec![1]);
+        let mut fa = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d0, d1],
+        };
+        let old_initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+        let new_initial = fa.reverse(&old_initial);
+        let reversed_dfa = crate::determinize::subset_construction(&fa, &new_initial);
+
+        // Reversing "ends with 1" gives "starts with 1".
+        fn starts_with_one(word: &[i32]) -> bool {
+            matches!(word.first(), Some(1))
+        }
+        for word in [
+            vec![],
+            vec![1],
+            vec![0],
+            vec![1, 0, 0],
+            vec![0, 1, 1],
+            vec![1, 1, 1],
+        ] {
+            assert_eq!(
+                reversed_dfa.accepts_word(&word),
+                starts_with_one(&word),
+                "mismatch on {word:?}"
+            );
+        }
+    }
+
+    /// Generates a total DFA (`q0` fixed at `0`) over a FIXED `alphabet_size` — fixed,
+    /// not randomized, so that a correlated random word (drawn from `0..alphabet_size`
+    /// at the call site) always lands on real symbols. An earlier version of this
+    /// generator randomized `alphabet_size` too while callers still drew words from a
+    /// hardcoded `0..2` range, so on every `alphabet_size == 1` case the word strategy
+    /// could draw symbol `1`, which both sides of any comparison reject vacuously —
+    /// contributing no signal. `determinize.rs`'s `arb_nfa_fixed_alphabet` hit and
+    /// documented this identical pitfall first; this generator now follows the same
+    /// fixed-alphabet rule.
+    fn arb_total_dfa(q_max: usize, alphabet_size: usize) -> impl Strategy<Value = Fa> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let o_strategy = prop::collection::vec(0i32..=1, q);
+            let trans_strategy =
+                prop::collection::vec(prop::collection::vec(0usize..q, alphabet_size), q);
+            (o_strategy, trans_strategy).prop_map(move |(o, trans)| {
+                let d = trans
+                    .into_iter()
+                    .map(|r| {
+                        r.into_iter()
+                            .enumerate()
+                            .map(|(sym, dest)| (sym as i32, vec![dest]))
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect();
+                Fa {
+                    q0: 0,
+                    q,
+                    alphabet_size,
+                    o,
+                    d,
+                }
+            })
+        })
+    }
+
+    /// Generates a genuine NFA (nondeterminism + partial transitions allowed) with a
+    /// RANDOM `q0` over a fixed `alphabet_size` — the shape `reverse`/`star_states`/
+    /// `concat_states`/`canonicalize` actually operate on, unlike [`arb_total_dfa`]'s
+    /// always-`q0`-0 total DFAs. Mirrors `determinize.rs`'s `arb_nfa_fixed_alphabet`
+    /// (same per-symbol-subset-of-destinations shape) plus a randomized `q0`, needed
+    /// here because several of this unit's reviewed gaps were specifically about
+    /// `q0 != 0`, `q0` accepting, and `q0` with incoming edges never being generated.
+    fn arb_nfa_with_q0(q_max: usize, alphabet_size: usize) -> impl Strategy<Value = Fa> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let row_strategy =
+                prop::collection::vec(prop::collection::vec(any::<bool>(), q), alphabet_size);
+            let table_strategy = prop::collection::vec(row_strategy, q);
+            let o_strategy = prop::collection::vec(0i32..=1, q);
+            let q0_strategy = 0..q;
+            (table_strategy, o_strategy, q0_strategy).prop_map(move |(table, o, q0)| {
+                let d = table
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .enumerate()
+                            .filter_map(|(sym, incl)| {
+                                let dests: Vec<usize> = incl
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(dest, keep)| keep.then_some(dest))
+                                    .collect();
+                                if dests.is_empty() {
+                                    None
+                                } else {
+                                    Some((sym as i32, dests))
+                                }
+                            })
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect();
+                Fa {
+                    q0,
+                    q,
+                    alphabet_size,
+                    o,
+                    d,
+                }
+            })
+        })
+    }
+
+    /// `word ∈ L(A)*` via a naive O(n^2)-`accepts_word`-calls DP split-check — cheap
+    /// enough for the tiny (`<=5`-symbol) words these proptests generate, and gives an
+    /// independent ground truth for `star_states` that doesn't reuse any of its own
+    /// machinery.
+    fn star_accepts(a: &Fa, word: &[i32]) -> bool {
+        let n = word.len();
+        let mut dp = vec![false; n + 1];
+        dp[0] = true;
+        for i in 1..=n {
+            for j in 0..i {
+                if dp[j] && a.accepts_word(&word[j..i]) {
+                    dp[i] = true;
+                    break;
+                }
+            }
+        }
+        dp[n]
+    }
+
+    /// Ground truth for `concat_states`'s ACTUAL (quirky, see its doc comment)
+    /// behavior: `L(a) ∪ L(a)·L(b_from_index_0)`, i.e. `a`'s language leaks through
+    /// whole (WB-009) and the continuation is spliced from `b`'s state index `0`, not
+    /// `b.q0` (WB-008) — `b_index0` must already have `q0` forced to `0` by the
+    /// caller. This deliberately encodes the two ported bugs, not the documented
+    /// "correct" concatenation semantics — the point of this test is to pin the
+    /// quirks so a future refactor can't silently "fix" them without a test noticing.
+    fn concat_quirk_accepts(a: &Fa, b_index0: &Fa, word: &[i32]) -> bool {
+        if a.accepts_word(word) {
+            return true;
+        }
+        (0..=word.len()).any(|i| a.accepts_word(&word[..i]) && b_index0.accepts_word(&word[i..]))
+    }
+
+    /// Hand-derived multi-state-seed case for `reverse` (adversarial-review finding:
+    /// every OTHER test in this file only ever seeds `reverse` with `{self.q0}`, which
+    /// cannot distinguish the `old_initial_states` loop from `self.o[self.q0] = 1`).
+    /// `q=3`, `0--0-->1--0-->2`, only state 2 accepting, seeded with `{0, 1}`.
+    #[test]
+    fn reverse_with_a_genuine_multi_state_seed() {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![2]);
+        let mut fa = Fa {
+            q0: 0,
+            q: 3,
+            alphabet_size: 1,
+            o: vec![0, 0, 1],
+            d: vec![d0, d1, BTreeMap::new()],
+        };
+        let old_initial: BTreeSet<usize> = [0, 1].into_iter().collect();
+        let new_initial = fa.reverse(&old_initial);
+
+        assert_eq!(new_initial, [2].into_iter().collect::<BTreeSet<_>>());
+        assert_eq!(fa.o, vec![1, 1, 0], "both seed states are now accepting");
+
+        let dfa = crate::determinize::subset_construction(&fa, &new_initial);
+        assert!(dfa.accepts_word(&[0]), "0 must be accepted");
+        assert!(dfa.accepts_word(&[0, 0]), "00 must be accepted");
+        assert!(!dfa.accepts_word(&[]), "empty word must be rejected");
+        assert!(
+            !dfa.accepts_word(&[0, 0, 0]),
+            "000 must be rejected (dead end)"
+        );
+    }
+
+    proptest! {
+        /// Tier-4 sanity check named directly in the unit brief: reversing twice (with
+        /// a re-determinize in between, since `reverse` itself only ever produces an
+        /// NFA-shaped result) returns to the original language. This is the same
+        /// "Brzozowski double-reversal" property `CLAUDE.md`'s correctness ladder
+        /// names as a Tier-4 invariant, minus the minimization step (not needed to
+        /// observe language equality via `accepts_word`).
+        #[test]
+        fn double_reverse_preserves_language(
+            fa in arb_total_dfa(5, 2),
+            word in prop::collection::vec(0i32..2, 0..5),
+        ) {
+            let mut once = fa.clone();
+            let seed1: BTreeSet<usize> = [once.q0].into_iter().collect();
+            let new_initial1 = once.reverse(&seed1);
+            let mut twice = crate::determinize::subset_construction(&once, &new_initial1);
+
+            let seed2: BTreeSet<usize> = [twice.q0].into_iter().collect();
+            let new_initial2 = twice.reverse(&seed2);
+            let thrice = crate::determinize::subset_construction(&twice, &new_initial2);
+
+            prop_assert_eq!(fa.accepts_word(&word), thrice.accepts_word(&word));
+        }
+
+        /// The DIRECT reversal property (adversarial-review finding: double-reversal
+        /// alone is self-cancelling and can survive a symmetric fault in `reverse`) —
+        /// `L(reverse(A)) == reverse(L(A))` — checked over genuine NFAs (nondeterminism,
+        /// partial transition tables, random `q0`), not just `arb_total_dfa`'s total
+        /// DFAs, since `reverse`'s real inputs are exactly those shapes.
+        #[test]
+        fn reverse_computes_the_reversed_language(
+            fa in arb_nfa_with_q0(5, 3),
+            word in prop::collection::vec(0i32..3, 0..5),
+        ) {
+            let mut reversed_fa = fa.clone();
+            let seed: BTreeSet<usize> = [fa.q0].into_iter().collect();
+            let new_initial = reversed_fa.reverse(&seed);
+            let reversed_dfa = crate::determinize::subset_construction(&reversed_fa, &new_initial);
+
+            let reversed_word: Vec<i32> = word.iter().rev().copied().collect();
+            prop_assert_eq!(fa.accepts_word(&word), reversed_dfa.accepts_word(&reversed_word));
+        }
+    }
+
+    // --- star_states / concat_states (FA.java:97-124) ---
+
+    #[test]
+    fn star_states_builds_kleene_star_nfa() {
+        // A accepts exactly the single word "1" (symbol 1): q0=0 --1--> 1 (accepting,
+        // dead end).
+        let mut d0 = BTreeMap::new();
+        d0.insert(1, vec![1]);
+        let a = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d0, BTreeMap::new()],
+        };
+        let mut n = a.clone();
+        Fa::star_states(&a, &mut n);
+
+        assert_eq!(n.q0, 2);
+        assert_eq!(n.q, 3);
+        assert!(n.is_accepting(n.q0), "star always accepts the empty word");
+        for word in [vec![], vec![1], vec![1, 1], vec![1, 1, 1]] {
+            assert!(n.accepts_word(&word), "1* must accept {word:?}");
+        }
+        for word in [vec![0], vec![1, 0], vec![0, 1]] {
+            assert!(!n.accepts_word(&word), "1* must reject {word:?}");
+        }
+    }
+
+    #[test]
+    fn concat_states_builds_concatenation_nfa() {
+        // "first" accepts exactly {"0"}; "other" accepts exactly {eps, "1"} (so
+        // eps is in L(other), which happens to mask the leaked-language quirk
+        // documented on `Fa::concat_states` and pinned below).
+        let mut d_first0 = BTreeMap::new();
+        d_first0.insert(0, vec![1]);
+        let first = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d_first0, BTreeMap::new()],
+        };
+        let mut d_other0 = BTreeMap::new();
+        d_other0.insert(1, vec![1]);
+        let other = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 1], // q0 accepting: eps is in L(other)
+            d: vec![d_other0, BTreeMap::new()],
+        };
+        let original_q = first.q;
+        let mut n = first.clone();
+        Fa::concat_states(&other, &mut n, original_q);
+
+        assert_eq!(n.q, 4);
+        assert_eq!(
+            n.q0, 0,
+            "concat_states never touches q0 -- inherited from the `first` clone"
+        );
+        for word in [vec![0], vec![0, 1]] {
+            assert!(
+                n.accepts_word(&word),
+                "{word:?} should be in {{0}}.{{eps,1}} = {{0, 01}}"
+            );
+        }
+        for word in [vec![], vec![1], vec![1, 0], vec![0, 0]] {
+            assert!(!n.accepts_word(&word), "{word:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon() {
+        // Ported Walnut bug (candidate for docs/WALNUT-BUGS.md): `concatStates`
+        // reuses `mergeInTransitions`, which is correct for `starStates` (old final
+        // states of a starred automaton SHOULD remain accepting) but never clears
+        // `first`'s old accepting flags for concatenation. So whenever eps is NOT in
+        // the second operand's language, the raw concatenation-NFA's language is
+        // `L(first) union L(first).L(other)` instead of the documented
+        // `L(first).L(other)` -- L(first) leaks through, unminimized/undeterminized.
+        // Ported verbatim per CLAUDE.md's mechanical-port rule.
+        let mut d_first0 = BTreeMap::new();
+        d_first0.insert(0, vec![1]);
+        let first = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d_first0, BTreeMap::new()],
+        };
+        let mut d_other0 = BTreeMap::new();
+        d_other0.insert(1, vec![1]);
+        let other = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1], // q0 NOT accepting: eps is NOT in L(other)
+            d: vec![d_other0, BTreeMap::new()],
+        };
+        let original_q = first.q;
+        let mut n = first.clone();
+        Fa::concat_states(&other, &mut n, original_q);
+
+        // Correct concatenation {"0"}.{"1"} = {"01"} only:
+        assert!(n.accepts_word(&[0, 1]), "01 must be accepted");
+        // But the bare "0" is ALSO accepted -- documents the quirk, not the intended
+        // semantics ("first"'s own old-final-state acceptance was never cleared).
+        assert!(
+            n.accepts_word(&[0]),
+            "documents FA.concatStates' leaked-first-language quirk, see module docs"
+        );
+    }
+
+    #[test]
+    fn concat_states_quirk_uses_others_state_zero_not_others_q0() {
+        // Ported Walnut bug (candidate for docs/WALNUT-BUGS.md): `FA.concatStates`
+        // (FA.java:107-124) splices in `N.t.getEntriesNfaD(originalQ)` -- i.e.
+        // `other`'s state INDEX 0 shifted into `n` -- as the "continue into `other`"
+        // transitions for each of `first`'s old final states, rather than `other`'s
+        // actual initial state `other.q0`. This is silently correct only when
+        // `other.q0 == 0`, which is NOT guaranteed in general -- confirmed reachable
+        // via a hand-authored `.txt` file, since `AutomatonReader` sets `q0` to
+        // whichever state is declared first in the file, not necessarily state 0 (see
+        // this method's doc comment / docs/WALNUT-BUGS.md WB-008). Contrast
+        // `star_states`, which correctly uses `automaton.q0` (see
+        // `star_states_builds_kleene_star_nfa` above).
+        //
+        // `first` accepts exactly {"0"}. `other` (q0 = 1, NOT 0) accepts `0.1*`:
+        // q0=1 --0--> state 0 (accepting), and state 0 self-loops on symbol 1 while
+        // remaining accepting -- so state 0 is very much reachable, not a distractor.
+        // The mathematically correct concatenation is {"0"}.(0.1*) = "00", "001", ...
+        // -- in particular "00" must be accepted and "01" must NOT be. The ported bug
+        // instead splices state-INDEX-0's transitions (symbol 1, self-loop) onto
+        // `first`'s final state, so it's exactly backwards: "00" is rejected and "01"
+        // is accepted.
+        let mut d_first0 = BTreeMap::new();
+        d_first0.insert(0, vec![1]);
+        let first = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d_first0, BTreeMap::new()],
+        };
+        let mut d_other0 = BTreeMap::new();
+        d_other0.insert(1, vec![0]); // distractor: state 0 --1--> state 0, unreachable from q0=1
+        let mut d_other1 = BTreeMap::new();
+        d_other1.insert(0, vec![0]); // real: q0=1 --0--> state 0 (accepting)
+        let other = Fa {
+            q0: 1,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 0],
+            d: vec![d_other0, d_other1],
+        };
+        assert!(other.accepts_word(&[0]), "sanity: L(other) = 0.1*");
+        assert!(!other.accepts_word(&[1]), "sanity: L(other) = 0.1*");
+        assert!(
+            other.accepts_word(&[0, 1]),
+            "sanity: L(other) = 0.1* (not just {{\"0\"}})"
+        );
+        assert!(
+            other.accepts_word(&[0, 1, 1]),
+            "sanity: L(other) = 0.1* (not just {{\"0\"}})"
+        );
+
+        let original_q = first.q;
+        let mut n = first.clone();
+        Fa::concat_states(&other, &mut n, original_q);
+
+        // Documents the quirk: the mathematically correct "00" is rejected...
+        assert!(
+            !n.accepts_word(&[0, 0]),
+            "documents the quirk: the correct concatenation string is dropped"
+        );
+        // ...while "01" (never in L(first).(0.1*)) is incorrectly accepted, because
+        // state-INDEX-0's symbol-1 self-loop was spliced in instead of q0's real
+        // symbol-0 transition.
+        assert!(
+            n.accepts_word(&[0, 1]),
+            "documents the quirk: a wrong string is accepted instead"
+        );
+    }
+
+    proptest! {
+        /// Pins `star_states`' actual language against an independent ground truth
+        /// (adversarial-review finding: only one hand-built shape was previously
+        /// exercised, and `automaton.q0` accepting / having incoming edges was never
+        /// generated). A future refactor that breaks the Kleene-star construction
+        /// while every hand-written test still passes would be caught here.
+        #[test]
+        fn star_states_computes_kleene_star_over_random_nfas(
+            a in arb_nfa_with_q0(4, 2),
+            word in prop::collection::vec(0i32..2, 0..5),
+        ) {
+            let mut n = a.clone();
+            Fa::star_states(&a, &mut n);
+            prop_assert_eq!(n.accepts_word(&word), star_accepts(&a, &word));
+        }
+
+        /// Pins `concat_states`' ACTUAL (quirky) language — `L(a) ∪ L(a)·L(b)` with
+        /// `b` read from state INDEX 0, not `b.q0` — against an independent ground
+        /// truth (`concat_quirk_accepts`), over random NFAs including `q0 != 0` on
+        /// both operands. This is deliberately NOT a "concat is correct" test (it
+        /// isn't, per WB-008/WB-009); it exists so a future refactor that
+        /// half-fixes one of the two documented bugs without updating both this test
+        /// AND the doc comment gets caught immediately.
+        #[test]
+        fn concat_states_matches_the_documented_quirks_exactly(
+            a in arb_nfa_with_q0(4, 2),
+            b in arb_nfa_with_q0(4, 2),
+            word in prop::collection::vec(0i32..2, 0..5),
+        ) {
+            let original_q = a.q;
+            let mut n = a.clone();
+            Fa::concat_states(&b, &mut n, original_q);
+
+            let mut b_index0 = b.clone();
+            b_index0.q0 = 0;
+            prop_assert_eq!(n.accepts_word(&word), concat_quirk_accepts(&a, &b_index0, &word));
+        }
+    }
+
+    // --- canonicalize (FA.java:148-214) ---
+
+    #[test]
+    fn canonicalize_prunes_entries_with_empty_destination_list() {
+        // Mirrors FATest.canonizeInternal_prunesEntriesWithEmptyDestinationList:
+        // state 1 has a transition on symbol 0 to an EMPTY destination list
+        // (constructible only via direct raw-`Fa` manipulation). Since there is
+        // nothing to remap, the entry must be pruned entirely rather than kept as an
+        // empty list.
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1]); // state 0 --0--> state 1 (real transition)
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![]); // state 1 --0--> {} (empty destination list)
+        let mut fa = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 1,
+            o: vec![0, 1],
+            d: vec![d0, d1],
+        };
+
+        fa.canonicalize();
+
+        assert_eq!(fa.q0, 0);
+        assert_eq!(fa.q, 2);
+        assert_eq!(fa.o, vec![0, 1]);
+        assert_eq!(fa.d[0].get(&0), Some(&vec![1]));
+        assert!(
+            fa.d[1].is_empty(),
+            "the empty-destination entry was pruned entirely"
+        );
+    }
+
+    #[test]
+    fn canonicalize_drops_forward_unreachable_states_and_bfs_renumbers() {
+        // 3 states: q0=1 <-> 2 (a 2-cycle); state 0 is unreachable from q0 even though
+        // it has an outgoing transition of its own.
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![2]);
+        let mut d2 = BTreeMap::new();
+        d2.insert(0, vec![1]);
+        let mut fa = Fa {
+            q0: 1,
+            q: 3,
+            alphabet_size: 1,
+            o: vec![0, 0, 1],
+            d: vec![d0, d1, d2],
+        };
+
+        fa.canonicalize();
+
+        assert_eq!(fa.q0, 0, "the BFS root always becomes state 0");
+        assert_eq!(fa.q, 2, "the unreachable state was dropped");
+        assert!(fa.accepts_word(&[0]), "old q0(=1) --0--> old 2 (accepting)");
+    }
+
+    #[test]
+    fn canonicalize_is_a_noop_on_a_zero_state_automaton() {
+        let mut fa = Fa {
+            q0: 0,
+            q: 0,
+            alphabet_size: 2,
+            o: vec![],
+            d: vec![],
+        };
+        fa.canonicalize();
+        assert_eq!(fa.q, 0);
+    }
+
+    proptest! {
+        /// `canonicalize` must not change the language of any state that survives it
+        /// (in particular, `q0` always survives, since it is the BFS root) -- checked
+        /// via `accepts_word` before vs. after, since exact state identity isn't the
+        /// invariant this project cares about (`CLAUDE.md` prime directive #1).
+        ///
+        /// Uses `arb_nfa_with_q0`, not `arb_total_dfa` (adversarial-review finding: a
+        /// total-DFA-only, `q0`-always-`0` generator makes every destination of every
+        /// surviving row forward-reachable by construction, so the prune-on-empty-
+        /// remap branch at `canonicalize`'s `if !remapped.is_empty()` check is a
+        /// guaranteed no-op on every generated case — real nondeterminism/partial
+        /// rows/random `q0` are needed to actually exercise dropped-destination
+        /// pruning here, on top of the dedicated hand-written unit test above).
+        #[test]
+        fn canonicalize_preserves_language(
+            fa in arb_nfa_with_q0(6, 2),
+            word in prop::collection::vec(0i32..2, 0..5),
+        ) {
+            let before = fa.accepts_word(&word);
+            let mut canon = fa;
+            canon.canonicalize();
+            prop_assert_eq!(before, canon.accepts_word(&word));
+        }
     }
 }
