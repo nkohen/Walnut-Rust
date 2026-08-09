@@ -26,11 +26,18 @@
 //! coupled in one flat Java package and cannot be split across crates without
 //! breaking mechanical fidelity (kit-findings #1/#2). A full file-by-file
 //! KEEP/DROP + boundary map of `Automata/` is a Phase 0 deliverable.
+//!
+//! Also here (Phase 3a, U0a): [`logging`], the progress-reporting/log-buffer state
+//! ported from Java's `Main/Logging.java`. Despite its Java package, 121 of its call
+//! sites are inside `Automata/` (this crate's own scope), so a `wr-cli`-resident
+//! placement would invert the crate dependency graph — see that module's docs for
+//! the full crate-boundary reasoning.
 
 pub mod automaton;
 pub mod determinize;
 pub mod equiv;
 pub mod fa;
+pub mod logging;
 pub mod logicalops;
 pub mod minimize;
 pub mod numsys;
