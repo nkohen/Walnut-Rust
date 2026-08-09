@@ -27,6 +27,7 @@
 //! breaking mechanical fidelity (kit-findings #1/#2). A full file-by-file
 //! KEEP/DROP + boundary map of `Automata/` is a Phase 0 deliverable.
 
+pub mod automaton;
 pub mod determinize;
 pub mod equiv;
 pub mod fa;
