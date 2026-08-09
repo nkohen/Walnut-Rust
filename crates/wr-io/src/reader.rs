@@ -86,6 +86,13 @@ pub enum ReadError {
     },
     /// A transition named a destination state with no `<id> <output>` block.
     UndeclaredDestState(usize),
+    /// A header line was followed by no state declarations at all (a 0-state `Fa` is
+    /// a valid, harmless value everywhere else in this crate — `trim`/`minimize`/
+    /// `Fa::is_language_empty` all pass it through — but this reader has no `q0` to
+    /// report for it, since Walnut's own file format has no way to declare one; the
+    /// closest real Walnut behavior would be a file containing just `false`, which
+    /// this reader already reports as [`ReadError::UnsupportedTrivialAutomaton`]).
+    NoStates,
     /// Declared state ids weren't exactly `0..Q` (see module docs).
     NonDenseStateIds,
     /// Propagated from the auto-determinize-on-load step.
@@ -198,6 +205,13 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
     }
 
     let q = declaration_order.len();
+    if q == 0 {
+        // A header with no state blocks at all — vacuously "dense" (both sides of
+        // the check below are empty), but there is no q0 to report. Distinct from
+        // NonDenseStateIds: this is a real Walnut file shape (a degenerate but
+        // syntactically valid header-only file), not a corrupt one.
+        return Err(ReadError::NoStates);
+    }
     if output.len() != q || (0..q).any(|i| !output.contains_key(&i)) {
         return Err(ReadError::NonDenseStateIds);
     }
@@ -548,6 +562,21 @@ mod tests {
         assert!(matches!(
             read_automaton_txt(&path),
             Err(ReadError::NonDenseStateIds)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn header_only_file_is_an_error_not_a_panic() {
+        // Regression test for a reviewer-found panic: a header with no state blocks
+        // at all used to index declaration_order[0] on an empty Vec.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-nostates-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("header_only.txt");
+        std::fs::write(&path, "msd_2\n").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::NoStates)
         ));
         std::fs::remove_dir_all(&dir).ok();
     }

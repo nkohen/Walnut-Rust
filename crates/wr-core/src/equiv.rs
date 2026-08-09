@@ -16,6 +16,23 @@
 //! Scope note: acceptance is treated as a plain 0/1 bit here (`Fa::is_accepting`), not
 //! Walnut's more general DFAO word-output value — matches this crate's current scope
 //! (predicate automata only); revisit when DFAO support lands.
+//!
+//! **Known gap, flagged by the Phase-1 spike's final integration review (not yet
+//! fixed): this module only checks [`Fa::alphabet_size`] (an integer), never symbol
+//! *content* or per-track *order*.** `Fa` is deliberately track-agnostic (symbols are
+//! pre-encoded integers, see the `fa` module docs), so it has no way to know whether
+//! "symbol 1" means the same digit tuple on both sides being compared — that's a
+//! property of the `automaton::Automaton` layer (its `alphabet`/`encoder`), which
+//! this module never sees. A caller comparing two `Automaton`s built from
+//! *differently-ordered* alphabets could get a confidently wrong "equivalent" or
+//! "not equivalent" verdict with no diagnostic. Every call site so far (this crate's
+//! own tests, `wr-logic`'s, and `tests/differential`) happens to compare
+//! same-alphabet automata, so this hasn't produced a wrong answer yet — but nothing
+//! enforces it. `tests/differential/tests/spike_ei_i_lt_x.rs` works around this by
+//! asserting `Automaton::alphabet` equality explicitly before calling into here;
+//! that pattern (or a real content-aware check added to `Automaton`, since `Fa` alone
+//! can't express one) should be revisited before this oracle is used for genuinely
+//! multi-track differential testing (Phase 3+).
 
 use crate::fa::Fa;
 use std::collections::BTreeMap;

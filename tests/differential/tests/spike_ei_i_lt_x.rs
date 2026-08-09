@@ -31,9 +31,21 @@ fn ei_i_lt_x_matches_real_walnut_output() {
         wr_io::reader::read_automaton_txt(&fixture).expect("fixture must parse cleanly");
 
     // Sanity on the reduced automaton's shape before the language check, so a
-    // failure here doesn't get misdiagnosed as an oracle bug.
+    // failure here doesn't get misdiagnosed as an oracle bug. Critically, this
+    // includes `alphabet` equality, not just `alphabet_size`: `wr_core::equiv` works
+    // on raw `Fa` (bare integer symbols) and only checks alphabet_size, never track
+    // content or order — it has no way to know "symbol 1" means the same digit on
+    // both sides. That's true here only because both automata happen to be built
+    // from an identical single [0, 1] track; asserting it explicitly turns a future
+    // silent track-order mismatch (e.g. a multi-track differential case) into a
+    // clear failure here rather than a wrong "equivalent" from the oracle.
     assert_eq!(ours.label, vec!["x".to_string()]);
     assert_eq!(ground_truth.alphabet, vec![vec![0, 1]]);
+    assert_eq!(
+        ours.alphabet, ground_truth.alphabet,
+        "the oracle below only compares alphabet_size, not content/order — this \
+         assertion is what actually guarantees symbol ids mean the same digit on both sides"
+    );
 
     let ours_total = {
         let mut fa = ours.fa.clone();
