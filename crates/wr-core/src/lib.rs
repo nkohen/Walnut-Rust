@@ -27,15 +27,6 @@
 //! breaking mechanical fidelity (kit-findings #1/#2). A full file-by-file
 //! KEEP/DROP + boundary map of `Automata/` is a Phase 0 deliverable.
 
+pub mod equiv;
+pub mod fa;
 pub mod numsys;
-
-/// Placeholder so the crate compiles from the first commit; replace as the port lands.
-pub fn placeholder() {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        super::placeholder();
-    }
-}

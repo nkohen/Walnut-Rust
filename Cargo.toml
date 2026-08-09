@@ -22,3 +22,5 @@ rust-version = "1.75"
 # Keep the tree lean; add deps deliberately (each Java dep needs a justified Rust
 # answer — see DESIGN.md §6 dependency-replacement table).
 [workspace.dependencies]
+# DESIGN.md §5 Tier 4 (mandatory, Walnut-independent property invariants).
+proptest = "1"
