@@ -188,10 +188,11 @@ panic), and a minimal `wr-io` `.txt` reader. **Exit criterion met**: `tests/diff
 checks `∃i (i<x)` over msd base-2 against real `walnut-java` output via the Rust-native equivalence
 oracle — green. `cargo test --workspace` is green throughout; `cargo fmt`/`clippy` clean.
 
-**Phase 2 in progress** (plan at `.claude/plans/toasty-napping-wall.md`, adversarially reviewed before
+**Phase 2 complete** (plan at `.claude/plans/toasty-napping-wall.md`, adversarially reviewed before
 execution — the first draft's unit ordering was dependency-backwards in several places, corrected before
-any code landed). Toolchain bumped to current stable first (U0, `206413a`). Units landed so far, each
-through the full implementer → two-independent-Opus-reviewer → fixer loop:
+any code landed). Toolchain bumped to current stable first (U0, `206413a`). All units landed, each
+through the full implementer → two-independent-reviewer (model always different from the author) →
+fixer loop:
 - **U1** (`23e030d`): `fa.rs` completion — `reverse`, `star_states`/`concat_states`, `canonicalize`. Found
   and logged two genuine Walnut bugs in `concatStates` (WB-008/WB-009, both confirmed live against the
   real `walnut-java` CLI during review).
@@ -212,9 +213,36 @@ through the full implementer → two-independent-Opus-reviewer → fixer loop:
   because `wr-core`'s own `NumberSystem` needs to call it 10× and `wr-logic` must depend on `wr-core`, not
   the reverse — a real incoming-edge coupling `docs/BOUNDARY-MAP.md`'s original analysis missed (now
   corrected there and in `docs/DESIGN.md`'s crate-mapping table).
+- **U7** (`0fe14f7`): `numsys.rs` — `NumberSystem`'s positive-base msd/lsd surface (addition, comparison,
+  base-change/constant automata, arithmetic/multiplication/division), Opus-authored as the largest,
+  hardest-reasoning file in this phase. Negative-base logic deleted outright (`docs/BOUNDARY-MAP.md`
+  §4.1's already-made call), base-change dropped entirely (its sole real caller is the DROP-scope `split`
+  command), file-backed custom bases (`msd_fib`, …) confirmed out of scope and deferred to `wr-io`.
+- **U8** (`7abb42a`): hardened the equivalence oracle — added `Automaton`-level track-structure checking
+  and De Morgan property tests. Adversarial review found the new function's own doc overclaimed what it
+  caught (label-permuted tracks with identical per-position alphabets are NOT detected and get a silently
+  wrong verdict — a real, common-case gap, now honestly documented and pinned by a dedicated test rather
+  than the closed claim an earlier draft made).
+- **U9** (`0e0be83`): completed the Tier-4 core property suite — audited what already existed (most of
+  DESIGN.md §5's named properties landed incidentally during U1–U8) and filled the one gap, quantifier
+  duality (`∀y φ ≡ ¬∃y ¬φ`), checked against an independent brute-force oracle.
+- **U9a** (`4ddc930`): the cross-oracle minimizer check. DESIGN.md's plan to reuse
+  `RustConstantTermSequences`'s "Moore minimizer" for this turned out to rest on a function that doesn't
+  exist in that repo (verified against its full source and git history) — and a deeper mismatch besides
+  (its `DFAO` type is single-track only, `wr-core`'s automata are not). Per the user's explicit decision,
+  authored a small standalone Moore minimizer from scratch in `wr-cts` instead (fresh code, not a port —
+  `CLAUDE.md`'s mechanical-port rule doesn't apply), cross-checked against the ported Valmari minimizer
+  and a from-scratch brute-force Myhill–Nerode oracle.
 
-Remaining Phase 2 units (see the plan doc for the full dependency-ordered list and rationale): U7
-(`NumberSystem`, base-*k* — the largest, hardest-reasoning file in this phase), U8/U9/U9a
-(equivalence-oracle hardening + the Tier-4 core property suite + a cross-oracle minimizer check against
-the `RustConstantTermSequences` substrate).
+**Phase 2 exit criterion met**: Tier-2 tests and Tier-4 core invariants are green across `wr-core`
+(fa/automaton/product/determinize/logicalops/quantify/numsys/equiv) and the new `wr-cts` cross-check.
+Four new genuine Walnut (Java) bugs found and logged during the port (WB-008–WB-010, all in
+`docs/WALNUT-BUGS.md`, all ported verbatim per the mechanical-port rule, not fixed). `cargo test
+--workspace` is green throughout; `cargo fmt`/`clippy` clean.
+
+Not yet started: Phase 3 (`wr-logic`'s parser/quantifier-elimination/boolean-op formula layer, `wr-io`,
+`wr-cli`; the full FOL decider) — needs the user's explicit go-ahead per
+`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating. Deferred into Phase 3 by Phase 2's own scope calls:
+`Morphism`, `WordAutomaton`, `AutomatonDFA`'s regex constructors, `BricsConverter`, `Transducer`,
+`Infinite`, `Search/ProductBFS`, `convertNS`, and `NumberSystem`'s file-backed custom-base loading.
 per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
