@@ -33,4 +33,5 @@ pub mod equiv;
 pub mod fa;
 pub mod minimize;
 pub mod numsys;
+pub mod product;
 pub mod trim;
