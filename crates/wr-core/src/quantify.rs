@@ -392,4 +392,246 @@ mod tests {
             Err(QuantifyError::NotFreeVariable("z".to_string()))
         );
     }
+
+    // ------------------------------------------------- Tier-4: quantifier duality (U9)
+    //
+    // DESIGN.md §5 Tier 4 traceability (this table is U9's audit result, not a
+    // restatement of coverage this unit wrote -- see U9's final report for the full
+    // per-property assessment):
+    //   * `L(minimize(A)) == L(A)`, idempotence        -> wr-core/src/minimize.rs
+    //     (`minimize_preserves_language`, `minimize_is_idempotent`)
+    //   * `L(determinize(A)) == L(A)`, Brzozowski
+    //     vs. direct minimize                           -> wr-core/src/determinize.rs
+    //     (`determinize_preserves_language`,
+    //     `brzozowski_yields_the_minimal_dfa_cross_checked_against_direct_minimize`)
+    //   * De Morgan across product                       -> wr-core/src/logicalops.rs
+    //     (`de_morgan_not_and_equals_or_of_nots`, `de_morgan_not_or_equals_and_of_nots`)
+    //   * adder/comparator/msd-lsd number-system laws     -> wr-core/src/numsys.rs
+    //     (`addition_automaton_computes_real_addition`,
+    //     `comparison_automata_agree_with_the_integer_order`,
+    //     `msd_and_lsd_agree_after_reversal`)
+    //   * projection soundness (∃)                        -> wr-logic/src/quantify.rs
+    //     (`quantify_matches_brute_force_existential`)
+    //   * quantifier duality: `∀y φ ≡ ¬∃y ¬φ`              -> HERE (U9):
+    //     `forall_via_not_exists_not_matches_brute_force_universal`, below. NOTE
+    //     (adversarial-review finding, both reviewers independently confirmed by
+    //     exhaustive sweep): this property is checked only in the regime where
+    //     `quantify`'s internal leading-zero fixup is a no-op. The regime where the
+    //     fixup does real work, COMPOSED WITH negation, is NOT covered by any test in
+    //     this repository — see the section doc comment below for the honest account
+    //     (an earlier version of this comment claimed that gap didn't cost anything;
+    //     it does, and the gap is real).
+    //
+    // (The cross-oracle "Moore `minimize` agrees with ported Valmari `minimize`"
+    // property is a separate unit, U9a's responsibility -- not built here.)
+    //
+    // # Why this test lives here, in `wr-core`, not `wr-logic`
+    //
+    // `∀y φ ≡ ¬∃y ¬φ` is stated at the logic layer, but every primitive it composes --
+    // [`quantify`] (this module) and [`crate::logicalops::not`] -- is a `wr-core`
+    // primitive; `wr_logic::quantify::exists` is a thin one-line delegation to
+    // [`quantify`] (see this module's own docs) that adds nothing able to change this
+    // property. There is no formula/AST/`Predicate` layer yet for a general `forall`
+    // command to live in (that is explicitly out of scope for this unit, deferred to a
+    // future `wr-cli`/`wr-logic` formula-evaluation unit) -- this test exists solely to
+    // pin the algebraic law using exactly the primitives that exist today. Co-locating
+    // it with `quantify`'s own direct-coverage smoke suite (added by U6, above) follows
+    // this codebase's established convention of co-locating Tier-4 property tests with
+    // the module under test (see `minimize.rs`, `determinize.rs`, `logicalops.rs`,
+    // `numsys.rs`, all audited above).
+    //
+    // # The ground truth, and why it is independent (not circular)
+    //
+    // `brute_force_forall_y` below decides "for every `y`-word of the same length as
+    // `x_digits`, does the ORIGINAL (pre-negation) automaton `phi` accept?" by exhaustive
+    // enumeration using `Fa::accepts_word` on `phi` itself -- it never calls `quantify`
+    // or `not`. Comparing the real `not`+`quantify`+`not` composition's answer against
+    // this checks the composition against direct automaton semantics, not a restatement
+    // of the composition in different words (checking "¬∃¬ agrees with itself" would
+    // pass even if `not` and `quantify` shared a compensating bug -- this cannot).
+    //
+    // # Neutralizing the leading-zero fixup — what this buys, and what it honestly
+    // # does NOT cover (adversarial-review correction: an earlier version of this
+    // # section overclaimed both halves of this argument)
+    //
+    // `quantify`'s internal `fix_leading_zeros_problem` step exists to make the
+    // quantified language closed under leading zeros. To keep this property's ground
+    // truth (`brute_force_forall_y`) simple -- pure per-length ∃/∀ semantics, no
+    // zero-closure logic of its own to get independently right -- `phi` below is built
+    // so the fixup is provably a no-op on it, via `arb_self_looping_zero_two_track`,
+    // which pins state `q0` (only) to self-loop on the reduced "x = 0" symbol, for both
+    // values of `y` -- the SAME `pin_zero_class` shape `wr_logic::quantify`'s own
+    // `quantify_matches_brute_force_existential` already uses, not a stronger
+    // whole-automaton version. **A stronger, every-state pin was tried in an earlier
+    // version of this test and REMOVED**: two independent adversarial reviewers
+    // exhaustively verified the weaker `q0`-only pin is already sufficient (a `q0`
+    // self-loop is preserved by ANY language-preserving quotient/subset-construction,
+    // since Nerode-equivalence classes and reachable-metastate unions both map a
+    // self-looping representative to itself) and that the every-state version
+    // needlessly killed genuine random structure on roughly half the generated cases
+    // (any state whose "x=1" transitions also happened not to matter).
+    //
+    // With `q0` alone pinned: `not(phi)`'s `q0`-representative block still self-loops
+    // on "x=0" (accepting-ness of that block may flip, but the self-loop survives
+    // `not`'s `totalize`/`just_minimize` for the reason above), so after `quantify`'s
+    // projection the reduced automaton's `q0` self-loops on the projected "x=0"
+    // symbol, its zero-closure is exactly `{q0}`, and `fix_leading_zeros_problem`
+    // changes nothing. (One honestly-checked exception, found by adversarial review:
+    // when `L(¬phi) = ∅`, `minimize` can strip ALL transitions including that self-loop
+    // -- but the fixup is STILL neutral there too, because forcing a self-loop onto a
+    // language that is already `∅` cannot add anything. Both cases end at "the fixup
+    // doesn't change this specific composition's answer", just via two different
+    // arguments, not one -- an earlier version of this comment asserted only the
+    // first case's mechanism as if it were universal, which was false on exactly the
+    // `L(¬phi) = ∅` shape.)
+    //
+    // **What this does NOT cover, and no other test in this repository covers either
+    // (adversarial-review finding, confirmed by exhaustive sweep on the UNPINNED
+    // generator: ~4% of cases disagree with pure per-length ∀, and the fixup's actual
+    // "zero-closed" semantics still disagrees with a smaller but nonzero fraction):**
+    // the regime where the leading-zero fixup does real, non-trivial work IN
+    // COMPOSITION WITH negation. `wr_logic::quantify`'s own closure test
+    // (`quantified_language_is_closed_under_leading_zeros`) only checks
+    // self-consistency (`L(w) == L(0w)`) against `quantify` alone, never against an
+    // independent oracle, and never composed with `not`. That is a genuine, currently
+    // open gap in this project's Tier-4 coverage, not a redundant case -- flagging it
+    // here plainly rather than claiming (as an earlier version of this comment did)
+    // that covering it would add "no extra bug-catching power". A future unit wanting
+    // to close it would need an oracle that computes the fixup's own zero-closure
+    // semantics independently (a small BFS over `phi` directly, not reusing
+    // `fix_leading_zeros_problem`/`quantify`), generated over the UNPINNED automaton
+    // family.
+    //
+    // `phi` is trimmed at construction time so the FIRST of the two explicit `not`
+    // calls below cannot hit `docs/WALNUT-BUGS.md` WB-001 (`not`'s `just_minimize`
+    // calls `minimize` directly with no trim of its own -- the same reasoning
+    // `logicalops.rs`'s De Morgan properties document for their own `not` calls).
+    // WB-001's actual precondition is every state forward-reachable from `q0` (see
+    // `minimize.rs`'s "q0 aliasing quirk" section). The SECOND `not` call (on
+    // `exists_not_phi`, `quantify`'s output) is safe for a DIFFERENT, specific reason,
+    // not just "because `quantify` trims internally": `quantify`'s own
+    // `subset_construction` call never materializes an unreachable metastate (every
+    // metastate it emits is discovered by BFS from the seed), so every state `minimize`
+    // sees there is already forward-reachable, and Valmari's quotient cannot orphan a
+    // reachable block. If `subset_construction` ever changed to pre-allocate or
+    // totalize a dead/unreachable metastate, this argument (and this test's safety
+    // from WB-001) would need re-deriving, not just re-asserting.
+
+    use proptest::prelude::*;
+
+    /// A 2-track (`y`, `x`) automaton where ONLY `q0` is forced to deterministically
+    /// self-loop on the symbol "x = 0" (for both values of `y`) -- the same
+    /// `pin_zero_class` shape `wr_logic::quantify`'s `arb_two_track` already uses for
+    /// its own ∃-only property, not a stronger whole-automaton version (see the
+    /// section doc comment above for why the weaker pin is enough). Every OTHER
+    /// state's "x = 0" transitions, and every state's "x = 1" transitions, are free --
+    /// genuine random structure everywhere except the one pinned edge. Trimmed at the
+    /// end so every state is reachable from `q0` (see the section doc comment's WB-001
+    /// argument).
+    fn arb_self_looping_zero_two_track(q_max: usize) -> impl Strategy<Value = Automaton> {
+        (1..=q_max).prop_flat_map(|q| {
+            let o = prop::collection::vec(0i32..=1, q);
+            // Free destinations for every (state, symbol) pair EXCEPT q0's two
+            // "x = 0" entries, which are pinned below.
+            let dest_y0_x0 = prop::collection::vec(0..q, q);
+            let dest_y1_x0 = prop::collection::vec(0..q, q);
+            let dest_y0_x1 = prop::collection::vec(0..q, q);
+            let dest_y1_x1 = prop::collection::vec(0..q, q);
+            (o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1).prop_map(
+                move |(o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1)| {
+                    let fa = Fa {
+                        q0: 0,
+                        q,
+                        alphabet_size: 4,
+                        o,
+                        d: vec![BTreeMap::new(); q],
+                    };
+                    let mut a = Automaton::new(
+                        fa,
+                        vec![vec![0, 1], vec![0, 1]],
+                        vec!["y".to_string(), "x".to_string()],
+                        vec![Some(true), Some(true)],
+                    );
+                    let zero_y0 = a.encode(&[0, 0]);
+                    let zero_y1 = a.encode(&[1, 0]);
+                    let one_y0 = a.encode(&[0, 1]);
+                    let one_y1 = a.encode(&[1, 1]);
+                    for s in 0..q {
+                        // Free everywhere...
+                        a.fa.d[s].insert(zero_y0, vec![dest_y0_x0[s]]);
+                        a.fa.d[s].insert(zero_y1, vec![dest_y1_x0[s]]);
+                        a.fa.d[s].insert(one_y0, vec![dest_y0_x1[s]]);
+                        a.fa.d[s].insert(one_y1, vec![dest_y1_x1[s]]);
+                    }
+                    // ...except q0's two "x = 0" entries, forced to self-loop: the
+                    // one invariant this generator exists to guarantee.
+                    a.fa.d[0].insert(zero_y0, vec![0]);
+                    a.fa.d[0].insert(zero_y1, vec![0]);
+                    a.fa = trim(&a.fa);
+                    a
+                },
+            )
+        })
+    }
+
+    /// Independent ground truth for `∀y φ(x, y)` at a fixed word length: does `phi`
+    /// (the ORIGINAL, un-negated automaton) accept `(y, x)` for every one of the
+    /// `2^|x_digits|` candidate `y`-words of the same length? Uses only
+    /// `Fa::accepts_word`/`Automaton::encode` on `phi` directly -- never `quantify` or
+    /// `not` -- so it is a genuine oracle, the universal analogue of
+    /// `wr_logic::quantify`'s `brute_force_exists_y`.
+    fn brute_force_forall_y(phi: &Automaton, x_digits: &[i32]) -> bool {
+        let n = x_digits.len();
+        for mask in 0..(1u32 << n) {
+            let word: Vec<i32> = (0..n)
+                .map(|i| {
+                    let y = ((mask >> i) & 1) as i32;
+                    phi.encode(&[y, x_digits[i]])
+                })
+                .collect();
+            if !phi.fa.accepts_word(&word) {
+                return false;
+            }
+        }
+        true
+    }
+
+    proptest! {
+        /// Tier-4 (DESIGN.md §5): quantifier duality, `∀y φ ≡ ¬∃y ¬φ`, built from the
+        /// real [`crate::logicalops::not`] and this module's [`quantify`], checked
+        /// against `brute_force_forall_y`'s independent ground truth. See the section
+        /// doc comment above for the full argument: why the leading-zero fixup is
+        /// provably a no-op on this generator (and, honestly, what regime that leaves
+        /// uncovered), and why the ground truth is not circular. If `not` or `quantify`
+        /// had a plausible subtle bug (e.g. `not` skipping its `totalize` step, or
+        /// `quantify` unioning the wrong destination sets, or negating in the wrong
+        /// place), it would show up as a mismatch between `actual` and this exhaustive
+        /// `phi`-level computation. Default case count (no `proptest_config` override --
+        /// an earlier version of this test capped it at 32, well below this crate's
+        /// established convention for a composed property, with no resource
+        /// justification; nothing here is expensive enough to need one).
+        #[test]
+        fn forall_via_not_exists_not_matches_brute_force_universal(
+            phi in arb_self_looping_zero_two_track(4),
+            x_digits in prop::collection::vec(0i32..2, 0..4),
+        ) {
+            let not_phi = crate::logicalops::not(phi.as_dfa());
+            let mut exists_not_phi = not_phi.into_automaton();
+            quantify(&mut exists_not_phi, &labels(&["y"])).unwrap();
+            // Structural sanity: the quantified track must actually be gone (a
+            // `quantify` that silently no-op'd on projection would otherwise be
+            // compared via a mis-encoded word instead of failing loudly).
+            prop_assert_eq!(&exists_not_phi.label, &vec!["x".to_string()]);
+            let forall_phi = crate::logicalops::not(exists_not_phi.as_dfa());
+
+            let word: Vec<i32> = x_digits
+                .iter()
+                .map(|&d| forall_phi.automaton().encode(&[d]))
+                .collect();
+            let actual = forall_phi.automaton().fa.accepts_word(&word);
+            let expected = brute_force_forall_y(&phi, &x_digits);
+
+            prop_assert_eq!(actual, expected, "mismatch on x = {:?}", x_digits);
+        }
+    }
 }
