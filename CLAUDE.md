@@ -168,6 +168,18 @@ empirical check** (DESIGN.md §9 F3) run and resolved — **decided: defer the e
 determinization surface** (`CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`/`OTF()`), confirming the original KEEP-only-
 `SC`+`BRZ` plan; full evidence + a follow-up scope-comparison (sizing what a smaller cut would cost, in
 case the deferral is ever revisited) in `walnut-java/phase0-artifacts/PROGRESS.md`'s Item 7 entries and
-`docs/DESIGN.md` §9/§10. **Phase 0 is now complete.** Next: the **Phase 1 spike** — base-k DFA + `minimize`
-+ one quantified `eval`, plus the `wr-core` equivalence oracle, differentially checked vs `walnut-java` —
-not yet started, needs the user's explicit go-ahead per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
+`docs/DESIGN.md` §9/§10. **Phase 0 is complete.**
+
+**Phase 1 spike done** (7 commits, `e36e8f7..52e0bcf`; plan at `.claude/plans/fluttering-foraging-spindle.md`):
+`wr-core`'s `Fa` representation, the semantic-equivalence oracle, subset-construction `determinize`,
+`Trimmer`, a faithful port of Valmari minimization (authored by an Opus subagent per the model-tiering
+doctrine — found and documented a genuine Walnut bug in the process, the "q0 aliasing quirk", see
+`minimize.rs`'s module docs), a minimal `Automaton` wrapper + `RichAlphabet` encoding + `less_than_msd`,
+`wr-logic`'s `exists` (∃-quantification + the mandatory leading-zero fixup, also Opus-authored — two
+adversarial-reviewer passes each for the two Opus-authored commits caught and fixed a real reachable
+panic), and a minimal `wr-io` `.txt` reader. **Exit criterion met**: `tests/differential` differentially
+checks `∃i (i<x)` over msd base-2 against real `walnut-java` output via the Rust-native equivalence
+oracle — green. `cargo test --workspace` is green throughout; `cargo fmt`/`clippy` clean.
+
+Not yet started: Phase 2 (mechanical port of the rest of `wr-core`) — needs the user's explicit go-ahead
+per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
