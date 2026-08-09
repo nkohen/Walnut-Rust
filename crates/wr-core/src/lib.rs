@@ -31,6 +31,7 @@ pub mod automaton;
 pub mod determinize;
 pub mod equiv;
 pub mod fa;
+pub mod logicalops;
 pub mod minimize;
 pub mod numsys;
 pub mod product;

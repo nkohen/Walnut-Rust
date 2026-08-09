@@ -253,6 +253,45 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-010 — `AutomatonLogicalOps.leftQuotient` checks the subset containment in the wrong direction
+
+- **Where:** `Automata/AutomatonLogicalOps.java`, `leftQuotient` (`:237-256`), specifically the
+  guard at `:242` (`isSubsetA(A, B)`, i.e. "A's alphabet ⊆ B's alphabet") followed by the call to
+  `rightQuotient(reverse(A), reverse(B), skipSubsetCheck=true)` at `:248`.
+- **What:** `rightQuotient` re-encodes the SECOND operand's transition symbols under the FIRST
+  operand's alphabet (`RichAlphabet.encode` inside `rightQuotient`, `:198`) — which requires the
+  *opposite* containment (second's alphabet ⊆ first's) to be safe. `leftQuotient` checks "A ⊆ B"
+  but then calls `rightQuotient` with A reversed as the FIRST argument and B reversed as the
+  SECOND — so the containment `rightQuotient` actually needs is "B ⊆ A", not "A ⊆ B". It then
+  passes `skipSubsetCheck=true`, disabling `rightQuotient`'s own (correct-direction) guard
+  entirely. The two checks coincide only when the alphabets are equal as sets — which is not
+  guaranteed and not checked.
+- **Trigger:** `leftquo` (or the equivalent CLI/API call) with A's alphabet a proper subset of B's
+  alphabet as a SET — e.g. A over `{0,1}` and B over `{0,1,2}`. `isSubsetA(A, B)` passes (A ⊆ B is
+  true), but the actual re-encoding inside `rightQuotient` needs B's digits to all appear in A's
+  alphabet, which fails for digit `2`. In Java this manifests as `RichAlphabet.encode` hitting
+  `indexOf == -1` and silently producing a corrupt (possibly negative) symbol id — a silent
+  wrong-automaton result, not a crash. Reachable from the plain CLI: `Main/Commands/Quotient.java`
+  reads both operands straight from `.txt` files with no alphabet normalization in between.
+- **Found:** Phase 2, U5 (`logicalops.rs`'s `AutomatonLogicalOps` port), 2026-08-09, while porting
+  `leftQuotient`/`rightQuotient`. Confirmed by direct reading of the guard logic and the
+  re-encoding direction it's meant to protect — not yet run against a live Java reproduction.
+- **Rust port:** `ported verbatim (quirk)` — `wr_core::logicalops::left_quotient` reproduces the
+  same wrong-direction guard. Note the FAILURE MODE differs from Java's, faithfully inheriting an
+  earlier, deliberate crate-wide improvement (not something introduced for this bug):
+  `Automaton::encode` already panics on an out-of-alphabet digit (`PORTING.md`'s error-mapping
+  table calls for a hard error over Java's silent `List.indexOf`-returns-`-1` corruption), so this
+  port surfaces the same underlying guard defect as a clean panic instead of a silently wrong
+  automaton.
+- **Upstream:** not filed. Fix in Java would be checking `isSubsetA(B, A)` (or, more robustly,
+  requiring the alphabets be equal as sets, matching how same-labeled-track merges elsewhere in
+  this codebase are guarded) before the `rightQuotient(reverse(A), reverse(B), true)` call.
+- **Severity:** moderate — silent wrong answer in Java (this port turns it into a clean panic, not
+  a fix); reachable whenever `leftquo`'s two operands have genuinely different (non-equal-as-sets)
+  alphabets, which is a plausible real usage shape, not a contrived corner case.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has
