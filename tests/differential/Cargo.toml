@@ -1,0 +1,12 @@
+[package]
+name = "wr-differential"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+wr-core = { path = "../../crates/wr-core" }
+wr-io = { path = "../../crates/wr-io" }
+wr-logic = { path = "../../crates/wr-logic" }

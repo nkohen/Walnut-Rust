@@ -11,6 +11,7 @@ members = [
     "crates/wr-io",     # Walnut .txt automaton reader/writer (multi-track + NFA), Graphviz
     "crates/wr-cli",    # Prover/Session command dispatch + REPL (binary)
     "crates/wr-cts",    # thin adapter over RustConstantTermSequences primitives (see DESIGN.md §4)
+    "tests/differential", # Rust-vs-real-walnut-java query comparison (Phase 1 spike's exit criterion so far)
 ]
 
 [workspace.package]
