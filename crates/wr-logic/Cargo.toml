@@ -11,6 +11,13 @@ wr-core = { path = "../wr-core" }
 # workspace-root `[workspace.dependencies]` entry. `wr-logic` is the only crate that needs
 # it (the lexer lives here); keep it out of `wr-core`/`wr-io`.
 regex-automata.workspace = true
+# `Token::NumberLiteral`/`Expressions::NumberLiteralExpression` (U2) hold the literal's
+# exact `BigInteger` value, matching `RelationalOperator`/`ArithmeticOperator`'s later
+# (U9) need to compare/arith it losslessly — same justification as the workspace-root
+# entry (`NumberSystem.getConstant`/etc.'s `BigInteger` keys). `TryFrom<&BigInt> for i32`
+# (used for `intValueExact`'s "exact fit or nothing" semantics) is inherent to `num-bigint`
+# itself, so no separate `num-traits` dependency is needed for that.
+num-bigint.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

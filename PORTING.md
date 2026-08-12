@@ -109,6 +109,41 @@ and add a property test that the result is order-independent.
   file-library lookups (the word/function/macro libraries and the number-system cache),
   kept disjoint from whatever field(s) later hold `MetaCommands`/determinize-context
   state. `Session` as a whole should never itself be the `impl PredicateEnv for _` target.
+- **A closed Java `instanceof`-dispatched class hierarchy ports to one Rust `enum`, not
+  one struct per subclass.** Hit for the first time in U2: `Token`/`Operator` (8 concrete
+  subclasses) and `Expression` (6 concrete subclasses) are each a Java abstract base
+  class whose every real field/behavior access is gated by an `instanceof` check
+  narrowing to a **closed disjunction of concrete subclasses** first — sometimes exactly
+  one subclass, but not always: e.g. `RelationalOperator.act`'s `ns.comparison(a.identifier,
+  b.identifier, opp)` narrows `a`/`b` to `(ArithmeticExpression | VariableExpression)`
+  before reading `.identifier` off the still-`Expression`-typed local
+  (`RelationalOperator.java:135-137`), and `ArithmeticOperator`'s `getIntConstantForWord`/
+  `getConstantValue` read a bare `Expression` parameter's `.constant` after only a
+  `NumberLiteralExpression` early-return (`ArithmeticOperator.java:264`, `:275`) — never a
+  *fully generic*, unnarrowed base-type read with no `instanceof` at all (verified for
+  both hierarchies by tracing every call site before applying this ruling, the same
+  "prove the untaken state is unreachable AND unread" bar `PORTING.md`'s
+  `TRUE_FALSE_AUTOMATON`→`Option<bool>` entry above already sets — the earlier draft of
+  this ruling overclaimed "always narrows to ONE concrete subclass," corrected during
+  Phase 3a U2's adversarial review once these multi-subclass call sites were found). For
+  the single-subclass case, one Rust `enum` variant (holding only the fields that
+  subclass actually sets) per concrete Java subclass is the direct translation of
+  `instanceof`-narrowed access — a `match` arm already has exactly the fields in scope
+  that an `instanceof`-then-cast block would. For the closed-disjunction case, add a
+  small `Option`-returning accessor on the enum (e.g. `Expression::identifier`/
+  `Expression::constant` in `expr.rs`) covering exactly the variants that set the field,
+  rather than either a `match` at every call site or a field promoted onto the enum
+  itself. Either way, with no runtime cost and no risk of reading a field a Java subclass
+  left at its default. Do **not** model this as one Rust struct with every field
+  `Option`-wrapped (that's Java's problem shape, not a fix for it) or as a trait object
+  per concrete type (no dynamic-dispatch need has been found; a `match`/accessor suffices
+  everywhere this has come up so far). Where the hierarchy also has its own
+  *sub*-hierarchy of "abstract middle class" (`Operator` between `Token` and its five
+  operator subclasses), fold the middle class's shared fields into a payload struct held
+  by the relevant outer variant (`Token::Operator(Operator)`) rather than adding a second
+  enum layer, unless a later unit finds a real reason to split it further. Full worked
+  examples: `crates/wr-logic/src/token.rs` and `crates/wr-logic/src/expr.rs`'s module
+  docs.
 
 ## Open questions to resolve during Phase 0 (add rulings here)
 

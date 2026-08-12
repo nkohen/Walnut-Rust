@@ -385,6 +385,57 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-013 — `VariableExpression.act` NPEs when the same variable indexes a `{...}`-declared track twice
+
+- **Where:** `Main/EvalComputations/Expressions/VariableExpression.java`, `act` (`:34-48`),
+  specifically `ns.equality.clone()` (`:39`) in the repeated-identifier branch.
+- **What:** `VariableExpression.act`'s `ns` parameter is whatever `Word.act` passed in from
+  `wordAutomaton.getNS().get(i)` (`Word.java:62`). `Automaton.NS` is populated one entry per track by
+  `ParseMethods.parseAlphabetDeclaration` (`Automata/ParseMethods.java:84-109`): a `msd_k`/`lsd_k`
+  token adds a real `NumberSystem` (`:98-103`), but an explicit-alphabet token like `{0,1}` adds a
+  literal `null` (`:91-96`, `bases.add(null)`) — Walnut deliberately supports tracks with no attached
+  number system. `VariableExpression.act`'s FIRST occurrence of a variable never touches `ns` (it
+  just records the identifier), but a REPEATED occurrence of the same variable dereferences
+  `ns.equality` unconditionally. So a word automaton with an explicit-alphabet-declared track,
+  referenced by the SAME index variable more than once in one `eval`/`def` query — e.g. `T[i][i] =
+  @1` where `T`'s second track is declared `{0,1}` rather than `msd_k`/`lsd_k` — throws a real
+  `NullPointerException`, not a `WalnutException`. This is a genuine, user-triggerable crash on
+  syntactically valid input, not dead code or a doc mismatch.
+- **Trigger:** an `eval`/`def` query indexing a `{...}`-declared word-automaton track with a
+  repeated variable, e.g. `T[i][i] = @1` for a `T` whose relevant track has no `msd_k`/`lsd_k` base.
+- **Found:** Phase 3a, U2 adversarial review (`crates/wr-logic/src/expr.rs`'s
+  `VariableExpression::act`), 2026-08-12. Confirmed by direct trace of the call chain
+  (`VariableExpression.java:34-48` -> `Word.java:62` -> `ParseMethods.java:84-109`'s
+  `bases.add(null)` branch), not yet run against a live crash reproduction — the arithmetic/control
+  flow is unambiguous (an unconditional dereference of a value provably `null` on this path).
+- **Rust port:** `ported verbatim (quirk)`, but represented as an explicit, documented
+  `Result::Err` rather than a `panic!`. `VariableExpression::act`'s `ns` parameter is
+  `Option<&NumberSystem>` (`None` standing in for Java's `null`); the repeated-identifier branch
+  returns `Err(ExprError::RepeatedIdentifierMissingNumberSystem)` instead of dereferencing. A
+  `panic!` was deliberately rejected here (unlike, e.g., `relational_op_from_symbol`'s panic for an
+  unreachable-by-construction internal invariant): Java's NPE is an unchecked `RuntimeException`
+  that `Prover.dispatch`'s top-level `catch (RuntimeException e)` (`Prover.java:390`) recovers from
+  — prints a stack trace, the session continues — so an uncaught Rust `panic!` here would be *less*
+  faithful, not more: absent a `catch_unwind` boundary this port doesn't have yet, it would unwind
+  and kill the whole process, the opposite of Java's actual recoverable behavior. (Same reasoning
+  `wr_core::logging`'s module doc already applies to `dedent()`'s `IllegalArgumentException`, and
+  the same "recoverable crash on raw user-typed input stays a `Result`" convention WB-011's entry
+  above documents for `parse_morphism`.) Pinned by
+  `variable_expression_act_repeated_occurrence_with_no_ns_reports_the_java_npe_shape` in
+  `expr.rs`. Not yet wired to any real caller — `Word`/`Function` (the only real source of a `None`
+  `ns`) are deferred to U4, so this is a signature-level fix ahead of its first live call site, not
+  something exercised through the CLI yet.
+- **Upstream:** not filed. A ~3-line guard in `VariableExpression.act` (throw a real
+  `WalnutException` naming the offending variable/track when `ns == null` in the repeated-identifier
+  branch, rather than falling through to the NPE) would fix it in Java too.
+- **Severity:** moderate — a real crash (not silent-wrong-answer) on syntactically valid, plausible
+  input (any multi-track word automaton mixing an `msd_k`/`lsd_k` track with an explicit-alphabet
+  track, indexed by a repeated variable) rather than a contrived construction; not yet reachable
+  through walnut-rs's own CLI (no lexer/`Word`/`Function` yet), so no *live* user impact in this port
+  today.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has
