@@ -36,13 +36,13 @@
 //! The ruling (settled before any parser code was written, and recorded in `PORTING.md`):
 //!
 //! * **`wr_core::numsys::NumberSystem` owns its own memoization, behind interior
-//!   mutability.** The three dynamic tables become `RefCell<BTreeMap<BigInt, Automaton>>`
-//!   and `get_constant`/`get_multiplication`/`get_division` take `&self`. **This is U5's
-//!   job — they still take `&mut self` today**, so a `NumberSystem` handed out by this
-//!   trait is read-only until U5 lands. Nothing in `wr-logic` may work around that by
-//!   wrapping the handle in a `RefCell` of its own; that would recreate the aliasing
-//!   problem this ruling exists to prevent, and would put two independent memo caches
-//!   behind one logical number system.
+//!   mutability.** The three dynamic tables are `RefCell<BTreeMap<BigInt, Automaton>>` and
+//!   `get_constant`/`get_multiplication`/`get_division` take `&self`. **Delivered by U5**
+//!   (Phase 3a) — see `wr_core::numsys::NumberSystem`'s `constants_dynamic_table` doc
+//!   comment for the implementation and its borrow discipline. Nothing in `wr-logic` may
+//!   wrap the handle in a `RefCell` of its own; that would recreate the aliasing problem
+//!   this ruling exists to prevent, and would put two independent memo caches behind one
+//!   logical number system.
 //! * **This trait therefore hands out a shared, immutable handle** — [`std::rc::Rc`] —
 //!   and never a `&mut NumberSystem`, a `RefCell`, or an index into a caller-owned arena.
 //!   [`Rc`] rather than [`std::sync::Arc`] because `NumberSystem`'s memo tables are about
@@ -56,10 +56,13 @@
 //!   `computeIfAbsent` leaves the map **unmodified** when the mapping function throws, so
 //!   a failed resolution is not negatively cached and a later identical lookup retries.
 //!
-//! Consequence for U5: custom bases (`msd_fib`, `msd_pell`, …) slot in *underneath*
-//! [`PredicateEnv::number_system`] without changing its signature — the implementation
-//! grows a "not a plain `msd_k`/`lsd_k`? then load the custom-base files" branch, and the
-//! trait keeps returning `Rc<NumberSystem>`.
+//! Consequence for U5, as delivered: custom bases (`msd_fib`, `msd_pell`, …) slotted in
+//! *underneath* [`PredicateEnv::number_system`] without changing its signature — the
+//! implementation grows a "not a plain `msd_k`/`lsd_k`? then load the custom-base files"
+//! branch (`wr_core::numsys::NumberSystem::with_custom_base_files`, fed by whatever the
+//! implementor can read off disk), and the trait keeps returning `Rc<NumberSystem>`. The
+//! in-memory double below still resolves only what `NumberSystem::new` can build, since it
+//! has no filesystem to consult; U14's real `Session` is where the file probing lands.
 //!
 //! # Ruling 2 — `regex-automata`, for `\G`-anchored lexing
 //!
@@ -216,10 +219,10 @@ use wr_core::numsys::{NumSysError, NumberSystem};
 /// [`fmt::Display`] output (timing-normalized) against Walnut's real message text, so
 /// verbatim wording is the *goal* for every variant — but **only
 /// [`Self::FileDoesNotExist`] and [`Self::MacroDoesNotExist`] deliver on it today**.
-/// [`Self::NumberSystem`] and [`Self::MalformedAutomaton`] are both self-described
-/// placeholders in their own doc comments (pending `NumSysError`'s `Display`, U5; and
-/// pending a real `wr_io::ReadError` → Java-text mapping, U13/U14, respectively) — see
-/// each variant's docs for exactly what is missing and why it isn't fixed here.
+/// [`Self::NumberSystem`] delivers on it as of U5 (`NumSysError` grew a `Display` emitting
+/// Walnut's verbatim text). [`Self::MalformedAutomaton`] is still a self-described
+/// placeholder in its own doc comment, pending a real `wr_io::ReadError` → Java-text
+/// mapping (U13/U14).
 #[derive(Debug)]
 pub enum PredicateEnvError {
     /// `WalnutException.fileDoesNotExist` — `"File does not exist: " + address`
@@ -311,14 +314,14 @@ impl fmt::Display for PredicateEnvError {
             PredicateEnvError::MacroDoesNotExist { name } => {
                 write!(f, "Macro does not exist: {name}")
             }
-            // `NumSysError` has no `Display` of its own yet (it predates any need for
-            // one — nothing in Phase 2 rendered it to a user). Its Java messages are
-            // recorded per-variant in `wr_core::numsys`, and Tier 1's `error*` fixtures
-            // will force the issue; U5 should give it a `Display` that emits them, at
-            // which point this arm becomes a plain `{source}` and nothing else changes.
-            PredicateEnvError::NumberSystem { name, source } => {
-                write!(f, "Number system {name} is not defined. ({source:?})")
-            }
+            // `NumSysError` gained a `Display` emitting Walnut's verbatim message text in
+            // U5, so this is now a plain pass-through, exactly as that note predicted.
+            // Java does not wrap either: the `WalnutException` thrown by the
+            // `NumberSystem(String)` constructor propagates out of
+            // `NumberSystem.getComputeIfAbsent` unchanged, so re-stating the name here
+            // would ADD text Walnut never prints. `name` is kept on the variant for
+            // programmatic inspection (tests match on it) but is deliberately not printed.
+            PredicateEnvError::NumberSystem { name: _, source } => write!(f, "{source}"),
             PredicateEnvError::MalformedAutomaton { address, detail } => {
                 write!(f, "File does not parse: {address} ({detail})")
             }

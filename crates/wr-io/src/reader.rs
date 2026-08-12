@@ -27,7 +27,11 @@
 //!   `lsd_<k>`, bare `msd` (= `msd_2`), and bare `lsd` (= `lsd_2`)** — real Walnut
 //!   also accepts custom-base names (`msd_fib`, ...) via `NumberSystem.
 //!   getComputeIfAbsent`, which constructs a whole `NumberSystem` (adder/comparator
-//!   automata and all); out of scope here, so any other token is
+//!   automata and all) by reading more files out of `Custom Bases/`. `wr-core` gained the
+//!   ability to build those as of Phase 3a's U5
+//!   (`wr_core::numsys::NumberSystem::with_custom_base_files`), but only from
+//!   already-loaded automata — supplying them is this crate's side of the boundary and is
+//!   U13's unit, not done here. So any other token is still
 //!   [`ReadError::UnsupportedNumeration`], never silently misread.
 //! - Then repeated state blocks: `<id> <output>` (first declared block's `id` becomes
 //!   `q0`, **not necessarily `0`**), each followed by zero or more transition lines

@@ -31,12 +31,15 @@
 //!    place (`totalize()` + `flipOutput()` + `justMinimize()`). An earlier version of
 //!    this doc claimed `not` "does NOT go through `crossProduct` AT ALL" — false: `not`
 //!    also calls `A.applyAllRepresentations()` (`AutomatonLogicalOps.java:166`), which
-//!    calls `AutomatonLogicalOps.and` (`Automaton.java:263`) — but that path is INERT
-//!    for base-*k* numeration (`NumberSystem.flagUseAllRepresentations` is only ever
-//!    `true` for Fibonacci/Ostrowski/Pell-family bases, `NumberSystem.java:147-150`,
-//!    all DROPPED from this port's scope — confirmed by reading it, not assumed). So
-//!    `not` is still correctly out of scope for this unit, just not for the reason
-//!    originally stated.
+//!    calls `AutomatonLogicalOps.and` (`Automaton.java:263`). **Second correction, Phase
+//!    3a U5:** the U3-era text then claimed that path is INERT because
+//!    `NumberSystem.flagUseAllRepresentations` is only ever `true` for the
+//!    Fibonacci/Ostrowski/Pell family, all dropped from this port's scope. Only those
+//!    bases' bespoke *algorithms* were ever dropped; U5 put the generic `Custom Bases/`
+//!    *file* mechanism (which is how every one of those names actually works) back in
+//!    scope, so that path is live. `not` was still correctly out of scope for THIS unit —
+//!    it lives in `crate::logicalops` — and `update_axb_fields` below now propagates
+//!    `Automaton::all_reps` alongside `msd` so the restriction survives a cross product.
 //!    **Precondition families 1's callers actually rely on, not yet enforced by
 //!    anything in this file:** `AutomatonLogicalOps.and` (`:41-62`) does NOT
 //!    totalize either operand first (a missing transition already means "reject"
@@ -368,16 +371,25 @@ fn update_axb_fields(
         axb.alphabet.push(a.alphabet[i].clone());
         axb.label.push(a.label[i].clone());
         axb.msd.push(a.msd[i]);
+        axb.all_reps.push(a.all_reps[i].clone());
     }
     for (i, &j) in same_inputs_in_a_and_b.iter().enumerate() {
         if j == NOT_SAME_INPUT_IN_BOTH {
             axb.alphabet.push(b.alphabet[i].clone());
             axb.label.push(b.label[i].clone());
             axb.msd.push(b.msd[i]);
+            axb.all_reps.push(b.all_reps[i].clone());
         } else {
             let j = j as usize;
+            // Java's `AxB.getNS().set(j, bNS.get(i))` replaces the whole `NumberSystem`
+            // object, i.e. BOTH halves of this crate's per-track stand-in at once — the
+            // `msd` guard is the `bNS.get(i) != null && AxB.getNS().get(j) == null` test
+            // verbatim (`msd[..].is_none()` IS "this track has no number system"), and
+            // `all_reps` must move in lockstep or the two halves would describe different
+            // number systems (see `Automaton::all_reps`'s invariant).
             if b.msd[i].is_some() && axb.msd[j].is_none() {
                 axb.msd[j] = b.msd[i];
+                axb.all_reps[j] = b.all_reps[i].clone();
             }
         }
     }

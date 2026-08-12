@@ -88,20 +88,26 @@
 //! `the_trivial_branches_never_totalize_their_operands`, which asserts operands come
 //! back unmutated.
 //!
-//! # `applyAllRepresentations` — inert, not ported
+//! # `applyAllRepresentations` — live at all three call sites as of U5
 //!
-//! `totalizeCrossProduct` (`:121`), `not` (`:163`) and `rightQuotient` (`:228`) each
-//! call `Automaton.applyAllRepresentations()`. That method's body
-//! (`Automaton.java:253-270`) only does anything for a track whose `NumberSystem` is
-//! non-null AND `useAllRepresentations()`. That flag
-//! (`NumberSystem.flagUseAllRepresentations`, `NumberSystem.java:130`) starts `true` but
-//! is cleared in the constructor (`:147-150`) whenever `loadAutomatonOrNull` finds no
-//! `<name>.txt` "set of all representations" automaton in the custom-bases directory
-//! (`:304-...`) — which is exactly how the Fibonacci/Ostrowski/Pell family is
-//! configured, and never the case for a plain base-*k*. All of that family is DROPPED
-//! from this port's scope, so `applyAllRepresentations` is a guaranteed no-op here and
-//! is not ported (the same judgment `product.rs`'s module docs already recorded for
-//! `not`'s call to it).
+//! `totalizeCrossProduct` (`:121`), `not` (`:163`) and `rightQuotient` (`:228`) each call
+//! `Automaton.applyAllRepresentations()`, and all three are ported now.
+//!
+//! **This corrects what this doc said through Phase 2.** The old text argued the method
+//! was a guaranteed no-op: its body (`Automaton.java:252-270`) only fires for a track whose
+//! `NumberSystem` is non-null AND `useAllRepresentations()`, and that flag
+//! (`NumberSystem.flagUseAllRepresentations`, `NumberSystem.java:130`) is cleared in the
+//! constructor (`:147-150`) unless `loadAutomatonOrNull` finds a `<name>.txt`
+//! "set of all representations" automaton in `Custom Bases/` — never the case for a plain
+//! base-*k*, and the whole Fibonacci/Ostrowski/Pell family was then out of scope. Phase 3a's
+//! U5 put the *custom-base file mechanism* back in scope (only the bespoke
+//! Ostrowski/Fibonacci/Pell *algorithms* were ever dropped — see
+//! `crate::numsys::NumberSystem::with_custom_base_files`), so the premise is false and the
+//! three calls are real. [`crate::automaton::Automaton::apply_all_representations`] carries
+//! the empirical evidence that they change answers rather than merely running.
+//!
+//! [`and`] deliberately has NO such call, in Java or here — it is the one connective that
+//! never totalizes, so it cannot re-admit an invalid representation in the first place.
 //!
 //! # The former duplication with `wr-logic`'s `quantify.rs` — resolved (U6)
 //!
@@ -170,6 +176,7 @@ use crate::fa::Fa;
 use crate::minimize::{minimize, MinimizeError};
 use crate::product::{cross_product_and_minimize, BooleanOp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // `FA`-level helpers this file needs that `fa.rs` does not (yet) expose.
@@ -323,10 +330,42 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 /// Java's per-track `List<NumberSystem>` (see `Automaton`'s struct doc comment), so
 /// `None` plays the null role and the base — which Java re-parses out of the name and
 /// preserves — is carried by the track's alphabet here and needs no touching.
-fn flip_ns(msd: &mut [Option<bool>]) {
-    for slot in msd.iter_mut() {
+///
+/// # The custom-base half, and its one declared limitation (U5)
+///
+/// Java doesn't flip a flag: it *replaces* each entry with
+/// `new NumberSystem("msd"|"lsd" + "_" + base)`, which for a custom base re-runs the whole
+/// `Custom Bases/` file-loading dance under the flipped name. So the flipped system's
+/// `getAllRepresentations()` is whatever
+/// `loadAutomatonOrNull` finds for the new direction. `wr-core` performs no file I/O
+/// (U5's whole design premise), so it cannot re-run that lookup here.
+///
+/// What it does instead is reproduce the *outcome* for the only shape that actually ships:
+/// every automaton in `walnut-java/Custom Bases/` exists in the `msd_*` direction only, so
+/// `loadAutomatonOrNull` for the flipped name always misses the main file, hits the
+/// complement, and returns `AutomatonLogicalOps.reverse(loaded, false)`
+/// (`NumberSystem.java:311-315`) — i.e. the language-reversal of the same automaton, which
+/// is also exactly the right restriction for tracks whose digits are now read in the
+/// opposite order. So each track's all-representations automaton is reversed in place.
+///
+/// **Where this diverges from Java:** if a user supplies BOTH directions' files with
+/// languages that are not each other's reversal (e.g. a hand-written `lsd_foo.txt` that is
+/// not `reverse(msd_foo.txt)`), Java would load the flipped file while this reverses the
+/// original. Declared here rather than papered over; closing it needs a caller-supplied
+/// flipped-base file set, which is `wr-io`/`wr-cli`'s (U13/U14's) side of the boundary —
+/// see [`crate::numsys::NumberSystem::flip_with_custom_base_files`], which is the API a
+/// caller that *does* have the files should use instead of relying on this.
+fn flip_ns(a: &mut Automaton) {
+    for slot in a.msd.iter_mut() {
         if let Some(is_msd) = slot.as_mut() {
             *is_msd = !*is_msd;
+        }
+    }
+    for slot in a.all_reps.iter_mut() {
+        if let Some(all_reps) = slot.as_mut() {
+            let mut flipped = (**all_reps).clone();
+            reverse(&mut flipped, false);
+            *all_reps = Rc::new(flipped);
         }
     }
 }
@@ -371,7 +410,13 @@ pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
 fn totalize_cross_product(a: &mut Automaton, b: &mut Automaton, op: BooleanOp) -> AutomatonDFA {
     totalize(&mut a.fa);
     totalize(&mut b.fa);
-    cross_product_and_minimize(a, b, |p, q| op.combine(p, q))
+    let mut n = cross_product_and_minimize(a, b, |p, q| op.combine(p, q)).into_automaton();
+    // `N.applyAllRepresentations()` (`:121`). Live as of U5 — and load-bearing exactly
+    // here: `totalize` above adds a sink that accepts every previously-missing transition,
+    // which for a custom base re-admits INVALID digit strings, so the restriction has to be
+    // re-applied afterwards. (`and` deliberately has no such call: it never totalizes.)
+    n.apply_all_representations();
+    AutomatonDFA::from(n)
 }
 
 /// `AutomatonLogicalOps.or` (`:67-75`) — `L(A) ∪ L(B)`. Totalizes both operands in
@@ -462,9 +507,9 @@ pub fn iff(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
 /// Java's working sequence is `totalize()` (`:160`), `flipOutput()` (`:161`),
 /// `justMinimize()` (`:162`) — all three ported below, preceded by the
 /// `isTRUE_FALSE_AUTOMATON` short-circuit (`:146-149`, U0), which flips only
-/// `TRUE_AUTOMATON` and returns the same (still-trivial) automaton. Only
-/// `applyAllRepresentations()`/`convertNFAtoDFA()` have no analog here (see this
-/// module's docs). Totalization is what makes
+/// `TRUE_AUTOMATON` and returns the same (still-trivial) automaton, plus
+/// `applyAllRepresentations()` (`:163`, live as of U5) and `convertNFAtoDFA()` (`:164`,
+/// discharged by the closing [`AutomatonDFA::from`]). Totalization is what makes
 /// this a genuine complement rather than a mere output flip — without it, a word that
 /// runs off the end of a partial transition table would be rejected by BOTH the
 /// automaton and its "negation".
@@ -496,6 +541,13 @@ pub fn not(a: AutomatonDFA) -> AutomatonDFA {
     totalize(&mut m.fa);
     flip_output(&mut m.fa);
     m.fa = just_minimize(&m.fa);
+    // `A.applyAllRepresentations()` (`:163`). Live as of U5, and the single most
+    // load-bearing of its three call sites: complementing a language restricted to a custom
+    // base's VALID representations re-admits every invalid one, so without this
+    // `~(x=x)` over `msd_fib` would return "the strings containing `11`" instead of the
+    // empty language (empirically confirmed against the real Walnut CLI — see
+    // `Automaton::apply_all_representations`).
+    m.apply_all_representations();
     AutomatonDFA::from(m)
 }
 
@@ -566,7 +618,9 @@ pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> 
     other_clone.alphabet = a.alphabet.clone();
     other_clone.setup_encoder();
     other_clone.fa.alphabet_size = a.fa.alphabet_size;
+    // `otherClone.setNS(A.getNS())` (`:206`) — both halves of the per-track stand-in.
     other_clone.msd = a.msd.clone();
+    other_clone.set_all_reps(a.all_reps.clone());
 
     for i in 0..a.fa.q {
         // A temporary automaton identical to `a` except that it starts from state `i`.
@@ -586,6 +640,11 @@ pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> 
     }
 
     m.determinize_and_minimize();
+    // `M.applyAllRepresentations()` (`:228`), between `determinizeAndMinimize` and
+    // `forceCanonize` — live as of U5. Needed here for the same reason as in `not`: the
+    // accepting set was recomputed from scratch above (`setOutputIfEqual`), with no regard
+    // for whether each state is reachable by a VALID representation.
+    m.apply_all_representations();
     m.force_canonize();
     m
 }
@@ -787,7 +846,7 @@ pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
     a.determinize_and_minimize_from(&set_of_final_states);
 
     if reverse_msd {
-        flip_ns(&mut a.msd);
+        flip_ns(a);
     }
 }
 
@@ -957,9 +1016,234 @@ mod tests {
 
     #[test]
     fn flip_ns_flips_arithmetic_tracks_and_skips_non_arithmetic_ones() {
-        let mut msd = vec![Some(true), None, Some(false)];
-        flip_ns(&mut msd);
-        assert_eq!(msd, vec![Some(false), None, Some(true)]);
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 8,
+                o: vec![0],
+                d: vec![BTreeMap::new()],
+            },
+            vec![vec![0, 1], vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            vec![Some(true), None, Some(false)],
+        );
+        flip_ns(&mut a);
+        assert_eq!(a.msd, vec![Some(false), None, Some(true)]);
+    }
+
+    /// The custom-base half of `flip_ns` (U5): a track carrying an all-representations
+    /// automaton gets that automaton's LANGUAGE reversed, reproducing what Java's
+    /// `new NumberSystem("lsd_<base>")` would have loaded via `loadAutomatonOrNull`'s
+    /// complement-with-reverse fallback. Uses a deliberately NON-reversal-symmetric
+    /// language (`0*1`, i.e. "ends in 1") so a no-op implementation cannot pass.
+    #[test]
+    fn flip_ns_reverses_each_tracks_all_representations_automaton() {
+        let ends_in_one = single_track(
+            {
+                let mut d0 = BTreeMap::new();
+                d0.insert(0, vec![0]);
+                d0.insert(1, vec![1]);
+                Fa {
+                    true_false: None,
+                    q0: 0,
+                    q: 2,
+                    alphabet_size: 2,
+                    o: vec![0, 1],
+                    d: vec![d0, BTreeMap::new()],
+                }
+            },
+            Some(true),
+        );
+        let mut a = single_track(ends_with_one(), Some(true));
+        a.set_all_reps(vec![Some(Rc::new(ends_in_one.clone()))]);
+
+        flip_ns(&mut a);
+
+        assert_eq!(a.msd, vec![Some(false)], "direction still flips");
+        let flipped = a.all_reps[0].as_ref().expect("still present");
+        let mut expected = ends_in_one;
+        reverse(&mut expected, false);
+        let mut got = flipped.fa.clone();
+        got.totalize(0);
+        let mut want = expected.fa.clone();
+        want.totalize(0);
+        assert_eq!(equiv::language_equivalent(&got, &want), Ok(true));
+        // And it really is a different language from where it started (guards against a
+        // "reverse is the identity here" test that would pass with no implementation).
+        let original = ends_in_one_fa_totalized();
+        assert_eq!(equiv::language_equivalent(&got, &original), Ok(false));
+    }
+
+    // ============================== U5: applyAllRepresentations at its three call sites
+
+    /// The valid-representation restriction of a Fibonacci-style base: the words over
+    /// `{0, 1}` with **no `11` substring** (`walnut-java/Custom Bases/msd_fib.txt`, verbatim).
+    /// Deliberately a language that ordinary `msd_k` numeration would never impose, so any
+    /// test below that passes without the restriction being applied is caught.
+    fn no_adjacent_ones() -> Fa {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![0]);
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 1],
+            d: vec![d0, d1],
+        }
+    }
+
+    /// A one-track automaton over `{0,1}` with `fa` as its language and the
+    /// [`no_adjacent_ones`] restriction attached to its (only) track — the shape every
+    /// automaton derived from a custom base carries.
+    fn restricted(fa: Fa) -> Automaton {
+        let mut a = single_track(fa, Some(true));
+        a.set_all_reps(vec![Some(Rc::new(single_track(
+            no_adjacent_ones(),
+            Some(true),
+        )))]);
+        a
+    }
+
+    /// The 1-state total automaton accepting everything (`Σ*`).
+    fn universal() -> Fa {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![0]);
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![1],
+            d: vec![d0],
+        }
+    }
+
+    fn accepts_exactly_the_valid_representations(a: &Automaton) {
+        for word in [
+            &[][..],
+            &[0],
+            &[1],
+            &[0, 1],
+            &[1, 0],
+            &[1, 0, 1],
+            &[0, 1, 0, 1],
+        ] {
+            assert!(a.fa.accepts_word(word), "must accept valid word {word:?}");
+        }
+        for word in [&[1, 1][..], &[0, 1, 1], &[1, 1, 0], &[1, 0, 1, 1]] {
+            assert!(
+                !a.fa.accepts_word(word),
+                "must reject invalid word {word:?}"
+            );
+        }
+    }
+
+    /// `not`'s `A.applyAllRepresentations()` (`:163`). Complementing a language already
+    /// restricted to the valid representations re-admits every INVALID one, so the
+    /// restriction has to be re-applied — otherwise `~(x = x)` over a custom base returns
+    /// "the words containing `11`" instead of the empty language. Real Walnut returns the
+    /// empty language (verified against its CLI with `eval x "?msd_fib ~(x=x)"`).
+    #[test]
+    fn not_reapplies_the_valid_representation_restriction() {
+        let restricted_identity = restricted(no_adjacent_ones());
+        let negated = not(restricted_identity.as_dfa()).into_automaton();
+        assert!(
+            negated.is_empty(),
+            "the complement of the valid representations, re-restricted, is empty"
+        );
+
+        // The discriminating half: the SAME automaton without the restriction attached
+        // complements to a non-empty language, so this test cannot pass by accident.
+        let unrestricted = single_track(no_adjacent_ones(), Some(true));
+        let negated_unrestricted = not(unrestricted.as_dfa()).into_automaton();
+        assert!(!negated_unrestricted.is_empty());
+        assert!(negated_unrestricted.fa.accepts_word(&[1, 1]));
+    }
+
+    /// `totalizeCrossProduct`'s `N.applyAllRepresentations()` (`:121`), reached via `imply`.
+    /// `A => A` is a tautology, so the raw cross product is `Σ*`; the restriction cuts it
+    /// back to the valid representations. (`and` deliberately has no such call — it never
+    /// totalizes, so it can never re-admit an invalid representation; asserted below.)
+    #[test]
+    fn totalize_cross_product_reapplies_the_valid_representation_restriction() {
+        let mut a = restricted(no_adjacent_ones());
+        let mut b = restricted(no_adjacent_ones());
+        let implied = imply(&mut a, &mut b).into_automaton();
+        assert!(implied.fa.accepts_word(&[0, 1, 0]));
+        accepts_exactly_the_valid_representations(&implied);
+
+        // Without the restriction the same tautology really is `Σ*` -- the discriminator.
+        let mut c = single_track(no_adjacent_ones(), Some(true));
+        let mut d = single_track(no_adjacent_ones(), Some(true));
+        let unrestricted = imply(&mut c, &mut d).into_automaton();
+        assert!(unrestricted.fa.accepts_word(&[1, 1]));
+    }
+
+    /// `and` must NOT apply the restriction (no such call in Java) — and it doesn't need to:
+    /// intersection cannot widen a language. Pinned so a future edit doesn't "helpfully" add
+    /// the call for symmetry.
+    #[test]
+    fn and_does_not_apply_the_valid_representation_restriction() {
+        let a = restricted(universal());
+        let b = restricted(universal());
+        let intersection = and(&a, &b).into_automaton();
+        assert!(
+            intersection.fa.accepts_word(&[1, 1]),
+            "`and` leaves the restriction unapplied, exactly as Java does"
+        );
+    }
+
+    /// `rightQuotient`'s `M.applyAllRepresentations()` (`:228`). The accepting set is
+    /// recomputed from scratch by `setOutputIfEqual`, with no regard for whether a state is
+    /// reachable by a VALID representation, so the restriction must be re-applied after.
+    /// `Σ* / Σ*` is `Σ*`, which the restriction cuts back to the valid representations.
+    #[test]
+    fn right_quotient_reapplies_the_valid_representation_restriction() {
+        let a = restricted(universal());
+        let b = single_track(universal(), Some(true));
+        let quotient = right_quotient(&a, &b, false);
+        accepts_exactly_the_valid_representations(&quotient);
+
+        // Discriminator: unrestricted, the same quotient is `Σ*`.
+        let a_plain = single_track(universal(), Some(true));
+        let plain_quotient = right_quotient(&a_plain, &b, false);
+        assert!(plain_quotient.fa.accepts_word(&[1, 1]));
+    }
+
+    /// The restriction must survive `right_quotient`'s wholesale replacement of the second
+    /// operand's track metadata (`otherClone.setNS(A.getNS())`, `:206`) — both halves of the
+    /// per-track number-system stand-in move together.
+    #[test]
+    fn right_quotient_copies_both_halves_of_the_track_metadata_onto_the_second_operand() {
+        let a = restricted(universal());
+        let b = single_track(universal(), Some(true));
+        let quotient = right_quotient(&a, &b, false);
+        assert_eq!(quotient.msd, vec![Some(true)]);
+        assert!(quotient.all_reps.iter().all(|r| r.is_some()));
+    }
+
+    /// `0*1` totalized — the "before" language for the test above.
+    fn ends_in_one_fa_totalized() -> Fa {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![1]);
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d0, BTreeMap::new()],
+        };
+        fa.totalize(0);
+        fa
     }
 
     // -------------------------------------------------- the boolean connectives

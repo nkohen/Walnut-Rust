@@ -42,24 +42,22 @@
 //! # What's implemented here, and what's deferred (and why)
 //!
 //! Every concrete `act(...)` method below (`AutomatonExpression`, `ArithmeticExpression`,
-//! `VariableExpression`) is a *different* method from the `Token::act` semantics
-//! deferred to U9/U10 — grep confirms all of Java's `Expression::act(...)` overloads
-//! (besides the always-throwing base `act(String)`, ported below) are called
-//! exclusively from `Word.java`/`Function.java` (U4 scope, not yet ported), so nothing
-//! here is reachable from real code yet either — but nothing blocks porting the
-//! *methods themselves* now, except one:
+//! `VariableExpression`, `NumberLiteralExpression`) is a *different* method from the
+//! `Token::act` semantics deferred to U9/U10 — grep confirms all of Java's
+//! `Expression::act(...)` overloads (besides the always-throwing base `act(String)`, ported
+//! below) are called exclusively from `Word.java`/`Function.java` (U4 scope, not yet
+//! ported), so nothing here is reachable from real code yet either — but nothing blocks
+//! porting the *methods themselves* now:
 //!
-//! * [`NumberLiteralExpression`]'s own `act(Token, List, List, Automaton)`
-//!   (`NumberLiteralExpression.java:61-71`) calls `this.base.getConstant(this.value)`
-//!   — `NumberSystem::get_constant` still takes `&mut self` today (`predicate_env.rs`'s
-//!   Ruling 1: that becomes `&self` behind interior mutability in U5, not before). This
-//!   crate's [`crate::predicate_env::PredicateEnv`] deliberately hands out
-//!   `Rc<NumberSystem>` — shared, never `&mut` — so there is no sound signature for this
-//!   method to have *today*; writing one now would mean guessing at U5's design instead
-//!   of deferring to it. The struct itself (construction, [`NumberLiteralExpression::value`],
-//!   [`NumberLiteralExpression::is_zero`], [`NumberLiteralExpression::int_value_exact`])
-//!   is fully ported — only this one method is deferred, to whichever of U4/U5 lands
-//!   the `&self`-based `get_constant` this needs.
+//! * [`NumberLiteralExpression::act`] (`NumberLiteralExpression.java:61-71`) was the one
+//!   exception when U2 landed: it calls `this.base.getConstant(this.value)`, and
+//!   `NumberSystem::get_constant` took `&mut self` at the time, while this crate's
+//!   [`crate::predicate_env::PredicateEnv`] deliberately hands out `Rc<NumberSystem>` —
+//!   shared, never `&mut` — so there was no sound signature for it to have. **Phase 3a's
+//!   U5 delivered `predicate_env.rs`'s Ruling 1** (the memo tables are `RefCell`s and
+//!   `get_constant` takes `&self`), which is exactly the signature this needed, so the
+//!   method is ported now rather than leaving a doc comment describing a blocker that no
+//!   longer exists.
 //! * Every other `act(...)` below replaces `Token.getUniqueString()` with
 //!   `&mut `[`FreshIdentifiers`]`::`[`next_identifier`](FreshIdentifiers::next_identifier),
 //!   per `predicate_env.rs`'s Ruling 4 — a `Token` parameter is never threaded through.
@@ -81,7 +79,7 @@ use std::rc::Rc;
 use num_bigint::BigInt;
 use wr_core::automaton::Automaton;
 use wr_core::logicalops::and;
-use wr_core::numsys::NumberSystem;
+use wr_core::numsys::{NumSysError, NumberSystem};
 
 use crate::predicate_env::FreshIdentifiers;
 
@@ -125,6 +123,18 @@ pub enum ExprError {
     /// `wr_core::logging`'s module doc makes for `dedent()`'s `IllegalArgumentException`,
     /// applied here to a different unchecked-exception call site.)
     RepeatedIdentifierMissingNumberSystem { identifier: String },
+    /// Propagated out of `this.base.getConstant(this.value)` in
+    /// [`NumberLiteralExpression::act`] (`NumberLiteralExpression.java:62`). Java lets the
+    /// `WalnutException` from `NumberSystem` escape unchanged; this wraps it so the caller
+    /// still gets one error type, and [`fmt::Display`] renders the inner Java text verbatim
+    /// (`wr_core::numsys::NumSysError` gained a `Display` in the same unit).
+    NumberSystem(NumSysError),
+}
+
+impl From<NumSysError> for ExprError {
+    fn from(e: NumSysError) -> Self {
+        ExprError::NumberSystem(e)
+    }
 }
 
 impl fmt::Display for ExprError {
@@ -147,6 +157,7 @@ impl fmt::Display for ExprError {
                 "variable {identifier} was repeated under a track with no attached number \
                  system (Java: NullPointerException in VariableExpression.act, see WB-013)"
             ),
+            ExprError::NumberSystem(e) => write!(f, "{e}"),
         }
     }
 }
@@ -186,7 +197,12 @@ pub enum Expression {
     Variable(VariableExpression),
     NumberLiteral(NumberLiteralExpression),
     AlphabetLetter(AlphabetLetterExpression),
-    Word(WordExpression),
+    /// Boxed, unlike its five siblings: [`WordExpression`] holds TWO [`Automaton`]s where
+    /// the next-largest variant holds one, and U5's addition of a per-track field to
+    /// `Automaton` pushed that gap past `clippy::large_enum_variant`'s threshold. Pure
+    /// indirection — `PORTING.md`'s "one enum variant per concrete subclass" ruling is
+    /// unaffected, and nothing about the variant's meaning changes.
+    Word(Box<WordExpression>),
 }
 
 impl Expression {
@@ -430,8 +446,9 @@ impl VariableExpression {
 // NumberLiteralExpression
 // ---------------------------------------------------------------------------
 
-/// `Expressions/NumberLiteralExpression.java` (72 LOC). See the module docs: its own
-/// `act(...)` is deferred (needs `NumberSystem::get_constant`'s not-yet-`&self` form).
+/// `Expressions/NumberLiteralExpression.java` (72 LOC), complete as of U5 — see the module
+/// docs for why its own `act(...)` had to wait for `NumberSystem::get_constant`'s `&self`
+/// form.
 #[derive(Debug, Clone)]
 pub struct NumberLiteralExpression {
     expression_in_string: String,
@@ -492,6 +509,37 @@ impl NumberLiteralExpression {
     pub fn int_value_exact(&self, context: &str) -> Result<i32, String> {
         i32::try_from(&self.value)
             .map_err(|_| format!("{context} must fit in a Java int, found: {}", self.value))
+    }
+
+    /// `NumberLiteralExpression.act(Token t, List<String> identifiers, List<String> quantify,
+    /// Automaton M)` (`NumberLiteralExpression.java:61-71`): intersect `acc` with "this
+    /// track equals my value", under a fresh synthetic identifier that the caller then
+    /// quantifies away.
+    ///
+    /// **Unblocked by U5, not by this unit's own design.** U2 ported the rest of this struct
+    /// but deferred this one method, because it needs `NumberSystem::get_constant` and that
+    /// took `&mut self` at the time, while [`crate::predicate_env::PredicateEnv`]
+    /// deliberately hands out a shared `Rc<NumberSystem>`
+    /// (`predicate_env.rs`'s Ruling 1). U5 made `get_constant` take `&self` behind interior
+    /// mutability, which is exactly the signature this needed — so it lands here rather than
+    /// leaving a doc comment claiming a blocker that no longer exists.
+    ///
+    /// `t.getUniqueString()` becomes `fresh.next_identifier()` (Ruling 4), and
+    /// `Logging.indent()`/`dedent()` around the `and` are not ported, both matching every
+    /// sibling `act` in this file.
+    pub fn act(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        identifiers: &mut Vec<String>,
+        quantify: &mut Vec<String>,
+        acc: Automaton,
+    ) -> Result<Automaton, ExprError> {
+        let mut constant = self.base.get_constant(&self.value)?;
+        let id = fresh.next_identifier();
+        constant.bind(vec![id.clone()]);
+        identifiers.push(id.clone());
+        quantify.push(id);
+        Ok(and(&acc, &constant).into_automaton())
     }
 }
 
@@ -681,12 +729,12 @@ mod tests {
     #[test]
     fn java_class_names_are_fully_qualified() {
         assert_eq!(
-            Expression::Word(WordExpression::new(
+            Expression::Word(Box::new(WordExpression::new(
                 "Thue[a]",
                 Automaton::true_false(true),
                 Automaton::true_false(true),
                 vec![]
-            ))
+            )))
             .java_class_name(),
             "Main.EvalComputations.Expressions.WordExpression"
         );
@@ -833,6 +881,87 @@ mod tests {
             "must NOT silently equal the accept-everything accumulator's language \
              (would happen if `and` had been swapped for `or`, since own ∪ acc == acc)"
         );
+    }
+
+    // --------------------------------------------------- NumberLiteralExpression::act
+
+    /// `NumberLiteralExpression.act` (`:61-71`), unblocked by U5's `&self` `get_constant`.
+    /// The literal's automaton is bound to a FRESH synthetic name, which is both recorded as
+    /// an identifier and queued for quantification, and intersected into the accumulator.
+    #[test]
+    fn number_literal_expression_act_binds_a_fresh_identifier_and_quantifies_it() {
+        let base = ns("msd_2");
+        let literal = NumberLiteralExpression::new("5", BigInt::from(5), Rc::clone(&base));
+        let mut fresh = FreshIdentifiers::new();
+        let mut identifiers = vec![];
+        let mut quantify = vec![];
+        let m = literal
+            .act(
+                &mut fresh,
+                &mut identifiers,
+                &mut quantify,
+                Automaton::true_false(true),
+            )
+            .unwrap();
+
+        assert_eq!(fresh.issued(), 1, "exactly one synthetic name is minted");
+        assert_eq!(identifiers, vec!["WALNUT_8AthA0PZZI_1".to_string()]);
+        assert_eq!(quantify, identifiers, "the same name is queued for removal");
+        // `and(TRUE, constant)` short-circuits to the constant automaton itself, bound to
+        // the fresh name -- so the result is a one-track automaton over that name.
+        assert_eq!(m.label, identifiers);
+        assert_eq!(m.alphabet, vec![vec![0, 1]]);
+    }
+
+    /// The number system is consulted through a SHARED handle, so two literals over the same
+    /// base hit one memo cache — `PORTING.md`'s Ruling 1 in action, and the reason this
+    /// method could not be written before U5.
+    #[test]
+    fn number_literal_expression_act_shares_one_number_system_handle() {
+        let base = ns("msd_2");
+        let five = NumberLiteralExpression::new("5", BigInt::from(5), Rc::clone(&base));
+        let also_five = NumberLiteralExpression::new("5", BigInt::from(5), Rc::clone(&base));
+        assert_eq!(Rc::strong_count(&base), 3);
+
+        let mut fresh = FreshIdentifiers::new();
+        let mut identifiers = vec![];
+        let mut quantify = vec![];
+        let first = five
+            .act(
+                &mut fresh,
+                &mut identifiers,
+                &mut quantify,
+                Automaton::true_false(true),
+            )
+            .unwrap();
+        let second = also_five
+            .act(
+                &mut fresh,
+                &mut identifiers,
+                &mut quantify,
+                Automaton::true_false(true),
+            )
+            .unwrap();
+        assert_eq!(fresh.issued(), 2, "each act mints its own name");
+        assert_eq!(first.fa.q, second.fa.q, "same cached constant automaton");
+    }
+
+    /// A rejected constant surfaces as an `Err`, wrapping `NumSysError`'s verbatim Walnut
+    /// message rather than a fresh string.
+    #[test]
+    fn number_literal_expression_act_propagates_number_system_errors() {
+        let base = ns("msd_2");
+        let negative = NumberLiteralExpression::new("-1", BigInt::from(-1), base);
+        let mut fresh = FreshIdentifiers::new();
+        let err = negative
+            .act(
+                &mut fresh,
+                &mut vec![],
+                &mut vec![],
+                Automaton::true_false(true),
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "negative constant -1");
     }
 
     // -------------------------------------------------------------- VariableExpression
@@ -991,7 +1120,7 @@ mod tests {
             Automaton::true_false(false),
             vec!["x".to_string()],
         );
-        let e = Expression::Word(word);
+        let e = Expression::Word(Box::new(word));
         match &e {
             Expression::Word(w) => {
                 assert_eq!(w.identifiers_to_quantify, vec!["x".to_string()]);

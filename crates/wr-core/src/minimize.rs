@@ -60,7 +60,7 @@
 use crate::fa::Fa;
 use std::collections::BTreeMap;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MinimizeError {
     /// Some `(state, symbol)` pair had more than one destination. Ports the
     /// `"Unexpected NFA instead of DFA."` throw in `FA.convertNFAtoDFA`.

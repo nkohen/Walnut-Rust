@@ -374,9 +374,16 @@ fn match_next_alphabet_token(s: &str) -> Option<(AlphabetToken, usize)> {
 ///
 /// Propagates [`NumSysError`] exactly where Java's `NumberSystem.getComputeIfAbsent`
 /// (via the `NumberSystem(String)` constructor) would throw an uncaught
-/// `WalnutException` — e.g. a non-numeric custom-base name like `msd_fib`, since
-/// file-backed custom bases are out of scope in this port (`wr_core::numsys`'s
-/// module docs).
+/// `WalnutException`.
+///
+/// It ALSO errors on a non-numeric custom-base name like `msd_fib`, where Java succeeds by
+/// reading `Custom Bases/msd_fib*.txt`. That is a *reachability* gap, not a scope one, and
+/// the reason is this function's signature: `wr_core::numsys::NumberSystem::with_custom_base_files`
+/// (Phase 3a U5) can build a custom base, but only from already-loaded automata, and this
+/// function takes a bare `&str` with no way to reach the filesystem. Closing it means
+/// threading a file-supplying resolver through here — U13's job, tracked in the Phase 3a
+/// plan. Until then the failure is a clean [`NumSysError::NotDefined`], never a silent
+/// misparse.
 pub fn parse_alphabet_declaration(s: &str) -> Result<AlphabetDeclaration, NumSysError> {
     let mut alphabet: Vec<Vec<i32>> = Vec::new();
     let mut number_systems: Vec<Option<NumberSystem>> = Vec::new();
@@ -960,8 +967,10 @@ mod tests {
 
     #[test]
     fn alphabet_declaration_custom_base_name_errors_not_silent() {
-        // File-backed custom bases (msd_fib, ...) are out of scope in wr-core's
-        // NumberSystem -- this must be a clean Err, not a silent misparse.
+        // `wr-core` CAN build a custom base as of U5, but only from already-loaded
+        // automaton files, and this function has no way to reach the filesystem (see its
+        // doc comment; U13 threads a resolver through). Until then: a clean Err, never a
+        // silent misparse.
         let err = parse_alphabet_declaration("msd_fib").unwrap_err();
         assert!(matches!(err, NumSysError::NotDefined(_)));
     }

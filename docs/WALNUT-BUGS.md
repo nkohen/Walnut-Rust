@@ -436,6 +436,64 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-014 — `NumberSystem.getComputeIfAbsent` is reentrant, so loading a custom base whose files declare a number system throws `ConcurrentModificationException`
+
+- **Where:** `Automata/NumberSystem.java:211-213`
+  (`numberSystemHash.computeIfAbsent(base, NumberSystem::new)`), reached recursively through
+  `NumberSystem(String)` -> `setAdditionAutomaton` (`:322`) -> `loadAutomatonOrNull` (`:299-319`) ->
+  `new Automaton(mainName)` -> `AutomatonReader` -> `ParseMethods.parseAlphabetDeclaration`
+  (`Automata/ParseMethods.java:99-100`), which calls `NumberSystem.getComputeIfAbsent` **again**.
+- **What:** `java.util.HashMap.computeIfAbsent` forbids its mapping function from structurally
+  modifying the map, and detects the violation (since JDK 9) by throwing
+  `ConcurrentModificationException`. Here the mapping function is the `NumberSystem` constructor
+  itself, and for a **custom base** that constructor reads `Custom Bases/<name>_addition.txt` (and
+  `<name>_less_than.txt`, and `<name>.txt`). If any of those files declares its alphabet with a
+  number-system token (`msd_2 msd_2 msd_2`) rather than an explicit set (`{0,1} {0,1} {0,1}`), the
+  reader resolves that token through `getComputeIfAbsent`, inserting into the very map the outer
+  `computeIfAbsent` is still executing over. Result: the whole command dies with a bare
+  `java.util.ConcurrentModificationException` and a one-line stack trace, with no indication that the
+  problem is the custom-base file's header.
+  Both header forms are fully legal in the `.txt` format, and Walnut's own `Word Automata Library`
+  files routinely use the `msd_k` form — so this is a plausible authoring choice, not a contrived one.
+  (Nothing in `walnut-java/Custom Bases/` happens to use it today, which is why the bug has gone
+  unnoticed: all nine shipped bases declare `{0, 1}`-style explicit alphabets.)
+- **Trigger (minimal, verified against the real CLI):** create
+  `Custom Bases/msd_wrtest_addition.txt` containing
+  ```
+  msd_2 msd_2 msd_2
+
+  0 1
+  0 0 0 -> 0
+  ```
+  then run `eval wrtest1 "?msd_wrtest x=x";`. Actual output:
+  `java.util.ConcurrentModificationException at java.base/java.util.HashMap.computeIfAbsent(HashMap.java:1221)`.
+  (Run against `target/Walnut-all.jar`, JDK 17, 2026-08-12. A *self*-referential header — a
+  `msd_foo_addition.txt` declaring `msd_foo` — instead recurses until the stack overflows; that half
+  is arguably user error, the cross-base case above is not.)
+- **Found:** Phase 3a, U5 (custom-base `NumberSystem` loading), 2026-08-12, while tracing what the
+  I/O-free builder's callers would have to do.
+- **Rust port:** `not reached` — and the port's architecture makes it unreachable by construction
+  rather than by accident, which is worth recording explicitly so nobody "restores fidelity" later.
+  `wr_core::numsys::NumberSystem::with_custom_base_files` takes ALREADY-PARSED automata and performs
+  no I/O, so the constructor cannot re-enter the name -> `NumberSystem` cache. The cache itself lives
+  outside `wr-core` (`wr_logic::predicate_env`'s `InMemoryPredicateEnv`, and later U14's `Session`),
+  behind a `RefCell<BTreeMap<..>>` whose lookup borrow is released before the constructor runs — so
+  a reentrant resolution would be a plain nested lookup, not a panic. **Consequence for U13** (the
+  `wr-io` reader's custom-base header support): reading a custom-base file whose header names another
+  number system must resolve that name through the same cache, and will *succeed* where Java throws.
+  That is a divergence, and it is the one this entry exists to make deliberate — recorded here rather
+  than replicated, since replicating it would mean deliberately engineering a self-modification panic
+  into the resolver.
+- **Upstream:** not filed. Two independent fixes exist in Java: (a) replace `computeIfAbsent` with an
+  explicit `get`/construct/`put` (which is reentrancy-safe and preserves the existing
+  "failed construction is not negatively cached" behavior), or (b) resolve the alphabet declaration's
+  number systems lazily, after the outer construction completes.
+- **Severity:** moderate — a hard crash with a useless message (not a silent wrong answer), on
+  syntactically valid input, but only for a user authoring their own custom base with an `msd_k`-style
+  alphabet header. Nothing in the shipped corpus triggers it, so no golden fixture covers it.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

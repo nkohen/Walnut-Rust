@@ -11,7 +11,14 @@
 //! comparator, and constant automata over base-k that the FOL decider composes
 //! all live here, alongside the automaton types they produce.
 //!
-//! DROPPED: Ostrowski / Fibonacci / Pell / negative bases (DESIGN.md §3).
+//! DROPPED: negative bases (DESIGN.md §3, `docs/BOUNDARY-MAP.md` §4.1), and the bespoke
+//! Ostrowski / Fibonacci / Pell *algorithms*. **NOT dropped, as of Phase 3a's U5: the
+//! generic `Custom Bases/*.txt` mechanism**, which is how every one of those numerations
+//! (`msd_fib`, `msd_pell`, `msd_trib`, `msd_tib`, `msd_ns`, …) is actually configured in
+//! Walnut — there is no Fibonacci-specific code path in `NumberSystem.java` at all, only a
+//! file loader. See [`NumberSystem::with_custom_base_files`]. (`CLAUDE.md`'s
+//! "DROP: Ostrowski/Fibonacci/Pell" line predates that distinction and needs the same
+//! correction the Phase 3 plan's gap #4 already records.)
 //!
 //! # U7 scope — what is here, and what is deliberately not
 //!
@@ -49,31 +56,43 @@
 //!    DROP (`docs/BOUNDARY-MAP.md` §6). So the whole base-change surface is dropped
 //!    for two independent reasons, not just the negative-base one.
 //!
-//! ## DEFERRED: file-backed custom bases (`Custom Bases/*.txt`)
+//! ## U5 (Phase 3a): file-backed custom bases, I/O-free
 //!
-//! Java's constructor tries `loadAutomatonOrNull` (`:304-319`) FIRST for each of the
-//! addition / less-than / all-representations automata, and only falls back to
-//! programmatic construction when no file exists. **The ordinary `msd_k`/`lsd_k` case
-//! never actually loads a file** — verified by listing `walnut-java/Custom Bases/`:
-//! it ships `msd_fib`, `msd_kim`, `msd_nara`, `msd_neg_fib`, `msd_ns`, `msd_pell`,
-//! `msd_pisot4`, `msd_tib`, `msd_trib` (+ their `_addition`/`_less_than`/
-//! `_base_change` companions) and **no `msd_<digits>` file at all**. So the file path
-//! is reached only for a genuinely custom base name, or for a user deliberately
-//! *overriding* a standard base — both `wr-io`/Phase-3 territory. This port builds
-//! the standard case programmatically and has no file I/O; `NumberSystem::new("msd_fib")`
-//! therefore returns [`NumSysError::NotDefined`] where Java would have loaded a file.
+//! U7 deferred this whole surface; U5 lands it. Java's constructor tries
+//! `loadAutomatonOrNull` (`:299-319`) FIRST for each of the addition / less-than /
+//! all-representations automata, and only falls back to programmatic construction when no
+//! file exists. **The ordinary `msd_k`/`lsd_k` case never actually loads a file** —
+//! verified by listing `walnut-java/Custom Bases/`: it ships `msd_fib`, `msd_kim`,
+//! `msd_nara`, `msd_neg_fib`, `msd_ns`, `msd_pell`, `msd_pisot4`, `msd_tib`, `msd_trib`
+//! (+ their `_addition`/`_less_than`/`_base_change` companions) and **no `msd_<digits>`
+//! file at all**. So the file path is reached only for a genuinely custom base name, or
+//! for a user deliberately *overriding* a standard base.
 //!
-//! Two knock-on effects of dropping file loading:
-//! * `flagUseAllRepresentations` (`:147-150`) is `false` for every number system this
-//!   module can build — matching `product.rs`'s already-recorded finding that it is
-//!   only ever `true` for the Fibonacci/Ostrowski/Pell-family bases. So
-//!   [`NumberSystem::use_all_representations`] is a hardcoded `false`, and the three
-//!   `applyAllRepresentations()` calls at `:153-155` have nothing to do.
-//! * The addition/less-than *validation* checks (`:342-362`, `:383-395`) only ever
-//!   guard a FILE-LOADED automaton. They are still ported (as assertions, with Java's
-//!   messages) so a future `wr-io` custom-base loader inherits them, but the
-//!   programmatic constructions below satisfy every one of them by construction, so
-//!   `NumberSystemTest`'s six file-backed validation tests have no analog here.
+//! `wr-core` still performs no file I/O: the two `File.isFile()` probes and the two
+//! `new Automaton(address)` reads stay in `wr-io`/`wr-cli` (matching `wr_io::reader`'s
+//! existing "takes a path, doesn't reach into `Session`" shape). What lives here is the
+//! *decision logic* — [`CustomBaseCandidates::resolve`] (Java's precedence and
+//! complement-with-reverse fallback) and [`custom_base_candidate_names`] (the naming
+//! convention, which is `NumberSystem.java`'s, not `Session`'s). [`NumberSystem::new`]
+//! passes no files and so behaves exactly as it did pre-U5, including
+//! `NumberSystem::new("msd_fib")` returning [`NumSysError::NotDefined`];
+//! [`NumberSystem::with_custom_base_files`] is the full constructor.
+//!
+//! Three knock-on effects, all of which invalidate a claim this port previously recorded:
+//! * `flagUseAllRepresentations` (`:147-150`) is no longer always `false`, so
+//!   [`NumberSystem::use_all_representations`] is a real field read and
+//!   `Automaton.applyAllRepresentations`'s five call sites (three in
+//!   `AutomatonLogicalOps`, three here at `:153-155`) are live. Both
+//!   `crate::logicalops`'s and `crate::product`'s module docs said the opposite and are
+//!   corrected; `crate::automaton::Automaton::apply_all_representations` is the port.
+//! * The addition/less-than *validation* checks (`:342-362`, `:383-393`) were ported as
+//!   `assert!`s on the grounds that only a FILE-LOADED automaton could fail them. Now one
+//!   can, on plausible user input, so they are `Err`s
+//!   ([`NumSysError::AdditionInputCount`] and friends). `NumberSystemTest`'s six
+//!   file-backed validation tests finally have analogs here.
+//! * `msd_neg_*` no longer fails by accident (`"neg_fib"` not being `\d+`) — it names a
+//!   real, shipped, file-backed base. It is now rejected on purpose and by name:
+//!   [`NumSysError::UnsupportedNegativeBase`].
 //!
 //! ## DEFERRED: the `lsd` half of the composed constructions
 //!
@@ -123,7 +142,10 @@ use crate::fa::Fa;
 use crate::logicalops::{and, not, reverse};
 use crate::quantify::{quantify, QuantifyError};
 use num_bigint::BigInt;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::rc::Rc;
 
 /// Ports `NumberSystem.determineMsd(List<NumberSystem>)` (`NumberSystem.java:197-209`,
 /// package-private `static Boolean`): `None` ("skip the zero fixup") if any track is
@@ -239,11 +261,24 @@ pub const MSD_2: &str = "msd_2";
 pub const LSD: &str = "lsd";
 /// `NumberSystem.LSD_UNDERSCORE` (`:75`).
 pub const LSD_UNDERSCORE: &str = "lsd_";
+/// `NumberSystem.UNDERSCORE_NEG_UNDERSCORE` (`:78`). Java uses it to compute `isNeg`
+/// (`:137`, with the source comment "fix: `msd_neg_fib`... but not `msd_renege`" —
+/// the leading underscore is what stops `msd_renege` matching). This port uses it to
+/// *reject* the whole negative-base family: see [`NumSysError::UnsupportedNegativeBase`].
+/// `NEG_UNDERSCORE` (`:77`) itself is not ported — its only other use is building the
+/// negative-base name in the dropped `determineNegativeNS`.
+pub const UNDERSCORE_NEG_UNDERSCORE: &str = "_neg_";
 
-// `NEG_UNDERSCORE`/`UNDERSCORE_NEG_UNDERSCORE` (`:77-78`) and the three
-// `UNDERSCORE_*_AUTOMATON` filename suffixes (`:80-84`) are NOT ported: the first two
-// are negative-base only, the last three exist solely to build `Custom Bases` file
-// paths (both dropped — see module docs).
+/// `Prover.TXT_EXTENSION` — the extension of the "set of all representations" file
+/// (`NumberSystem.java:147`, which passes `Prover.TXT_EXTENSION` as the extension).
+pub const TXT_EXTENSION: &str = ".txt";
+/// `NumberSystem.UNDERSCORE_ADDITION_AUTOMATON` (`:80`).
+pub const UNDERSCORE_ADDITION_AUTOMATON: &str = "_addition.txt";
+/// `NumberSystem.UNDERSCORE_LESS_THAN_AUTOMATON` (`:84`).
+pub const UNDERSCORE_LESS_THAN_AUTOMATON: &str = "_less_than.txt";
+
+// `NumberSystem.UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) is NOT ported: the whole
+// base-change surface is dropped for two independent reasons (see module docs).
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -252,7 +287,7 @@ pub const LSD_UNDERSCORE: &str = "lsd_";
 /// Every `WalnutException` (and one unchecked Java exception) reachable from the
 /// ported surface, as a real error enum rather than a stringly-typed throw
 /// (`PORTING.md`'s type/error mapping table).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NumSysError {
     /// `determineMsdOrLsd` (`:268-270`) does `name.substring(0, name.indexOf("_"))`,
     /// which throws `StringIndexOutOfBoundsException` when the name contains no `_`.
@@ -295,6 +330,53 @@ pub enum NumSysError {
     /// system currently yields `Quantify(UnsupportedLsdFixup)` from every composed
     /// construction — see module docs.
     Quantify(QuantifyError),
+    /// **A deliberate divergence from Java, decided in Phase 3a's U5**, not a ported
+    /// `WalnutException`: any name containing `_neg_` (`msd_neg_fib`, `lsd_neg_3`, …) is
+    /// rejected here at name-resolution time.
+    ///
+    /// Java supports negative bases through `isNeg` (`NumberSystem.java:137`) plus
+    /// `baseNegNAddition`/`baseNegNLessThan`/`setBaseChangeAutomaton`, and ships
+    /// `Custom Bases/msd_neg_fib*.txt`. Negative-base numeration is DROPPED from this
+    /// port's scope (`docs/BOUNDARY-MAP.md` §4.1, decided in Phase 2's U7, which deleted
+    /// that code outright rather than stubbing it).
+    ///
+    /// Before U5 the deletion produced the right answer for the wrong reason: `msd_neg_3`
+    /// happened to fail with [`NumSysError::NotDefined`] because `"neg_3"` isn't `\d+`.
+    /// U5's custom-base loading breaks that accident — `msd_neg_fib` names a real,
+    /// shipped, file-backed base, so a caller that hands over the loaded
+    /// `msd_neg_fib_addition.txt`/`msd_neg_fib_less_than.txt` would otherwise get a
+    /// *silently wrong* number system: the files are the negative-base adder/comparator,
+    /// but every construction layered on them here
+    /// ([`NumberSystem::validate_non_negative`] and the deleted `n.signum() < 0`
+    /// branches) assumes a positive base. So this variant makes the deferral explicit and
+    /// loud, per `docs/DESIGN.md`'s "deferred features fail cleanly" principle.
+    ///
+    /// The check runs BEFORE any file is consulted (mirroring Java's own line order:
+    /// `isNeg` at `:137`, `setAdditionAutomaton` at `:142`), so it can never be masked by
+    /// a missing-file error and never causes a pointless load attempt.
+    UnsupportedNegativeBase(String),
+    /// `"The addition automaton must have exactly 3 inputs: base " + name` (`:342-345`).
+    ///
+    /// This and the five variants below were ported as `assert!`s in U7, on the grounds
+    /// that only a FILE-LOADED automaton could fail them and this port had no file
+    /// loading. U5 gave it file loading, so they are reachable on plausible user input and
+    /// become real errors — Java throws a `WalnutException` at each, which
+    /// `PORTING.md`'s error table maps to a `Result`, not a panic.
+    AdditionInputCount(String),
+    /// `"The input alphabet of addition automaton must contain 0: base " + name` (`:347-350`).
+    AdditionAlphabetMissingZero(String),
+    /// `"The input alphabet of addition automaton must contain 1: base " + name` (`:352-355`).
+    AdditionAlphabetMissingOne(String),
+    /// `"All 3 inputs of the addition automaton must have the same alphabet: base " + name`
+    /// (`:357-362`).
+    AdditionAlphabetsDiffer(String),
+    /// `UNDERSCORE_LESS_THAN_AUTOMATON + " must have exactly 2 inputs: base " + name`
+    /// (`:383-385`).
+    LessThanInputCount(String),
+    /// `"Inputs of " + UNDERSCORE_LESS_THAN_AUTOMATON + " must have the same alphabet as
+    /// the alphabet of inputs of " + UNDERSCORE_ADDITION_AUTOMATON + " : base " + name`
+    /// (`:388-393`).
+    LessThanAlphabetMismatch(String),
 }
 
 impl From<QuantifyError> for NumSysError {
@@ -302,6 +384,81 @@ impl From<QuantifyError> for NumSysError {
         NumSysError::Quantify(e)
     }
 }
+
+/// The verbatim `WalnutException` message text for each variant, so Tier 1's `error*`
+/// fixtures compare real Walnut wording rather than a `{:?}` dump.
+///
+/// Assigned to this unit by `wr_logic::predicate_env`'s U1 notes ("pending `NumSysError`'s
+/// `Display`, U5"). Three variants have no Java message of their own and say so inline:
+/// [`Self::MalformedName`] (Java throws a bare `StringIndexOutOfBoundsException`),
+/// [`Self::BaseNotAnI32`] (a bare `NumberFormatException`), and
+/// [`Self::UnsupportedNegativeBase`] (this port's own declared divergence).
+impl fmt::Display for NumSysError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // No Java message: `name.substring(0, -1)` throws
+            // `StringIndexOutOfBoundsException` with the JDK's own text (`:268-270`).
+            NumSysError::MalformedName(name) => {
+                write!(f, "Number system name must contain '_', found: {name}")
+            }
+            NumSysError::NotDefined(name) => write!(f, "Number system {name} is not defined."),
+            NumSysError::InvalidBase(base) => write!(
+                f,
+                "Base of automaton's number system must be > 1 and int, found: {base}"
+            ),
+            // No Java message: `Integer.parseInt` throws `NumberFormatException`.
+            NumSysError::BaseNotAnI32(base) => write!(
+                f,
+                "Base of automaton's number system must fit in an int, found: {base}"
+            ),
+            NumSysError::NegativeConstant(n) => write!(f, "negative constant {n}"),
+            NumSysError::OperatorTwoVariables(op) => {
+                write!(f, "the operator {op} cannot be applied to two variables")
+            }
+            NumSysError::UnexpectedArithmeticOperator(op) => {
+                write!(f, "unexpected arithmetic operator:{op}")
+            }
+            NumSysError::ConstantDividedByVariable => {
+                write!(f, "constants cannot be divided by variables")
+            }
+            NumSysError::DivisionByZero => write!(f, "division by zero"),
+            NumSysError::MultiplicationByZero => write!(f, "multiplication(0)"),
+            NumSysError::Quantify(e) => write!(f, "{e:?}"),
+            // This port's own text: Java has no such error (it supports negative bases).
+            NumSysError::UnsupportedNegativeBase(name) => write!(
+                f,
+                "Number system {name} is not supported: negative bases are out of scope."
+            ),
+            NumSysError::AdditionInputCount(name) => write!(
+                f,
+                "The addition automaton must have exactly 3 inputs: base {name}"
+            ),
+            NumSysError::AdditionAlphabetMissingZero(name) => write!(
+                f,
+                "The input alphabet of addition automaton must contain 0: base {name}"
+            ),
+            NumSysError::AdditionAlphabetMissingOne(name) => write!(
+                f,
+                "The input alphabet of addition automaton must contain 1: base {name}"
+            ),
+            NumSysError::AdditionAlphabetsDiffer(name) => write!(
+                f,
+                "All 3 inputs of the addition automaton must have the same alphabet: base {name}"
+            ),
+            NumSysError::LessThanInputCount(name) => write!(
+                f,
+                "{UNDERSCORE_LESS_THAN_AUTOMATON} must have exactly 2 inputs: base {name}"
+            ),
+            NumSysError::LessThanAlphabetMismatch(name) => write!(
+                f,
+                "Inputs of {UNDERSCORE_LESS_THAN_AUTOMATON} must have the same alphabet as \
+                 the alphabet of inputs of {UNDERSCORE_ADDITION_AUTOMATON} : base {name}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NumSysError {}
 
 // ---------------------------------------------------------------------------
 // Locally-scoped operation-kind enums (see module docs)
@@ -632,6 +789,107 @@ fn names(names: &[&str]) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Custom-base file loading, made I/O-free
+// ---------------------------------------------------------------------------
+
+/// The two files one `NumberSystem.loadAutomatonOrNull` probe considers
+/// (`NumberSystem.java:299-319`), already read and parsed by the caller.
+///
+/// `wr-core` performs no file I/O — that stays `wr-io`/`wr-cli`'s job, matching
+/// `wr_io::reader`'s existing "takes a path, doesn't reach into `Session`" shape. So the
+/// two `File.isFile()` probes and the two `new Automaton(address)` reads happen outside;
+/// this type carries their *results*, and [`CustomBaseCandidates::resolve`] applies Java's
+/// precedence and fallback verbatim.
+///
+/// Use [`custom_base_candidate_names`] to get the two file names, so the naming convention
+/// (which lives in `NumberSystem.java`, not in `Session`) is not re-derived at the call
+/// site.
+#[derive(Debug, Clone, Default)]
+pub struct CustomBaseCandidates {
+    /// `Custom Bases/<name><extension>` — Java's `mainName` (`:306`). Taken as-is.
+    pub main: Option<Automaton>,
+    /// `Custom Bases/<lsd|msd>_<base><extension>` — Java's `complementName` (`:307`): the
+    /// SAME base under the OPPOSITE direction ("When the number system does not exist, we
+    /// try to see whether its complement exists or not. For example `lsd_2` is the
+    /// complement of `msd_2`"). Consulted only when `main` is absent, and then
+    /// language-**reversed** (`AutomatonLogicalOps.reverse(A, false)` — reverse the
+    /// language, leave the declared direction alone).
+    pub complement: Option<Automaton>,
+}
+
+impl CustomBaseCandidates {
+    /// `NumberSystem.loadAutomatonOrNull` (`:299-319`) minus its two `File.isFile()`
+    /// probes: "Tries to create an Automaton from the main file path. If it does not
+    /// exist, tries the complement file path and reverses. Otherwise, returns null."
+    ///
+    /// Note the precedence is strict — a present `main` wins outright and is **not**
+    /// reversed even for an lsd system, which is exactly why
+    /// [`NumberSystem::set_addition_automaton`]'s `if (!isMsd) reverse(...)` sits INSIDE
+    /// the "no file was found" branch in Java and must stay there here.
+    pub fn resolve(self) -> Option<Automaton> {
+        if let Some(main) = self.main {
+            return Some(main);
+        }
+        if let Some(mut complement) = self.complement {
+            reverse(&mut complement, false);
+            return Some(complement);
+        }
+        None
+    }
+}
+
+/// All three `loadAutomatonOrNull` probes a `NumberSystem` constructor makes, in Java's
+/// own order: the adder (`_addition.txt`, `:323`), the comparator (`_less_than.txt`,
+/// `:370`), and the "set of all representations" automaton (`.txt`, `:147`).
+///
+/// `Default::default()` (every candidate absent) reproduces the pre-U5, no-file-loading
+/// behavior exactly, which is what [`NumberSystem::new`] passes.
+///
+/// There is deliberately no `_base_change.txt` slot: that whole surface is dropped (see
+/// this module's docs), and its sole production caller (`determineNegativeNS`, for the
+/// DROP-scope `split` command) is negative-base-only.
+///
+/// Nothing here covers `setEqualityAutomaton`: **Java never file-loads the equality
+/// automaton** (`:403-409` takes only an alphabet and always builds the diagonal
+/// programmatically — verified, not assumed). It nonetheless adapts to a custom base
+/// automatically, because the alphabet it is handed is `getAlphabet()`, i.e. the
+/// possibly-file-loaded adder's track-0 alphabet.
+#[derive(Debug, Clone, Default)]
+pub struct CustomBaseFiles {
+    /// Probe for `<name>_addition.txt` (`UNDERSCORE_ADDITION_AUTOMATON`).
+    pub addition: CustomBaseCandidates,
+    /// Probe for `<name>_less_than.txt` (`UNDERSCORE_LESS_THAN_AUTOMATON`).
+    pub less_than: CustomBaseCandidates,
+    /// Probe for `<name>.txt` (`TXT_EXTENSION`) — the valid-representation restriction.
+    pub all_representations: CustomBaseCandidates,
+}
+
+/// The two `Custom Bases/` FILE NAMES `loadAutomatonOrNull` probes for `name` and
+/// `extension`, in Java's precedence order `(main, complement)` (`:306-307`).
+///
+/// Returns bare file names, not paths: prefixing the custom-bases directory is
+/// `Session.getReadAddressForCustomBases`'s job, i.e. `wr-cli`'s (U14). Exposed from here
+/// because the *naming convention* — "same base, opposite direction" — is
+/// `NumberSystem.java`'s, and a caller re-deriving it would be re-deriving the fallback
+/// semantics too.
+///
+/// `extension` is one of [`UNDERSCORE_ADDITION_AUTOMATON`],
+/// [`UNDERSCORE_LESS_THAN_AUTOMATON`], [`TXT_EXTENSION`].
+pub fn custom_base_candidate_names(
+    name: &str,
+    extension: &str,
+) -> Result<(String, String), NumSysError> {
+    let msd_or_lsd = determine_msd_or_lsd(name)?;
+    let is_msd = msd_or_lsd == MSD;
+    let base = determine_base(name);
+    let opposite = if is_msd { LSD } else { MSD };
+    Ok((
+        format!("{name}{extension}"),
+        format!("{opposite}_{base}{extension}"),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // NumberSystem
 // ---------------------------------------------------------------------------
 
@@ -655,13 +913,57 @@ pub struct NumberSystem {
     /// `NumberSystem.equality` (`:114`, `public` in Java too): two inputs, accepts iff
     /// they are equal.
     pub equality: Automaton,
+    /// `NumberSystem.allRepresentations` (`:116`) **and** `flagUseAllRepresentations`
+    /// (`:130`), folded into a single `Option` per `PORTING.md`'s "two coupled `boolean`s
+    /// where one gates the other → one `Option`" rule — with that rule's required audit
+    /// done rather than assumed:
+    ///
+    /// * **Writers.** The field and the flag are written in exactly one place, the
+    ///   constructor's `:147-156`: the flag starts `true`, and the *only* thing that ever
+    ///   clears it is `allRepresentations == null`. Nothing else in the tree writes either
+    ///   (`grep` over all of `src/main/java`). So `flag == true` ⟺ field non-null,
+    ///   post-construction.
+    /// * **Readers.** `useAllRepresentations()` (`:253-255`) has two callers,
+    ///   `Automaton.normalizeNumberSystems` (`:166`) and
+    ///   `applyAllRepresentations(WithOutput)` (`Automaton.java:258`/`:278`); both consult
+    ///   it before `getAllRepresentations()` (`:261-263`), so no reader ever reaches the
+    ///   gated value without checking the gate.
+    /// * **The window where they disagree.** Between field initialization and `:147` the
+    ///   flag is `true` while the field is still `null`. Unobservable: nothing calls
+    ///   `useAllRepresentations()` on a half-constructed `NumberSystem` — the constructor's
+    ///   own reach-out chain (`loadAutomatonOrNull` → the `.txt` reader →
+    ///   `ParseMethods.parseAlphabetDeclaration` → `getComputeIfAbsent`) only ever touches
+    ///   *other* instances (and, per `docs/WALNUT-BUGS.md` WB-014, blows up if it does).
+    all_representations: Option<Rc<Automaton>>,
     /// `constantsDynamicTable`/`multiplicationsDynamicTable`/`divisionsDynamicTable`
     /// (`:126-128`). Java uses `HashMap`; these are `BTreeMap` because [`BigInt`] is
     /// `Ord` and nothing here ever *iterates* them (so `PORTING.md`'s
     /// iteration-order trap doesn't bite either way) — lookup/insert only.
-    constants_dynamic_table: BTreeMap<BigInt, Automaton>,
-    multiplications_dynamic_table: BTreeMap<BigInt, Automaton>,
-    divisions_dynamic_table: BTreeMap<BigInt, Automaton>,
+    ///
+    /// # `RefCell`: `PORTING.md`'s Ruling 1, implemented (U5)
+    ///
+    /// Java hands the *same* cached `NumberSystem` instance to every token in a formula and
+    /// lets those tokens mutate these three tables at `act()` time. Rather than let that
+    /// force `Rc<RefCell<NumberSystem>>` into every `Token`/`Expression::act` signature,
+    /// the memoization lives here behind interior mutability, so
+    /// [`NumberSystem::get_constant`]/[`NumberSystem::get_multiplication`]/
+    /// [`NumberSystem::get_division`] take `&self` and `wr_logic::predicate_env` can hand
+    /// out a plain `Rc<NumberSystem>`. Nothing in `wr-logic` may wrap the handle in a
+    /// second `RefCell` — that would recreate the aliasing problem the ruling exists to
+    /// prevent, and put two independent memo caches behind one logical number system.
+    ///
+    /// # Borrow discipline (the one hazard `RefCell` introduces)
+    ///
+    /// Every construction below is **recursive** — `constant(n)` calls `get_constant(n/2)`,
+    /// `multiplication(n)` calls `get_multiplication(n/2)`, `division(n)` calls
+    /// `comparison_const_b`. So no borrow of any of these three cells may be held across a
+    /// call back into `self`: each lookup takes its borrow, clones out, and drops it in the
+    /// same statement; each insert takes a fresh `borrow_mut` after all recursion has
+    /// finished. Violating that is a runtime `already borrowed` panic, not a compile error,
+    /// which is why it is spelled out here.
+    constants_dynamic_table: RefCell<BTreeMap<BigInt, Automaton>>,
+    multiplications_dynamic_table: RefCell<BTreeMap<BigInt, Automaton>>,
+    divisions_dynamic_table: RefCell<BTreeMap<BigInt, Automaton>>,
 }
 
 fn big(v: i32) -> BigInt {
@@ -669,28 +971,87 @@ fn big(v: i32) -> BigInt {
 }
 
 impl NumberSystem {
-    /// `NumberSystem(String name)` (`:132-163`), programmatic path only.
+    /// `NumberSystem(String name)` (`:132-163`) with no custom-base files supplied — the
+    /// plain `msd_k`/`lsd_k` path, and the exact pre-U5 behavior.
     ///
-    /// Java's sequence is: parse msd/lsd + base out of the name, build (or file-load)
-    /// `addition`, then `lessThan`, then `equality` over `getAlphabet()`, then try to
-    /// file-load the all-representations automaton. This port keeps that order — it
-    /// matters, since `setLessThanAutomaton`/`setEqualityAutomaton` both read
-    /// `getAlphabet()`, which is `addition`'s track-0 alphabet — and drops the file
-    /// loading and the `allRepresentations` field entirely (see module docs).
-    ///
-    /// `isNeg = name.contains("_neg_")` (`:137`) is dropped: negative bases are out of
-    /// scope, and every base this constructor accepts is `\d+` and `> 1`, so a name
-    /// containing `_neg_` fails at [`NumSysError::NotDefined`] instead.
+    /// A genuinely custom base (`msd_fib`, `msd_pell`, `msd_ns`, …) has no programmatic
+    /// construction, so it still fails here with [`NumSysError::NotDefined`], exactly as it
+    /// did before U5. Callers that CAN read `Custom Bases/` (i.e. `wr-io`/`wr-cli`) use
+    /// [`NumberSystem::with_custom_base_files`] instead.
     pub fn new(name: &str) -> Result<NumberSystem, NumSysError> {
+        Self::with_custom_base_files(name, CustomBaseFiles::default())
+    }
+
+    /// `NumberSystem(String name)` (`:132-163`) in full, with the three file loads lifted
+    /// out into a caller-supplied [`CustomBaseFiles`] (see that type for why).
+    ///
+    /// Java's sequence, preserved exactly, because the order is load-bearing:
+    ///
+    /// 1. `determineMsdOrLsd`/`isMsd` (`:135-136`), then `isNeg` (`:137`) — which this port
+    ///    turns into a hard [`NumSysError::UnsupportedNegativeBase`] rejection, BEFORE any
+    ///    file is consulted, matching Java's own line order;
+    /// 2. `setAdditionAutomaton` (`:142`) — file first, programmatic fallback second;
+    /// 3. `setLessThanAutomaton` (`:143`) and `setEqualityAutomaton(getAlphabet())`
+    ///    (`:144`), both of which read `getAlphabet()` = the (possibly file-loaded) adder's
+    ///    track-0 alphabet, which is why they must come after step 2;
+    /// 4. the all-representations file (`:147-156`): if absent, `flagUseAllRepresentations`
+    ///    goes `false` and nothing else happens; if present, its own number-system list is
+    ///    filled with `this` and `applyAllRepresentations()` is applied to the adder, the
+    ///    comparator, and the equality automaton, in that order.
+    ///
+    /// # One declared, proven-unobservable divergence in step 4
+    ///
+    /// `Collections.fill(allRepresentations.getNS(), this)` (`:151`) makes the
+    /// all-representations automaton point at the very number system that owns it —
+    /// a reference cycle Java's GC shrugs off but `Rc` would leak. This port fills the
+    /// direction half (`msd`) and leaves the [`crate::automaton::Automaton::all_reps`] half
+    /// empty. Provably unread: `all_reps[i]` is only consulted by
+    /// `apply_all_representations`, and the only reader of *this* automaton's copy would be
+    /// `product::update_axb_fields`'s `bNS.get(i) != null && AxB.getNS().get(j) == null`
+    /// merge — which cannot fire, because the automaton it is `and`ed into always has a
+    /// non-`None` `msd` on the matching track (that track is precisely the one carrying the
+    /// restriction, so `all_reps`'s own invariant makes its `msd` `Some`).
+    pub fn with_custom_base_files(
+        name: &str,
+        files: CustomBaseFiles,
+    ) -> Result<NumberSystem, NumSysError> {
         let msd_or_lsd = determine_msd_or_lsd(name)?;
         // `isMsd = msdOrLsd.equals(MSD)` (`:136`) -- anything that is not EXACTLY
         // "msd" (including "MSD", or the empty prefix of a name like "_5") is lsd.
         let is_msd = msd_or_lsd == MSD;
+        // `isNeg = name.contains(UNDERSCORE_NEG_UNDERSCORE)` (`:137`) -> reject.
+        if name.contains(UNDERSCORE_NEG_UNDERSCORE) {
+            return Err(NumSysError::UnsupportedNegativeBase(name.to_string()));
+        }
         let base = determine_base(name);
 
-        let addition = Self::build_addition_automaton(name, base, is_msd)?;
-        let less_than = Self::build_less_than_automaton(name, &addition.alphabet[0], is_msd);
-        let equality = equality_automaton(&addition.alphabet[0], is_msd);
+        let mut addition =
+            Self::set_addition_automaton(name, base, is_msd, files.addition.resolve())?;
+        let alphabet = addition.alphabet[0].clone();
+        let mut less_than =
+            Self::set_less_than_automaton(name, &alphabet, is_msd, files.less_than.resolve())?;
+        let mut equality = equality_automaton(&alphabet, is_msd);
+
+        // `allRepresentations = loadAutomatonOrNull(name, TXT_EXTENSION, base)` (`:147`).
+        let all_representations = match files.all_representations.resolve() {
+            // `flagUseAllRepresentations = false` (`:149`).
+            None => None,
+            Some(mut n) => {
+                // `Collections.fill(allRepresentations.getNS(), this)` (`:151`) -- see this
+                // method's doc comment for the `all_reps` half, deliberately left empty.
+                n.msd = vec![Some(is_msd); n.alphabet.len()];
+                let n = Rc::new(n);
+                // `addition.applyAllRepresentations(); lessThan...; equality...` (`:153-155`).
+                // Java reaches the automaton via each track's `NumberSystem` (= `this`,
+                // installed by the two setters above and by `initBasicAutomaton`); here the
+                // per-track handle is installed explicitly.
+                for a in [&mut addition, &mut less_than, &mut equality] {
+                    a.set_all_reps(vec![Some(Rc::clone(&n)); a.alphabet.len()]);
+                    a.apply_all_representations();
+                }
+                Some(n)
+            }
+        };
 
         Ok(NumberSystem {
             name: name.to_string(),
@@ -698,94 +1059,127 @@ impl NumberSystem {
             addition,
             less_than,
             equality,
-            constants_dynamic_table: BTreeMap::new(),
-            multiplications_dynamic_table: BTreeMap::new(),
-            divisions_dynamic_table: BTreeMap::new(),
+            all_representations,
+            constants_dynamic_table: RefCell::new(BTreeMap::new()),
+            multiplications_dynamic_table: RefCell::new(BTreeMap::new()),
+            divisions_dynamic_table: RefCell::new(BTreeMap::new()),
         })
     }
 
-    /// `NumberSystem.setAdditionAutomaton(String name, String base)` (`:322-367`) minus
-    /// the `loadAutomatonOrNull` attempt (`:323`) and the `baseNegNAddition` fallback
-    /// (`:327-328`), both dropped — see module docs.
+    /// `NumberSystem.setAdditionAutomaton(String name, String base)` (`:322-367`).
     ///
-    /// The four structural validations (`:342-362`) are ported as assertions. They can
-    /// only fail on a file-loaded automaton, which this port cannot produce: the
-    /// programmatic construction always yields 3 tracks over `0..k` with `k > 1`, so
-    /// `0` and `1` are always present and all three tracks are literally the same list.
-    /// Kept anyway so a future `wr-io` custom-base loader inherits the checks.
+    /// `loaded` is `loadAutomatonOrNull(name, UNDERSCORE_ADDITION_AUTOMATON, base)`'s
+    /// result (`:323`), resolved by the caller. The `baseNegNAddition` fallback
+    /// (`:327-328`) is deleted along with the rest of the negative-base surface — and is
+    /// now unreachable anyway, since [`NumberSystem::with_custom_base_files`] rejects
+    /// `_neg_` names outright.
     ///
-    /// `addition.getNS().set(i, this)` (`:364-366`) is already done by
-    /// [`init_basic_automaton`] via `msd`.
-    fn build_addition_automaton(
+    /// **The `if (!isMsd) reverse(...)` step sits INSIDE the "no file found" branch**
+    /// (`:335-337`) — a file-loaded adder is used exactly as loaded, because
+    /// `loadAutomatonOrNull` has already reversed it if (and only if) it came from the
+    /// opposite direction's file. Getting this wrong would double-reverse every lsd custom
+    /// base.
+    ///
+    /// The four structural validations (`:342-362`) were `assert!`s in U7 on the grounds
+    /// that only a file-loaded automaton could fail them; they are `Err`s now (see
+    /// [`NumSysError::AdditionInputCount`]). The programmatic construction still satisfies
+    /// all four by construction.
+    ///
+    /// `addition.getNS().set(i, this)` (`:364-366`) is ported explicitly: for the
+    /// programmatic path [`init_basic_automaton`] already did it, but a file-loaded adder
+    /// arrives with whatever number systems its `.txt` header declared (`null` for a
+    /// `{0,1}`-style declaration), and Java overwrites all of them.
+    fn set_addition_automaton(
         name: &str,
         base: &str,
         is_msd: bool,
+        loaded: Option<Automaton>,
     ) -> Result<Automaton, NumSysError> {
-        if !is_number(base) {
-            return Err(NumSysError::NotDefined(name.to_string()));
-        }
-        let k: i32 = base
-            .parse()
-            .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
-        if k <= 1 {
-            return Err(NumSysError::NotDefined(name.to_string()));
-        }
-        let mut addition = base_n_addition_automaton(k, is_msd);
-        if !is_msd {
-            // `AutomatonLogicalOps.reverse(addition, false)` (`:333`) -- reverse the
-            // LANGUAGE, keep the declared numeration direction (`reverseMsd = false`).
-            reverse(&mut addition, false);
-        }
+        let mut addition = match loaded {
+            Some(loaded) => loaded,
+            None => {
+                if !is_number(base) {
+                    return Err(NumSysError::NotDefined(name.to_string()));
+                }
+                let k: i32 = base
+                    .parse()
+                    .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
+                if k <= 1 {
+                    return Err(NumSysError::NotDefined(name.to_string()));
+                }
+                let mut addition = base_n_addition_automaton(k, is_msd);
+                if !is_msd {
+                    // `AutomatonLogicalOps.reverse(addition, false)` (`:336`) -- reverse the
+                    // LANGUAGE, keep the declared numeration direction (`reverseMsd = false`).
+                    reverse(&mut addition, false);
+                }
+                addition
+            }
+        };
 
-        assert_eq!(
-            addition.alphabet.len(),
-            3,
-            "The addition automaton must have exactly 3 inputs: base {name}"
-        );
+        if addition.alphabet.len() != 3 {
+            return Err(NumSysError::AdditionInputCount(name.to_string()));
+        }
         let alphabet = addition.alphabet[0].clone();
-        assert!(
-            alphabet.contains(&0),
-            "The input alphabet of addition automaton must contain 0: base {name}"
-        );
-        assert!(
-            alphabet.contains(&1),
-            "The input alphabet of addition automaton must contain 1: base {name}"
-        );
+        if !alphabet.contains(&0) {
+            return Err(NumSysError::AdditionAlphabetMissingZero(name.to_string()));
+        }
+        if !alphabet.contains(&1) {
+            return Err(NumSysError::AdditionAlphabetMissingOne(name.to_string()));
+        }
         for track in &addition.alphabet[1..] {
             // `UtilityMethods.areEqual` is SET equality (see `Automaton::remove_same_inputs`).
             let lhs: BTreeSet<i32> = track.iter().copied().collect();
             let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
-            assert_eq!(
-                lhs, rhs,
-                "All 3 inputs of the addition automaton must have the same alphabet: base {name}"
-            );
+            if lhs != rhs {
+                return Err(NumSysError::AdditionAlphabetsDiffer(name.to_string()));
+            }
         }
+        // `for (i) addition.getNS().set(i, this)` (`:364-366`).
+        addition.msd = vec![Some(is_msd); addition.alphabet.len()];
         Ok(addition)
     }
 
-    /// `NumberSystem.setLessThanAutomaton(String name, String base)` (`:369-396`) minus
-    /// the file-load attempt (`:370`) and the `baseNegNLessThan` fallback (`:372-373`).
-    /// Same "assertions can't fail on a programmatic build" note as
-    /// [`NumberSystem::build_addition_automaton`].
-    fn build_less_than_automaton(name: &str, alphabet: &[i32], is_msd: bool) -> Automaton {
-        let mut less_than = lexicographic_less_than(alphabet, is_msd);
-        if !is_msd {
-            reverse(&mut less_than, false);
+    /// `NumberSystem.setLessThanAutomaton(String name, String base)` (`:369-396`).
+    ///
+    /// `loaded` is `loadAutomatonOrNull(name, UNDERSCORE_LESS_THAN_AUTOMATON, base)`'s
+    /// result (`:370`); the `baseNegNLessThan` fallback (`:372-373`) is deleted with the
+    /// rest of the negative-base surface. Same "the reverse lives inside the no-file
+    /// branch" note as [`NumberSystem::set_addition_automaton`]. `alphabet` is
+    /// `getAlphabet()`, i.e. the adder's track-0 alphabet.
+    ///
+    /// Note `lessThan.getNS().set(i, this)` (`:392`) sits INSIDE the validation loop, after
+    /// that iteration's alphabet check — so a mismatch on track 0 leaves track 1's number
+    /// system unset. Irrelevant (the error aborts construction) but ported in place rather
+    /// than hoisted.
+    fn set_less_than_automaton(
+        name: &str,
+        alphabet: &[i32],
+        is_msd: bool,
+        loaded: Option<Automaton>,
+    ) -> Result<Automaton, NumSysError> {
+        let mut less_than = match loaded {
+            Some(loaded) => loaded,
+            None => {
+                let mut less_than = lexicographic_less_than(alphabet, is_msd);
+                if !is_msd {
+                    reverse(&mut less_than, false);
+                }
+                less_than
+            }
+        };
+        if less_than.alphabet.len() != 2 {
+            return Err(NumSysError::LessThanInputCount(name.to_string()));
         }
-        assert_eq!(
-            less_than.alphabet.len(),
-            2,
-            "_less_than.txt must have exactly 2 inputs: base {name}"
-        );
-        for track in &less_than.alphabet {
-            let lhs: BTreeSet<i32> = track.iter().copied().collect();
-            let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
-            assert_eq!(
-                lhs, rhs,
-                "Inputs of _less_than.txt must have the same alphabet as the alphabet of inputs of _addition.txt : base {name}"
-            );
+        let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
+        for i in 0..less_than.alphabet.len() {
+            let lhs: BTreeSet<i32> = less_than.alphabet[i].iter().copied().collect();
+            if lhs != rhs {
+                return Err(NumSysError::LessThanAlphabetMismatch(name.to_string()));
+            }
+            less_than.msd[i] = Some(is_msd);
         }
-        less_than
+        Ok(less_than)
     }
 
     /// `NumberSystem.isMsd()` (`:245-247`).
@@ -798,11 +1192,28 @@ impl NumberSystem {
         &self.name
     }
 
-    /// `NumberSystem.useAllRepresentations()` (`:253-255`). Always `false` here: the
-    /// flag is only ever set by successfully file-loading an all-representations
-    /// automaton, which this port doesn't do (see module docs).
+    /// `NumberSystem.useAllRepresentations()` (`:253-255`). `true` exactly when a
+    /// `Custom Bases/<name>.txt` "set of all representations" automaton was supplied —
+    /// i.e. never for a plain `msd_k`/`lsd_k`, and (of the bases `walnut-java` ships)
+    /// always for `msd_fib`/`msd_pell`/`msd_trib`/`msd_tib`/`msd_ns`/`msd_kim`/
+    /// `msd_nara`/`msd_pisot4`.
+    ///
+    /// Before U5 this was a hardcoded `false`, with the port's own docs (here, in
+    /// `logicalops.rs`, and in `product.rs`) reasoning from that to
+    /// "`applyAllRepresentations` is dead code". All three are corrected.
     pub fn use_all_representations(&self) -> bool {
-        false
+        self.all_representations.is_some()
+    }
+
+    /// `NumberSystem.getAllRepresentations()` (`:261-263`).
+    ///
+    /// Java returns the field directly and its callers then `bind` it, mutating the shared
+    /// instance against the class's own "returned automata must not be altered" warning;
+    /// this hands back the shared [`Rc`] and
+    /// [`crate::automaton::Automaton::apply_all_representations`] clones out of it before
+    /// binding. See that method's docs — the difference is unobservable.
+    pub fn all_representations(&self) -> Option<&Rc<Automaton>> {
+        self.all_representations.as_ref()
     }
 
     /// `NumberSystem.getAlphabet()` (`:257-259`) — `addition.richAlphabet.getA().get(0)`.
@@ -847,10 +1258,25 @@ impl NumberSystem {
     /// with new adder/comparator automata — and is what
     /// `NumberSystemTest.testMSDFlip`'s assertions are actually about.
     pub fn flip(&self) -> Result<NumberSystem, NumSysError> {
+        self.flip_with_custom_base_files(CustomBaseFiles::default())
+    }
+
+    /// [`NumberSystem::flip`] for a custom base: the caller supplies the FLIPPED name's
+    /// `Custom Bases/` files, since Java's `new NumberSystem(newName)` re-runs the whole
+    /// file lookup under the new name and `wr-core` cannot.
+    ///
+    /// Without this, `flip()` on a custom base fails with [`NumSysError::NotDefined`]
+    /// (`"fib"` is not a base this crate can build programmatically) — correct, but useless
+    /// to a caller that does have the files. Use [`custom_base_candidate_names`] with the
+    /// flipped name to find out which files to read.
+    pub fn flip_with_custom_base_files(
+        &self,
+        files: CustomBaseFiles,
+    ) -> Result<NumberSystem, NumSysError> {
         let msd_or_lsd = determine_msd_or_lsd(&self.name)?;
         let base = determine_base(&self.name);
         let new_name = format!("{}_{}", if msd_or_lsd == MSD { LSD } else { MSD }, base);
-        NumberSystem::new(&new_name)
+        NumberSystem::with_custom_base_files(&new_name, files)
     }
 
     /// `NumberSystem.validateNeg(BigInteger)` (`:1026-1028`), with the `!isNeg` half
@@ -917,7 +1343,7 @@ impl NumberSystem {
     /// "this way, we make sure B != a"), intersects with the two-variable comparison,
     /// and quantifies that name away.
     pub fn comparison_const_b(
-        &mut self,
+        &self,
         a: &str,
         b: &BigInt,
         op: RelationalOp,
@@ -943,7 +1369,7 @@ impl NumberSystem {
     /// `NumberSystem.comparison(BigInteger a, String b, RelationalOperator.Ops)`
     /// (`:735-738`) — the constant on the LEFT, delegated by reversing the relation.
     pub fn comparison_const_a(
-        &mut self,
+        &self,
         a: &BigInt,
         b: &str,
         op: RelationalOp,
@@ -990,7 +1416,7 @@ impl NumberSystem {
     /// The `b.signum() < 0` rewrite (`:809-813`, "we rewrite `a-b=c` as `a+(-b)=c`") is
     /// DELETED — unreachable after `validateNeg` once negative bases are gone.
     pub fn arithmetic_const_b(
-        &mut self,
+        &self,
         a: &str,
         b: &BigInt,
         c: &str,
@@ -1026,7 +1452,7 @@ impl NumberSystem {
     /// `validateNeg`), so only the `else` arm survives — which is also the arm Java's
     /// own `NumberSystemTest.testConstantAsTheLeftOperand` characterizes for `a >= 0`.
     pub fn arithmetic_const_a(
-        &mut self,
+        &self,
         a: &BigInt,
         b: &str,
         c: &str,
@@ -1057,7 +1483,7 @@ impl NumberSystem {
     /// The `c.signum() < 0 && MINUS` rewrite (`:910-913`) is DELETED (unreachable after
     /// `validateNeg`).
     pub fn arithmetic_const_c(
-        &mut self,
+        &self,
         a: &str,
         b: &str,
         c: &BigInt,
@@ -1089,8 +1515,24 @@ impl NumberSystem {
     /// Java returns `constant(n).clone()`, i.e. a deep copy of the memoized automaton,
     /// because the class-level warning is explicit that the cached instances must never
     /// be mutated by a caller. Same here.
-    pub fn get_constant(&mut self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        Ok(self.constant(n)?.clone())
+    ///
+    /// # `&self`, not `&mut self` (U5, `PORTING.md`'s Ruling 1)
+    ///
+    /// This and its two siblings memoize into [`RefCell`]-wrapped tables, so a formula's
+    /// tokens can share one `Rc<NumberSystem>` and still populate the cache — see the
+    /// doc comment on `constants_dynamic_table` for the full argument and the borrow
+    /// discipline the private builders below must respect. Behaviorally identical to the
+    /// pre-U5 `&mut self` version: same memo keys, same automata, same errors.
+    ///
+    /// One structural simplification comes with it. Java's `getConstant` is
+    /// `constant(n).clone()`, where `constant` returns the cached instance by reference; a
+    /// `RefCell` cannot lend out a reference that outlives the borrow, so [`Self::constant`]
+    /// now returns the clone itself and this is a pass-through. That removes one of the two
+    /// clones per call and changes nothing observable — every internal caller already went
+    /// through the `get_*` wrappers, never through `constant`/`multiplication`/`division`
+    /// directly (verified across all call sites, in both engines).
+    pub fn get_constant(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+        self.constant(n)
     }
 
     /// `NumberSystem.getMultiplication(BigInteger n)` (`:648-650`) — two inputs,
@@ -1100,14 +1542,16 @@ impl NumberSystem {
     /// `:644-646`) are confirmed-dead (zero callers; `docs/WALNUT-BUGS.md`'s dead-code
     /// section) and are not ported — the `BigInteger` forms below are the live ones,
     /// reached from `arithmetic` with a `MULT`/`DIV` operator.
-    pub fn get_multiplication(&mut self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        Ok(self.multiplication(n)?.clone())
+    /// `&self` as of U5 — see [`NumberSystem::get_constant`].
+    pub fn get_multiplication(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+        self.multiplication(n)
     }
 
     /// `NumberSystem.getDivision(BigInteger n)` (`:640-642`) — two inputs, accepting
     /// iff the second is one `n`th of the first.
-    pub fn get_division(&mut self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        Ok(self.division(n)?.clone())
+    /// `&self` as of U5 — see [`NumberSystem::get_constant`].
+    pub fn get_division(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+        self.division(n)
     }
 
     /// `NumberSystem.constant(BigInteger n)` (`:931-971`), memoized.
@@ -1122,10 +1566,18 @@ impl NumberSystem {
     /// This is entirely self-contained arithmetic over the adder — the earlier
     /// speculation that it might need a regex/`BricsConverter` substitute applies ONLY
     /// to the two base cases, which are `0*` and `0*1`/`10*`.
-    fn constant(&mut self, n: &BigInt) -> Result<&Automaton, NumSysError> {
+    ///
+    /// Returns an owned clone rather than a borrow of the cache entry — see
+    /// [`NumberSystem::get_constant`]'s note on why, and the `constants_dynamic_table` doc
+    /// comment for the borrow discipline the recursion below relies on (the lookup borrow
+    /// is scoped and dropped before any recursive call; the insert takes a fresh one).
+    fn constant(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
-        if self.constants_dynamic_table.contains_key(n) {
-            return Ok(&self.constants_dynamic_table[n]);
+        {
+            let table = self.constants_dynamic_table.borrow();
+            if let Some(cached) = table.get(n) {
+                return Ok(cached.clone());
+            }
         }
 
         let (a, b, c) = ("a", "b", "c");
@@ -1153,12 +1605,14 @@ impl NumberSystem {
 
         // Java stores here as well as inside `makeConstant` for the 0/1 cases -- a
         // harmless double `put` of the same value, ported as-is.
-        self.constants_dynamic_table.insert(n.clone(), p);
-        Ok(&self.constants_dynamic_table[n])
+        self.constants_dynamic_table
+            .borrow_mut()
+            .insert(n.clone(), p.clone());
+        Ok(p)
     }
 
     /// `NumberSystem.makeZero()` (`:1060-1062`) — `makeConstant("0*", 0)`.
-    fn make_zero(&mut self) -> Automaton {
+    fn make_zero(&self) -> Automaton {
         // `0*`: one accepting state self-looping on digit 0.
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0usize]);
@@ -1176,7 +1630,7 @@ impl NumberSystem {
     }
 
     /// `NumberSystem.makeOne()` (`:1064-1066`) — `makeConstant(isMsd ? "0*1" : "10*", 1)`.
-    fn make_one(&mut self) -> Automaton {
+    fn make_one(&self) -> Automaton {
         let fa = if self.is_msd {
             // `0*1`: state 0 loops on 0 and moves to the accepting state 1 on digit 1;
             // state 1 has no outgoing transitions.
@@ -1234,13 +1688,14 @@ impl NumberSystem {
     /// Java does NOT reset the track's number system after the widening, so the track
     /// keeps the `numSys` that `AutomatonDFA`'s constructor attached (`AutomatonDFA.java:58`)
     /// — replicated by `msd: [Some(self.is_msd)]`.
-    fn make_constant(&mut self, fa: Fa, constant: i32) -> Automaton {
+    fn make_constant(&self, fa: Fa, constant: i32) -> Automaton {
         let alphabet = self.get_alphabet().to_vec();
         let mut m = Automaton::new(fa, vec![alphabet], Vec::new(), vec![Some(self.is_msd)]);
         m.determine_alphabet_size();
         m.setup_encoder();
         m.canonize();
         self.constants_dynamic_table
+            .borrow_mut()
             .insert(BigInt::from(constant), m.clone());
         m
     }
@@ -1261,13 +1716,16 @@ impl NumberSystem {
     /// mutated in a way that reaches back into `self.equality` or another memo entry,
     /// regardless of what future callers (e.g. a ported `applyAllRepresentations`) do
     /// with their own clone.
-    fn multiplication(&mut self, n: &BigInt) -> Result<&Automaton, NumSysError> {
+    fn multiplication(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
         if *n == big(0) {
             return Err(NumSysError::MultiplicationByZero);
         }
-        if self.multiplications_dynamic_table.contains_key(n) {
-            return Ok(&self.multiplications_dynamic_table[n]);
+        {
+            let table = self.multiplications_dynamic_table.borrow();
+            if let Some(cached) = table.get(n) {
+                return Ok(cached.clone());
+            }
         }
         let (a, b, c, d) = ("a", "b", "c", "d");
         let two = big(2);
@@ -1304,8 +1762,10 @@ impl NumberSystem {
             p
         };
 
-        self.multiplications_dynamic_table.insert(n.clone(), p);
-        Ok(&self.multiplications_dynamic_table[n])
+        self.multiplications_dynamic_table
+            .borrow_mut()
+            .insert(n.clone(), p.clone());
+        Ok(p)
     }
 
     /// `NumberSystem.division(BigInteger n)` (`:1034-1058`), memoized. Two inputs;
@@ -1314,13 +1774,16 @@ impl NumberSystem {
     /// `a / n = b  <=>  Er,q  a = q + r & q = n*b & 0 <= r < n` (Java's own comment).
     /// The `n < 0` operand selections at `:1047-1048` are DELETED (unreachable after
     /// `validateNeg`), so the two range comparisons are always `r >= 0` and `r < n`.
-    fn division(&mut self, n: &BigInt) -> Result<&Automaton, NumSysError> {
+    fn division(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
         if *n == big(0) {
             return Err(NumSysError::DivisionByZero);
         }
-        if self.divisions_dynamic_table.contains_key(n) {
-            return Ok(&self.divisions_dynamic_table[n]);
+        {
+            let table = self.divisions_dynamic_table.borrow();
+            if let Some(cached) = table.get(n) {
+                return Ok(cached.clone());
+            }
         }
         let (a, b, r, q) = ("a", "b", "r", "q");
 
@@ -1335,8 +1798,10 @@ impl NumberSystem {
         quantify(&mut rr, &label_set(&[q, r]))?;
         rr.sort_label();
 
-        self.divisions_dynamic_table.insert(n.clone(), rr);
-        Ok(&self.divisions_dynamic_table[n])
+        self.divisions_dynamic_table
+            .borrow_mut()
+            .insert(n.clone(), rr.clone());
+        Ok(rr)
     }
 }
 
@@ -1560,7 +2025,7 @@ mod tests {
     /// wrong direction's automaton.
     #[test]
     fn lsd_one_constant() {
-        let mut ns = NumberSystem::new("lsd_5").unwrap();
+        let ns = NumberSystem::new("lsd_5").unwrap();
         let one = ns.get_constant(&big(1)).unwrap();
         assert_eq!(one.alphabet[0].len(), 5);
         assert_eq!(one.get_arity(), 1);
@@ -1583,7 +2048,7 @@ mod tests {
     #[test]
     fn constant_zero_is_the_all_zeros_language() {
         for name in ["msd_3", "lsd_3"] {
-            let mut ns = NumberSystem::new(name).unwrap();
+            let ns = NumberSystem::new(name).unwrap();
             let zero = ns.get_constant(&big(0)).unwrap();
             assert_eq!(zero.get_arity(), 1, "{name}");
             // the track alphabet was widened from the regex's {0,1} to the full base
@@ -1602,7 +2067,7 @@ mod tests {
     /// would catch that, but not the reverse mistake.
     #[test]
     fn msd_one_constant_is_the_mirror_image() {
-        let mut ns = NumberSystem::new("msd_5").unwrap();
+        let ns = NumberSystem::new("msd_5").unwrap();
         let one = ns.get_constant(&big(1)).unwrap();
         assert!(accepts_tuples(&one, &single_track("1")));
         assert!(accepts_tuples(&one, &single_track("001")));
@@ -1731,7 +2196,7 @@ mod tests {
     /// `NumberSystemTest.testArithmetic` (`:128-144`).
     #[test]
     fn arithmetic_rejects_unsupported_operator_shapes() {
-        let mut ns = NumberSystem::new("msd_3").unwrap();
+        let ns = NumberSystem::new("msd_3").unwrap();
         // Can't divide two variables.
         assert_eq!(
             ns.arithmetic("a", "b", "c", ArithmeticOp::Div).unwrap_err(),
@@ -1765,14 +2230,14 @@ mod tests {
     /// `NumberSystemTest.testMultiplicationOfTwoVariablesAndByZero` (`:514-528`).
     #[test]
     fn multiplication_of_two_variables_and_by_zero() {
-        let mut ns = NumberSystem::new("msd_3").unwrap();
+        let ns = NumberSystem::new("msd_3").unwrap();
         assert_eq!(
             ns.arithmetic_const_c("a", "b", &big(0), ArithmeticOp::Mult)
                 .unwrap_err(),
             NumSysError::OperatorTwoVariables("*")
         );
 
-        let mut base2 = NumberSystem::new("msd_2").unwrap();
+        let base2 = NumberSystem::new("msd_2").unwrap();
         assert_eq!(
             base2
                 .arithmetic_const_b("x", &big(0), "y", ArithmeticOp::Mult)
@@ -1785,7 +2250,7 @@ mod tests {
     /// `validateNeg` (see module docs), reached through every entry point that has one.
     #[test]
     fn negative_constants_are_rejected_everywhere_validate_neg_guards() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         let neg = big(-5);
         let expected = NumSysError::NegativeConstant("-5".to_string());
         assert_eq!(ns.get_constant(&neg).unwrap_err(), expected);
@@ -1826,7 +2291,7 @@ mod tests {
     /// result and confirming the next call is unaffected.
     #[test]
     fn get_multiplication_and_get_division_hand_back_fresh_clones() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
 
         let mut times_three = ns.get_multiplication(&big(3)).unwrap();
         assert_eq!(times_three.get_arity(), 2);
@@ -1936,7 +2401,7 @@ mod tests {
     /// `NumberSystemTest.testBaseTwoConstantFiveSemantics` (`:591-602`).
     #[test]
     fn base_two_constant_five_semantics() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         let five = ns.get_constant(&big(5)).unwrap();
         assert_eq!(five.get_arity(), 1);
 
@@ -1950,7 +2415,7 @@ mod tests {
     /// `NumberSystemTest.testMultiplicationByThreeSemantics` (`:604-616`).
     #[test]
     fn multiplication_by_three_semantics() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         let times_three = ns
             .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Mult)
             .unwrap();
@@ -1970,7 +2435,7 @@ mod tests {
     /// overloads' operand order would fail.
     #[test]
     fn constant_as_the_right_operand() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
 
         let plus_three = ns
             .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Plus)
@@ -1992,7 +2457,7 @@ mod tests {
     /// observable.
     #[test]
     fn constant_as_the_left_operand() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
 
         let three_plus = ns
             .arithmetic_const_a(&big(3), "x", "y", ArithmeticOp::Plus)
@@ -2019,7 +2484,7 @@ mod tests {
     /// (`:495-512`): `x + y = 3`.
     #[test]
     fn constant_as_the_result() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         let sum_is_three = ns
             .arithmetic_const_c("x", "y", &big(3), ArithmeticOp::Plus)
             .unwrap();
@@ -2041,7 +2506,7 @@ mod tests {
     /// `a / n = b` with truncation.
     #[test]
     fn division_by_three_semantics() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         let div_three = ns
             .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Div)
             .unwrap();
@@ -2067,7 +2532,7 @@ mod tests {
     /// `y == x / n` with truncation, for every `x` in range, over two divisors.
     #[test]
     fn division_matches_truncating_integer_division_over_a_small_table() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
         for n in [2u32, 3u32] {
             let div = ns
                 .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Div)
@@ -2092,7 +2557,7 @@ mod tests {
     /// they would be the only untested branches of `comparison_const_b`.
     #[test]
     fn comparison_against_a_constant_equal_and_not_equal_short_circuit() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
 
         let eq_five = ns
             .comparison_const_b("x", &big(5), RelationalOp::Equal)
@@ -2119,7 +2584,7 @@ mod tests {
     /// side-by-side asymmetric fixture catches that.
     #[test]
     fn comparison_with_the_constant_on_the_left() {
-        let mut ns = NumberSystem::new("msd_2").unwrap();
+        let ns = NumberSystem::new("msd_2").unwrap();
 
         let three_lt_x = ns
             .comparison_const_a(&big(3), "x", RelationalOp::LessThan)
@@ -2235,7 +2700,7 @@ mod tests {
     /// the non-composed ones (adder, comparator, equality, constants 0 and 1) work.
     #[test]
     fn lsd_composed_constructions_report_the_unsupported_fixup() {
-        let mut ns = NumberSystem::new("lsd_2").unwrap();
+        let ns = NumberSystem::new("lsd_2").unwrap();
         // Non-composed: fine.
         assert!(ns.get_constant(&big(0)).is_ok());
         assert!(ns.get_constant(&big(1)).is_ok());
@@ -2440,7 +2905,7 @@ mod tests {
             width in 5usize..8,
         ) {
             let m = if exact { n } else { m_free };
-            let mut ns = NumberSystem::new(&format!("msd_{base}")).unwrap();
+            let ns = NumberSystem::new(&format!("msd_{base}")).unwrap();
             let automaton = ns.get_constant(&BigInt::from(n)).unwrap();
             let Some(md) = msd_digits(m, base, width) else { return Ok(()); };
             let word: Vec<Vec<i32>> = md.iter().map(|&d| vec![d]).collect();
@@ -2464,7 +2929,7 @@ mod tests {
         ) {
             let y = if exact { n * x } else { y_free };
             let base = 2u32;
-            let mut ns = NumberSystem::new("msd_2").unwrap();
+            let ns = NumberSystem::new("msd_2").unwrap();
             let times_n = ns
                 .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
                 .unwrap();
@@ -2492,5 +2957,675 @@ mod tests {
         assert_eq!(msd_string(5, 2, 4), "0101");
         assert_eq!(msd_string(6, 3, 3), "020");
         assert_eq!(value_msd(&[0, 1, 0, 1], 2), 5);
+    }
+
+    // ================================================================ U5: custom bases
+
+    /// Builds a single-track automaton over `{0, 1}` from `(output, [(digit, dest)])` rows —
+    /// the shape `Custom Bases/*.txt` files declare.
+    fn one_track_fixture(rows: &[(i32, &[(i32, usize)])]) -> Automaton {
+        let q = rows.len();
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q,
+            alphabet_size: 2,
+            o: rows.iter().map(|(o, _)| *o).collect(),
+            d: vec![BTreeMap::new(); q],
+        };
+        for (state, (_, edges)) in rows.iter().enumerate() {
+            for (digit, dest) in *edges {
+                fa.d[state].insert(*digit, vec![*dest]);
+            }
+        }
+        // Track number system left `None`, exactly as the reader leaves a `{0,1}`-declared
+        // track (`ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)`); the
+        // constructor is what overwrites it.
+        Automaton::new(fa, vec![vec![0, 1]], Vec::new(), vec![None])
+    }
+
+    /// `walnut-java/Custom Bases/msd_fib.txt`, verbatim: the set of valid Zeckendorf
+    /// representations over `{0, 1}` — i.e. the words with no `11` substring.
+    fn msd_fib_all_representations() -> Automaton {
+        one_track_fixture(&[(1, &[(0, 0), (1, 1)]), (1, &[(0, 0)])])
+    }
+
+    /// `walnut-java/Custom Bases/msd_fib_addition.txt`, verbatim (7 states, 3 tracks over
+    /// `{0,1}`). Transition rows are the file's `d0 d1 d2 -> dest` lines; the encoded symbol
+    /// is `encode([d0, d1, d2])` (track 0 fastest-varying — see `automaton.rs`'s module
+    /// docs), which this helper computes rather than hard-coding.
+    fn msd_fib_addition() -> Automaton {
+        /// One state's `(output, transitions)` row, transitions as
+        /// `(digit tuple, destination)` — factored out only to satisfy
+        /// `clippy::type_complexity`.
+        type Row = (i32, Vec<([i32; 3], usize)>);
+        let rows: Vec<Row> = vec![
+            (
+                1,
+                vec![
+                    ([0, 0, 0], 0),
+                    ([0, 0, 1], 1),
+                    ([1, 0, 1], 0),
+                    ([0, 1, 1], 0),
+                ],
+            ),
+            (
+                0,
+                vec![
+                    ([0, 0, 0], 2),
+                    ([1, 0, 0], 3),
+                    ([0, 1, 0], 3),
+                    ([1, 1, 0], 4),
+                    ([1, 0, 1], 2),
+                    ([0, 1, 1], 2),
+                    ([1, 1, 1], 3),
+                ],
+            ),
+            (
+                0,
+                vec![
+                    ([1, 0, 0], 2),
+                    ([0, 1, 0], 2),
+                    ([1, 1, 0], 3),
+                    ([1, 1, 1], 2),
+                ],
+            ),
+            (
+                0,
+                vec![
+                    ([0, 0, 0], 1),
+                    ([1, 0, 0], 0),
+                    ([0, 1, 0], 0),
+                    ([1, 0, 1], 1),
+                    ([0, 1, 1], 1),
+                    ([1, 1, 1], 0),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    ([0, 0, 0], 5),
+                    ([0, 0, 1], 6),
+                    ([1, 0, 1], 5),
+                    ([0, 1, 1], 5),
+                ],
+            ),
+            (0, vec![([0, 0, 1], 0)]),
+            (
+                1,
+                vec![
+                    ([0, 0, 0], 3),
+                    ([1, 0, 0], 4),
+                    ([0, 1, 0], 4),
+                    ([0, 0, 1], 2),
+                    ([1, 0, 1], 3),
+                    ([0, 1, 1], 3),
+                    ([1, 1, 1], 4),
+                ],
+            ),
+        ];
+        let q = rows.len();
+        let alphabet = vec![vec![0, 1], vec![0, 1], vec![0, 1]];
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q,
+                alphabet_size: 8,
+                o: rows.iter().map(|(o, _)| *o).collect(),
+                d: vec![BTreeMap::new(); q],
+            },
+            alphabet,
+            Vec::new(),
+            vec![None, None, None],
+        );
+        for (state, (_, edges)) in rows.iter().enumerate() {
+            for (digits, dest) in edges {
+                let sym = a.encode(digits);
+                a.fa.d[state].insert(sym, vec![*dest]);
+            }
+        }
+        a
+    }
+
+    /// The full shipped `msd_fib` base, exactly as `wr-io`/`wr-cli` will hand it over:
+    /// `msd_fib_addition.txt` as the main addition file, no `_less_than` file at all (Walnut
+    /// ships none — the comparator falls back to lexicographic), `msd_fib.txt` as the
+    /// all-representations file.
+    fn msd_fib_files() -> CustomBaseFiles {
+        CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(msd_fib_addition()),
+                complement: None,
+            },
+            less_than: CustomBaseCandidates::default(),
+            all_representations: CustomBaseCandidates {
+                main: Some(msd_fib_all_representations()),
+                complement: None,
+            },
+        }
+    }
+
+    /// Runs a single-track word (msd-first) through `a`, NFA-style.
+    fn accepts_single_track_word(a: &Automaton, digits: &[i32]) -> bool {
+        assert_eq!(a.alphabet.len(), 1, "single-track helper");
+        let word: Vec<i32> = digits.iter().map(|&d| a.encode(&[d])).collect();
+        let mut current: BTreeSet<usize> = [a.fa.q0].into_iter().collect();
+        for sym in word {
+            let mut next = BTreeSet::new();
+            for q in &current {
+                if let Some(dests) = a.fa.d[*q].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+            }
+            current = next;
+        }
+        current.iter().any(|&q| a.fa.o[q] != 0)
+    }
+
+    // ------------------------------------------- loadAutomatonOrNull's fallback logic
+
+    #[test]
+    fn custom_base_candidate_names_are_the_two_paths_java_probes() {
+        assert_eq!(
+            custom_base_candidate_names("msd_fib", UNDERSCORE_ADDITION_AUTOMATON).unwrap(),
+            (
+                "msd_fib_addition.txt".to_string(),
+                "lsd_fib_addition.txt".to_string()
+            )
+        );
+        assert_eq!(
+            custom_base_candidate_names("lsd_fib", UNDERSCORE_ADDITION_AUTOMATON).unwrap(),
+            (
+                "lsd_fib_addition.txt".to_string(),
+                "msd_fib_addition.txt".to_string()
+            )
+        );
+        assert_eq!(
+            custom_base_candidate_names("lsd_fib", TXT_EXTENSION).unwrap(),
+            ("lsd_fib.txt".to_string(), "msd_fib.txt".to_string())
+        );
+        assert_eq!(
+            custom_base_candidate_names("msd_2", UNDERSCORE_LESS_THAN_AUTOMATON).unwrap(),
+            (
+                "msd_2_less_than.txt".to_string(),
+                "lsd_2_less_than.txt".to_string()
+            )
+        );
+        // Same `indexOf('_')` guard as everywhere else in this file.
+        assert_eq!(
+            custom_base_candidate_names("fib", TXT_EXTENSION),
+            Err(NumSysError::MalformedName("fib".to_string()))
+        );
+    }
+
+    /// `loadAutomatonOrNull`: main file present wins outright and is used **unreversed**.
+    #[test]
+    fn resolve_prefers_the_main_file_and_leaves_it_alone() {
+        let ends_in_one = one_track_fixture(&[(0, &[(0, 0), (1, 1)]), (1, &[])]);
+        let resolved = CustomBaseCandidates {
+            main: Some(ends_in_one),
+            complement: Some(msd_fib_all_representations()),
+        }
+        .resolve()
+        .expect("main file present");
+        assert!(accepts_single_track_word(&resolved, &[0, 0, 1]));
+        assert!(!accepts_single_track_word(&resolved, &[1, 0]));
+    }
+
+    /// **The fallback this unit exists to reproduce.** Only the OPPOSITE direction's file
+    /// exists (the real situation for every base `walnut-java` ships: there is a
+    /// `msd_fib_addition.txt` and no `lsd_fib_addition.txt`), so Java loads it and applies
+    /// `AutomatonLogicalOps.reverse(A, false)`. Checked with a deliberately
+    /// NON-reversal-symmetric language, so a "forgot to reverse" implementation fails.
+    #[test]
+    fn resolve_falls_back_to_the_complement_and_reverses_its_language() {
+        let ends_in_one = one_track_fixture(&[(0, &[(0, 0), (1, 1)]), (1, &[])]);
+        let resolved = CustomBaseCandidates {
+            main: None,
+            complement: Some(ends_in_one),
+        }
+        .resolve()
+        .expect("complement file present");
+        // Reversal of "ends in 1" is "starts with 1".
+        assert!(accepts_single_track_word(&resolved, &[1, 0, 0]));
+        assert!(!accepts_single_track_word(&resolved, &[0, 0, 1]));
+    }
+
+    #[test]
+    fn resolve_returns_none_when_neither_file_exists() {
+        assert!(CustomBaseCandidates::default().resolve().is_none());
+    }
+
+    /// The whole-constructor version of the fallback: `lsd_fib` supplied ONLY with
+    /// `msd_fib*` files (as the complement candidates) still builds, and its adder is the
+    /// reversal of the msd one. Also pins that the reverse is applied EXACTLY once — the
+    /// `if (!isMsd) reverse(...)` inside `setAdditionAutomaton` must not fire on a
+    /// file-loaded adder, or an lsd custom base would be double-reversed back to msd.
+    #[test]
+    fn lsd_custom_base_built_from_the_msd_files_reverses_exactly_once() {
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: None,
+                complement: Some(msd_fib_addition()),
+            },
+            less_than: CustomBaseCandidates::default(),
+            all_representations: CustomBaseCandidates {
+                main: None,
+                complement: Some(msd_fib_all_representations()),
+            },
+        };
+        let lsd = NumberSystem::with_custom_base_files("lsd_fib", files).unwrap();
+        assert!(!lsd.is_msd());
+        assert!(lsd.use_all_representations());
+
+        let msd = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        // Reversing the lsd adder's language must give the msd one back, not leave it
+        // unchanged (which is what a missing OR a doubled reverse would produce).
+        let mut round_trip = lsd.addition().clone();
+        reverse(&mut round_trip, false);
+        let mut got = round_trip.fa.clone();
+        got.totalize(0);
+        let mut want = msd.addition().fa.clone();
+        want.totalize(0);
+        assert_eq!(equiv::language_equivalent(&got, &want), Ok(true));
+
+        let mut unreversed = lsd.addition().fa.clone();
+        unreversed.totalize(0);
+        assert_eq!(
+            equiv::language_equivalent(&unreversed, &want),
+            Ok(false),
+            "the msd_fib adder is not reversal-symmetric, so a no-op fallback would be caught"
+        );
+    }
+
+    // ------------------------------------------------- the constructor's own wiring
+
+    /// End-to-end reproduction of real Walnut's answer to `eval x "?msd_fib x=x";`, which
+    /// writes out exactly `Custom Bases/msd_fib.txt` (verified by running `walnut-java`'s
+    /// CLI). That answer is only correct because the constructor applied the
+    /// valid-representation restriction to `equality`.
+    #[test]
+    fn msd_fib_equality_is_exactly_the_valid_representation_language() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        assert!(ns.use_all_representations());
+        assert_eq!(ns.get_alphabet(), &[0, 1]);
+
+        // `?msd_fib x=x`: both tracks bound to the same name, so `bind` merges them.
+        let x_equals_x = ns.comparison("x", "x", RelationalOp::Equal);
+        assert_eq!(x_equals_x.alphabet.len(), 1, "the two tracks merged");
+        for word in [
+            vec![],
+            vec![0],
+            vec![1],
+            vec![0, 1],
+            vec![1, 0],
+            vec![1, 0, 1],
+            vec![0, 1, 0, 1],
+        ] {
+            assert!(
+                accepts_single_track_word(&x_equals_x, &word),
+                "valid Zeckendorf word {word:?} must be accepted"
+            );
+        }
+        for word in [vec![1, 1], vec![0, 1, 1], vec![1, 1, 0], vec![1, 0, 1, 1]] {
+            assert!(
+                !accepts_single_track_word(&x_equals_x, &word),
+                "word {word:?} contains `11` and is not a valid representation"
+            );
+        }
+    }
+
+    /// Real Walnut's answer to `eval x "?msd_fib ~(x=x)";` is the EMPTY language (verified
+    /// against its CLI), not "the words containing `11`". That is `not`'s
+    /// `applyAllRepresentations` call doing real work — see the dedicated `logicalops.rs`
+    /// test for the same property at the primitive level.
+    #[test]
+    fn msd_fib_negation_stays_inside_the_valid_representations() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let x_equals_x = ns.comparison("x", "x", RelationalOp::Equal);
+        let negated = not(x_equals_x.as_dfa()).into_automaton();
+        assert!(
+            negated.is_empty(),
+            "~(x=x) over a fully-restricted base is unsatisfiable"
+        );
+    }
+
+    /// The constructor installs the restriction on all three defining automata, on every
+    /// track, and it survives into everything derived from them.
+    #[test]
+    fn the_restriction_is_installed_on_every_track_and_propagates() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        for a in [ns.addition(), ns.less_than(), &ns.equality] {
+            assert_eq!(a.all_reps.len(), a.alphabet.len());
+            assert!(
+                a.all_reps.iter().all(|r| r.is_some()),
+                "every track carries the valid-representation automaton"
+            );
+            assert!(
+                a.msd.iter().all(|m| m == &Some(true)),
+                "`getNS().set(i, this)` overwrote the file's null number systems"
+            );
+        }
+        // Propagation through `arithmetic` (a clone + bind) and then `and`/`quantify`.
+        let sum = ns.arithmetic("p", "q", "r", ArithmeticOp::Plus).unwrap();
+        assert!(sum.all_reps.iter().all(|r| r.is_some()));
+    }
+
+    /// `applyAllRepresentations`'s label quirk, observed at the one place in the port that
+    /// actually triggers it: the constructor applies the restriction to UNBOUND automata, so
+    /// `copy(K)` leaves them bound to `randomLabel`'s numeric names. Ported verbatim; every
+    /// consumer re-`bind`s first, which is why it is harmless.
+    #[test]
+    fn the_constructor_leaves_the_defining_automata_numerically_labelled() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        assert_eq!(ns.addition().label, vec!["0", "1", "2"]);
+        assert_eq!(ns.equality.label, vec!["0", "1"]);
+        // Without any all-representations file, nothing runs and they stay unbound.
+        let plain = NumberSystem::new("msd_2").unwrap();
+        assert!(plain.addition().label.is_empty());
+        assert!(!plain.use_all_representations());
+        assert!(plain.all_representations().is_none());
+    }
+
+    /// No `_less_than` file ships for `msd_fib`, so the comparator is the lexicographic one
+    /// built over `getAlphabet()` — and it, too, gets the restriction applied.
+    #[test]
+    fn a_missing_less_than_file_falls_back_to_lexicographic_over_the_loaded_alphabet() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        assert_eq!(ns.less_than().alphabet, vec![vec![0, 1], vec![0, 1]]);
+        // 01 < 10 lexicographically; both are valid representations.
+        let lt = ns.comparison("x", "y", RelationalOp::LessThan);
+        assert!(accepts_digits(&lt, &[("x", "01"), ("y", "10")]));
+        assert!(!accepts_digits(&lt, &[("x", "10"), ("y", "01")]));
+        // 011 is not a valid representation, so no comparison involving it holds.
+        assert!(!accepts_digits(&lt, &[("x", "011"), ("y", "100")]));
+    }
+
+    // ---------------------------------------------------- the validation error paths
+
+    #[test]
+    fn a_file_loaded_adder_with_the_wrong_arity_is_a_clean_error() {
+        let two_track = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 4,
+                o: vec![1],
+                d: vec![BTreeMap::new()],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            Vec::new(),
+            vec![None, None],
+        );
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(two_track),
+                complement: None,
+            },
+            ..CustomBaseFiles::default()
+        };
+        assert_eq!(
+            NumberSystem::with_custom_base_files("msd_weird", files).unwrap_err(),
+            NumSysError::AdditionInputCount("msd_weird".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_loaded_adder_missing_digit_one_is_a_clean_error() {
+        let mut adder = msd_fib_addition();
+        adder.alphabet = vec![vec![0, 2], vec![0, 2], vec![0, 2]];
+        adder.setup_encoder();
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(adder),
+                complement: None,
+            },
+            ..CustomBaseFiles::default()
+        };
+        assert_eq!(
+            NumberSystem::with_custom_base_files("msd_odd", files).unwrap_err(),
+            NumSysError::AdditionAlphabetMissingOne("msd_odd".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_loaded_adder_with_mismatched_track_alphabets_is_a_clean_error() {
+        let mut adder = msd_fib_addition();
+        adder.alphabet = vec![vec![0, 1], vec![0, 1], vec![0, 1, 2]];
+        adder.setup_encoder();
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(adder),
+                complement: None,
+            },
+            ..CustomBaseFiles::default()
+        };
+        assert_eq!(
+            NumberSystem::with_custom_base_files("msd_mix", files).unwrap_err(),
+            NumSysError::AdditionAlphabetsDiffer("msd_mix".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_loaded_comparator_with_the_wrong_arity_is_a_clean_error() {
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(msd_fib_addition()),
+                complement: None,
+            },
+            less_than: CustomBaseCandidates {
+                // Three tracks where the comparator needs exactly two.
+                main: Some(msd_fib_addition()),
+                complement: None,
+            },
+            all_representations: CustomBaseCandidates::default(),
+        };
+        assert_eq!(
+            NumberSystem::with_custom_base_files("msd_fib", files).unwrap_err(),
+            NumSysError::LessThanInputCount("msd_fib".to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_loaded_comparator_over_a_different_alphabet_is_a_clean_error() {
+        let mut comparator = lexicographic_less_than(&[0, 1, 2], true);
+        comparator.msd = vec![None, None];
+        let files = CustomBaseFiles {
+            addition: CustomBaseCandidates {
+                main: Some(msd_fib_addition()),
+                complement: None,
+            },
+            less_than: CustomBaseCandidates {
+                main: Some(comparator),
+                complement: None,
+            },
+            all_representations: CustomBaseCandidates::default(),
+        };
+        assert_eq!(
+            NumberSystem::with_custom_base_files("msd_fib", files).unwrap_err(),
+            NumSysError::LessThanAlphabetMismatch("msd_fib".to_string())
+        );
+    }
+
+    // --------------------------------------------------- the `msd_neg_*` U5 decision
+
+    /// U5's decision: a `_neg_` name is an explicit, named "unsupported numeration" error at
+    /// NAME-RESOLUTION time — not a silent misparse, and not an attempt to load the
+    /// (genuinely present) `Custom Bases/msd_neg_fib*.txt` files.
+    #[test]
+    fn negative_base_names_are_rejected_by_name_before_any_file_is_consulted() {
+        for name in ["msd_neg_fib", "lsd_neg_fib", "msd_neg_3", "lsd_neg_2"] {
+            assert_eq!(
+                NumberSystem::new(name).unwrap_err(),
+                NumSysError::UnsupportedNegativeBase(name.to_string()),
+                "{name}"
+            );
+            // Supplying perfectly good files must NOT rescue it -- the rejection happens
+            // first, so the negative-base adder can never be layered under this module's
+            // positive-base-only constructions.
+            assert_eq!(
+                NumberSystem::with_custom_base_files(name, msd_fib_files()).unwrap_err(),
+                NumSysError::UnsupportedNegativeBase(name.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    /// Java's own comment on `isNeg` names the false positive its leading underscore
+    /// avoids. `msd_renege` must NOT be treated as a negative base — it fails for the
+    /// ordinary reason (`"renege"` is not a base this crate can build).
+    #[test]
+    fn a_name_merely_containing_neg_is_not_a_negative_base() {
+        assert_eq!(
+            NumberSystem::new("msd_renege").unwrap_err(),
+            NumSysError::NotDefined("msd_renege".to_string())
+        );
+        assert_eq!(
+            NumberSystem::new("msd_negative").unwrap_err(),
+            NumSysError::NotDefined("msd_negative".to_string())
+        );
+        // `"neg_fib"` itself is NOT a negative base either: Java's guard is `contains("_neg_")`
+        // WITH the leading underscore, and this name has none, so it is an ordinary
+        // unrecognized base. (Same reason `msd_renege` above escapes.)
+        assert_eq!(
+            NumberSystem::new("neg_fib").unwrap_err(),
+            NumSysError::NotDefined("neg_fib".to_string())
+        );
+        // The `_neg_` check runs AFTER `determineMsdOrLsd` (Java's line order, `:135` then
+        // `:137`), so a name with no `_` at all still fails the earlier guard.
+        assert_eq!(
+            NumberSystem::new("fib").unwrap_err(),
+            NumSysError::MalformedName("fib".to_string())
+        );
+    }
+
+    // ------------------------------------------- Ruling 1: `&self` memoization
+
+    /// `PORTING.md`'s Ruling 1: the three dynamic tables are populated through a SHARED,
+    /// IMMUTABLE handle, which is what lets `wr-logic` hand one `Rc<NumberSystem>` to every
+    /// token in a formula.
+    #[test]
+    fn the_dynamic_tables_memoize_through_a_shared_immutable_handle() {
+        let ns = Rc::new(NumberSystem::new("msd_2").unwrap());
+        assert!(ns.constants_dynamic_table.borrow().is_empty());
+
+        let first = ns.get_constant(&big(5)).unwrap();
+        let after_first = ns.constants_dynamic_table.borrow().len();
+        assert!(
+            after_first > 1,
+            "the halving recursion caches every intermediate, not just 5"
+        );
+
+        // A second handle to the same instance -- no `&mut` anywhere, and no second cache.
+        let alias = Rc::clone(&ns);
+        let second = alias.get_constant(&big(5)).unwrap();
+        assert_eq!(
+            ns.constants_dynamic_table.borrow().len(),
+            after_first,
+            "the second lookup was a cache hit, not a rebuild"
+        );
+
+        let mut a = first.fa.clone();
+        a.totalize(0);
+        let mut b = second.fa.clone();
+        b.totalize(0);
+        assert_eq!(equiv::language_equivalent(&a, &b), Ok(true));
+
+        // The other two tables, same shape (and `division` recurses through
+        // `comparison_const_b`/`arithmetic_const_a`, exercising the nested-borrow case).
+        assert!(ns.get_multiplication(&big(3)).is_ok());
+        assert!(!ns.multiplications_dynamic_table.borrow().is_empty());
+        assert!(ns.get_division(&big(3)).is_ok());
+        assert!(!ns.divisions_dynamic_table.borrow().is_empty());
+    }
+
+    /// A failed lookup must not poison the cache. (This test's error paths all return
+    /// before ever touching the `RefCell`, so it does NOT exercise the
+    /// held-borrow-across-recursion hazard — that's covered by
+    /// `the_dynamic_tables_memoize_through_a_shared_immutable_handle` below, which forces
+    /// real recursion through live `borrow()`/`borrow_mut()` cycles and would panic if the
+    /// scoping discipline were wrong.)
+    #[test]
+    fn a_rejected_lookup_leaves_the_cache_untouched() {
+        let ns = NumberSystem::new("msd_2").unwrap();
+        assert_eq!(
+            ns.get_constant(&big(-1)).unwrap_err(),
+            NumSysError::NegativeConstant("-1".to_string())
+        );
+        assert_eq!(
+            ns.get_multiplication(&big(0)).unwrap_err(),
+            NumSysError::MultiplicationByZero
+        );
+        assert_eq!(
+            ns.get_division(&big(0)).unwrap_err(),
+            NumSysError::DivisionByZero
+        );
+        assert!(ns.constants_dynamic_table.borrow().is_empty());
+        assert!(ns.multiplications_dynamic_table.borrow().is_empty());
+        assert!(ns.divisions_dynamic_table.borrow().is_empty());
+        // Still usable afterwards -- i.e. nothing is stuck borrowed.
+        assert!(ns.get_constant(&big(3)).is_ok());
+    }
+
+    /// Every ported `WalnutException` message, verbatim (`Display`, added in U5 for Tier 1's
+    /// `error*` fixtures).
+    #[test]
+    fn error_display_matches_walnuts_message_text() {
+        assert_eq!(
+            NumSysError::NotDefined("msd_fib".to_string()).to_string(),
+            "Number system msd_fib is not defined."
+        );
+        assert_eq!(
+            NumSysError::InvalidBase("1".to_string()).to_string(),
+            "Base of automaton's number system must be > 1 and int, found: 1"
+        );
+        assert_eq!(
+            NumSysError::NegativeConstant("-5".to_string()).to_string(),
+            "negative constant -5"
+        );
+        assert_eq!(
+            NumSysError::OperatorTwoVariables("*").to_string(),
+            "the operator * cannot be applied to two variables"
+        );
+        assert_eq!(
+            NumSysError::UnexpectedArithmeticOperator("_").to_string(),
+            "unexpected arithmetic operator:_"
+        );
+        assert_eq!(
+            NumSysError::ConstantDividedByVariable.to_string(),
+            "constants cannot be divided by variables"
+        );
+        assert_eq!(NumSysError::DivisionByZero.to_string(), "division by zero");
+        assert_eq!(
+            NumSysError::MultiplicationByZero.to_string(),
+            "multiplication(0)"
+        );
+        assert_eq!(
+            NumSysError::AdditionInputCount("msd_x".to_string()).to_string(),
+            "The addition automaton must have exactly 3 inputs: base msd_x"
+        );
+        assert_eq!(
+            NumSysError::AdditionAlphabetMissingZero("msd_x".to_string()).to_string(),
+            "The input alphabet of addition automaton must contain 0: base msd_x"
+        );
+        assert_eq!(
+            NumSysError::AdditionAlphabetMissingOne("msd_x".to_string()).to_string(),
+            "The input alphabet of addition automaton must contain 1: base msd_x"
+        );
+        assert_eq!(
+            NumSysError::AdditionAlphabetsDiffer("msd_x".to_string()).to_string(),
+            "All 3 inputs of the addition automaton must have the same alphabet: base msd_x"
+        );
+        assert_eq!(
+            NumSysError::LessThanInputCount("msd_x".to_string()).to_string(),
+            "_less_than.txt must have exactly 2 inputs: base msd_x"
+        );
+        assert_eq!(
+            NumSysError::LessThanAlphabetMismatch("msd_x".to_string()).to_string(),
+            "Inputs of _less_than.txt must have the same alphabet as the alphabet of \
+             inputs of _addition.txt : base msd_x"
+        );
     }
 }

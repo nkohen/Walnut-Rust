@@ -69,9 +69,20 @@ and add a property test that the result is order-independent.
   code mutate it (`getConstant`/`getMultiplication`/`getDivision`'s dynamic tables). Rather
   than let that force `Rc<RefCell<NumberSystem>>`-style sharing into every `Token`/
   `Expression::act` signature, `wr_core::numsys::NumberSystem` owns its own memoization
-  behind interior mutability (U5); `wr-logic`'s `PredicateEnv` trait hands out a
+  behind interior mutability; `wr-logic`'s `PredicateEnv` trait hands out a
   read-only `Rc<NumberSystem>` and nothing wraps it in a second `RefCell`. Full argument:
   `crates/wr-logic/src/predicate_env.rs`'s module doc, "Ruling 1".
+  **Delivered by U5**: the three dynamic tables are `RefCell<BTreeMap<BigInt, Automaton>>`
+  and `get_constant`/`get_multiplication`/`get_division` take `&self`. Two follow-on rules
+  that fell out of implementing it, and that any future `RefCell` memo in this port should
+  copy: (a) **never hold a cell borrow across a call back into `self`** — every one of
+  those three builders recurses, so each does a scoped `borrow()` + `clone()` for the
+  lookup and a fresh `borrow_mut()` for the insert, after all recursion has finished
+  (violating this is a runtime `already borrowed` panic, not a compile error); (b) a
+  method that Java writes as "return the cached instance by reference, and let the public
+  wrapper `.clone()` it" collapses into a single clone-returning method here, because a
+  `RefCell` cannot lend a reference out past its borrow — verify first that no *internal*
+  caller bypassed the public wrapper, or that collapse changes behavior.
 - **`\G`-anchored lexing needs `regex-automata`, not `regex`.** Java's lexer is 15
   `\G`-anchored `Matcher.find(index)` calls (match starts *exactly* at the cursor, never
   scans forward); the `regex` crate has no `\G` anchor. `regex-automata`'s
@@ -144,6 +155,35 @@ and add a property test that the result is order-independent.
   enum layer, unless a later unit finds a real reason to split it further. Full worked
   examples: `crates/wr-logic/src/token.rs` and `crates/wr-logic/src/expr.rs`'s module
   docs.
+
+- **A Java field whose per-element type is a whole object, where the port only keeps a
+  DERIVED fact, becomes one PARALLEL VECTOR PER FACT — and every mutation site must move
+  all of them together.** Hit twice now on the same field: `Automaton.NS`
+  (`List<NumberSystem>`, one entry per track). `wr-core`'s `Automaton` does not hold
+  `NumberSystem` objects (that would be circular — a `NumberSystem` *owns* three
+  `Automaton`s — and would force every hand-built test automaton to construct a real
+  numeration system), so it keeps the two facts any ported code actually reads off one:
+  `msd: Vec<Option<bool>>` (the msd/lsd direction, Phase 1) and
+  `all_reps: Vec<Option<Rc<Automaton>>>` (the custom-base valid-representation restriction,
+  U5). The hazard this creates is real and is the reason for the ruling: Java's single
+  `getNS().set(i, ns)` / `removeIndices(getNS(), I)` / `permute(getNS(), p)` moves both
+  facts at once, so a port that updates one vector and forgets the other silently
+  describes two different number systems on one track. Rules: (1) document the invariant
+  on the *added* field, including which combinations are impossible and why; (2) update
+  every parallel vector in the SAME statement as the original (`automaton.rs`'s
+  `clear`/`sort_label`/`reduce_dimension`, `product.rs`'s `update_axb_fields`,
+  `quantify.rs`'s track removal, `logicalops.rs`'s `right_quotient`/`flip_ns` are the
+  full current list); (3) gate the only public bulk setter on an assertion, and add a
+  `debug_assert`-backed invariant check the operations that consume the fields call. Do
+  **not** merge them into one `Vec<Option<TrackInfo>>` retroactively unless a unit is
+  already touching every `msd` call site for another reason — the churn across
+  trust-critical code costs more than the invariant check.
+- **Adding a field to a widely-embedded struct can trip `clippy::large_enum_variant`
+  somewhere else entirely.** U5's one extra `Vec` on `Automaton` (24 bytes) pushed
+  `wr_logic::expr::Expression`'s largest/second-largest variant gap past clippy's 200-byte
+  default, because `WordExpression` holds two `Automaton`s where its siblings hold one.
+  Apply clippy's own suggestion (box the large variant) rather than `#[allow]` — this
+  codebase has no clippy allows and shouldn't grow its first one for a size lint.
 
 ## Open questions to resolve during Phase 0 (add rulings here)
 

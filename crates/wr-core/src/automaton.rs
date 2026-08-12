@@ -8,8 +8,11 @@
 //! `docs/BOUNDARY-MAP.md` §4.3; the U6 architecture unit moved that primitive down into
 //! [`crate::quantify`] — see its module docs for why): per-track alphabets,
 //! labels, msd/lsd-ness, and the mixed-radix symbol encoder/decoder. **This is
-//! deliberately NOT full Java parity** — no `NumberSystem` objects attached per track,
-//! no DFAO/`combine` bookkeeping (see `docs/DESIGN.md` §8 Phase 1's spike scope).
+//! deliberately NOT full Java parity** — no `NumberSystem` objects attached per track
+//! (only the two facts any ported code reads off one: msd/lsd direction via
+//! [`Automaton::msd`], and the custom-base valid-representation restriction via
+//! [`Automaton::all_reps`], added in U5), no DFAO/`combine` bookkeeping (see
+//! `docs/DESIGN.md` §8 Phase 1's spike scope).
 //!
 //! # U0 addition: the trivial (TRUE/FALSE) automaton
 //!
@@ -47,12 +50,21 @@
 //!   ported below as
 //!   [`Automaton::is_in_new_alphabet`]/[`Automaton::rebuild_transitions_for_new_alphabet`]
 //!   for a future unit to assemble once `NumberSystem` lands.
-//! - `Automaton.normalizeNumberSystems`, `applyAllRepresentations`,
-//!   `applyAllRepresentationsWithOutput` (all need real `NumberSystem` objects with
-//!   `useAllRepresentations`/`getAllRepresentations`, plus `AutomatonLogicalOps.and`/
-//!   `ProductStrategies.crossProduct`).
+//! - `Automaton.normalizeNumberSystems` (still out of scope: it *constructs* a
+//!   `NumberSystem` from a track's alphabet maximum, which is `setAlphabet`/U16's
+//!   business).
 //! - `AutomatonDFA`'s regex-string constructors (need `BricsConverter`) and its
 //!   file-address constructor (file I/O is `wr-io`/Phase 3 scope).
+//!
+//! # U5 additions: `applyAllRepresentations`/`applyAllRepresentationsWithOutput`
+//!
+//! U2 deferred both on the premise that the whole custom-base numeration family was out
+//! of scope, so `useAllRepresentations()` could never be `true`. Phase 3a's U5 made
+//! custom bases real ([`crate::numsys::NumberSystem::with_custom_base_files`]), which
+//! invalidated that premise, so both methods are ported here now, along with the per-track
+//! state they read ([`Automaton::all_reps`]) and `determineRandomLabel`/`unlabel`'s role in
+//! them. See [`Automaton::apply_all_representations`] for the empirical confirmation that
+//! these are load-bearing (not merely reachable) on a custom base.
 //!
 //! Also not replicated: Java's manual `clone()`/`cloneFields()`/`copy()` boilerplate —
 //! `#[derive(Clone)]` already gives deep-copy semantics (`PORTING.md`'s
@@ -72,6 +84,7 @@
 use crate::fa::Fa;
 use crate::util::{is_sorted, remove_indices};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::rc::Rc;
 
 /// `.expect()` message for every call into [`crate::determinize::determinize`] that
 /// passes `None` for its context.
@@ -122,6 +135,39 @@ pub struct Automaton {
     /// Also this crate's stand-in for Java's per-track `List<NumberSystem>` wherever a
     /// port needs "the NS list", e.g. [`Automaton::reduce_dimension`] below.
     pub msd: Vec<Option<bool>>,
+    /// The OTHER half of the per-track `NumberSystem` stand-in, added in Phase 3a's U5:
+    /// per track, `Some(N)` iff Java's `getNS().get(i) != null &&
+    /// getNS().get(i).useAllRepresentations()`, carrying that number system's
+    /// `getAllRepresentations()` automaton (`NumberSystem.java:253-263`).
+    ///
+    /// # Why a second parallel vector rather than a `NumberSystem` per track
+    ///
+    /// [`Automaton::apply_all_representations`] is the only code **currently ported in
+    /// this crate** that reads a track's `NumberSystem` for anything other than its
+    /// msd/lsd direction, and it reads exactly these two facts. (Java has at least one
+    /// other reader outside this crate's scope so far — `Image.determineImageNumberSystemPrefix`,
+    /// which reads `NumberSystem::toString()`; already flagged in `docs/WALNUT-BUGS.md`'s
+    /// not-yet-confirmed section, unrelated to this field.) Storing exactly these two facts
+    /// directly keeps `Automaton` free of a `NumberSystem` field — which would be circular
+    /// (`NumberSystem` *owns* three `Automaton`s) and would force every one of this crate's
+    /// hand-built test automata to construct a real numeration system.
+    ///
+    /// # Invariant (kept by every mutator in this crate, checked by [`Automaton::debug_assert_track_invariant`])
+    ///
+    /// `all_reps.len() == msd.len()`, and `all_reps[i].is_some()` implies
+    /// `msd[i].is_some()` — because both derive from the same Java `NumberSystem` object,
+    /// so "this track has an all-representations automaton" cannot hold for a track whose
+    /// number system is `null`. Every site that permutes, removes, clears, or merges
+    /// `msd` entries below does the same to `all_reps` in the same step, mirroring Java,
+    /// where a single `List<NumberSystem>` element carries both facts at once.
+    ///
+    /// [`Rc`] (not [`Box`]) because Java shares one `getAllRepresentations()` instance
+    /// across every track of every automaton derived from that number system, and because
+    /// `Automaton` is cloned constantly; `Rc` keeps that a pointer bump instead of a deep
+    /// automaton copy. This makes `Automaton` `!Send`/`!Sync`, which is fine — Walnut is
+    /// single-threaded throughout, and `PORTING.md`'s Ruling 1 already picked `Rc` over
+    /// `Arc` for `NumberSystem` handles for the same reason.
+    pub all_reps: Vec<Option<Rc<Automaton>>>,
     /// `encoder[i]` = product of `alphabet[0..i]`'s sizes (`encoder[0] == 1`). Cached at
     /// construction, matching Java's `RichAlphabet.encoder` (there computed lazily on
     /// first `encode()` call; here eagerly, since this crate always needs it).
@@ -138,6 +184,13 @@ impl Automaton {
     /// `alphabet`, `label`, and `msd` must have the same length as each other and match
     /// `fa.alphabet_size` (`Π alphabet[i].len() == fa.alphabet_size`) — not asserted here
     /// (this is a Phase-1 slice, not a validating constructor); callers are responsible.
+    ///
+    /// [`Automaton::all_reps`] starts all-`None` — i.e. "no track uses a custom base's
+    /// valid-representation restriction", the state every plain `msd_k`/`lsd_k` automaton
+    /// is in. Only [`Automaton::set_all_reps`] (called by
+    /// `crate::numsys::NumberSystem`'s custom-base constructor) ever changes that, so this
+    /// constructor's signature is unchanged from U5 and every pre-U5 call site keeps its
+    /// exact previous behavior.
     pub fn new(
         fa: Fa,
         alphabet: Vec<Vec<i32>>,
@@ -145,11 +198,13 @@ impl Automaton {
         msd: Vec<Option<bool>>,
     ) -> Self {
         let encoder = Self::compute_encoder(&alphabet);
+        let all_reps = vec![None; alphabet.len()];
         Automaton {
             fa,
             alphabet,
             label,
             msd,
+            all_reps,
             encoder,
             label_sorted: false,
         }
@@ -168,6 +223,7 @@ impl Automaton {
             alphabet: Vec::new(),
             label: Vec::new(),
             msd: Vec::new(),
+            all_reps: Vec::new(),
             encoder: Vec::new(),
             label_sorted: false,
         }
@@ -200,8 +256,59 @@ impl Automaton {
         self.alphabet.clear();
         self.encoder.clear();
         self.msd.clear();
+        // Java's single `NS = null` covers both halves of this crate's NS stand-in.
+        self.all_reps.clear();
         self.label.clear();
         self.label_sorted = false;
+    }
+
+    /// Installs the per-track [`Automaton::all_reps`] entries wholesale — the write half
+    /// of Java's `Automaton.setNS(List<NumberSystem>)`/`getNS().set(i, ns)` for the
+    /// all-representations facet.
+    ///
+    /// # Panics
+    ///
+    /// If `all_reps` is not one entry per track, if `msd` is not already parallel to
+    /// `alphabet`, or if any `Some` entry sits on a track whose `msd` is `None` — the
+    /// invariant documented on [`Automaton::all_reps`]. Java cannot violate it (one
+    /// `NumberSystem` object carries both facts); this crate can, so the one public entry
+    /// point checks.
+    pub fn set_all_reps(&mut self, all_reps: Vec<Option<Rc<Automaton>>>) {
+        assert_eq!(
+            all_reps.len(),
+            self.alphabet.len(),
+            "set_all_reps: one entry per track required"
+        );
+        assert_eq!(
+            self.msd.len(),
+            self.alphabet.len(),
+            "set_all_reps: msd must already be parallel to alphabet"
+        );
+        for (i, entry) in all_reps.iter().enumerate() {
+            assert!(
+                entry.is_none() || self.msd[i].is_some(),
+                "set_all_reps: track {i} has an all-representations automaton but no number system"
+            );
+        }
+        self.all_reps = all_reps;
+    }
+
+    /// Debug-only check of [`Automaton::all_reps`]'s documented invariant. Deliberately
+    /// side-effect-free (`PORTING.md`'s "`debug_assert!` erasing side effects" regression
+    /// class) — it only reads.
+    pub(crate) fn debug_assert_track_invariant(&self) {
+        debug_assert_eq!(
+            self.all_reps.len(),
+            self.msd.len(),
+            "all_reps must stay parallel to msd"
+        );
+        debug_assert!(
+            self.all_reps
+                .iter()
+                .zip(self.msd.iter())
+                .all(|(reps, msd)| reps.is_none() || msd.is_some()),
+            "a track with an all-representations automaton must have a number system"
+        );
     }
 
     /// `RichAlphabet.determineEncoder` (`RichAlphabet.java:100-108`). Panics on overflow
@@ -373,14 +480,145 @@ impl Automaton {
         self.label = (0..self.alphabet.len()).map(|i| i.to_string()).collect();
     }
 
-    /// `Automaton.unlabel` (`Automaton.java:307-310`). Currently only reachable from
-    /// this file's own tests: its only Java caller is `applyAllRepresentations(WithOutput)`,
-    /// both out of scope here (see module docs) — kept as a faithful, self-contained
-    /// one-liner rather than dropped, since a future unit porting those methods will
-    /// want it as-is.
+    /// `Automaton.unlabel` (`Automaton.java:307-310`). Its Java callers are
+    /// `applyAllRepresentations`/`applyAllRepresentationsWithOutput`, both ported below as
+    /// of U5.
     pub fn unlabel(&mut self) {
         self.label = Vec::new();
         self.label_sorted = false;
+    }
+
+    /// `Automaton.determineRandomLabel` (`Automaton.java:291-297`, `private`): label the
+    /// tracks `"0"`, `"1"`, … if they are not labeled already, reporting whether it did
+    /// (so the caller knows to [`Automaton::unlabel`] afterwards).
+    fn determine_random_label(&mut self) -> bool {
+        if !self.is_bound() {
+            self.random_label();
+            return true;
+        }
+        false
+    }
+
+    /// `Automaton.applyAllRepresentations` (`Automaton.java:252-270`) — intersect with each
+    /// track's valid-representation restriction.
+    ///
+    /// For every track whose number system supplies an all-representations automaton
+    /// ([`Automaton::all_reps`]), that automaton is bound to the track's label and
+    /// intersected in. For a plain base-*k* numeration every entry is `None` and this is a
+    /// no-op *except* for the label bookkeeping, which Java performs unconditionally (see
+    /// the "even with nothing to apply" note below) — that is why this is a real method
+    /// rather than an early return.
+    ///
+    /// # Why this is live, and not the dead code Phase 1/2 recorded it as
+    ///
+    /// Until U5 this crate had no custom-base numeration at all, so
+    /// `useAllRepresentations()` was hardcoded `false` and this method was documented as a
+    /// guaranteed no-op (in `logicalops.rs`'s and `product.rs`'s module docs, both now
+    /// corrected). U5 added `crate::numsys::NumberSystem`'s custom-base constructor, which
+    /// installs an all-representations automaton on the tracks of its
+    /// adder/comparator/equality automata — and from there it propagates through every
+    /// cross product, quantification, and quotient into the results whose
+    /// `applyAllRepresentations` calls (`AutomatonLogicalOps`'s `totalizeCrossProduct`,
+    /// `not`, `rightQuotient`) then genuinely fire. Empirically confirmed against the real
+    /// Walnut CLI: `eval x "?msd_fib x=x"` returns the 2-state "no `11` substring"
+    /// Zeckendorf-representation automaton rather than a 1-state universal one, and
+    /// `eval x "?msd_fib ~(x=x)"` returns the empty language rather than "contains `11`".
+    ///
+    /// # Faithful details that are easy to get wrong
+    ///
+    /// * **`K` starts as an ALIAS of `this`, not a copy** (`Automaton K = this;`). The
+    ///   `None` state of `k` below plays that role: when no track has a restriction, the
+    ///   closing `copy(K)` copies `this` onto itself, i.e. does nothing.
+    /// * **Each iteration reads `this.label`, not `K`'s.** `and`'s cross product appends
+    ///   only genuinely new tracks, and `N`'s single track always matches a track of `K`
+    ///   by label, so the two label lists stay identical anyway — but the port reads the
+    ///   same list Java does.
+    /// * **Even with nothing to apply, an UNBOUND automaton is left unbound but with
+    ///   `label_sorted` reset**: `unlabel()` runs before `copy(K)`, and when `K` is still
+    ///   `this` there is nothing to overwrite it. When at least one restriction *was*
+    ///   applied, `copy(K)` restores `K`'s label — so an automaton that entered unbound
+    ///   leaves **bound to `"0"`, `"1"`, …**, and Java's `unlabel()` is dead on that path.
+    ///   Ported verbatim (this is how `NumberSystem`'s custom-base adder/comparator end up
+    ///   carrying numeric labels; harmless, since every consumer `bind`s them first).
+    /// * **The shared all-representations automaton is `bind`-mutated in Java**
+    ///   (`N.bind(...)` writes through `ns.getAllRepresentations()`'s own object, against
+    ///   that class's "returned automata must not be altered" warning). This port clones
+    ///   out of the [`Rc`] instead. Unobservable: `bind` only rewrites the label (and, for
+    ///   the one-track automaton it always is, `removeSameInputs` is a no-op), and every
+    ///   use re-binds it before reading it.
+    ///
+    /// `Logging.logAndPrint("Applying valid representation #i")`/`indent`/`dedent`
+    /// (`:262-265`) are not ported, matching the rest of `wr-core`: `crate::logging`'s
+    /// context is not threaded into the automaton engine's call sites yet (see
+    /// `crate::product`'s "Progress logging not ported" note).
+    pub fn apply_all_representations(&mut self) {
+        self.debug_assert_track_invariant();
+        let flag = self.determine_random_label();
+        // `None` == "K is still `this`" (Java's alias).
+        let mut k: Option<Automaton> = None;
+        for i in 0..self.alphabet.len() {
+            let Some(n) = self.all_reps[i].clone() else {
+                continue;
+            };
+            let mut n = (*n).clone();
+            n.bind(vec![self.label[i].clone()]);
+            let current: &Automaton = k.as_ref().unwrap_or(&*self);
+            k = Some(crate::logicalops::and(current, &n).into_automaton());
+        }
+        if flag {
+            self.unlabel();
+        }
+        if let Some(k) = k {
+            *self = k; // `copy(K)`
+        }
+    }
+
+    /// `Automaton.applyAllRepresentationsWithOutput` (`Automaton.java:272-287`,
+    /// package-private) — the DFAO-capable variant.
+    ///
+    /// Identical to [`Automaton::apply_all_representations`] except for two things, both
+    /// load-bearing and both flagged by Java's own comment at `:281-282`:
+    ///
+    /// 1. it uses the raw `ProductStrategies.crossProduct` with `Prover.IF_OTHER_OP`
+    ///    (`determineOutput`'s `mQ != 0 ? aP : 0`, `ProductStrategies.java:187`) rather
+    ///    than `AutomatonLogicalOps.and`, so a word automaton's output *value* survives
+    ///    instead of collapsing to `0`/`1`, and there is no minimization step; and
+    /// 2. it combines with **`this`**, not with the running `K` — "This appears to be by
+    ///    design, and causes a bug in `combine()` otherwise." So with two or more
+    ///    restricted tracks, every restriction but the last is silently discarded. Ported
+    ///    verbatim; not logged in `docs/WALNUT-BUGS.md` because it is deliberate,
+    ///    documented-in-source behavior rather than a defect, and because no shipped custom
+    ///    base has more than one arithmetic track in a *word* automaton for it to bite.
+    ///
+    /// No caller in this crate yet: Java's two are `Automaton.setAlphabet` (Phase 3a U16)
+    /// and `AutomatonLogicalOps.combine` (out of scope, needs `Prover.COMBINE`'s product
+    /// mode). Ported now anyway, alongside its sibling, so U16 inherits it rather than
+    /// re-deriving the `IF_OTHER_OP` truth table under pressure.
+    pub fn apply_all_representations_with_output(&mut self) {
+        self.debug_assert_track_invariant();
+        let flag = self.determine_random_label();
+        let mut k: Option<Automaton> = None;
+        for i in 0..self.alphabet.len() {
+            let Some(n) = self.all_reps[i].clone() else {
+                continue;
+            };
+            let mut n = (*n).clone();
+            n.bind(vec![self.label[i].clone()]);
+            // `Prover.IF_OTHER_OP`, and against `this` -- not against `k`.
+            k = Some(crate::product::cross_product(&*self, &n, |a_p, m_q| {
+                if m_q != 0 {
+                    a_p
+                } else {
+                    0
+                }
+            }));
+        }
+        if flag {
+            self.unlabel();
+        }
+        if let Some(k) = k {
+            *self = k; // `copy(K)`
+        }
     }
 
     /// `RichAlphabet.isInNewAlphabet` (`RichAlphabet.java:51-58`): true iff every track's
@@ -535,6 +773,9 @@ impl Automaton {
         self.alphabet = permuted_alphabet;
         self.encoder = permuted_encoder;
         self.msd = Self::permute(&self.msd, &label_permutation);
+        // Java permutes the single `NS` list, which carries both halves of this crate's
+        // per-track number-system stand-in (`Automaton.java:377`).
+        self.all_reps = Self::permute(&self.all_reps, &label_permutation);
 
         for row in self.fa.d.iter_mut() {
             let mut permuted_row = BTreeMap::new();
@@ -680,6 +921,9 @@ impl Automaton {
 
         same_label_indices.remove(0);
         remove_indices(&mut automaton.msd, &same_label_indices);
+        // Java's `removeIndices(A.getNS(), I)` removes the whole `NumberSystem` entry,
+        // i.e. both halves of this crate's stand-in.
+        remove_indices(&mut automaton.all_reps, &same_label_indices);
         automaton.alphabet = new_alphabet;
         automaton.encoder = new_encoder;
         automaton.determine_alphabet_size();
@@ -1677,5 +1921,242 @@ mod tests {
             assert!(dfa.automaton().is_true_false_automaton());
             assert_eq!(dfa.automaton().is_true_automaton(), truth);
         }
+    }
+
+    // ===================================== U5: applyAllRepresentations(WithOutput)
+
+    /// A one-track automaton over `{0,1}` accepting the words with no `11` substring
+    /// (`walnut-java/Custom Bases/msd_fib.txt`, verbatim) — the restriction a Fibonacci-style
+    /// custom base attaches to each of its tracks.
+    fn no_adjacent_ones(label: &str) -> Automaton {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![0]);
+        Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 2,
+                o: vec![1, 1],
+                d: vec![d0, d1],
+            },
+            vec![vec![0, 1]],
+            vec![label.to_string()],
+            vec![Some(true)],
+        )
+    }
+
+    /// The `n`-track total automaton over `{0,1}` accepting everything, with `outputs` as its
+    /// single state's output (so `1` is `Σ*` and `7` is a DFAO value, for
+    /// `apply_all_representations_with_output`).
+    fn universal_tracks(labels: &[&str], output: i32) -> Automaton {
+        let n = labels.len();
+        let alphabet_size = 1usize << n;
+        let mut d0 = BTreeMap::new();
+        for sym in 0..alphabet_size as i32 {
+            d0.insert(sym, vec![0usize]);
+        }
+        Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size,
+                o: vec![output],
+                d: vec![d0],
+            },
+            vec![vec![0, 1]; n],
+            labels.iter().map(|s| s.to_string()).collect(),
+            vec![Some(true); n],
+        )
+    }
+
+    #[test]
+    fn apply_all_representations_is_a_total_no_op_when_no_track_is_restricted() {
+        let before = universal_tracks(&["x", "y"], 1);
+        let mut after = before.clone();
+        after.apply_all_representations();
+        assert_eq!(after.fa.q, before.fa.q);
+        assert_eq!(after.fa.o, before.fa.o);
+        assert_eq!(after.fa.d, before.fa.d);
+        assert_eq!(after.label, before.label);
+        assert_eq!(after.alphabet, before.alphabet);
+        assert_eq!(after.msd, before.msd);
+    }
+
+    #[test]
+    fn apply_all_representations_intersects_the_restricted_track_only() {
+        let mut a = universal_tracks(&["x", "y"], 1);
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        a.apply_all_representations();
+
+        // Track `x` is restricted, track `y` is not: `(11, **)` is rejected, `(**, 11)` is not.
+        let word = |xs: &[i32], ys: &[i32]| -> Vec<i32> {
+            xs.iter()
+                .zip(ys.iter())
+                .map(|(&x, &y)| a.encode(&[x, y]))
+                .collect()
+        };
+        assert!(a.fa.accepts_word(&word(&[0, 1], &[1, 1])));
+        assert!(!a.fa.accepts_word(&word(&[1, 1], &[0, 0])));
+        assert_eq!(a.label, vec!["x", "y"], "labels are unchanged");
+    }
+
+    #[test]
+    fn apply_all_representations_applies_every_restricted_track() {
+        let mut a = universal_tracks(&["x", "y"], 1);
+        a.set_all_reps(vec![
+            Some(Rc::new(no_adjacent_ones("ignored"))),
+            Some(Rc::new(no_adjacent_ones("ignored"))),
+        ]);
+        a.apply_all_representations();
+        let word = |xs: &[i32], ys: &[i32]| -> Vec<i32> {
+            xs.iter()
+                .zip(ys.iter())
+                .map(|(&x, &y)| a.encode(&[x, y]))
+                .collect()
+        };
+        assert!(a.fa.accepts_word(&word(&[0, 1], &[1, 0])));
+        assert!(
+            !a.fa.accepts_word(&word(&[0, 1], &[1, 1])),
+            "the SECOND track's restriction must survive too -- `K` accumulates"
+        );
+        assert!(!a.fa.accepts_word(&word(&[1, 1], &[0, 1])));
+    }
+
+    /// `determineRandomLabel`/`unlabel`'s exact interplay (`Automaton.java:252-270`), ported
+    /// verbatim including the part that looks like an oversight: `unlabel()` runs BEFORE
+    /// `copy(K)`, so when at least one restriction was applied it is overwritten and the
+    /// automaton comes back **bound** to `randomLabel`'s numeric names.
+    #[test]
+    fn apply_all_representations_label_bookkeeping_matches_java() {
+        // Unbound + nothing to apply: `unlabel()` wins, the automaton stays unbound.
+        let mut nothing = universal_tracks(&["x", "y"], 1);
+        nothing.unlabel();
+        assert!(!nothing.is_bound());
+        nothing.apply_all_representations();
+        assert!(
+            !nothing.is_bound(),
+            "still unbound, nothing was copied over it"
+        );
+
+        // Unbound + something to apply: `copy(K)` restores the random labels.
+        let mut applied = universal_tracks(&["x", "y"], 1);
+        applied.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        applied.unlabel();
+        applied.apply_all_representations();
+        assert_eq!(
+            applied.label,
+            vec!["0", "1"],
+            "Java's dead `unlabel()` is overwritten by `copy(K)`"
+        );
+    }
+
+    /// `applyAllRepresentationsWithOutput`'s two documented differences from its sibling:
+    /// it preserves DFAO output values (`IF_OTHER_OP` returns `aP`, not `0`/`1`), and it
+    /// combines with `this` rather than the running `K` — so with two restricted tracks only
+    /// the LAST restriction survives. Java's own source comment says the second is by design
+    /// ("causes a bug in `combine()` otherwise"), so it is ported verbatim.
+    #[test]
+    fn apply_all_representations_with_output_keeps_dfao_values_and_only_the_last_track() {
+        let mut a = universal_tracks(&["x", "y"], 7);
+        a.set_all_reps(vec![
+            Some(Rc::new(no_adjacent_ones("ignored"))),
+            Some(Rc::new(no_adjacent_ones("ignored"))),
+        ]);
+        a.apply_all_representations_with_output();
+
+        assert!(
+            a.fa.o.contains(&7),
+            "the word-automaton output value survives (IF_OTHER_OP returns aP)"
+        );
+        let word = |xs: &[i32], ys: &[i32]| -> Vec<i32> {
+            xs.iter()
+                .zip(ys.iter())
+                .map(|(&x, &y)| a.encode(&[x, y]))
+                .collect()
+        };
+        assert!(
+            !a.fa.accepts_word(&word(&[0, 1], &[1, 1])),
+            "the last track's restriction IS applied"
+        );
+        assert!(
+            a.fa.accepts_word(&word(&[1, 1], &[0, 1])),
+            "the first track's restriction is discarded -- combines with `this`, not `K`"
+        );
+    }
+
+    // --- the per-track metadata stays parallel through every track-list mutation ---
+
+    #[test]
+    fn sort_label_permutes_all_reps_alongside_msd() {
+        let restriction = Rc::new(no_adjacent_ones("ignored"));
+        let mut a = Automaton::new(
+            trivial_fa(8),
+            vec![vec![0, 1], vec![0, 1], vec![0, 1]],
+            vec!["c".into(), "a".into(), "b".into()],
+            vec![Some(true), Some(false), None],
+        );
+        a.set_all_reps(vec![Some(Rc::clone(&restriction)), None, None]);
+        a.sort_label();
+        assert_eq!(a.label, vec!["a", "b", "c"]);
+        assert_eq!(a.msd, vec![Some(false), None, Some(true)]);
+        assert!(
+            a.all_reps[0].is_none() && a.all_reps[1].is_none() && a.all_reps[2].is_some(),
+            "the restriction followed track `c` to its new position"
+        );
+    }
+
+    #[test]
+    fn reduce_dimension_drops_the_merged_tracks_all_reps_entry() {
+        let restriction = Rc::new(no_adjacent_ones("ignored"));
+        let mut a = Automaton::new(
+            trivial_fa(8),
+            vec![vec![0, 1], vec![0, 1], vec![0, 1]],
+            Vec::new(),
+            vec![Some(true), Some(true), Some(true)],
+        );
+        a.set_all_reps(vec![
+            Some(Rc::clone(&restriction)),
+            Some(Rc::clone(&restriction)),
+            None,
+        ]);
+        // Two tracks share a label, so `bind` merges them via `reduceDimension`.
+        a.bind(vec!["x".into(), "x".into(), "y".into()]);
+        assert_eq!(a.label, vec!["x", "y"]);
+        assert_eq!(a.msd.len(), 2);
+        assert_eq!(a.all_reps.len(), 2, "stayed parallel to msd");
+        assert!(a.all_reps[0].is_some() && a.all_reps[1].is_none());
+    }
+
+    #[test]
+    fn clear_empties_all_reps_with_the_rest_of_the_track_metadata() {
+        let mut a = universal_tracks(&["x"], 1);
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored")))]);
+        a.clear();
+        assert!(a.all_reps.is_empty());
+        assert!(a.msd.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "one entry per track required")]
+    fn set_all_reps_rejects_a_wrong_length_list() {
+        let mut a = universal_tracks(&["x", "y"], 1);
+        a.set_all_reps(vec![None]);
+    }
+
+    #[test]
+    #[should_panic(expected = "no number system")]
+    fn set_all_reps_rejects_a_restriction_on_a_non_arithmetic_track() {
+        let mut a = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![None],
+        );
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored")))]);
     }
 }
