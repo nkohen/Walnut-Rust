@@ -14,6 +14,7 @@
 //! DESIGN.md §5.
 
 pub mod expr;
+pub mod predicate;
 pub mod predicate_env;
 pub mod quantify;
 pub mod token;

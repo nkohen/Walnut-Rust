@@ -494,6 +494,83 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-015 — `Predicate`'s tokenizer records three classes of wrong `positionInPredicate`, all surfaced in user-visible error text
+
+- **Where:** `Main/Predicate.java`, `tokenizeAndComputePostOrder` (`:228-237`, the two parenthesis
+  arms) and `handleQuantifier` (`:276-285`). Every other arm of the same scanning loop uses the
+  form `realStartingPosition + matcher.start(1)`; these three deviate from it, each differently.
+- **What:** `Token.positionInPredicate` is Walnut's "char at N" pointer into the user's query. It is
+  read in exactly two places — `Predicate.java:248`'s `unbalancedParen(op.getPositionInPredicate())`
+  and `EvalDef.compute`'s catch block (`Main/Commands/EvalDef.java:126`, which appends
+  `System.lineSeparator() + "\t: char at " + t.getPositionInPredicate()` to the message of ANY
+  `RuntimeException` a token's `act()` throws) — so a wrong value is a wrong diagnostic, printed to
+  the user, not dead data. Three distinct defects:
+  1. **Both parenthesis tokens record the pre-whitespace cursor, not the parenthesis.**
+     `new LeftParenthesis(realStartingPosition + index)` / `new RightParenthesis(realStartingPosition
+     + index)` use the loop's `index`, i.e. the offset where scanning *began*, while the pattern
+     itself is `\G\s*\(` — so any whitespace before the parenthesis shifts the reported position
+     backwards onto that whitespace (or onto the end of the previous token).
+  2. **A quantifier operator and its quantified variables omit `realStartingPosition` entirely.**
+     `handleQuantifier` passes the bare `MATCHER_FOR_LOGICAL_OPERATORS.start()` and
+     `MATCHER_FOR_LIST_OF_QUANTIFIED_VARIABLES.start()`. Both are offsets into *this* `Predicate`'s
+     own string, which for a nested `Predicate` (a word index, `:310`, or a function argument,
+     `:462-463`) is a fragment of the real query — so the reported position is in the wrong
+     coordinate space, and points at an unrelated character of the query (or, for a short query,
+     off the front of the construct entirely). It is also a whole-match start rather than
+     `start(1)`, so it has defect 1's leading-whitespace problem on top.
+  3. **Every variable in one quantifier's list shares one position** — the list match's start —
+     instead of its own offset, so `E x, y, z` reports `x`'s position for a complaint about `z`.
+- **Trigger (empirically confirmed against the real `walnut-java`, via a probe that constructs
+  `new Predicate(line)` and prints each token's `getPositionInPredicate()`, run against
+  `target/Walnut-all.jar`, JDK 19, 2026-08-12):**
+  - defect 1: `new Predicate("a=1 & ( b=2")` throws `unbalanced parenthesis: char at 5`; the `(` is
+    at offset 6, and offset 5 is a space. (This one reaches the user through Walnut's own error
+    text with no `eval` needed.)
+  - defect 2: `new Predicate("T[  Ex (x=1)  ]=@1")` (with a real `T` in the word library) yields
+    token positions `x=3, x=8, 1=10, ==9, E=0, T=0, 1=17, ==15`. The nested index predicate's
+    `realStartingPosition` is 2, and its ordinary tokens correctly show it (the inner `x` at nested
+    offset 6 reports 8) — but the `E` reports **0** and its quantified `x` reports **3**, both
+    missing the +2. With a longer prefix the gap is larger: `"xxxxxxxxxx & T[Ey (y=1)]=@1"` reports
+    the quantified `y` at **1** where the correct position is 16.
+  - defect 3: `new Predicate("E x, y, z (x=y)")` yields positions `1,1,1` for the three quantified
+    variables.
+  - The `EvalDef.compute` half of the surface (defects 2/3's route to the user) is a one-line trace
+    rather than a live reproduction: a quantifier's `act()` really can throw on plausible input
+    (`WalnutException.notFreeVariable`, "Variable X in the list of quantified variables is not a
+    free variable."), and `EvalDef.compute` unconditionally appends that token's position — so e.g.
+    `T[Ey (x=1)]` prints a "char at" pointing into the wrong coordinate space. Not run end-to-end
+    through the CLI, unlike the three token/error observations above.
+- **Found:** Phase 3a, U3 (`crates/wr-logic/src/predicate.rs`, the `Predicate` tokenizer port),
+  2026-08-12.
+- **Rust port:** `ported verbatim (quirk)` — all three. `predicate.rs`'s scanning loop uses
+  `self.position(index)` (i.e. `realStartingPosition + offset`) for the parenthesis arms exactly as
+  Java does, and `handle_quantifier` uses `self.java_offset(...)` (no `realStartingPosition`) for
+  both the operator and every variable, with the list's start reused for all of them. Each is
+  flagged in a code comment naming this entry, and pinned by a dedicated test asserting the
+  *defective* values: `parenthesis_positions_are_the_pre_whitespace_cursor_wb015`,
+  `quantifier_token_positions_omit_real_starting_position_wb015`,
+  `all_quantified_variables_share_one_position_wb015`. Note the port fixes a *different*, unrelated
+  position problem that Java does not have: `predicate.rs` converts its UTF-8 byte cursor to UTF-16
+  code units before recording any position, so the two legal non-ASCII grammar characters
+  (˜ U+02DC, ◌̃ U+0303) do not shift positions relative to Java's — see that module's docs.
+- **Upstream:** not filed. All three are small, independent fixes: use `matcher.start()` for the
+  parenthesis position (or `matcher.end() - 1`); add `realStartingPosition` and switch to `start(1)`
+  in `handleQuantifier`; and compute each variable's own offset while splitting the list (the split
+  currently discards offsets, so this one needs a `Matcher`-based split rather than
+  `String.split`).
+- **Severity:** low — diagnostics only. No automaton, language, or accept/reject decision depends on
+  `positionInPredicate`; the damage is a misleading "char at N" in an error message, which is worst
+  for defect 2 (a quantifier error inside a function argument or word index points somewhere
+  unrelated). **Checked, so U27 does not have to guess:** 11 golden fixtures print a "char at"
+  (`error190`, `error398`–`error403`, `error459`, `error476`, `error669`, `error670`), and **none of
+  them encodes a WB-015-affected value** — the two `unbalanced parenthesis` ones (`def test669
+  "((("`, `def test670 ")))"`) have no whitespace before their parentheses, so defect 1 is
+  invisible there, and the other nine report function/arithmetic/relational tokens, which use the
+  correct `realStartingPosition + start(1)` form. So Tier 1 neither pins nor contradicts this
+  entry, and a future upstream fix would not look like a golden-corpus regression.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

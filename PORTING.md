@@ -104,7 +104,19 @@ and add a property test that the result is order-independent.
   Byte-vs-UTF-16 offset units diverge for the two non-ASCII grammar characters (˜ U+02DC,
   ◌̃ U+0303); U3/U4 must decide explicitly how to handle that in position-reporting error
   text, not let a golden `error*` fixture discover it. Full argument: `predicate_env.rs`'s
-  "Ruling 3".
+  "Ruling 3". **Decided by U3, and the rule for every later port of a Java `Matcher`
+  offset: the cursor stays a UTF-8 byte offset, and every offset that reaches a token,
+  an error message, or a nested construct's `realStartingPosition` is converted to
+  UTF-16 code units first** (`predicate.rs`'s `Predicate::java_offset`, a
+  `char_indices().map(len_utf16)` walk — panic-free, and linear in a string whose length
+  is irrelevant next to the automaton work each token triggers). Converting makes the
+  divergence *zero* rather than "documented", which is worth ~6 lines here because the
+  alternative silently shifts every reported position after a `˜` in a query;
+  `predicate.rs`'s `token_positions_after_a_non_ascii_operator_match_javas` pins it
+  against real Walnut's own output (`a˜=1` -> positions `0,3,2,1`, whose byte offsets
+  would be `0,4,3,1`). Corollary for U4: a nested `Predicate`'s `real_starting_position`
+  argument is in UTF-16 units, so the offset handed to it must be converted, not a raw
+  byte index.
 - **`PredicateEnv` (`&self`) must be implemented on a narrow `Session` sub-struct, never
   on `Session` as a whole.** `PredicateEnv`'s four methods deliberately take `&self`
   (`predicate_env.rs`'s trait docs), because the four file-library lookups it wraps are
