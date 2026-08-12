@@ -7,6 +7,10 @@ rust-version.workspace = true
 
 [dependencies]
 wr-core = { path = "../wr-core" }
+# `\G`-anchored lexing for the `Predicate` tokenizer — see the justifying comment on the
+# workspace-root `[workspace.dependencies]` entry. `wr-logic` is the only crate that needs
+# it (the lexer lives here); keep it out of `wr-core`/`wr-io`.
+regex-automata.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

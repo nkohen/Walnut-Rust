@@ -31,3 +31,20 @@ proptest = "1"
 # (if unlikely-to-bite) behavioral divergence rather than a provably-safe narrowing.
 # `default-features = false` + `std` keeps `rand`/`serde`/`quickcheck` out of the tree.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+# PORTING.md's `java.util.regex.Matcher` -> `regex-automata` mapping. Added in Phase 3 U1
+# for `wr-logic`'s lexer: `Main/Predicate.java` tokenizes with 15 `\G`-anchored patterns
+# driven by `Matcher.find(index)`, i.e. "match EXACTLY here, never scan forward". The
+# `regex` crate has no `\G` anchor and its `find_at` still scans forward, so it cannot
+# express that at all; `regex-automata`'s `Input::span(index..).anchored(Anchored::Yes)`
+# is the exact equivalent, and its `meta::Regex` keeps `regex`'s own syntax/engines.
+# `default-features = false` + this feature set keeps the `dfa`/`hybrid` engines (which
+# `meta` never needs for these patterns) out of the tree; `syntax`+`unicode` are required
+# because the ported patterns are written in `regex` surface syntax.
+regex-automata = { version = "0.4", default-features = false, features = [
+    "std",
+    "syntax",
+    "meta",
+    "nfa",
+    "perf",
+    "unicode",
+] }

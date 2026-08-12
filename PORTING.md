@@ -23,7 +23,7 @@ be justified in the diff.
 | Java (Walnut) | Rust (walnut-rs) | Notes |
 |---|---|---|
 | `public static` global state (`Prover.mainProver`, `usingOTF`, `Session` paths) | fields of an explicit `Session` context struct, threaded through calls | The one sanctioned deviation from mechanical fidelity. Do NOT use `static mut`/globals. |
-| `Token.getUniqueString()` `static long` fresh-name counter | a counter field on `Session` (or a passed `&mut FreshNames`) | Global mutable counter → threaded state. |
+| `Token.getUniqueString()` `static long` fresh-name counter | `wr_logic::predicate_env::FreshIdentifiers`, one instance per evaluation, threaded through `Token::act` alongside `&dyn PredicateEnv` | Global mutable counter → threaded state. Scoped per-evaluation, not per-session, since the literal counter value never reaches any observable output (verified: the fresh-name prefix appears nowhere in `walnut-java`'s golden fixtures) — see `predicate_env.rs`'s "Ruling 4" module doc for the full argument. |
 | `implements Cloneable` / `.clone()` deep copies of `FA`/`Automaton` | `#[derive(Clone)]` with **deep** semantics | Call sites assume deep copies — verify no accidental shared mutability. |
 | One class = one file (`Main/Commands/*`) | one module per command under `wr-cli` | The ~20 **inline** `Prover.java` commands (`split`/`rsplit`/`join`/`transduce`/`convert`/…) have no class — port them as modules too, LAST (kit F9). |
 
@@ -62,9 +62,61 @@ and add a property test that the result is order-independent.
   behavior can differ at the edges — don't `get_unchecked` to "match" Java.
 - **Slice length semantics** — off-by-one at boundaries when translating `a.length`/substring math.
 
+## Phase 3 rulings (added as `wr-logic`'s parser/quantifier layer landed)
+
+- **`NumberSystem` memoization lives in `wr-core`, never in `wr-logic`.** Java hands the
+  *same* cached `NumberSystem` instance to every token in a formula and lets `act()`-time
+  code mutate it (`getConstant`/`getMultiplication`/`getDivision`'s dynamic tables). Rather
+  than let that force `Rc<RefCell<NumberSystem>>`-style sharing into every `Token`/
+  `Expression::act` signature, `wr_core::numsys::NumberSystem` owns its own memoization
+  behind interior mutability (U5); `wr-logic`'s `PredicateEnv` trait hands out a
+  read-only `Rc<NumberSystem>` and nothing wraps it in a second `RefCell`. Full argument:
+  `crates/wr-logic/src/predicate_env.rs`'s module doc, "Ruling 1".
+- **`\G`-anchored lexing needs `regex-automata`, not `regex`.** Java's lexer is 15
+  `\G`-anchored `Matcher.find(index)` calls (match starts *exactly* at the cursor, never
+  scans forward); the `regex` crate has no `\G` anchor. `regex-automata`'s
+  `Input::new(hay).span(index..).anchored(Anchored::Yes)` is the equivalent, added to
+  `crates/wr-logic/Cargo.toml` with the same justification style as the workspace root's
+  `num-bigint` entry. Four empirically-verified Java-regex → Rust-regex dialect
+  divergences the lexer (U3) must handle (no look-behind, ASCII-vs-Unicode `\s`/`\w`/`\d`,
+  character-class intersection *does* survive, group numbering must be re-derived per
+  pattern) are catalogued in `predicate_env.rs`'s "Ruling 2" — read it before porting
+  `Predicate.java`'s regex table, don't re-derive these from scratch. (This is a
+  *different* `regex-automata` use than the still-open `dk.brics` question below — see
+  that entry, don't conflate the two.)
+- **A lexer never borrows the string it's lexing; it owns a `String` buffer.** Java's
+  `Predicate.putMacro` rewrites the predicate string mid-lex and rebuilds all its
+  matchers over the new string. The Rust lexer instead owns `src: String` (not `&'a str`),
+  never holds a match `Span`/slice across a buffer edit (extract offsets/copies first,
+  *then* mutate), and needs no matcher-rebuild step at all — `regex-automata`'s `Input` is
+  per-call, so the 15 patterns are compiled once into a `OnceLock`/`LazyLock` static.
+  Byte-vs-UTF-16 offset units diverge for the two non-ASCII grammar characters (˜ U+02DC,
+  ◌̃ U+0303); U3/U4 must decide explicitly how to handle that in position-reporting error
+  text, not let a golden `error*` fixture discover it. Full argument: `predicate_env.rs`'s
+  "Ruling 3".
+- **`PredicateEnv` (`&self`) must be implemented on a narrow `Session` sub-struct, never
+  on `Session` as a whole.** `PredicateEnv`'s four methods deliberately take `&self`
+  (`predicate_env.rs`'s trait docs), because the four file-library lookups it wraps are
+  read-only/memoizing. `crate::determinize::DeterminizeContext` (landed U0c, `wr-core`) is
+  the opposite shape: its methods take `&mut self` (`next_automaton_index` must advance;
+  `strategy`/`export_pre_determinization` are implementor-defined and may too). Nothing
+  implements both today, so this is not a live bug — but if U14's `Session` implemented
+  `PredicateEnv` directly on the whole struct, a nested evaluation needing
+  `&mut dyn DeterminizeContext` from `Session` at the same time it holds
+  `&dyn PredicateEnv` borrowed from `Session` would hit ordinary Rust aliasing rules.
+  Ruling, settled now so U14 doesn't have to re-derive it under pressure: `PredicateEnv`
+  is implemented on a narrow field/sub-struct of `Session` that holds *only* the four
+  file-library lookups (the word/function/macro libraries and the number-system cache),
+  kept disjoint from whatever field(s) later hold `MetaCommands`/determinize-context
+  state. `Session` as a whole should never itself be the `impl PredicateEnv for _` target.
+
 ## Open questions to resolve during Phase 0 (add rulings here)
 
 - Multi-track alphabet representation in `wr-core` (Walnut's `RichAlphabet`) — pick the Rust rep once.
 - NFA transition representation (Walnut: `Int2ObjectRBTreeMap<IntList>`), and how the equivalence
   oracle consumes it.
 - `dk.brics` regex→automaton replacement (`regex-automata` + converter) — pin the converter's contract.
+  **Unrelated to the "Phase 3 rulings" `regex-automata`-for-lexing entry above**: that entry settles
+  `\G`-anchored *lexing* of predicate strings (`Predicate.java`'s tokenizer); this one is about
+  converting a `reg`-command regex *string* into an automaton (replacing `dk.brics.automaton`). Same
+  crate, unrelated use — this question is still open even though lexing's is settled.
