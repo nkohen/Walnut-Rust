@@ -73,6 +73,39 @@ use crate::fa::Fa;
 use crate::util::{is_sorted, remove_indices};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+/// `.expect()` message for every call into [`crate::determinize::determinize`] that
+/// passes `None` for its context.
+///
+/// Java's two `Automaton.determinizeAndMinimize` overloads (`Automaton.java:394`,
+/// `:404`) are the ONLY callers of `DeterminizationStrategies.determinize` — but that is
+/// a fact about *Java's* call graph, not this port's. As of U0c, the dispatcher has
+/// **four** Rust call sites, not two: these same two `Automaton` methods below, plus
+/// `crate::quantify::quantify_helper` (∃-projection — the single most common
+/// determinization site in the whole engine) and `wr_io::reader::read_automaton_txt`
+/// (`.txt` loading), both of which call `crate::determinize::determinize` directly
+/// rather than through an `Automaton` method. All four currently pass `None`. This
+/// matters because it's what actually puts the `[strategy …]`/`[export …]` hook on the
+/// port's real call graph — an earlier version of this comment claimed only these two
+/// overloads mattered, which a reviewer caught: it was true for Java but left `quantify`
+/// and `reader` silently bypassing the hook, a real landmine for Phase 3b's
+/// `MetaCommands` port (some live subset-relevant golden fixtures already use in-scope
+/// strategy/export directives that would have silently never applied to ∃-elimination or
+/// `.txt`-load determinizations). Fixed by routing those two call sites through the
+/// dispatcher too, not just by correcting this comment.
+///
+/// None of the four supplies a context yet: Java reads the `Prover.mainProver.
+/// metaCommands` singleton *inside* the dispatcher, and threading the Rust equivalent
+/// down from `Prover` is Phase 3b (`U21`), which will widen all four call sites (or the
+/// two non-`Automaton` ones directly, and `Automaton`'s methods via a new overload/
+/// parameter — that call-graph-widening plan is U21's to make, not fixed here).
+///
+/// With `None` the dispatcher is behaviorally identical to the pre-U0c code at each of
+/// these four sites — strategy is unconditionally [`crate::determinize::Strategy::Sc`],
+/// the export sink and the automata counter are never touched, and the only fallible arm
+/// ([`crate::determinize::brzozowski`]) is unreachable — so this `expect` cannot fire.
+const NO_CONTEXT_CANNOT_FAIL: &str =
+    "determinize with no metacommand context always takes the SC arm, which is infallible";
+
 /// A multi-track automaton: the raw [`Fa`] plus enough track metadata to encode/decode
 /// symbols and (for `wr-logic`) know which tracks are quantifiable and how to fix up
 /// leading/trailing zeros after projection.
@@ -678,7 +711,7 @@ impl Automaton {
             // Working with an NFA. Let's trim, then determinize from {q0}.
             self.fa = crate::trim::trim(&self.fa);
             let initial: BTreeSet<usize> = [self.fa.q0].into_iter().collect();
-            self.fa = crate::determinize::subset_construction(&self.fa, &initial);
+            crate::determinize::determinize(self, &initial, None).expect(NO_CONTEXT_CANNOT_FAIL);
         }
         // `FA.justMinimize`'s `convertNFAtoDFA()` call is a storage-representation
         // optimization only (see `fa.rs` module docs: this crate always uses one
@@ -696,7 +729,7 @@ impl Automaton {
     /// necessarily a singleton). Unlike the no-arg overload, this is unconditional —
     /// Java's version has no `!isDeterministic` guard either.
     pub fn determinize_and_minimize_from(&mut self, initial: &BTreeSet<usize>) {
-        self.fa = crate::determinize::subset_construction(&self.fa, initial);
+        crate::determinize::determinize(self, initial, None).expect(NO_CONTEXT_CANNOT_FAIL);
         self.fa = crate::minimize::minimize(&self.fa).expect(
             "subset_construction's output is always deterministic and q0-reachable -- \
              minimize's documented preconditions",

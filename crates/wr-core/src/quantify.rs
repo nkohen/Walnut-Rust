@@ -133,7 +133,6 @@
 //!   [`crate::logicalops::zero_reachable_states`].
 
 use crate::automaton::Automaton;
-use crate::determinize::subset_construction;
 use crate::logicalops::fix_leading_zeros_problem;
 use crate::minimize::{minimize, MinimizeError};
 use crate::numsys::determine_msd;
@@ -336,9 +335,27 @@ fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Q
 
     // `A.determinizeAndMinimize()` (`:104`) — with the unconditional trim described in
     // the module docs (Java trims only when the rebuilt table is nondeterministic).
-    let trimmed = trim(&projected.fa);
-    let initial: BTreeSet<usize> = [trimmed.q0].into_iter().collect();
-    projected.fa = minimize(&subset_construction(&trimmed, &initial))?;
+    //
+    // Routed through the `determinize` dispatcher (U0c, `crate::determinize::determinize`)
+    // rather than calling `subset_construction` directly, so that Phase 3b's
+    // `[strategy …]`/`[export …]` metacommands apply here too -- this is the single most
+    // common determinization site in the whole engine (every existentially-quantified
+    // variable goes through it; see `automaton.rs`'s corrected module-level note on
+    // U0c's actual call-graph coverage). `ctx = None` is bit-for-bit identical to the
+    // pre-dispatcher direct call (`determinize.rs`'s
+    // `no_context_is_exactly_plain_subset_construction` pins this), and with `ctx = None`
+    // the dispatcher's only fallible arm is unreachable -- the same reasoning
+    // `Automaton::determinize_and_minimize`'s `NO_CONTEXT_CANNOT_FAIL` already documents.
+    // That's a Rust-native dispatcher invariant, not a ported Java "can't happen", so
+    // `PORTING.md`'s Result-not-panic rule for the latter (see `QuantifyError::Minimize`'s
+    // doc just above) doesn't apply to it -- unlike the `minimize` call below, which
+    // stays a propagated `Result` exactly as before.
+    projected.fa = trim(&projected.fa);
+    let initial: BTreeSet<usize> = [projected.fa.q0].into_iter().collect();
+    crate::determinize::determinize(&mut projected, &initial, None).expect(
+        "determinize with no metacommand context always takes the SC arm, which is infallible",
+    );
+    projected.fa = minimize(&projected.fa)?;
 
     *a = projected;
     Ok(())

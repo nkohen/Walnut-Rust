@@ -152,6 +152,25 @@ impl Fa {
         self.o[s] != 0
     }
 
+    /// `FA.isFAO()` (`FA.java:64-71`): true iff some state's output is `> 1`, i.e. this
+    /// is a word automaton (DFAO) rather than a plain accept/reject predicate automaton.
+    ///
+    /// Used by [`crate::determinize::determinize`] to reproduce Java's "DFAOs are not
+    /// supported for non-SC strategies" guard (`DeterminizationStrategies.java:115-119`)
+    /// and to fill in the `isFAO` argument its `[export ...]` metacommand hands to
+    /// `ProverHelper.exportAutomata` (`:107-108`).
+    ///
+    /// Fidelity note: Java iterates `for (int i = 0; i < Q; i++) O.getInt(i)`, so on the
+    /// one malformed shape this crate can produce — a cleared trivial automaton, whose
+    /// `q` stays stale while `o` is emptied (see [`Fa::clear`]) — Java would throw
+    /// `IndexOutOfBoundsException` where this returns `false`. Iterating `o` rather than
+    /// `0..q` matches the convention every other predicate on this type already follows
+    /// ([`Fa::is_deterministic`], [`Fa::is_language_empty`]), and the two are
+    /// indistinguishable for well-formed automata, where `o.len() == q`.
+    pub fn is_fao(&self) -> bool {
+        self.o.iter().any(|&out| out > 1)
+    }
+
     /// True iff every (state, symbol) pair present has at most one destination.
     /// Does NOT require every symbol be present — see [`Fa::is_deterministic_and_total`]
     /// for that stronger check.
@@ -1224,6 +1243,32 @@ mod tests {
         };
         fa.canonicalize();
         assert_eq!(fa.q, 0);
+    }
+
+    // --- isFAO (U0c, FA.java:64-71) ---
+
+    #[test]
+    fn is_fao_is_true_exactly_when_some_output_exceeds_one() {
+        // A plain predicate automaton's outputs are 0/1 -- not a DFAO.
+        let mut fa = contains_one_dfa();
+        assert!(!fa.is_fao());
+
+        // A word automaton's are arbitrary non-negative ints. `2` is the smallest
+        // value Java's `O.getInt(i) > 1` test accepts, so it pins the boundary.
+        fa.o = vec![0, 2];
+        assert!(fa.is_fao());
+
+        // Boundary the other way: output exactly 1 is accepting, but NOT a DFAO.
+        fa.o = vec![1, 1];
+        assert!(!fa.is_fao());
+    }
+
+    #[test]
+    fn is_fao_is_false_for_a_trivial_automaton() {
+        // No outputs at all -> the `any` is vacuously false. (Java would agree here:
+        // `Q == 0` for a freshly-built trivial automaton, so its loop never runs.)
+        assert!(!Fa::trivial(true).is_fao());
+        assert!(!Fa::trivial(false).is_fao());
     }
 
     // --- the trivial (TRUE/FALSE) automaton (U0, FA.java:52-53/90-94/149/593-617) ---

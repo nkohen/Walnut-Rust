@@ -61,7 +61,6 @@ use std::fmt;
 use std::path::Path;
 
 use wr_core::automaton::Automaton;
-use wr_core::determinize::subset_construction;
 use wr_core::fa::Fa;
 use wr_core::minimize::{minimize, MinimizeError};
 use wr_core::trim::trim;
@@ -257,10 +256,25 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
 
     // `AutomatonReader.readAutomaton`: auto-determinize + minimize non-deterministic
     // input (no DFAO branch here, see module docs).
+    //
+    // Routed through `wr_core::determinize::determinize` (the U0c dispatcher) rather
+    // than calling `subset_construction` directly, so Phase 3b's `[strategy …]`/
+    // `[export …]` metacommands apply to `.txt`-load-triggered determinizations too --
+    // see `wr_core::automaton`'s corrected module-level note on U0c's actual call-graph
+    // coverage. `ctx = None` is bit-for-bit identical to the pre-dispatcher direct
+    // call (`wr_core::determinize`'s `no_context_is_exactly_plain_subset_construction`
+    // pins this), and with `ctx = None` the dispatcher's only fallible arm is
+    // unreachable -- the same reasoning `Automaton::determinize_and_minimize`'s
+    // `NO_CONTEXT_CANNOT_FAIL` already documents, so it is `.expect()`ed here rather
+    // than propagated -- unlike the `minimize` call below, which stays a propagated
+    // `Result` (`ReadError::Minimize`) exactly as before.
     if !automaton.fa.is_deterministic() {
-        let trimmed = trim(&automaton.fa);
-        let initial: BTreeSet<usize> = [trimmed.q0].into_iter().collect();
-        automaton.fa = minimize(&subset_construction(&trimmed, &initial))?;
+        automaton.fa = trim(&automaton.fa);
+        let initial: BTreeSet<usize> = [automaton.fa.q0].into_iter().collect();
+        wr_core::determinize::determinize(&mut automaton, &initial, None).expect(
+            "determinize with no metacommand context always takes the SC arm, which is infallible",
+        );
+        automaton.fa = minimize(&automaton.fa)?;
     }
 
     Ok(automaton)
