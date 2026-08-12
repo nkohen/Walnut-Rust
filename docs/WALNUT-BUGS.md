@@ -891,6 +891,44 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-021 — `AutomatonWriter.exportToBA` has no `TRUE_FALSE_AUTOMATON` guard, unlike its two siblings; TRUE and FALSE export byte-identically
+
+- **Where:** `Automata/Writer/AutomatonWriter.java`, `exportToBA` (`:161-173`).
+- **What:** `writeToTxtFormat` (`:48-58`) and `writeToGV` (`:101-159`) both explicitly check
+  `automaton.fa.isTRUE_FALSE_AUTOMATON()` first and handle the trivial automaton specially, because a trivial `FA`'s
+  `Q`/alphabet/transition-table fields are meaningless/stale (see `wr_core::fa`'s and `crate::reader`'s own docs on
+  this shape). `exportToBA` has no such guard — it unconditionally calls `a.FAtoCompactNFA()` on whatever `FA` it's
+  given. Empirically confirmed (not just read) against the real `walnut-java` CLI (`target/Walnut-all.jar`, JDK 19,
+  small driver classes calling `AutomatonWriter.exportToBA` directly on both `new Automaton(true).fa` and
+  `new Automaton(false).fa`): it does not crash — `FAtoCompactNFA` builds a 0-state `CompactNFA` over an empty
+  alphabet, `setInitial(0, true)` records an initial-state id that doesn't correspond to any real state, and
+  `BAWriter` happily writes it — but the two calls produce **byte-identical** output, just `"0\n"`: one initial-state
+  line (the phantom id `0`), zero transition lines (`FA.t` is empty), and zero final-state lines (`BAWriter`'s
+  "if every state is accepting, write no final-state section at all" rule — see `crates/wr-io/src/writer.rs`'s module
+  docs for the full derivation — is vacuously true when there are zero states to disagree). The TRUE and FALSE
+  automata are indistinguishable in `.ba` output, and neither carries any information about which one it was.
+- **Trigger:** `[export <name> BA]` (or any direct `exportToBA` call) on an automaton that is currently the trivial
+  TRUE or FALSE automaton — plausible and common: the golden corpus shows 13% of `automaton*` fixtures are exactly
+  this shape (`crates/wr-io/src/reader.rs`'s docs).
+- **Found:** Phase 3a, U12 (`wr-io`'s `AutomatonWriter` port), 2026-08-12, while deriving the `.ba` format from real
+  `walnut-java` output (the plan's `.ba`-format-fidelity retiering explicitly called for empirical verification, not
+  guessing). Confirmed live: both the no-crash result and the byte-identical output were run, not inferred.
+- **Rust port:** `ported verbatim (quirk)` — `wr_io::writer::export_to_ba` never special-cases
+  `Fa::is_true_false_automaton`, exactly matching Java's omission; the trivial-`Fa` shape (`q0 = 0, q = 0`) naturally
+  falls through the same general algorithm to the same `"0\n"` output. Pinned by
+  `ba_matches_real_walnut_output_for_true_automaton_wb016` and `ba_matches_real_walnut_output_for_false_automaton_wb016`
+  in `crates/wr-io/src/writer.rs`, the latter also asserting the two real fixture files are themselves byte-identical
+  (so the test can't silently pass if a future re-verification run shows Java's behavior has changed).
+- **Upstream:** not filed. A ~3-line fix would add the same `isTRUE_FALSE_AUTOMATON()` guard `writeToTxtFormat`/
+  `writeToGV` already have — e.g. writing a single well-known sentinel state (accepting for TRUE, non-accepting for
+  FALSE) instead of falling through to `FAtoCompactNFA` on stale/empty fields.
+- **Severity:** moderate — silent, information-losing wrong output (not a crash) reachable from the plain CLI export
+  command, on an automaton shape (trivial TRUE/FALSE) the golden corpus shows is common, not a contrived corner case;
+  bounded by the fact that a `.ba` export of a trivial automaton is presumably a rare real workflow (most `export`
+  usage is on a non-trivial query result), which is why this wasn't caught before.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

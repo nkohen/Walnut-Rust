@@ -13,11 +13,12 @@
 //! and WRITE files Walnut can load. (Comparison, however, is by semantic
 //! equivalence in `wr-core`, not by textual identity.)
 //!
-//! # Phase 1 spike scope
+//! # Phase 1 spike scope (historical)
 //!
-//! Only [`reader::read_automaton_txt`] so far — a reader is what the spike's
-//! differential test (`.claude/plans/fluttering-foraging-spindle.md`) needs to ingest
-//! real `walnut-java` output; the writer is deferred.
+//! Originally only [`reader::read_automaton_txt`] — a reader is what the spike's
+//! differential test (`.claude/plans/fluttering-foraging-spindle.md`) needed to ingest
+//! real `walnut-java` output. The writer ([`writer`]) landed in Phase 3a's U12.
 
 pub mod parse_methods;
 pub mod reader;
+pub mod writer;

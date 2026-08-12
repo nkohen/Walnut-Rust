@@ -1,0 +1,7 @@
+digraph G {
+label = "(): false predicate";
+rankdir = LR;
+node [shape = circle, label="0", fontsize=12]0;
+node [shape = point ]; qi
+qi ->0;
+}
