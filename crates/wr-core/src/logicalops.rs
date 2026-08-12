@@ -174,7 +174,7 @@
 use crate::automaton::{Automaton, AutomatonDFA};
 use crate::fa::Fa;
 use crate::minimize::{minimize, MinimizeError};
-use crate::product::{cross_product_and_minimize, BooleanOp};
+use crate::product::{cross_product, cross_product_and_minimize, BooleanOp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
 
@@ -207,26 +207,16 @@ use std::rc::Rc;
 /// operands which may well be nondeterministic (Java only determinizes afterwards,
 /// inside `crossProductAndMinimize` -> `asDFA()`), so calling `Fa::totalize` there
 /// would panic where Java works. The two agree exactly on deterministic input.
+///
+/// A thin wrapper around [`Fa::totalize_relaxed`] (Java's sink output here is always
+/// the literal `0`, per `FA.totalize`'s `addSinkState(0, sinkState)` — unlike
+/// `addDistinguishedDeadState`'s `determineMinOutput() - 1`, which is what
+/// `Fa::add_distinguished_dead_state` passes at its own call site instead). Kept as a
+/// free function here, rather than inlined at each call site, purely to preserve this
+/// module's existing call shape (`totalize(&mut a.fa)`) across its several callers
+/// below.
 fn totalize(fa: &mut Fa) {
-    let sink_state = fa.q;
-    let mut needs_sink = false;
-    for q in 0..fa.q {
-        for sym in 0..fa.alphabet_size as i32 {
-            if let std::collections::btree_map::Entry::Vacant(entry) = fa.d[q].entry(sym) {
-                entry.insert(vec![sink_state]);
-                needs_sink = true;
-            }
-        }
-    }
-    if needs_sink {
-        fa.o.push(0);
-        fa.q += 1;
-        let mut sink_row = BTreeMap::new();
-        for sym in 0..fa.alphabet_size as i32 {
-            sink_row.insert(sym, vec![sink_state]);
-        }
-        fa.d.push(sink_row);
-    }
+    fa.totalize_relaxed(0);
 }
 
 /// `FA.flipOutput()` (`FA.java:423-426`), i.e. `setOutputIfEqual(q, !isAccepting(q))`
@@ -355,7 +345,7 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 /// flipped-base file set, which is `wr-io`/`wr-cli`'s (U13/U14's) side of the boundary —
 /// see [`crate::numsys::NumberSystem::flip_with_custom_base_files`], which is the API a
 /// caller that *does* have the files should use instead of relying on this.
-fn flip_ns(a: &mut Automaton) {
+pub(crate) fn flip_ns(a: &mut Automaton) {
     for slot in a.msd.iter_mut() {
         if let Some(is_msd) = slot.as_mut() {
             *is_msd = !*is_msd;
@@ -874,6 +864,70 @@ pub fn remove_states_with_output_rebuild(fa: &mut Fa, min_output: i32) {
     for q in 0..fa.q {
         fa.d[q].retain(|_sym, dests| !(!dests.is_empty() && states_to_remove.contains(&dests[0])));
     }
+}
+
+/// `AutomatonLogicalOps.combine(Automaton A, Queue<Automaton> subautomata, IntList outputs)`
+/// (`:679-722`) — folds `A` and each of `subautomata` together into one DFAO whose
+/// output at a state is `outputs[i]` where `i` is the index (into `outputs`, `A`
+/// counting as index `0`) of the first operand that accepts there, or the running
+/// combined output otherwise. Added in Phase 3a's U6 as a hard, previously-missing
+/// dependency of `WordAutomaton::minimize_with_output` (`WordAutomaton.java:216-229`
+/// calls it directly) — not part of U6's own file, but this file (`AutomatonLogicalOps`)
+/// is `combine`'s real Java home, and `Main/Commands/Combine.java`'s later `combine`
+/// command (Phase 3b, batch A) should call this directly rather than re-porting it.
+///
+/// # `combineIndex`/`combineOutputs` not ported as `Automaton` fields
+///
+/// Java threads the running output value through two fields on `Automaton`
+/// (`combineIndex`/`combineOutputs`), read back inside `ProductStrategies.
+/// determineOutput`'s `Prover.COMBINE` arm via `Automaton.determineCombineOutVal`
+/// (`Automaton.java:72-74`) — architecture needed because Java's `crossProduct` takes
+/// a `String op`, not a closure. `wr-core`'s [`crate::product::cross_product`] is
+/// already generic over the combining function (`docs/BOUNDARY-MAP.md` §3a), so the
+/// per-step combine value is captured directly into a closure below instead; no
+/// `Automaton`-level state is needed, and none is added.
+///
+/// # Totalization via the free [`totalize`] helper, not [`Fa::totalize`]
+///
+/// Matches [`totalize_cross_product`]'s own reasoning (see this module's docs): Java's
+/// `FA.totalize()` doesn't require determinism, and while `first`/`next` are
+/// deterministic in every real call here (both operands always already went through
+/// `determinizeAndMinimize`, and [`crate::product::cross_product`] over two
+/// deterministic inputs is itself deterministic — the same injectivity argument
+/// `crate::product`'s own docs give), using the assert-free helper avoids relying on
+/// that invariant staying true if a future caller ever violates it.
+pub fn combine(a: &Automaton, subautomata: Vec<Automaton>, outputs: &[i32]) -> Automaton {
+    let mut first = a.clone();
+    for q in 0..first.fa.q {
+        if first.fa.is_accepting(q) {
+            first.fa.o[q] = outputs[0];
+        }
+    }
+    // `outputs[0]` is consumed above (for `A`'s own accepting-state rewrite); each
+    // subsequent element pairs with `subautomata` in order (Java: `first.combineIndex`
+    // starts at `1` and increments once per loop iteration).
+    for (combine_out, mut next) in outputs[1..].iter().copied().zip(subautomata) {
+        first.random_label();
+        next.label = first.label.clone();
+        totalize(&mut first.fa);
+        totalize(&mut next.fa);
+        let product = cross_product(
+            &first,
+            &next,
+            |a_out, b_out| {
+                if b_out == 1 {
+                    combine_out
+                } else {
+                    a_out
+                }
+            },
+        );
+        first = product;
+    }
+    totalize(&mut first.fa);
+    first.force_canonize();
+    first.apply_all_representations_with_output();
+    first
 }
 
 #[cfg(test)]
@@ -1981,6 +2035,98 @@ mod tests {
             None,
             "first dest (1) has output 0, so the whole entry goes -- including the \
              surviving second dest (2)"
+        );
+    }
+
+    // ------------------------------------------------------------------ combine
+
+    /// TOTAL 2-state DFA over `{0,1}` accepting exactly the words of EVEN length
+    /// (state 0 = even, accepting; state 1 = odd, non-accepting).
+    fn even_length() -> Fa {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1]);
+        d0.insert(1, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![0]);
+        d1.insert(1, vec![0]);
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 0],
+            d: vec![d0, d1],
+        }
+    }
+
+    /// Walks `fa` from `q0` along `word` and returns the output at the reached state
+    /// (there is no shared "evaluate a DFAO" helper yet in this crate -- `Fa::
+    /// accepts_word` only answers accept/reject -- so this test-local walker reads the
+    /// raw output value `combine` produces).
+    fn output_after(fa: &Fa, word: &[i32]) -> i32 {
+        let mut state = fa.q0;
+        for &sym in word {
+            state = fa.d[state][&sym][0];
+        }
+        fa.o[state]
+    }
+
+    #[test]
+    fn combine_two_automata_matches_the_hand_derived_truth_table() {
+        // A = "ends with 1" (from `ends_with_one`, already TOTAL & deterministic).
+        // next = "even length" (`even_length`, also TOTAL & deterministic), so
+        // `combine`'s own `totalize` calls are no-ops and don't complicate the
+        // expected output table.
+        //
+        // Per `AutomatonLogicalOps.combine`'s semantics (see this function's doc
+        // comment): A's accepting states get rewritten to `outputs[0]`; then, for each
+        // subsequent automaton (`next`), states where `next` accepts get forced to that
+        // step's `outputs[i]`, overriding whatever A/earlier steps produced; states
+        // where `next` doesn't accept keep the running value. So here: even-length
+        // words always output 20 (evenness checked "last" wins, since it's the only
+        // `next`); odd-length words output 10 if they end in `1`, else the untouched
+        // original non-accepting output, `0`.
+        let a = single_track(ends_with_one(), Some(true));
+        let next = single_track(even_length(), Some(true));
+
+        let result = combine(&a, vec![next], &[10, 20]);
+
+        assert_eq!(output_after(&result.fa, &[]), 20, "\"\": even length");
+        assert_eq!(
+            output_after(&result.fa, &[1]),
+            10,
+            "\"1\": odd, ends with 1"
+        );
+        assert_eq!(
+            output_after(&result.fa, &[0]),
+            0,
+            "\"0\": odd, doesn't end with 1"
+        );
+        assert_eq!(output_after(&result.fa, &[1, 1]), 20, "\"11\": even length");
+        assert_eq!(output_after(&result.fa, &[0, 1]), 20, "\"01\": even length");
+        assert_eq!(
+            output_after(&result.fa, &[0, 1, 1]),
+            10,
+            "\"011\": odd, ends with 1"
+        );
+        assert_eq!(
+            output_after(&result.fa, &[0, 1, 0]),
+            0,
+            "\"010\": odd, doesn't end with 1"
+        );
+    }
+
+    #[test]
+    fn combine_single_automaton_no_subautomata_just_rewrites_accepting_states() {
+        // An empty `subautomata` list: the `while` loop never runs, so this is just
+        // "rewrite A's accepting states to `outputs[0]`, leave everything else."
+        let a = single_track(ends_with_one(), Some(true));
+        let result = combine(&a, vec![], &[42]);
+        assert_eq!(output_after(&result.fa, &[1]), 42, "accepting: rewritten");
+        assert_eq!(
+            output_after(&result.fa, &[0]),
+            0,
+            "non-accepting: original output untouched"
         );
     }
 

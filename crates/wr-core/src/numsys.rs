@@ -319,6 +319,21 @@ pub enum NumSysError {
     /// `arithmetic(String,String,String,Ops)`, reachable only with
     /// [`ArithmeticOp::UnaryNegative`] (pinned by `NumberSystemTest.testArithmetic`).
     UnexpectedArithmeticOperator(&'static str),
+    /// `WalnutException.unexpectedOperator` — `"Unexpected operator:" + op`
+    /// (`WalnutException.java:136-138`), from `ArithmeticOperator.arith`'s own
+    /// `default:` arm (`ArithmeticOperator.java:256`), reachable only with
+    /// [`ArithmeticOp::UnaryNegative`]. **Not the same text as
+    /// [`Self::UnexpectedArithmeticOperator`]** — that variant is a different Java
+    /// throw site (`NumberSystem.arithmetic`'s own `default:`, lowercase "unexpected
+    /// arithmetic operator:"), confirmed by reading both; do not conflate them.
+    UnexpectedOperator(&'static str),
+    /// This port's declared stand-in for `ArithmeticOperator.arith(Ops, int, int)`'s
+    /// `BigInteger.intValueExact()` narrowing step (`ArithmeticOperator.java:237`)
+    /// overflowing — an uncaught, unchecked `ArithmeticException` in real Walnut (no
+    /// `WalnutException` text of its own), same pattern as [`Self::BaseNotAnI32`].
+    /// Reachable only through [`ArithmeticOp::arith`], the `int`-level helper
+    /// `WordAutomaton`'s per-state DFAO arithmetic uses.
+    ArithmeticIntOverflow(String),
     /// `"constants cannot be divided by variables"` (`:857`).
     ConstantDividedByVariable,
     /// `WalnutException.divisionByZero` — `"division by zero"` (`WalnutException.java:41`),
@@ -418,6 +433,15 @@ impl fmt::Display for NumSysError {
             NumSysError::UnexpectedArithmeticOperator(op) => {
                 write!(f, "unexpected arithmetic operator:{op}")
             }
+            NumSysError::UnexpectedOperator(op) => write!(f, "Unexpected operator:{op}"),
+            // No Java message: `BigInteger.intValueExact()` throws an unchecked
+            // `ArithmeticException` with no `WalnutException` wrapper.
+            NumSysError::ArithmeticIntOverflow(msg) => {
+                write!(
+                    f,
+                    "arithmetic result does not fit in a 32-bit output ({msg})"
+                )
+            }
             NumSysError::ConstantDividedByVariable => {
                 write!(f, "constants cannot be divided by variables")
             }
@@ -490,6 +514,31 @@ impl RelationalOp {
             RelationalOp::GreaterEqThan => RelationalOp::LessEqThan,
         }
     }
+
+    /// `RelationalOperator.compare(Ops, int, int)` / `compare(Ops, BigInteger,
+    /// BigInteger)` (`RelationalOperator.java:179-193`) — a plain, `NumberSystem`-
+    /// independent integer comparison (unlike [`NumberSystem::comparison`], which
+    /// builds an *automaton* recognizing the relation). Added in Phase 3a's U6 for
+    /// `WordAutomaton`'s per-state DFAO output comparisons, its sole caller in this
+    /// port's current scope (`compareWordAutomaton`/`compareWordAutomata`, via
+    /// `ProductStrategies.determineOutput`'s `RELATIONAL_OPERATORS` branch,
+    /// `ProductStrategies.java:172-175`).
+    ///
+    /// Java's `int` overload widens both operands to `BigInteger` and compares via
+    /// `compareTo`; comparison can't overflow, so a single `i32`-native implementation
+    /// is exact for every value either overload can reach — no narrowing step needed
+    /// (contrast [`ArithmeticOp::arith`], where narrowing back to `i32` is the whole
+    /// reason for [`NumSysError::ArithmeticIntOverflow`] existing).
+    pub fn compare(self, a: i32, b: i32) -> bool {
+        match self {
+            RelationalOp::Equal => a == b,
+            RelationalOp::NotEqual => a != b,
+            RelationalOp::LessThan => a < b,
+            RelationalOp::GreaterThan => a > b,
+            RelationalOp::LessEqThan => a <= b,
+            RelationalOp::GreaterEqThan => a >= b,
+        }
+    }
 }
 
 /// The arithmetic operations `NumberSystem.arithmetic` dispatches on
@@ -517,6 +566,72 @@ impl ArithmeticOp {
             ArithmeticOp::Mult => "*",
             ArithmeticOp::UnaryNegative => "_",
         }
+    }
+
+    /// `ArithmeticOperator.arith(Ops, BigInteger, BigInteger)`
+    /// (`ArithmeticOperator.java:240-258`), narrowed to `i32` exactly as the `arith(Ops,
+    /// int, int)` overload (`:236-238`) does — the only form `WordAutomaton`'s per-state
+    /// DFAO arithmetic calls (`applyWordArithOperator`/`applyWordOperator`, via
+    /// `ProductStrategies.determineOutput`'s `ARITHMETIC_OPERATORS` branch,
+    /// `ProductStrategies.java:176-178`). Added in Phase 3a's U6.
+    ///
+    /// Java's two-step design (compute in `BigInteger`, then narrow with
+    /// `.intValueExact()`) is collapsed into one `i64`-intermediate computation: `i64`
+    /// cannot overflow for any `+`/`-`/`*`/floor-`/` of two `i32` inputs (max magnitude
+    /// `~2^63` vs. the `~2^33` this domain can ever produce), so it stands in for
+    /// `BigInteger`'s unbounded precision exactly here, and the final `i32::try_from`
+    /// reproduces `intValueExact()`'s narrowing check.
+    ///
+    /// - [`Self::Div`]: **floor** division (rounds toward negative infinity), NOT
+    ///   Java/Rust's default truncate-toward-zero. Java's `a.divideAndRemainder(b)`
+    ///   truncates toward zero, then (`:251`) subtracts `1` from the quotient whenever
+    ///   the remainder is nonzero AND the truncated quotient rounded the WRONG way
+    ///   (operands' signs differ) — i.e. exactly the correction that turns
+    ///   truncating division into flooring division. Division by zero returns
+    ///   [`NumSysError::DivisionByZero`] (`WalnutException.divisionByZero()`, `:249`) —
+    ///   a real, clean, checked `WalnutException`, unlike the overflow case below. The
+    ///   `r != 0 && (a<0)!=(b<0)` guard below is only ever evaluated once `b != 0`
+    ///   (checked first) and, since `r == a % b` is `0` whenever `a == 0`, only once
+    ///   `a != 0` too — so `(a<0)!=(b<0)` and Java's `a.signum() != b.signum()` agree
+    ///   exactly on every input that reaches it (signum's third value, `0`, is
+    ///   unreachable there).
+    /// - [`Self::UnaryNegative`]: the `default:` arm (`:256`) — unreachable through any
+    ///   real `WordAutomaton` call site (unary negation of a word automaton is rewritten
+    ///   to `arith(MINUS, 0, x)` by `ArithmeticOperator.processUnaryOperator`,
+    ///   `ArithmeticOperator.java:111`, before it ever reaches here), but a live, tested
+    ///   branch: [`NumSysError::UnexpectedOperator`] (`WalnutException.
+    ///   unexpectedOperator`, text `"Unexpected operator:_"` — see that variant's docs
+    ///   for why it is a DIFFERENT text from [`NumSysError::UnexpectedArithmeticOperator`]).
+    /// - Overflow: [`NumSysError::ArithmeticIntOverflow`] — see that variant's docs.
+    pub fn arith(self, a: i32, b: i32) -> Result<i32, NumSysError> {
+        let a = a as i64;
+        let b = b as i64;
+        let result = match self {
+            ArithmeticOp::Plus => a + b,
+            ArithmeticOp::Minus => a - b,
+            ArithmeticOp::Mult => a * b,
+            ArithmeticOp::Div => {
+                if b == 0 {
+                    return Err(NumSysError::DivisionByZero);
+                }
+                let q = a / b;
+                let r = a % b;
+                if r != 0 && (a < 0) != (b < 0) {
+                    q - 1
+                } else {
+                    q
+                }
+            }
+            ArithmeticOp::UnaryNegative => {
+                return Err(NumSysError::UnexpectedOperator(self.symbol()));
+            }
+        };
+        i32::try_from(result).map_err(|_| {
+            NumSysError::ArithmeticIntOverflow(format!(
+                "{a} {op} {b} = {result}",
+                op = self.symbol()
+            ))
+        })
     }
 }
 
@@ -3627,5 +3742,135 @@ mod tests {
             "Inputs of _less_than.txt must have the same alphabet as the alphabet of \
              inputs of _addition.txt : base msd_x"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `RelationalOp::compare` / `ArithmeticOp::arith` (Phase 3a U6, added for
+    // `WordAutomaton`'s per-state DFAO output comparison/arithmetic).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn relational_op_compare_every_variant() {
+        // `RelationalOperator.compare` (`RelationalOperator.java:183-193`): every
+        // variant checked against both a `<`, `=`, and `>` pair.
+        let cases: &[(RelationalOp, i32, i32, bool)] = &[
+            (RelationalOp::Equal, 3, 3, true),
+            (RelationalOp::Equal, 3, 5, false),
+            (RelationalOp::NotEqual, 3, 5, true),
+            (RelationalOp::NotEqual, 3, 3, false),
+            (RelationalOp::LessThan, 3, 5, true),
+            (RelationalOp::LessThan, 5, 3, false),
+            (RelationalOp::LessThan, 3, 3, false),
+            (RelationalOp::GreaterThan, 5, 3, true),
+            (RelationalOp::GreaterThan, 3, 5, false),
+            (RelationalOp::GreaterThan, 3, 3, false),
+            (RelationalOp::LessEqThan, 3, 5, true),
+            (RelationalOp::LessEqThan, 3, 3, true),
+            (RelationalOp::LessEqThan, 5, 3, false),
+            (RelationalOp::GreaterEqThan, 5, 3, true),
+            (RelationalOp::GreaterEqThan, 3, 3, true),
+            (RelationalOp::GreaterEqThan, 3, 5, false),
+        ];
+        for &(op, a, b, expected) in cases {
+            assert_eq!(op.compare(a, b), expected, "{op:?}({a}, {b})");
+        }
+    }
+
+    #[test]
+    fn relational_op_compare_negative_operands() {
+        assert!(RelationalOp::LessThan.compare(-5, -1));
+        assert!(!RelationalOp::LessThan.compare(-1, -5));
+        assert!(RelationalOp::Equal.compare(-3, -3));
+    }
+
+    #[test]
+    fn arithmetic_op_arith_plus_minus_mult() {
+        assert_eq!(ArithmeticOp::Plus.arith(3, 4), Ok(7));
+        assert_eq!(ArithmeticOp::Plus.arith(-3, 4), Ok(1));
+        assert_eq!(ArithmeticOp::Minus.arith(3, 4), Ok(-1));
+        assert_eq!(ArithmeticOp::Minus.arith(-3, -4), Ok(1));
+        assert_eq!(ArithmeticOp::Mult.arith(3, 4), Ok(12));
+        assert_eq!(ArithmeticOp::Mult.arith(-3, 4), Ok(-12));
+        assert_eq!(ArithmeticOp::Mult.arith(0, 5), Ok(0));
+    }
+
+    #[test]
+    fn arithmetic_op_arith_div_truncating_case_matches_rust_native_division() {
+        // Same-sign operands: floor division and truncating division agree.
+        assert_eq!(ArithmeticOp::Div.arith(7, 2), Ok(3));
+        assert_eq!(ArithmeticOp::Div.arith(-7, -2), Ok(3));
+        assert_eq!(ArithmeticOp::Div.arith(6, 3), Ok(2));
+    }
+
+    #[test]
+    fn arithmetic_op_arith_div_floors_toward_negative_infinity() {
+        // `ArithmeticOperator.arith`'s `DIV` case (`ArithmeticOperator.java:248-252`):
+        // floor division, NOT Rust/Java's native truncate-toward-zero. `7 / -2` truncates
+        // to `-3` (Rust's `/`) but floors to `-4`.
+        assert_eq!(ArithmeticOp::Div.arith(7, -2), Ok(-4));
+        assert_eq!(ArithmeticOp::Div.arith(-7, 2), Ok(-4));
+        // Sanity: Rust's own `/` truncates, confirming the two differ on this input --
+        // this test is pinning FLOOR semantics, not accidentally matching native `/`.
+        assert_eq!(7i32 / -2, -3);
+        assert_eq!(-7i32 / 2, -3);
+    }
+
+    #[test]
+    fn arithmetic_op_arith_div_exact_negative_quotient_no_floor_adjustment() {
+        // Remainder is zero, so no floor correction applies even though signs differ.
+        assert_eq!(ArithmeticOp::Div.arith(-8, 2), Ok(-4));
+        assert_eq!(ArithmeticOp::Div.arith(8, -2), Ok(-4));
+    }
+
+    #[test]
+    fn arithmetic_op_arith_div_by_zero_is_division_by_zero_error() {
+        assert_eq!(
+            ArithmeticOp::Div.arith(5, 0),
+            Err(NumSysError::DivisionByZero)
+        );
+        assert_eq!(
+            ArithmeticOp::Div.arith(0, 0),
+            Err(NumSysError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn arithmetic_op_arith_unary_negative_is_unexpected_operator() {
+        // Unreachable through any real `WordAutomaton` call site (see `arith`'s doc
+        // comment) but a live, directly-testable branch, matching
+        // `NumberSystemTest.testArithmetic`'s analogous coverage of `NumberSystem::
+        // arithmetic`'s own (textually different) `default:` throw.
+        assert_eq!(
+            ArithmeticOp::UnaryNegative.arith(1, 2),
+            Err(NumSysError::UnexpectedOperator("_"))
+        );
+        assert_eq!(
+            NumSysError::UnexpectedOperator("_").to_string(),
+            "Unexpected operator:_"
+        );
+    }
+
+    #[test]
+    fn arithmetic_op_arith_i32_overflow_is_a_clean_error_not_a_panic() {
+        // `i32::MAX * 2` overflows `i32` but not the `i64` intermediate.
+        let err = ArithmeticOp::Mult.arith(i32::MAX, 2).unwrap_err();
+        assert!(matches!(err, NumSysError::ArithmeticIntOverflow(_)));
+
+        // `i32::MIN / -1` is the classic two's-complement overflow trap: the
+        // mathematically exact result (`2147483648`) doesn't fit `i32`, even though
+        // neither Rust's checked `/` nor a native `i32` division would necessarily
+        // signal it the same way. Confirms the `i64` intermediate computes the exact
+        // value and the final `i32::try_from` catches it.
+        let err = ArithmeticOp::Div.arith(i32::MIN, -1).unwrap_err();
+        assert!(matches!(err, NumSysError::ArithmeticIntOverflow(_)));
+    }
+
+    #[test]
+    fn arithmetic_op_arith_no_overflow_at_i32_boundary_values() {
+        // Values that fit exactly at the `i32` boundary must NOT be reported as
+        // overflow.
+        assert_eq!(ArithmeticOp::Plus.arith(i32::MAX, 0), Ok(i32::MAX));
+        assert_eq!(ArithmeticOp::Plus.arith(i32::MIN, 0), Ok(i32::MIN));
+        assert_eq!(ArithmeticOp::Minus.arith(0, i32::MAX), Ok(-i32::MAX));
     }
 }

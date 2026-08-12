@@ -644,6 +644,72 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-016 — `WordAutomaton.reverseWithOutput` never updates `q0` after rebuilding the automaton, silently corrupting the result whenever the input's initial state isn't already numbered `0`
+
+- **Where:** `Automata/WordAutomaton.java`, `reverseWithOutput` (`:109-192`), specifically the
+  `wordA.fa.setFields(newStates.size(), newO, newD)` call at `:175`.
+- **What:** the reversal construction (Theorem 4.3.3, Allouche & Shallit) rebuilds the automaton's
+  states from scratch as a subset-of-functions construction: `newStates.get(0)` is ALWAYS the
+  correct new initial state by construction (it's the BFS root, added before the loop at `:136`,
+  and `newO`/`newD` are built in BFS-discovery order so index `0` in the rebuilt arrays always
+  corresponds to it). But `FA.setFields` (`FA.java:547-551`) only assigns `Q`/`O`/the transition
+  table — it does **not** touch `q0` — and `reverseWithOutput` never calls `setQ0(0)` (or anything
+  else) afterward. So `wordA.fa.q0` keeps whatever value it had **before** reversal, which after a
+  complete state renumbering is almost always a reference to the wrong state (or, if the old value
+  happens to be `>=` the new state count, out of bounds). The very next call,
+  `minimizeSelfWithOutput` → `minimizeWithOutput` → `uncombine` → each sub-automaton's
+  `determinizeAndMinimize()`, starts subset construction from this stale `q0`, so the corruption
+  propagates through the entire reversed result — this is the same failure shape as WB-001 (a
+  wrong `q0` after a state rebuild silently producing a wrong language), independently introduced.
+  The same missing-`setQ0` pattern also appears in the structurally identical BFS-rebuild-via-
+  `setFields` at `AutomatonLogicalOps.java:645` (`convertLsdBaseToRoot`, Phase 3b/U18 scope, not
+  re-verified here but flagged for whoever lands that unit).
+- **Why it's usually invisible:** `FA.canonizeInternal` (`FA.java:148-191`) always renumbers so
+  `q0` becomes `0`, and most word automata reaching `reverseWithOutput` arrive via a
+  `determinizeAndMinimize` + canonicalize pipeline, so `q0 == 0` is the common case — masking the
+  bug by coincidence (new state `0` IS the correct new initial state, so the stale, unset `q0`
+  happens to already equal the right value). The bug is live whenever that coincidence doesn't
+  hold, e.g. a hand-authored `.txt` word-automaton file (Walnut's documented, supported way to
+  introduce a DFAO — the `Word Automata Library` directory) whose first listed state block is not
+  numbered `0`; `AutomatonReader` sets `q0` to whatever state ID is listed first
+  (`AutomatonReader.java:41-57`), with no requirement that it be `0`.
+- **Trigger (minimal, empirically confirmed against the real `walnut-java` CLI, `target/
+  Walnut-all.jar`, 2026-08-12):** a 2-state, alphabet-`{0,1}` (`msd_2`) word automaton, total and
+  deterministic. Isomorphic pair, differing only in which state is listed (hence numbered) first:
+  - `q0` numbered `1`: `1 10 / 0->1, 1->0` then `0 20 / 0->0, 1->1`. Running `reverse` on this
+    produces a result whose (canonically renumbered-on-write) initial state has **output `20`**.
+  - The literal same automaton with states renumbered so `q0` is `0`: `0 10 / 0->0, 1->1` then
+    `1 20 / 0->1, 1->0`. Running `reverse` on this produces a result whose initial state has
+    **output `10`**.
+  - By Theorem 4.3.3, a DFAO's reversal evaluated at the empty string always equals the original
+    evaluated at the empty string (both are "", its own reversal) — i.e. `O_new(q0_new)` must equal
+    `O_old(q0_old)` regardless of state numbering. The original automaton's `q0` has output `10` in
+    BOTH cases (same automaton, just relabeled) — so `20` is the wrong answer, and it appears
+    *only* in the `q0 != 0` run. Confirmed reproducible, not a one-off: reran both cases via a
+    `reverse newname oldname;` command file against the real jar with a fresh session each time.
+- **Found:** Phase 3a, U6 (`crates/wr-core/src/word_automaton.rs`, the `WordAutomaton` port),
+  2026-08-12, while working out `reverseWithOutput`'s subset-construction dependencies (it needed
+  `FA.setFields`, not yet ported) — reading the method line-by-line to port it surfaced the missing
+  `setQ0` call, then confirmed empirically per above before logging.
+- **Rust port:** `ported verbatim (quirk)` — `word_automaton::reverse_with_output` calls
+  `Fa::set_fields` (itself a faithful, no-`q0`-touching port of `FA.setFields`) and likewise never
+  assigns `fa.q0` afterward. Flagged inline in both `Fa::set_fields`'s and
+  `word_automaton::reverse_with_output`'s doc comments (citing this entry), and pinned by a
+  dedicated test, `reverse_with_output_wb016_wrong_q0_on_non_zero_initial_state`, which reproduces
+  the exact empirical shape above inside the Rust port and asserts it reproduces the SAME wrong
+  answer Java gives (not the corrected one) — per the mechanical-port rule, this is a case where
+  the test's job is to pin the bug, not catch a regression from it.
+- **Upstream:** not filed. A one-line fix: `wordA.fa.setQ0(0);` immediately after the `setFields`
+  call at `:175` (new state `0` is always the correct new initial state, by the BFS-root argument
+  above — no further computation needed, just setting the field). The `AutomatonLogicalOps.
+  convertLsdBaseToRoot` sibling instance would need the same fix, separately verified.
+- **Severity:** **critical** — silent wrong answer (not a crash) in `reverse`'s core algorithm, for
+  an input shape (a hand-authored word-automaton `.txt` file whose initial state isn't numbered
+  `0`) that is plausible under Walnut's own documented usage, not an adversarial or degenerate
+  input.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

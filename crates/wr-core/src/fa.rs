@@ -568,6 +568,129 @@ impl Fa {
         }
         permutation
     }
+
+    /// `FA.setOutputIfEqual(int idx, boolean output)` (`FA.java:411-413`).
+    pub fn set_output_if_equal(&mut self, idx: usize, output: bool) {
+        self.o[idx] = i32::from(output);
+    }
+
+    /// `FA.setOutputIfEqual(int output)` (`FA.java:414-418`) — collapses every state's
+    /// output to `1` if it equals `output`, else `0`. Distinct Rust name from
+    /// [`Fa::set_output_if_equal`] because Rust has no method overloading; Java
+    /// disambiguates the two purely by parameter count.
+    pub fn restrict_output_to(&mut self, output: i32) {
+        for j in 0..self.o.len() {
+            self.set_output_if_equal(j, self.o[j] == output);
+        }
+    }
+
+    /// `FA.determineMinOutput()` (`FA.java:534-545`). Panics (matching Java's
+    /// `WalnutException.alphabetIsEmpty()`, text `"Output alphabet is empty"` — a
+    /// pre-existing Walnut naming quirk: the guarded condition is really "no states",
+    /// not "no alphabet symbols", ported verbatim including the misleading factory
+    /// name) if there are no states to take a minimum over.
+    pub fn determine_min_output(&self) -> i32 {
+        assert!(!self.o.is_empty(), "Output alphabet is empty");
+        self.o.iter().copied().min().unwrap()
+    }
+
+    /// `FA.addDistinguishedDeadState()` (`FA.java:244-266`) — adds a dead state whose
+    /// output is one less than the automaton's current minimum output, totalizing in
+    /// the process. Returns whether a dead state was actually added (`false` iff the
+    /// automaton was already total in Java's relaxed, key-presence-only sense —
+    /// [`Fa::totalize_relaxed`]'s doc comment explains why that's a different, weaker
+    /// notion than [`Fa::is_deterministic_and_total`]).
+    ///
+    /// # Why not [`Fa::totalize`]
+    ///
+    /// An earlier version of this method used exactly the `is_deterministic_and_total`
+    /// pre-check + [`Fa::totalize`] shape suggested by the two methods' names lining up
+    /// so neatly. That is a real bug (caught in adversarial review of this unit): Java's
+    /// `addDistinguishedDeadState` calls `ensureNfaTransitions()` then
+    /// `totalizeStates(this.Q)` (`FA.java:244-266`, `:336-344`) — the same
+    /// key-presence-only, determinism-agnostic pass `logicalops::totalize` already had
+    /// to replicate for the same reason (see that function's doc comment) — never
+    /// `FA.totalize()`'s DFA-only fast path. So an `Fa` where every `(state, symbol)`
+    /// pair has SOME destination list, but one of those lists has 2+ entries (an
+    /// NFA-shaped-but-symbol-total automaton), is "already totalized" to Java: no dead
+    /// state is added, no exception is thrown. The old
+    /// `is_deterministic_and_total`-gated version instead correctly noticed that case
+    /// was NOT total-with-determinism, fell through to `self.totalize(min - 1)`, and hit
+    /// that method's own `assert!(self.is_deterministic())` — a panic Java never
+    /// produces on this input. [`Fa::totalize_relaxed`] is the shared, assert-free fix,
+    /// used identically by `logicalops::totalize`.
+    pub fn add_distinguished_dead_state(&mut self) -> bool {
+        let missing_some_transition = (0..self.q)
+            .any(|q| (0..self.alphabet_size as i32).any(|sym| !self.d[q].contains_key(&sym)));
+        if !missing_some_transition {
+            return false;
+        }
+        let min = self.determine_min_output();
+        self.totalize_relaxed(min - 1);
+        true
+    }
+
+    /// Assert-free, key-presence-only totalization shared by
+    /// [`Fa::add_distinguished_dead_state`] and `logicalops::totalize`. Ports
+    /// `FA.totalizeStates`/`FA.addMissingTransitionsForState`/`FA.addSinkState`
+    /// (`FA.java:336-367`, `:315-321`) — the NFA-transitions half of Java's
+    /// `totalize()` dispatch, which both real call sites actually hit
+    /// (`addDistinguishedDeadState` always calls `ensureNfaTransitions()` first, and
+    /// `logicalops::totalize_cross_product`'s operands are plain `Automaton`s that may
+    /// be genuinely nondeterministic).
+    ///
+    /// Unlike [`Fa::totalize`], this makes NO determinism assumption at all: it only
+    /// asks "does this `(state, symbol)` pair have SOME destination list", exactly
+    /// mirroring `addMissingTransitionsForState`'s `!iMap.containsKey(x)` check, which
+    /// is oblivious to how many destinations that list holds. So an automaton with a
+    /// present-but-multi-destination entry for every `(state, symbol)` pair is already
+    /// "totalized" by this definition and gets no dead state — the case
+    /// [`Fa::is_deterministic_and_total`] (which additionally requires
+    /// `dests.len() == 1`) would call not-total, and [`Fa::totalize`] would panic on it
+    /// via its own `is_deterministic()` assert instead.
+    ///
+    /// Routes every missing pair to a fresh sink state (index `self.q` at entry, output
+    /// `sink_output`, self-looping on every symbol) — but only appends that sink if at
+    /// least one transition was actually missing, matching Java's
+    /// `if (!totalizeStates(sinkState)) addSinkState(...)` guard. Returns whether a sink
+    /// was added.
+    pub(crate) fn totalize_relaxed(&mut self, sink_output: i32) -> bool {
+        let sink_state = self.q;
+        let mut needs_sink = false;
+        for q in 0..self.q {
+            for sym in 0..self.alphabet_size as i32 {
+                if let std::collections::btree_map::Entry::Vacant(entry) = self.d[q].entry(sym) {
+                    entry.insert(vec![sink_state]);
+                    needs_sink = true;
+                }
+            }
+        }
+        if needs_sink {
+            self.o.push(sink_output);
+            self.q += 1;
+            let mut sink_row = BTreeMap::new();
+            for sym in 0..self.alphabet_size as i32 {
+                sink_row.insert(sym, vec![sink_state]);
+            }
+            self.d.push(sink_row);
+        }
+        needs_sink
+    }
+
+    /// `FA.setFields(int newStates, IntList newO, List<Int2ObjectRBTreeMap<IntList>> newD)`
+    /// (`FA.java:547-551`). Note this does **not** touch `q0` — faithfully: see
+    /// `WordAutomaton::reverse_with_output`'s doc comment (WB-016) for the one call
+    /// site where that omission is a genuine Walnut bug, ported verbatim.
+    pub fn set_fields(
+        &mut self,
+        new_q: usize,
+        new_o: Vec<i32>,
+        new_d: Vec<BTreeMap<i32, Vec<usize>>>,
+    ) {
+        self.q = new_q;
+        self.o = new_o;
+        self.d = new_d;
+    }
 }
 
 #[cfg(test)]
@@ -1333,6 +1456,150 @@ mod tests {
         fa.canonicalize();
         assert_eq!(fa.q, 2);
         assert!(fa.is_true_false_automaton() && !fa.is_true_automaton());
+    }
+
+    #[test]
+    fn set_output_if_equal_sets_only_the_given_index() {
+        let mut fa = contains_one_dfa();
+        fa.set_output_if_equal(0, true);
+        assert_eq!(fa.o, vec![1, 1]);
+        fa.set_output_if_equal(0, false);
+        assert_eq!(fa.o, vec![0, 1]);
+    }
+
+    #[test]
+    fn restrict_output_to_collapses_every_state_to_a_boolean() {
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 3,
+            alphabet_size: 1,
+            o: vec![3, 7, 3],
+            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+        };
+        fa.restrict_output_to(3);
+        assert_eq!(fa.o, vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn determine_min_output_finds_the_minimum() {
+        let mut fa = contains_one_dfa();
+        fa.o = vec![5, -2];
+        assert_eq!(fa.determine_min_output(), -2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Output alphabet is empty")]
+    fn determine_min_output_panics_on_no_states() {
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 0,
+            alphabet_size: 2,
+            o: Vec::new(),
+            d: Vec::new(),
+        };
+        fa.determine_min_output();
+    }
+
+    #[test]
+    fn add_distinguished_dead_state_no_op_when_already_total() {
+        let mut fa = contains_one_dfa(); // already deterministic and total
+        let added = fa.add_distinguished_dead_state();
+        assert!(!added);
+        assert_eq!(fa.q, 2, "no state added");
+    }
+
+    #[test]
+    fn add_distinguished_dead_state_adds_a_sink_with_output_one_below_the_minimum() {
+        // Partial automaton (state 0 has no transition for symbol 1), min output 0.
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![0],
+            d: vec![BTreeMap::from([(0, vec![0])])],
+        };
+        let added = fa.add_distinguished_dead_state();
+        assert!(added);
+        assert_eq!(fa.q, 2);
+        assert_eq!(fa.o[1], -1, "one less than the pre-add minimum output (0)");
+        assert!(fa.is_deterministic_and_total());
+    }
+
+    #[test]
+    fn add_distinguished_dead_state_no_op_on_nfa_shaped_but_symbol_total_automaton() {
+        // Pins the adversarial-review finding on this unit: an earlier version of
+        // `add_distinguished_dead_state` gated on `is_deterministic_and_total`, then
+        // fell through to the assert-requiring `Fa::totalize` -- so an automaton where
+        // EVERY (state, symbol) pair has SOME destination list, but one pair has TWO
+        // destinations (genuinely nondeterministic, yet still "total" by key
+        // presence), made `is_deterministic_and_total` return false and then panicked
+        // inside `totalize`'s `assert!(self.is_deterministic())`.
+        //
+        // Real `FA.addDistinguishedDeadState` (`FA.java:244-266`) never asserts
+        // determinism at all -- it calls `ensureNfaTransitions()` then
+        // `totalizeStates(this.Q)`, whose only test is `!iMap.containsKey(x)`
+        // (`FA.java:356-367`), oblivious to how many destinations are already there.
+        // So Java treats this exact shape as already-totalized: no dead state added,
+        // no exception. This test constructs that scenario directly and checks the
+        // Rust port now matches -- no panic, `add_distinguished_dead_state` returns
+        // `false`, and the automaton is left untouched.
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![0, 1]); // two destinations for symbol 1: present, but nondeterministic
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![1]);
+        d1.insert(1, vec![1]);
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d0, d1],
+        };
+        assert!(
+            !fa.is_deterministic_and_total(),
+            "sanity: the strict, determinism-requiring check correctly says NOT total"
+        );
+
+        let added = fa.add_distinguished_dead_state();
+
+        assert!(
+            !added,
+            "Java's key-presence-only totality check says this is already totalized"
+        );
+        assert_eq!(fa.q, 2, "no state added");
+        assert_eq!(
+            fa.d[0].get(&1),
+            Some(&vec![0, 1]),
+            "the existing nondeterministic entry is left alone, not pruned or panicked on"
+        );
+    }
+
+    #[test]
+    fn set_fields_replaces_q_o_and_d_but_leaves_q0_untouched() {
+        // Pins WB-016 (`docs/WALNUT-BUGS.md`): `set_fields` faithfully does NOT touch
+        // `q0`, matching `FA.setFields` exactly -- callers that need a fresh `q0` after
+        // a full rebuild (like `word_automaton::reverse_with_output` SHOULD, per the
+        // bug entry) must set it themselves; this port doesn't add that call either.
+        // Rebuilding down to a single state here leaves the pre-existing `q0 = 1`
+        // strictly OUT OF BOUNDS for the new `q = 1` -- exactly the shape of corruption
+        // WB-016 documents `reverse_with_output` producing on real (in-bounds, but
+        // wrong) inputs.
+        let mut fa = contains_one_dfa();
+        fa.q0 = 1;
+        let new_d = vec![BTreeMap::from([(0, vec![0])])];
+        fa.set_fields(1, vec![9], new_d.clone());
+        assert_eq!(fa.q, 1);
+        assert_eq!(fa.o, vec![9]);
+        assert_eq!(fa.d, new_d);
+        assert_eq!(
+            fa.q0, 1,
+            "left stale/out-of-bounds, matching Java's setFields"
+        );
     }
 
     #[test]
