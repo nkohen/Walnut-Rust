@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "wr_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "walnut-rs"
 path = "src/main.rs"
