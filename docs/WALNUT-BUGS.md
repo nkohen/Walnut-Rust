@@ -77,18 +77,91 @@ bug costs a silent wrong answer somewhere downstream.
   `findPath`'s BFS exhausts immediately and returns `null` for the witness path. `decode(null, r)`
   then iterates over that `null` and throws `NullPointerException`, instead of `infinite()`
   returning `""` (Walnut's convention for "the language is finite, no cycle witness").
-- **Trigger:** call `infinite`/the `inf` command on a 1-state, non-accepting automaton with only a
-  self-loop.
+- **Trigger (exact, empirically confirmed — not an approximation):** the sole state must be BOTH
+  non-accepting AND have at least one outgoing transition (necessarily a self-loop, the only
+  possible destination when `Q == 1`). Working through `findCycle`/`findPath`/`decode` for all four
+  `Q == 1` sub-cases (and confirming each empirically — `InfiniteTest.testSingleStateSelfLoop-
+  WithNoAcceptingStateThrowsNPE` is a *passing* JUnit test for the crashing row; the other three
+  rows were checked with a standalone driver calling `Infinite.infinite` directly against
+  `target/classes`, Phase 3a U7 review pass):
+
+  | state 0 accepting? | self-loop present? | Java's `infinite()` result |
+  |---|---|---|
+  | yes | yes | `"([0])*"` (genuinely infinite) |
+  | yes | no | `""` (finite — language is `{ε}`) |
+  | **no** | **yes** | **`NullPointerException`** |
+  | no | no | `""` (finite — language is `∅`) |
+
+  A `Q == 1` automaton whose sole state is either accepting, or has no transitions at all, does
+  **not** crash. Also confirmed empirically: a completely empty-language automaton with `Q > 1`
+  does not crash either — `Trimmer.trimAutomaton`'s `Q > 1` path genuinely runs, and
+  `Trimmer.quotient`'s `statesToKeep.isEmpty()` branch collapses the automaton to a single state
+  with **zero** transitions (not a self-loop), so `findCycle` finds nothing and cleanly returns
+  `""`. So the crash needs `Q == 1` (trimming skipped) specifically, not merely "empty language."
 - **Found:** Phase 0, Item 4 second wave, 2026-08-08 (`phase0-artifacts/PROGRESS.md`, second-wave
-  findings). Confirmed by direct reading of the interacting methods, not run against a live crash
-  (the characterization-test wave didn't force this exact degenerate case through the CLI; the
-  *reasoning* for why it would throw was verified, the throw itself was not observed via `mvn
-  test`).
-- **Rust port:** `not yet reached` — `Infinite`/`inf` is not yet ported (Phase 2+ scope).
+  findings); trigger condition narrowed to the exact table above and empirically confirmed (both
+  the crashing row via the pre-existing passing JUnit test, and the three non-crashing rows via a
+  standalone driver against `target/classes`) during Phase 3a's U7 refinement pass, 2026-08-12.
+- **Rust port:** `diverged (fixed)`, precisely — not a blanket "every empty-language input"
+  guard (an earlier draft of this fix over-broadened the trigger; corrected here). `wr_core::
+  infinite::infinite` (`crates/wr-core/src/infinite.rs`) reproduces Java's exact crash trigger as a
+  recoverable `Result::Err(InfiniteError::DegenerateSelfLoop)`, checked on the **untrimmed** input
+  (`a.fa.q == 1 && !is_accepting(q0) && a.fa.d[q0].values().any(|dests| !dests.is_empty())`) before
+  `crate::trim::trim` ever runs — matching the WB-011/WB-012/WB-013 precedent that a genuine Java
+  `RuntimeException` `Prover.dispatch`'s top-level `catch (RuntimeException e)` recovers from is
+  more faithfully ported as a `Result` than an uncaught `panic!` (which would unwind and kill the
+  process, not "print a stack trace and keep the session alive" the way Java's crash actually
+  behaves).
+
+  **Post-landing correction (Phase 3a U7 review, 2026-08-12):** two independent adversarial reviews
+  of the original guard, `!d[q0].is_empty()` (a `BTreeMap<i32, Vec<usize>>` non-emptiness check),
+  each separately found it tests only whether the map has *any symbol key present*, not whether that
+  key's destination `Vec` is actually non-empty. A `Fa` can have a symbol key mapped to an *empty*
+  destination list (constructible via direct `Fa` manipulation — `fa.rs`'s
+  `canonicalize_prunes_entries_with_empty_destination_list` test builds exactly this shape,
+  precisely because `canonicalize()` exists to prune it); that shape has no real transition at all,
+  so the original guard was a false positive, converting a correct `Ok(None)` (finite) into a
+  spurious `Err`. Fixed to check for an actual non-empty destination (`.values().any(|dests|
+  !dests.is_empty())`), matching how `find_cycle`/`find_path` in the same file already traverse
+  `dests` without checking map non-emptiness. Pinned by
+  `infinite::tests::single_state_empty_destination_list_is_finite_not_an_error`.
+
+  A second, separate guard remains **after** trimming
+  (`trimmed.is_language_empty()` → `Ok(None)`), but it is *not* part of the WB-002 fix and is *not*
+  a Java divergence: it exists purely because this port's own `crate::trim::trim` (shipped in Phase
+  2, out of U7's scope) collapses **every** empty-language input, any `Q`, to a canonical
+  **fully self-looping** 1-state automaton (`trim.rs`'s own module docs), unlike Java's
+  `Trimmer.quotient`, whose analogous collapse leaves the canonical state **transition-less**.
+  Without this second guard, the `Q > 1` empty-language case would trip an internal invariant this
+  port's own DFS relies on (a newly-introduced Rust-side failure mode Java never has, since Java's
+  `Q > 1` empty-language path never re-hits `findCycle`/`findPath` at all). With the guard, `Q > 1`
+  empty language answers `Ok(None)` (finite) — the same answer real Java gives, just reached by a
+  structurally different mechanism on both sides, exactly like Java's own `Q > 1` collapse differs
+  structurally from its `Q <= 1` case. **This was never actually a divergence** to begin with; an
+  earlier draft of this entry incorrectly described it as one.
+
+  Pinned by `infinite::tests::single_state_self_loop_with_no_accepting_state_errors` (the real
+  crash trigger, now asserting `Err`, direct port of `InfiniteTest.testSingleStateSelfLoop-
+  WithNoAcceptingStateThrowsNPE`), `infinite::tests::single_state_no_self_loop_is_finite_not_an_
+  error`, `infinite::tests::single_accepting_state_with_self_loop_is_infinite_not_an_error`, and
+  `infinite::tests::single_accepting_state_no_self_loop_is_finite_not_an_error` (the three
+  non-crashing `Q == 1` sub-cases, proving the guard doesn't over-fire), and
+  `infinite::tests::empty_language_is_finite_regardless_of_state_count` (the `Q > 1` case, proving
+  the pre-trim `DegenerateSelfLoop` guard correctly does *not* fire there, and the port still
+  answers "finite").
 - **Upstream:** not filed.
 - **Severity:** moderate — crash (not silent-wrong-answer) on a degenerate but real input shape;
-  unclear how often a real query's automaton collapses to exactly this 1-state form before `inf` is
-  invoked on it.
+  unclear how often a real query's automaton collapses to exactly this 1-state, non-accepting,
+  self-looping form before `inf` is invoked on it.
+- **Note (audit trail, not a separate bug):** `wr_core::infinite::infinite`'s guard-reordering fix
+  above also introduced a second, harmless, previously-uncalled-out divergence: its pre-trim
+  `a.fa.q == 0 || a.fa.q0 >= a.fa.q` check is intentionally *more* defensive than Java's real
+  behavior. Java's `Trimmer.trimAutomaton` only tolerates an out-of-range `q0` incidentally, via its
+  `getQ() <= 1` no-op guard — for `Q > 1`, an invalid `q0` would crash Java's own `Trimmer`
+  differently (not via WB-002's `NullPointerException` path) rather than being caught cleanly. This
+  port's guard catches an invalid `q0` for *every* `Q`, not just `Q <= 1`, which changes no answer
+  for any well-formed automaton and is strictly safer, but is worth recording for completeness since
+  it's a second, distinct place this same guard-reordering diverges from literal Java behavior.
 
 ---
 

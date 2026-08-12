@@ -37,6 +37,7 @@ pub mod automaton;
 pub mod determinize;
 pub mod equiv;
 pub mod fa;
+pub mod infinite;
 pub mod logging;
 pub mod logicalops;
 pub mod minimize;
