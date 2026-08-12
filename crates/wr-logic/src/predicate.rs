@@ -12,31 +12,48 @@
 //! shunting yard are one pass in Walnut, not two, and [`crate::token::Operator::push_onto`]
 //! (U2) already ports the yard itself.
 //!
-//! # Scope: what this unit does NOT build (the U3/U4 boundary)
+//! # `putWord`/`putFunction`/`putMacro` (U4)
 //!
 //! `Predicate.java` also contains `putWord`/`putFunction`/`putMacro`/
 //! `parseParenthesizedArguments`/`readMacroFile` — the three token kinds that reach out to
 //! [`crate::predicate_env::PredicateEnv`]'s word/function/macro lookups and build nested
-//! `Predicate`s. Those are **U4**, and this unit deliberately stops at the boundary:
+//! `Predicate`s. U3 ported everything *around* them (the four recognizing patterns
+//! `PATTERN_FOR_WORD`/`PATTERN_FOR_WORD_WITH_DELIMITER`/`PATTERN_FOR_FUNCTION`/
+//! `PATTERN_FOR_MACRO` at their exact scanning-chain priority, and the
+//! `lastTokenWasOperator` adjacency check Java performs *before* calling each of them) and
+//! stubbed the three construction methods; U4 (this section) replaces those three method
+//! bodies — [`Predicate::put_word`], [`Predicate::put_function`], [`Predicate::put_macro`]
+//! — plus [`Predicate::parse_parenthesized_arguments`] (shared by the latter two) and the
+//! macro `%N`-substitution helpers, without changing the scanning loop itself.
 //!
-//! * the four patterns that *recognize* them (`PATTERN_FOR_WORD`,
-//!   `PATTERN_FOR_WORD_WITH_DELIMITER`, `PATTERN_FOR_FUNCTION`, `PATTERN_FOR_MACRO`) are
-//!   ported and sit at their exact Java priority in the scanning chain, so the *shape* of
-//!   the token stream is already right — `T[i]` is recognized as a word rather than
-//!   mis-lexed as the variable `T`, and `$f(x)`/`#m(x)` likewise;
-//! * the `lastTokenWasOperator` adjacency check that Java performs **before** calling each
-//!   of them is ported here too (it is part of the scanning loop, not of `putWord`), so all
-//!   four of `PredicateTest`'s "operator is missing" characterization tests pass today;
-//! * their *construction* is a stub — [`Predicate::put_word`]/[`Predicate::put_function`]/
-//!   [`Predicate::put_macro`] each return [`LexError::NotYetImplemented`]. U4 replaces the
-//!   three method bodies (and adds `Token::Word`/`Token::Function` to [`crate::token`]);
-//!   **the scanning loop itself should not need to change**, which is the point of drawing
-//!   the line at the method boundary rather than at the pattern-table boundary.
+//! **Nested `Predicate` construction** (word indices, function arguments, and — via the
+//! re-lex, not a nested `Predicate` — macro expansions) all go through
+//! [`Predicate::with_context`], the same public entry point U3 exposed for exactly this;
+//! each index/argument's `real_starting_position` is computed via [`Self::position`] on
+//! its own start offset within *this* predicate's (unmutated, for `put_word`/
+//! `put_function`) buffer, so [`Self::java_offset`]'s UTF-16 conversion and
+//! `real_starting_position` threading both compose correctly through arbitrary nesting
+//! depth (Ruling 3's "corollary for U4").
 //!
-//! `PATTERN_LEFT_BRACKET` (`:110`) is the one pattern-table entry not ported here: it is
-//! used exclusively by `putWord`'s index-scanning loop, so it belongs to U4 alongside the
-//! loop that reads it (an unused compiled pattern here would be dead code, not a head
-//! start).
+//! **The macro re-lex** ([`Predicate::put_macro`]) is the one case that does NOT build a
+//! nested `Predicate`: per Ruling 3, it rewrites `self.predicate` in place (splicing the
+//! macro's `%N`-substituted expansion text in at the call site, preserving the leading
+//! whitespace Java's own pattern captures) and returns the byte offset the *main* scanning
+//! loop should resume at — the expansion is then lexed as part of the SAME `Predicate`,
+//! not a child one. No borrow of `self.predicate` is held across that rewrite (every
+//! offset/string this method needs is copied out of the `Captures`/cloned first — see
+//! [`Predicate::put_macro`]'s own body).
+//!
+//! **No macro-expansion depth or cycle guard exists**, ported faithfully per Ruling 3's
+//! explicit instruction: `#a` expanding to `#a(...)` loops forever in real Walnut, and
+//! does here too (pinned by
+//! [`tests::macro_expansion_has_no_depth_guard_and_will_recurse_until_the_environment_stops_it`],
+//! which proves it via a call-counting [`PredicateEnv`] rather than actually hanging).
+//!
+//! Four genuine Walnut (Java) bugs found while porting this section are logged in
+//! `docs/WALNUT-BUGS.md` (WB-017 through WB-020) and ported verbatim, not fixed — see each
+//! one's doc comment at its `LexError`/behavior site below for the empirical evidence and
+//! the exact trigger.
 //!
 //! # Ruling 2 (`predicate_env.rs`) — the four Java→Rust regex-dialect divergences
 //!
@@ -108,55 +125,20 @@ use wr_core::numsys::{normalize_number_system_token, MSD_2};
 use wr_core::util::{generic_list_string, is_java_whitespace, parse_big_integer, parse_int};
 
 use crate::predicate_env::{PredicateEnv, PredicateEnvError};
-use crate::token::{symbols, AlphabetLetter, NumberLiteral, Operator, Token, TokenError, Variable};
+use crate::token::{
+    symbols, AlphabetLetter, Function, NumberLiteral, Operator, Token, TokenError, Variable, Word,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Which of U4's three deferred token kinds a [`LexError::NotYetImplemented`] refers to.
-///
-/// Kept as an enum rather than a `&'static str` so tests can match on the kind without
-/// asserting on prose, and so U4 can delete the variants one at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeferredTokenKind {
-    /// `PATTERN_FOR_WORD` (`Predicate.java:99`) — `T[i]`, handled by `putWord(ns, false)`.
-    Word,
-    /// `PATTERN_FOR_WORD_WITH_DELIMITER` (`:100`) — `.AUTOMATON[i]`, `putWord(ns, true)`.
-    WordWithDelimiter,
-    /// `PATTERN_FOR_FUNCTION` (`:101`) — `$name(...)`, handled by `putFunction`.
-    Function,
-    /// `PATTERN_FOR_MACRO` (`:102`) — `#name(...)`, handled by `putMacro`.
-    Macro,
-}
-
-impl DeferredTokenKind {
-    /// The Java method this port still has to grow, for the error message.
-    fn java_method(self) -> &'static str {
-        match self {
-            DeferredTokenKind::Word | DeferredTokenKind::WordWithDelimiter => "Predicate.putWord",
-            DeferredTokenKind::Function => "Predicate.putFunction",
-            DeferredTokenKind::Macro => "Predicate.putMacro",
-        }
-    }
-
-    /// The syntax as a user would have written it, for the error message.
-    fn syntax(self) -> &'static str {
-        match self {
-            DeferredTokenKind::Word => "word/sequence index (`T[i]`)",
-            DeferredTokenKind::WordWithDelimiter => "delimited word index (`.NAME[i]`)",
-            DeferredTokenKind::Function => "function call (`$name(...)`)",
-            DeferredTokenKind::Macro => "macro call (`#name(...)`)",
-        }
-    }
-}
-
 /// Every failure the tokenizer itself can report.
 ///
 /// Module-local per this crate's established idiom ([`TokenError`], [`PredicateEnvError`],
 /// `wr_core::numsys::NumSysError`) rather than one unified `WalnutError` — see the Phase 3
-/// plan's resolved gap #8. Every variant except [`Self::NotYetImplemented`] renders
-/// `WalnutException`'s verbatim message text, since Tier 1's `error*` fixtures compare it.
+/// plan's resolved gap #8. Every variant renders `WalnutException`'s verbatim message
+/// text, since Tier 1's `error*` fixtures compare it.
 #[derive(Debug)]
 pub enum LexError {
     /// `Predicate.java:163-166` — thrown when `E`/`A`/`I` is not followed by something
@@ -172,23 +154,69 @@ pub enum LexError {
     /// `WalnutException.undefinedToken(int)` — "Undefined token: char at N". The scanning
     /// loop's final `else`: nothing matches at the cursor.
     UndefinedToken { position: usize },
-    /// Raised by [`Operator::push_onto`] (the shunting yard) or by the final
-    /// operator-stack drain — in practice always [`TokenError::UnbalancedParenthesis`].
+    /// Raised by [`Operator::push_onto`] (the shunting yard), the final operator-stack
+    /// drain, or (as of U4) [`Word::new`]/[`Function::new`]'s arity check — in practice
+    /// always [`TokenError::UnbalancedParenthesis`] or
+    /// [`TokenError::WrongArgumentArity`].
     Token(TokenError),
-    /// A [`PredicateEnv`] lookup failed. Today only [`PredicateEnv::number_system`] is
-    /// reachable from this unit (relational, arithmetic and number-literal tokens each
-    /// resolve the *currently active* number system at construction time, exactly as
-    /// Java's `NumberSystem.getComputeIfAbsent(currentNumberSystem)` does); U4 adds the
-    /// word/function/macro lookups behind the same variant.
+    /// A [`PredicateEnv`] lookup failed: [`PredicateEnv::number_system`] (relational,
+    /// arithmetic and number-literal tokens each resolve the *currently active* number
+    /// system at construction time, exactly as Java's
+    /// `NumberSystem.getComputeIfAbsent(currentNumberSystem)` does), or, as of U4,
+    /// [`PredicateEnv::word`]/[`PredicateEnv::function`]/[`PredicateEnv::macro_text`].
     Env(PredicateEnvError),
-    /// Not a Java behavior: this port has recognized a token kind whose construction is
-    /// U4's (see the module docs' U3/U4 boundary). Deliberately a hard, loud error rather
-    /// than a silent skip or a placeholder token — a placeholder would let a later unit's
-    /// test pass against a token stream real Walnut never produces.
-    NotYetImplemented {
-        kind: DeferredTokenKind,
+    /// `WalnutException.unbalancedBracket(int)` (`putWord`, `:298`) — "unbalanced
+    /// bracket: char at N". Ported for fidelity with Java's defensive check, but this
+    /// port's implementation of the bracket-matching loop (a depth counter over a
+    /// pre-sliced index text, rather than Java's character-by-character `Stack<Character>`)
+    /// makes the check's own precondition ("a `]` was seen while the bracket stack was
+    /// already empty") structurally unreachable, exactly as it is in Java: the moment
+    /// depth would reach zero, the scan finalizes and stops looking at more characters
+    /// from the same bracket run, so a second, deeper pop can never observe an empty
+    /// stack either. Traced by hand (both here and in Java) rather than asserted away.
+    UnbalancedBracket { position: usize },
+    /// `WalnutException.internalMacro(int)` (`parseParenthesizedArguments`, `:353-355`)
+    /// — "a function/macro cannot be called from inside another function/macro's
+    /// argument list: char at N". Raised the instant a `#`/`$` is seen anywhere in a
+    /// macro/function call's argument text (not just at the start).
+    InternalMacroInArgument { position: usize },
+    /// `putWord`'s per-index emptiness check (`:326-328`, no `WalnutException.` helper —
+    /// an inline `new WalnutException(...)`): "index N of the word NAME cannot be empty:
+    /// char at POS". **WB-017** (`docs/WALNUT-BUGS.md`): `POS` is `matcher.start(1)`,
+    /// i.e. the WORD's own name-group offset within *this* predicate — NOT adjusted by
+    /// `realStartingPosition`, unlike every other position in this file (confirmed
+    /// empirically: nesting the empty index inside a function argument reports the
+    /// position *within the nested predicate's own coordinate space*, not the true
+    /// absolute offset). `position` here is therefore [`Self::java_offset`]-converted
+    /// but NOT [`Self::position`]-adjusted — ported verbatim, not fixed.
+    EmptyWordIndex {
+        index: usize,
+        name: String,
         position: usize,
     },
+    /// `putFunction`'s per-argument emptiness check (`:479-483`): "argument N of the
+    /// function NAME cannot be empty: char at POS". Same WB-017 position defect as
+    /// [`Self::EmptyWordIndex`] (`POS` is the un-adjusted `matcher.start(1)`), a
+    /// different call site of the identical bug.
+    EmptyFunctionArgument {
+        index: usize,
+        name: String,
+        position: usize,
+    },
+    /// **WB-019** (`docs/WALNUT-BUGS.md`): `putMacro`'s `%N` argument substitution
+    /// (`Predicate.java:436`) is `String.replaceAll("%" + arg, arguments.get(arg))`, so
+    /// the REPLACEMENT text — a macro call's raw argument, verbatim user input — is run
+    /// through `java.util.regex.Matcher`'s replacement-string parsing, which gives `$`
+    /// and `\` special meaning `WalnutException`'s machinery never sees or catches: a
+    /// real, UNCAUGHT `IllegalArgumentException`/`IndexOutOfBoundsException`, confirmed
+    /// empirically against `walnut-java`. `$`/`#` can never reach this point (blocked
+    /// earlier by [`Self::InternalMacroInArgument`]), so `message` in practice is always
+    /// the backslash-escaping half of the quirk (a lone trailing `\` in an argument).
+    /// Ported as a recoverable `Result::Err` — like [`crate::expr::ExprError`]'s WB-013
+    /// entry, a real Java unchecked exception that `Prover`'s top-level `catch
+    /// (RuntimeException)` recovers from, not a Rust `panic!` that would abort this
+    /// process outright with no equivalent boundary (yet).
+    MacroArgumentReplacementError { message: &'static str },
 }
 
 impl From<TokenError> for LexError {
@@ -221,11 +249,41 @@ impl std::fmt::Display for LexError {
             }
             LexError::Token(e) => write!(f, "{e}"),
             LexError::Env(e) => write!(f, "{e}"),
-            LexError::NotYetImplemented { kind, position } => write!(
+            // Verbatim `WalnutException.unbalancedBracket`.
+            LexError::UnbalancedBracket { position } => {
+                write!(f, "unbalanced bracket: char at {position}")
+            }
+            // Verbatim `WalnutException.internalMacro`.
+            LexError::InternalMacroInArgument { position } => write!(
                 f,
-                "{} is not implemented yet ({} lands in Phase 3a U4): char at {position}",
-                kind.syntax(),
-                kind.java_method()
+                "a function/macro cannot be called from inside another function/macro's \
+                 argument list: char at {position}"
+            ),
+            // Verbatim inline `WalnutException` text from `putWord` (WB-017).
+            LexError::EmptyWordIndex {
+                index,
+                name,
+                position,
+            } => write!(
+                f,
+                "index {index} of the word {name} cannot be empty: char at {position}"
+            ),
+            // Verbatim inline `WalnutException` text from `putFunction` (WB-017).
+            LexError::EmptyFunctionArgument {
+                index,
+                name,
+                position,
+            } => write!(
+                f,
+                "argument {index} of the function {name} cannot be empty: char at {position}"
+            ),
+            // Not a `WalnutException` at all -- an uncaught Java `RuntimeException` from
+            // `Matcher.appendReplacement` (WB-019); `message` is that exception's own
+            // verbatim text.
+            LexError::MacroArgumentReplacementError { message } => write!(
+                f,
+                "{message} (uncaught Java exception from Predicate.putMacro's %N \
+                 substitution, see docs/WALNUT-BUGS.md WB-019)"
             ),
         }
     }
@@ -265,6 +323,11 @@ struct Patterns {
     left_parenthesis: Regex,
     right_parenthesis: Regex,
     whitespace: Regex,
+    /// `PATTERN_LEFT_BRACKET` (`Predicate.java:110`) — used exclusively by `putWord`'s
+    /// index-scanning loop to detect a CHAINED index bracket (`T[i][j]`) immediately
+    /// after one closes. Not part of the main scanning chain (U3's table), so it is not
+    /// tried by [`Predicate::tokenize_and_compute_post_order`]'s `if`/`else if` chain.
+    left_bracket: Regex,
 }
 
 /// Compiles one pattern, panicking on failure: these are compile-time-constant strings,
@@ -360,6 +423,8 @@ impl Patterns {
             // `PATTERN_FOR_WHITESPACE` (`:108`) — `\s+`, one or more (unlike the `\s*`
             // fragment every other pattern is prefixed with).
             whitespace: compile(r"(?-u:\s)+"),
+            // `PATTERN_LEFT_BRACKET` (`:110`).
+            left_bracket: compile(&format!(r"{ws}\[", ws = WHITESPACE)),
         }
     }
 }
@@ -809,65 +874,423 @@ impl Predicate {
         list_match_end
     }
 
-    /// `Predicate.putWord(String, boolean)` (`:287-337`) — **deferred to U4**.
+    /// `Predicate.putWord(String, boolean)` (`:287-337`).
     ///
-    /// The signature is already the one U4 needs: `default_number_system` is the
-    /// `currentNumberSystem` Java passes (it becomes the nested index `Predicate`s'
-    /// default), `caps` is the live word match (Java re-reads `MATCHER_FOR_WORD` /
-    /// `MATCHER_FOR_WORD_WITH_DELIMITER`), and the return value is the offset to resume
-    /// scanning at. The body is the only thing U4 has to replace.
+    /// `default_number_system` is the `currentNumberSystem` Java passes (it becomes each
+    /// index `Predicate`'s own default number system); `caps` is the live word match
+    /// (`MATCHER_FOR_WORD`/`MATCHER_FOR_WORD_WITH_DELIMITER`); the return value is the
+    /// offset to resume scanning at.
+    ///
+    /// Scans against a CLONE of `self.predicate` (Ruling 3's "one allocation per
+    /// `Predicate`" cost is irrelevant next to the automaton work each index triggers),
+    /// so nothing here needs to juggle a borrow of `self.predicate` alongside the `&mut
+    /// self.post_order`/`&mut self.operator_stack` writes at the end — `put_word` never
+    /// mutates `self.predicate` at all (only [`Self::put_macro`] does).
     fn put_word(
         &mut self,
-        _env: &dyn PredicateEnv,
-        _default_number_system: &str,
+        env: &dyn PredicateEnv,
+        default_number_system: &str,
         caps: &Captures,
         with_delimiter: bool,
     ) -> Result<usize, LexError> {
-        let name = caps
+        let name_span = caps
             .get_group_by_name("name")
             .expect("group `name` matched");
-        Err(LexError::NotYetImplemented {
-            kind: if with_delimiter {
-                DeferredTokenKind::WordWithDelimiter
-            } else {
-                DeferredTokenKind::Word
-            },
-            position: self.position(name.start),
-        })
+        let name = self.predicate[name_span.range()].to_string();
+        // `matcher.end()` (`:296`) -- the offset right after the opening `[`.
+        let mut i = caps.get_match().expect("matched").end();
+
+        // `new Automaton(Session.getReadFileForWordsLibrary(matcher.group(1) +
+        // TXT_EXTENSION))` (`:295`). Java resolves the word/sequence automaton BEFORE
+        // scanning for indices; a missing file is reported before any index-syntax
+        // error would be, and this ordering matches that.
+        let word_automaton = env.word(&name)?;
+        let _ = with_delimiter; // only affects which pattern matched `caps`, not the body
+
+        let text = self.predicate.clone();
+        let mut indices: Vec<Predicate> = Vec::new();
+        let mut depth: i32 = 1;
+        let mut starting_position = i;
+
+        while i < text.len() {
+            let ch = text[i..].chars().next().expect("i < text.len()");
+            if ch == ']' {
+                // `bracketStack.isEmpty()` (`:298`) -- see `LexError::UnbalancedBracket`'s
+                // docs on why this is structurally unreachable, ported anyway.
+                if depth == 0 {
+                    return Err(LexError::UnbalancedBracket {
+                        position: self.position(i),
+                    });
+                }
+                depth -= 1;
+                if depth == 0 {
+                    // `:302-303` -- finalize this index as a nested `Predicate`.
+                    let index_text = &text[starting_position..i];
+                    indices.push(Predicate::with_context(
+                        env,
+                        default_number_system,
+                        index_text,
+                        self.position(starting_position),
+                    )?);
+                    // `:305-311` -- a chained index (`T[i][j]`)?
+                    if let Some(next) = find_at(&patterns().left_bracket, &text, i + 1) {
+                        depth = 1;
+                        i = next.get_match().expect("matched").end();
+                        starting_position = i;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                // `:313` -- a nested `]` within a still-open index: just text.
+            } else if ch == '[' {
+                depth += 1;
+            }
+            i += ch.len_utf8();
+        }
+        // If the loop ran off the end without closing the LAST bracket (`i ==
+        // text.len()`), that final unclosed attempt contributes nothing to `indices`
+        // (WB-018: this can silently leave `indices.len()` matching the word's real
+        // arity despite trailing garbage — see that entry).
+
+        for (idx, p) in indices.iter().enumerate() {
+            if p.post_order().is_empty() {
+                // WB-017: `matcher.start(1)`, un-adjusted by `realStartingPosition`.
+                return Err(LexError::EmptyWordIndex {
+                    index: idx + 1,
+                    name: name.clone(),
+                    position: self.java_offset(name_span.start),
+                });
+            }
+        }
+        let index_count = indices.len();
+        for p in indices {
+            self.post_order.extend(p.into_post_order());
+        }
+
+        // `:333`: `new Word(realStartingPosition + matcher.start(1), matcher.group(1),
+        // A, indices.size())` -- correctly `realStartingPosition`-adjusted, unlike the
+        // empty-index check just above.
+        let w = Word::new(
+            self.position(name_span.start),
+            name,
+            word_automaton,
+            index_count,
+        )?;
+        self.post_order.push(Token::Word(w));
+        // `:335`: `return i + 1;`.
+        Ok(i + 1)
     }
 
-    /// `Predicate.putFunction(String)` (`:448-491`) — **deferred to U4**. See
-    /// [`Self::put_word`] on the signature.
+    /// `Predicate.putFunction(String)` (`:448-491`). See [`Self::put_word`] on the
+    /// clone-and-scan strategy.
     fn put_function(
         &mut self,
-        _env: &dyn PredicateEnv,
-        _default_number_system: &str,
+        env: &dyn PredicateEnv,
+        default_number_system: &str,
         caps: &Captures,
     ) -> Result<usize, LexError> {
-        let name = caps
+        let name_span = caps
             .get_group_by_name("name")
             .expect("group `name` matched");
-        Err(LexError::NotYetImplemented {
-            kind: DeferredTokenKind::Function,
-            position: self.position(name.start),
-        })
+        let function_name = self.predicate[name_span.range()].to_string();
+        let match_end = caps.get_match().expect("matched").end();
+
+        // `Automaton.readAutomatonFromFile(functionName)` (`:451`).
+        let automaton = env.function(&function_name)?;
+
+        let parse_result = self.parse_parenthesized_arguments(match_end)?;
+
+        let mut arguments: Vec<Predicate> = Vec::with_capacity(parse_result.arguments.len());
+        for arg in &parse_result.arguments {
+            arguments.push(Predicate::with_context(
+                env,
+                default_number_system,
+                &arg.text,
+                self.position(arg.start_pos),
+            )?);
+        }
+
+        // `:466-468`: a single, empty (or whitespace-only) argument means zero
+        // arguments, e.g. `$foo()`.
+        if arguments.len() == 1 && arguments[0].post_order().is_empty() {
+            arguments.remove(0);
+        }
+
+        let total_arguments = arguments.len();
+        for (idx, p) in arguments.iter().enumerate() {
+            if p.post_order().is_empty() && total_arguments > 1 {
+                // WB-017: `matcher.start(1)`, un-adjusted by `realStartingPosition`.
+                return Err(LexError::EmptyFunctionArgument {
+                    index: idx + 1,
+                    name: function_name.clone(),
+                    position: self.java_offset(name_span.start),
+                });
+            }
+        }
+        for p in arguments {
+            self.post_order.extend(p.into_post_order());
+        }
+
+        // `new NumberSystem(number_system)` (`Function.java:52`) — a FRESH, unmemoized
+        // instance, deliberately NOT resolved through `env.number_system` (Ruling 1's
+        // shared-`Rc` cache); see `Function`'s own doc comment in `token.rs` for why
+        // that non-sharing is preserved rather than "fixed".
+        let ns = wr_core::numsys::NumberSystem::new(default_number_system).map_err(|source| {
+            PredicateEnvError::NumberSystem {
+                name: default_number_system.to_string(),
+                source,
+            }
+        })?;
+
+        // `:485-487`: `new Function(defaultNumberSystem, realStartingPosition +
+        // matcher.start(1), matcher.group(1), A, arguments.size())`.
+        let f = Function::new(
+            self.position(name_span.start),
+            function_name,
+            automaton,
+            total_arguments,
+            ns,
+        )?;
+        self.post_order.push(Token::Function(Box::new(f)));
+        // `:490`: `return parseResult.endIndex + 1;`.
+        Ok(parse_result.end_index + 1)
     }
 
-    /// `Predicate.putMacro()` (`:419-446`) — **deferred to U4**.
-    ///
-    /// This is the one whose U4 body rewrites `self.predicate` in place and returns
-    /// `matcher.start()` so the scanning loop re-lexes the expansion; `predicate_env.rs`'s
-    /// Ruling 3 spells out the strategy. Nothing in this unit holds a borrow of
-    /// `self.predicate` across the call, so that body change is local.
-    fn put_macro(&mut self, _env: &dyn PredicateEnv, caps: &Captures) -> Result<usize, LexError> {
-        let name = caps
+    /// `Predicate.parseParenthesizedArguments(int)` (`:348-395`) — shared by
+    /// [`Self::put_function`] and [`Self::put_macro`]. `start_index` is the byte offset
+    /// right after the `(` that opens the argument list (already consumed by the
+    /// caller's match). Read-only (`&self`): nothing here mutates the buffer, so both
+    /// callers can hold `&mut self` around the call without any special-casing.
+    fn parse_parenthesized_arguments(&self, start_index: usize) -> Result<ParseResult, LexError> {
+        let text = &self.predicate;
+        let mut depth: i32 = 1;
+        let mut buf = String::new();
+        let mut current_arg_start = start_index;
+        let mut arguments = Vec::new();
+        let mut i = start_index;
+
+        while i < text.len() {
+            let ch = text[i..].chars().next().expect("i < text.len()");
+            // `:356-358` -- checked before `)`/`,` handling, exactly as Java orders it.
+            if ch == '#' || ch == '$' {
+                return Err(LexError::InternalMacroInArgument {
+                    position: self.position(i),
+                });
+            }
+            if ch == ')' {
+                // `:363-365` -- see `LexError::UnbalancedBracket`'s docs for why this
+                // "already empty" defensive check is structurally unreachable here too
+                // (same shape, different delimiter): finalize-and-return happens the
+                // instant `depth` reaches zero, so no later character in this call can
+                // ever observe it already at zero.
+                if depth == 0 {
+                    return Err(LexError::Token(TokenError::UnbalancedParenthesis {
+                        position: self.position(i),
+                    }));
+                }
+                depth -= 1;
+                if depth == 0 {
+                    // `:369-372`.
+                    arguments.push(ParsedArgument {
+                        text: std::mem::take(&mut buf),
+                        start_pos: current_arg_start,
+                    });
+                    return Ok(ParseResult {
+                        arguments,
+                        end_index: i,
+                    });
+                }
+                buf.push(')');
+            } else if ch == ',' {
+                if depth == 1 {
+                    // `:379-382` -- top-level comma: finalize one argument.
+                    arguments.push(ParsedArgument {
+                        text: std::mem::take(&mut buf),
+                        start_pos: current_arg_start,
+                    });
+                    current_arg_start = i + 1;
+                } else {
+                    // `:384-385` -- nested comma: just text.
+                    buf.push(',');
+                }
+            } else {
+                buf.push(ch);
+                if ch == '(' {
+                    depth += 1;
+                }
+            }
+            i += ch.len_utf8();
+        }
+        // `:391-393` -- ran off the end without closing the top-level `(`.
+        Err(LexError::Token(TokenError::UnbalancedParenthesis {
+            position: self.position(i),
+        }))
+    }
+
+    /// `Predicate.putMacro()` (`:419-446`) — rewrites `self.predicate` in place and
+    /// resumes scanning from the (preserved) leading whitespace, per `predicate_env.rs`'s
+    /// Ruling 3. Every offset/string this needs is extracted from `caps`/computed before
+    /// `self.predicate` is reassigned, so nothing holds a borrow of the OLD buffer across
+    /// the rewrite.
+    fn put_macro(&mut self, env: &dyn PredicateEnv, caps: &Captures) -> Result<usize, LexError> {
+        let name_span = caps
             .get_group_by_name("name")
             .expect("group `name` matched");
-        Err(LexError::NotYetImplemented {
-            kind: DeferredTokenKind::Macro,
-            position: self.position(name.start),
-        })
+        let name = self.predicate[name_span.range()].to_string();
+        let ws_span = caps.get_group_by_name("ws").expect("group `ws` matched");
+        let leading_ws = self.predicate[ws_span.range()].to_string();
+        let whole = caps.get_match().expect("matched").range();
+        let match_start = whole.start; // == ws_span.start
+        let match_end = whole.end; // right after '('
+
+        // `readMacroFile(matcher.group(2))` (`:422`).
+        let mut macro_text = env.macro_text(&name)?;
+
+        let parse_result = self.parse_parenthesized_arguments(match_end)?;
+
+        // `:435-437`: `for (int arg = arguments.size() - 1; arg >= 0; arg--)` --
+        // DESCENDING order, ported verbatim. This is load-bearing, not stylistic: `%1`
+        // is a literal-text substring of `%10`, so substituting `%1` first would mangle
+        // any later `%10` before it is ever reached, and — for the same reason —
+        // `%10`'s own replacement text is scanned again on `%1`'s pass, so a
+        // replacement that happens to CONTAIN `%1` gets a second, unintended
+        // substitution. Both are Java's real behavior, reproduced by literally
+        // replaying its loop rather than trying to special-case around it.
+        for (arg_index, arg) in parse_result.arguments.iter().enumerate().rev() {
+            macro_text =
+                java_replace_all_literal(&macro_text, &format!("%{arg_index}"), &arg.text)?;
+        }
+
+        // `:441-442`: `predicate = predicate.substring(0, matcher.start()) +
+        // matcher.group(1) + macro + predicate.substring(parseResult.endIndex + 1);`
+        let tail = &self.predicate[parse_result.end_index + 1..];
+        let mut new_predicate =
+            String::with_capacity(match_start + leading_ws.len() + macro_text.len() + tail.len());
+        new_predicate.push_str(&self.predicate[..match_start]);
+        new_predicate.push_str(&leading_ws);
+        new_predicate.push_str(&macro_text);
+        new_predicate.push_str(tail);
+        self.predicate = new_predicate;
+
+        // `:445`: `return matcher.start();` -- resume scanning from the (re-inserted)
+        // leading whitespace, so the SAME buffer is re-tokenized from there. No
+        // `initializeMatchers()` counterpart is needed (see the module docs' Ruling 2):
+        // `regex_automata`'s `Input` is per-call, not bound to a haystack.
+        Ok(match_start)
     }
+}
+
+/// `Predicate.ParsedArgument` (`record ParsedArgument(String text, int startPos)`,
+/// `:344-346`). `start_pos` is a **byte** offset into the predicate the argument was
+/// parsed from — converted to a UTF-16, `real_starting_position`-adjusted offset only at
+/// the point of use ([`Predicate::position`]), matching every other raw offset in this
+/// file (Ruling 3's "corollary for U4").
+struct ParsedArgument {
+    text: String,
+    start_pos: usize,
+}
+
+/// `Predicate.ParseResult` (`:412-415`).
+struct ParseResult {
+    arguments: Vec<ParsedArgument>,
+    end_index: usize,
+}
+
+/// `String.replaceAll(literalPattern, replacement)` as `Predicate.putMacro` uses it
+/// (`:436`): `literal_pattern` is always `"%" + N` for a non-negative `N` — plain
+/// digits, no regex metacharacters — so no real regex compilation is needed here. But
+/// the REPLACEMENT text (`arguments.get(arg)`, a macro call's raw argument) is still run
+/// through `java.util.regex.Matcher`'s replacement-string parsing, which gives `$`/`\`
+/// special meaning — see [`expand_java_replacement`] and **WB-019**
+/// (`docs/WALNUT-BUGS.md`).
+fn java_replace_all_literal(
+    haystack: &str,
+    literal_pattern: &str,
+    replacement: &str,
+) -> Result<String, LexError> {
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(idx) = rest.find(literal_pattern) {
+        out.push_str(&rest[..idx]);
+        out.push_str(&expand_java_replacement(replacement, literal_pattern)?);
+        rest = &rest[idx + literal_pattern.len()..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `Matcher.appendReplacement`'s replacement-string parsing (OpenJDK's
+/// `java.util.regex.Matcher`), specialized to a pattern with ZERO capturing groups —
+/// every pattern [`java_replace_all_literal`] is ever called with is `"%" + N`, plain
+/// digits — so group 0 (`whole_match`, i.e. the entire `%N` token) is the only valid
+/// group reference. `$1`..`$9` always fail (`groupCount() == 0 < 1`), matching a real,
+/// empirically-confirmed `IndexOutOfBoundsException`; a lone trailing `\` also fails
+/// (`IllegalArgumentException`), also confirmed empirically. **WB-019**, ported
+/// verbatim: `$`/`#` can never reach this function in practice (blocked earlier by
+/// [`LexError::InternalMacroInArgument`]), so the `\`-escaping arm is the one real
+/// callers exercise; the `$`-group-reference arm is implemented anyway, in the same
+/// spirit as `putWord`'s unreachable-but-ported [`LexError::UnbalancedBracket`] check,
+/// and is unreachable through this crate's own call graph today. **Its fidelity is
+/// narrower than that comparison implies**, flagged during adversarial review: real
+/// `Matcher.appendReplacement` extends a `$NNN` group reference digit-by-digit for as
+/// long as the accumulated number stays a valid group index (here, `groupCount()==0`,
+/// so it can extend through any number of leading `0`s before failing on the first
+/// nonzero digit), then treats any REMAINING digits as literal text — e.g. real Java's
+/// `"$007"` consumes both `0`s into the group reference and appends `whole_match+"7"`.
+/// This arm consumes exactly one digit after `$` (`"$007"` here would append
+/// `whole_match+"07"` instead). Since the whole arm is provably dead code, this
+/// divergence has zero live effect — recorded here rather than silently left
+/// undocumented, since a future change that makes this arm reachable must fix this
+/// first.
+fn expand_java_replacement(replacement: &str, whole_match: &str) -> Result<String, LexError> {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut out = String::with_capacity(replacement.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 1;
+                let c = *chars
+                    .get(i)
+                    .ok_or(LexError::MacroArgumentReplacementError {
+                        message: "character to be escaped is missing",
+                    })?;
+                out.push(c);
+                i += 1;
+            }
+            '$' => {
+                i += 1;
+                let d = *chars
+                    .get(i)
+                    .ok_or(LexError::MacroArgumentReplacementError {
+                        message: "Illegal group reference: group index is missing",
+                    })?;
+                if !d.is_ascii_digit() {
+                    return Err(LexError::MacroArgumentReplacementError {
+                        message: "Illegal group reference",
+                    });
+                }
+                // `groupCount() == 0`: any FIRST digit other than `0` already exceeds
+                // it (Java's own digit-extension loop can only ever shrink the
+                // candidate group number back down to this same first digit, never
+                // grow past it while staying <= 0), so only `$0` (the whole match) is
+                // ever valid here.
+                if d != '0' {
+                    return Err(LexError::MacroArgumentReplacementError {
+                        message: "No group",
+                    });
+                }
+                i += 1;
+                out.push_str(whole_match);
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl std::fmt::Display for Predicate {
@@ -982,6 +1405,8 @@ fn split_variable_list(list: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::predicate_env::InMemoryPredicateEnv;
+    use std::rc::Rc;
+    use wr_core::automaton::Automaton;
     use wr_core::numsys::NumberSystem;
 
     fn env() -> InMemoryPredicateEnv {
@@ -1390,29 +1815,30 @@ mod tests {
     }
 
     /// The word pattern outranks the variable pattern, so `T[i]` is a word occurrence and
-    /// not the variable `T` followed by an undefined `[`. (Construction is U4's; what this
-    /// pins is that the *chain* routes it to the word arm.)
+    /// not the variable `T` followed by an undefined `[`. With `T` unregistered, this
+    /// surfaces as [`PredicateEnvError::FileDoesNotExist`] rather than "undefined token"
+    /// or "operator missing" — proof the chain routed it to the word arm at all, since
+    /// neither of those errors is reachable once it has.
     #[test]
     fn word_pattern_outranks_variable_pattern() {
         match lex("T[i]").unwrap_err() {
-            LexError::NotYetImplemented { kind, position } => {
-                assert_eq!(kind, DeferredTokenKind::Word);
-                assert_eq!(position, 0);
+            LexError::Env(PredicateEnvError::FileDoesNotExist { address }) => {
+                assert_eq!(address, "Word Automata Library/T.txt")
             }
-            other => panic!("expected a deferred word token, got {other}"),
+            other => panic!("expected a FileDoesNotExist error, got {other}"),
         }
     }
 
     /// Likewise `.EVEN[i]`: the delimited-word pattern claims it, and its leading `E` is
-    /// never mistaken for a quantifier.
+    /// never mistaken for a quantifier — `EVEN` (no leading dot) is looked up, not
+    /// `.EVEN`.
     #[test]
     fn delimited_word_is_not_lexed_as_a_quantifier() {
         match lex(".EVEN[i]").unwrap_err() {
-            LexError::NotYetImplemented { kind, position } => {
-                assert_eq!(kind, DeferredTokenKind::WordWithDelimiter);
-                assert_eq!(position, 1, "the name starts after the delimiter dot");
+            LexError::Env(PredicateEnvError::FileDoesNotExist { address }) => {
+                assert_eq!(address, "Word Automata Library/EVEN.txt")
             }
-            other => panic!("expected a deferred delimited-word token, got {other}"),
+            other => panic!("expected a FileDoesNotExist error, got {other}"),
         }
     }
 
@@ -1430,22 +1856,21 @@ mod tests {
     }
 
     /// `$f(` and `#m(` are consulted before the bare-`(` pattern; without that ordering the
-    /// `$`/`#` would be undefined tokens.
+    /// `$`/`#` would be undefined tokens. With `phi`/`m` unregistered, the routing shows up
+    /// as each construction's own environment lookup instead.
     #[test]
     fn function_and_macro_patterns_outrank_the_left_parenthesis() {
         match lex("$phi(x)").unwrap_err() {
-            LexError::NotYetImplemented { kind, position } => {
-                assert_eq!(kind, DeferredTokenKind::Function);
-                assert_eq!(position, 1, "the name starts after the `$`");
+            LexError::Env(PredicateEnvError::FileDoesNotExist { address }) => {
+                assert_eq!(address, "Automata Library/phi.txt")
             }
-            other => panic!("expected a deferred function token, got {other}"),
+            other => panic!("expected a FileDoesNotExist error, got {other}"),
         }
         match lex("#m(x)").unwrap_err() {
-            LexError::NotYetImplemented { kind, position } => {
-                assert_eq!(kind, DeferredTokenKind::Macro);
-                assert_eq!(position, 1, "the name starts after the `#`");
+            LexError::Env(PredicateEnvError::MacroDoesNotExist { name }) => {
+                assert_eq!(name, "m")
             }
-            other => panic!("expected a deferred macro token, got {other}"),
+            other => panic!("expected a MacroDoesNotExist error, got {other}"),
         }
     }
 
@@ -1761,5 +2186,454 @@ mod tests {
             Predicate::new(&env, "?msd_3 b=2").unwrap().to_string(),
             "b:2:=_msd_3"
         );
+    }
+
+    // =======================================================================
+    // Word / Function / Macro (U4)
+    // =======================================================================
+
+    /// Lex against a caller-supplied environment (the four tests above and everything
+    /// before them only ever needed the empty [`env`]).
+    fn lex_with(env: &InMemoryPredicateEnv, s: &str) -> Result<Predicate, LexError> {
+        Predicate::new(env, s)
+    }
+
+    fn post_with(env: &InMemoryPredicateEnv, s: &str) -> String {
+        lex_with(env, s).expect("must tokenize").to_string()
+    }
+
+    fn err_with(env: &InMemoryPredicateEnv, s: &str) -> String {
+        lex_with(env, s).expect_err("must fail").to_string()
+    }
+
+    /// An unlabeled, `arity`-track automaton with an empty transition table — standing
+    /// in for a word/function file. The transition content is irrelevant to every test
+    /// below (none of them execute `act()`; that's U9/U10/U11 territory), only
+    /// `get_arity()` and `bind`'s arity check matter here.
+    fn stub_automaton(arity: usize) -> Automaton {
+        let fa = wr_core::fa::Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2usize.saturating_pow(arity as u32).max(1),
+            o: vec![1],
+            d: vec![std::collections::BTreeMap::new()],
+        };
+        Automaton::new(
+            fa,
+            vec![vec![0, 1]; arity],
+            Vec::new(),
+            vec![Some(true); arity],
+        )
+    }
+
+    // -- `PredicateTest.runPredicateTests` (all 15 cases), ported to real `#name(...)`
+    // -- macro CALLS now that `putMacro` is implemented (U3 could only test the
+    // -- already-expanded text; see `java_macro_case_9`/`_13` above). Cases 12/13 swap
+    // -- `msd_fib` for `msd_3`, matching the substitution `java_macro_case_13` already
+    // -- established (custom-base files are `wr-cli`'s `Session` territory, not this
+    // -- in-memory double's).
+
+    fn macro_test_env() -> InMemoryPredicateEnv {
+        InMemoryPredicateEnv::new()
+            .with_macro("my_macro0", "%0")
+            .with_macro("my_macro1", "%0")
+            .with_macro("my_macro2", "%0")
+            .with_macro("my_macro3", "%0=1")
+            .with_macro("my_macro4", "%0=1")
+            .with_macro("my_macro5", "%0=1")
+            .with_macro("my_macro6", "%0=1")
+            .with_macro("my_macro7", "a+b=2")
+            .with_macro("my_macro8", "a+b=2")
+            .with_macro("my_macro9", "%0 E%1 %2 = %1 + 1 & %1 = 5")
+            .with_macro("my_macro10", "%0 E%1 %2 = %1 + 1 & %1 = 5")
+            .with_macro("my_macro11", "%0 E%1 %2 = %1 + 1 &")
+            .with_macro("my_macro12", "E%0 %1 = %0 + 1 &")
+            .with_macro("my_macro13", "E%0 %1 = %0 + 1 &")
+            .with_macro("my_macro14", "%10=%1")
+    }
+
+    /// Regression guard for the DESCENDING substitution order `put_macro` uses
+    /// (`Predicate.java:435`'s `for (int arg = arguments.size()-1; arg >= 0; arg--)`,
+    /// mirrored by this port's `.rev()` iterator). With only single-digit placeholders
+    /// present, ascending vs. descending order is unobservable (no `%N` is a prefix of
+    /// another `%M`) — every OTHER macro test in this file tops out at `%2`, so none of
+    /// them can catch a regression that silently flips the iteration direction. This
+    /// test uses 11 placeholders (`%0`..`%10`) specifically so `%1` is a strict prefix
+    /// of `%10`: a naive ASCENDING substitution would replace the `%1` inside `%10`
+    /// first, corrupting it (`"%10=%1"` -> `"1"+"0=%1"` = `"10=%1"` instead of the
+    /// correct `"2=1"`), before `%10` ever gets its own turn.
+    #[test]
+    fn macro_call_with_eleven_placeholders_substitutes_in_descending_order() {
+        let env = macro_test_env();
+        let p = Predicate::new(&env, "#my_macro14(z,1,z,z,z,z,z,z,z,z,2)").expect("must tokenize");
+        assert_eq!(p.predicate(), "2=1");
+        assert_eq!(p.to_string(), "2:1:=_msd_2");
+    }
+
+    #[test]
+    fn java_macro_calls_expand_and_lex_to_javas_expected_post_order() {
+        let env = macro_test_env();
+        let cases: &[(&str, &str, &str)] = &[
+            // (predicate, expected rewritten `predicate` buffer, expected post-order)
+            ("#my_macro0(a)=1", "a=1", "a:1:=_msd_2"),
+            ("#my_macro1(a)=1", "a=1", "a:1:=_msd_2"),
+            ("#my_macro2(a)=1", "a=1", "a:1:=_msd_2"),
+            ("?msd_3 (#my_macro3(a))", "?msd_3 (a=1)", "a:1:=_msd_3"),
+            ("?msd_3 (#my_macro4(a))", "?msd_3 ( a=1)", "a:1:=_msd_3"),
+            ("?msd_3 (#my_macro5(a) )", "?msd_3 (a=1 )", "a:1:=_msd_3"),
+            (
+                "?msd_3 (#my_macro6(a) => #my_macro6(b))",
+                "?msd_3 (a=1 => b=1)",
+                "a:1:=_msd_3:b:1:=_msd_3:=>",
+            ),
+            ("#my_macro7()", "a+b=2", "a:b:+_msd_2:2:=_msd_2"),
+            (
+                "#my_macro8() & #my_macro8()",
+                "a+b=2 & a+b=2",
+                "a:b:+_msd_2:2:=_msd_2:a:b:+_msd_2:2:=_msd_2:&",
+            ),
+            (
+                "#my_macro9(?msd_2,a,b)",
+                "?msd_2 Ea b = a + 1 & a = 5",
+                "a:b:a:1:+_msd_2:=_msd_2:a:5:=_msd_2:&:E",
+            ),
+            (
+                "#my_macro10(?msd_3,a,b)",
+                "?msd_3 Ea b = a + 1 & a = 5",
+                "a:b:a:1:+_msd_3:=_msd_3:a:5:=_msd_3:&:E",
+            ),
+            (
+                "#my_macro11(?msd_2,a,b) a = 5",
+                "?msd_2 Ea b = a + 1 & a = 5",
+                "a:b:a:1:+_msd_2:=_msd_2:a:5:=_msd_2:&:E",
+            ),
+            (
+                // `msd_fib` -> `msd_3` (see this section's header note).
+                "?msd_3 #my_macro12(a,b) a = 5",
+                "?msd_3 Ea b = a + 1 & a = 5",
+                "a:b:a:1:+_msd_3:=_msd_3:a:5:=_msd_3:&:E",
+            ),
+            (
+                "?msd_3 (#my_macro13(a,b) a = 5) =>(?lsd_3   #my_macro13(f,g) f = 6)",
+                "?msd_3 (Ea b = a + 1 & a = 5) =>(?lsd_3   Ef g = f + 1 & f = 6)",
+                "a:b:a:1:+_msd_3:=_msd_3:a:5:=_msd_3:&:E:f:g:f:1:+_lsd_3:=_lsd_3:f:6:=_lsd_3:&:E:=>",
+            ),
+            // Case 14: a nested, parenthesized top-level comma inside the ONE argument
+            // exercises `parse_parenthesized_arguments`'s "nested comma" branch. `%0` is
+            // never referenced by `my_macro7`'s body, so the argument is parsed and
+            // discarded, unused -- identical result to case 7.
+            ("#my_macro7((x,y))", "a+b=2", "a:b:+_msd_2:2:=_msd_2"),
+        ];
+        for (predicate, expected_buffer, expected_post) in cases {
+            let p = Predicate::new(&env, predicate)
+                .unwrap_or_else(|e| panic!("{predicate:?} must tokenize: {e}"));
+            // `PredicateTest.test(PredTest)` compares BOTH strings with every space
+            // stripped (`t.expected_predicate.strip().replace(" ","")`) — not exact
+            // equality — so this mirrors that exact (weaker, deliberately
+            // whitespace-insensitive) invariant rather than a stronger one this port
+            // invented. `assertion left == right` failures should be trusted, but a
+            // difference in whitespace ALONE is not one Java's own suite checks either
+            // (the Java literal fixtures themselves have at least one such inconsistency
+            // between structurally-identical cases 3/4, confirmed by hand-tracing the
+            // algorithm against `putMacro`'s source — not a Rust-port defect).
+            let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+            assert_eq!(
+                strip(p.predicate()),
+                strip(expected_buffer),
+                "input {predicate:?}"
+            );
+            assert_eq!(
+                strip(&p.to_string()),
+                strip(expected_post),
+                "input {predicate:?}"
+            );
+        }
+    }
+
+    /// `PredicateTest.wordWithMissingClosingBracketConsumesToEndOfInput`: an unclosed
+    /// `[` means zero indices were ever finalized, mismatching `F`'s real arity (1), so
+    /// `Word::new`'s arity check fires — with `F`'s own (correctly `real_starting_position`-
+    /// adjusted) position, not WB-017's defect.
+    #[test]
+    fn word_with_missing_closing_bracket_consumes_to_end_of_input() {
+        let env = InMemoryPredicateEnv::new().with_word("F", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "F[i"),
+            "function F requires 1 arguments: char at 0"
+        );
+    }
+
+    /// `PredicateTest.wordWithEmptyIndexThrows`.
+    #[test]
+    fn word_with_empty_index_throws() {
+        let env = InMemoryPredicateEnv::new().with_word("F", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "F[]"),
+            "index 1 of the word F cannot be empty: char at 0"
+        );
+    }
+
+    /// `PredicateTest.macroCallInternalMacroInArgumentThrows`.
+    #[test]
+    fn macro_call_internal_macro_in_argument_throws() {
+        let env = macro_test_env();
+        assert_eq!(
+            err_with(&env, "#my_macro0(#x)"),
+            "a function/macro cannot be called from inside another function/macro's \
+             argument list: char at 11"
+        );
+    }
+
+    /// Same check, triggered by `$` rather than `#` — confirms `internalMacro` fires on
+    /// EITHER reserved character, not just the one that happens to start a nested macro
+    /// call, and rules out (see WB-019's doc comment) the `$`-group-reference half of
+    /// that bug: `$` can never reach `putMacro`'s substitution step at all.
+    #[test]
+    fn macro_call_argument_containing_dollar_is_also_blocked() {
+        let env = macro_test_env();
+        assert_eq!(
+            err_with(&env, "#my_macro0($5)"),
+            "a function/macro cannot be called from inside another function/macro's \
+             argument list: char at 11"
+        );
+    }
+
+    /// `PredicateTest.macroCallWithMissingClosingParenThrowsUnbalancedParen`.
+    #[test]
+    fn macro_call_with_missing_closing_paren_throws_unbalanced_paren() {
+        let env = macro_test_env();
+        assert_eq!(
+            err_with(&env, "#my_macro0(a"),
+            "unbalanced parenthesis: char at 12"
+        );
+    }
+
+    /// `PredicateTest.undefinedMacroFileThrows`.
+    #[test]
+    fn undefined_macro_file_throws() {
+        assert_eq!(
+            err("#no_such_macro_xyz(a)"),
+            "Macro does not exist: no_such_macro_xyz"
+        );
+    }
+
+    /// `PredicateTest.functionCallWithSingleEmptyArgumentIsTreatedAsZeroArgs`.
+    #[test]
+    fn function_call_with_single_empty_argument_is_treated_as_zero_args() {
+        let env = InMemoryPredicateEnv::new().with_function("endsIn2Zeros", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "$endsIn2Zeros()"),
+            "function endsIn2Zeros requires 1 arguments: char at 1"
+        );
+    }
+
+    /// `PredicateTest.functionCallWithEmptyArgumentAmongMultipleThrows`.
+    #[test]
+    fn function_call_with_empty_argument_among_multiple_throws() {
+        let env = InMemoryPredicateEnv::new().with_function("endsIn2Zeros", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "$endsIn2Zeros(a,)"),
+            "argument 2 of the function endsIn2Zeros cannot be empty: char at 1"
+        );
+    }
+
+    // -- Nested word-index / function-argument sub-`Predicate` construction --------
+
+    /// Each index of `T[i][j+1]` is its own sub-`Predicate`, including one with a real
+    /// arithmetic sub-expression (`j+1`, not just a bare variable) — proof that a
+    /// bracket's contents are tokenized as an arbitrary predicate, not special-cased to
+    /// a single identifier.
+    #[test]
+    fn word_index_brackets_are_independently_tokenized_sub_predicates() {
+        let env = InMemoryPredicateEnv::new().with_word("T", stub_automaton(2));
+        assert_eq!(post_with(&env, "T[i][j+1]"), "i:j:1:+_msd_2:T");
+    }
+
+    /// A word index containing NESTED brackets of its own (`T[a[0]]`, i.e. the index
+    /// expression is itself `a[0]` — a word occurrence of `a` indexed by the literal
+    /// `0`) exercises `put_word`'s inner-bracket-depth counting, not just the top-level
+    /// open/close pair.
+    #[test]
+    fn word_index_may_itself_contain_nested_brackets() {
+        let env = InMemoryPredicateEnv::new()
+            .with_word("T", stub_automaton(1))
+            .with_word("a", stub_automaton(1));
+        assert_eq!(post_with(&env, "T[a[0]]"), "0:a:T");
+    }
+
+    /// Multi-argument function calls: each comma-separated argument is its own
+    /// sub-`Predicate`, including one with a real arithmetic sub-expression.
+    #[test]
+    fn function_call_arguments_are_independently_tokenized_sub_predicates() {
+        let env = InMemoryPredicateEnv::new().with_function("phi", stub_automaton(3));
+        assert_eq!(post_with(&env, "$phi(a, b+1, 2)"), "a:b:1:+_msd_2:2:phi");
+    }
+
+    /// The `real_starting_position`/UTF-16 threading (Ruling 3's "corollary for U4")
+    /// through a nested function argument: the argument `x=1` starts at byte offset 5 in
+    /// `"$phi(x=1)"`, so its own tokens must report position 5, not 0.
+    #[test]
+    fn function_argument_position_is_correctly_offset() {
+        let env = InMemoryPredicateEnv::new().with_function("phi", stub_automaton(1));
+        let p = Predicate::new(&env, "$phi(x=1)").unwrap();
+        let positions: Vec<usize> = p
+            .post_order()
+            .iter()
+            .map(|t| t.position_in_predicate())
+            .collect();
+        // post-order: x, 1, =_msd_2, phi -- `x` is at byte/char offset 5.
+        assert_eq!(positions[0], 5);
+    }
+
+    // -- WB-017: `putWord`/`putFunction`'s empty-index/argument position defect -----
+
+    /// **WB-017**, direct case (`real_starting_position == 0`, so this alone doesn't
+    /// distinguish the bug from correct behavior — see the NESTED case right below for
+    /// that): `PredicateTest.wordWithEmptyIndexThrows`/
+    /// `functionCallWithEmptyArgumentAmongMultipleThrows` already pin the top-level
+    /// shape above. This one adds the FUNCTION side at top level for symmetry.
+    #[test]
+    fn wb017_empty_function_argument_position_at_top_level() {
+        let env = InMemoryPredicateEnv::new().with_function("endsIn2Zeros", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "$endsIn2Zeros(a,)"),
+            "argument 2 of the function endsIn2Zeros cannot be empty: char at 1"
+        );
+    }
+
+    /// **WB-017**, the case that actually distinguishes the bug from correct behavior:
+    /// nesting the empty word index inside a function argument gives it a non-zero
+    /// `real_starting_position` (14, `F`'s own byte offset within the full query). The
+    /// CORRECT position would be 14; Java (and this port, ported verbatim) reports 0 —
+    /// confirmed empirically against real `walnut-java`
+    /// (`$endsIn2Zeros(F[])` -> `"index 1 of the word F cannot be empty: char at 0"`).
+    #[test]
+    fn wb017_empty_word_index_position_is_not_real_starting_position_adjusted() {
+        let env = InMemoryPredicateEnv::new()
+            .with_word("F", stub_automaton(1))
+            .with_function("endsIn2Zeros", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "$endsIn2Zeros(F[])"),
+            "index 1 of the word F cannot be empty: char at 0"
+        );
+    }
+
+    /// **WB-017**, the FUNCTION-side analogue of the test above: an empty function
+    /// argument nested inside a WORD index likewise reports the un-adjusted local
+    /// position (1, `endsIn2Zeros`' own offset within the nested index text) instead of
+    /// the correct absolute position (3). Confirmed empirically against real
+    /// `walnut-java` (`F[$endsIn2Zeros(a,)]` -> `char at 1`, not `char at 3`).
+    #[test]
+    fn wb017_empty_function_argument_position_is_not_real_starting_position_adjusted() {
+        let env = InMemoryPredicateEnv::new()
+            .with_word("F", stub_automaton(1))
+            .with_function("endsIn2Zeros", stub_automaton(1));
+        assert_eq!(
+            err_with(&env, "F[$endsIn2Zeros(a,)]"),
+            "argument 2 of the function endsIn2Zeros cannot be empty: char at 1"
+        );
+    }
+
+    // -- WB-018: a satisfied word occurrence silently swallows trailing garbage -----
+
+    /// **WB-018**: once a word's declared arity is satisfied, `putWord` still checks for
+    /// ONE more chained `[`, and if it finds one but that bracket is never closed, the
+    /// whole unclosed remainder is silently discarded — NOT an error, matching real
+    /// Walnut exactly (`F[a][b` and `F[a][b=1` both succeed there, confirmed empirically,
+    /// dropping `[b`/`[b=1` with no diagnostic at all).
+    #[test]
+    fn wb018_trailing_unclosed_bracket_after_satisfied_arity_is_silently_dropped() {
+        let env = InMemoryPredicateEnv::new().with_word("F", stub_automaton(1));
+        assert_eq!(post_with(&env, "F[a][b"), "a:F");
+        assert_eq!(post_with(&env, "F[a][b=1"), "a:F");
+    }
+
+    // -- WB-019: `putMacro`'s `%N` substitution inherits Java's replacement-string quirks
+
+    /// **WB-019**: a macro-call argument ending in a lone, unescaped backslash makes the
+    /// substitution step fail with the exact (uncaught, non-`WalnutException`) message
+    /// Java's `Matcher.appendReplacement` reports for a dangling escape.
+    #[test]
+    fn wb019_macro_argument_trailing_backslash_reports_javas_exception_text() {
+        let env = InMemoryPredicateEnv::new().with_macro("echo", "%0");
+        match lex_with(&env, "#echo(\\)").unwrap_err() {
+            LexError::MacroArgumentReplacementError { message } => {
+                assert_eq!(message, "character to be escaped is missing");
+            }
+            other => panic!("expected MacroArgumentReplacementError, got {other}"),
+        }
+    }
+
+    /// **WB-019**: `\x` in an argument silently becomes literal `x` (the backslash is
+    /// swallowed as an escape character), rather than passing the two-character
+    /// sequence through as literal argument text.
+    #[test]
+    fn wb019_macro_argument_backslash_escapes_the_following_character() {
+        let env = InMemoryPredicateEnv::new().with_macro("echo", "%0");
+        let p = Predicate::new(&env, "#echo(\\x)").unwrap();
+        assert_eq!(p.predicate(), "x");
+        assert_eq!(p.to_string(), "x");
+    }
+
+    // -- Ruling 3: no macro-expansion depth/cycle guard ------------------------------
+
+    /// A [`PredicateEnv`] wrapper that counts `macro_text` calls and fails once a cap is
+    /// reached — the mechanism this crate's other "must not hang" tests use (per this
+    /// unit's brief: "use a cycle-bounded macro definition ... before you assert the
+    /// expansion truly doesn't self-limit"). `#loop` expands to the byte-identical text
+    /// `#loop(x)` (its body never references `%0`, so the argument's own content is
+    /// irrelevant), so each re-lex pass is O(1) work — genuinely unbounded recursion,
+    /// made observable without ever actually running unbounded.
+    struct CountingMacroEnv<'a> {
+        inner: &'a InMemoryPredicateEnv,
+        calls: std::cell::Cell<u32>,
+        cap: u32,
+    }
+
+    impl PredicateEnv for CountingMacroEnv<'_> {
+        fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
+            self.inner.number_system(name)
+        }
+        fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+            self.inner.word(name)
+        }
+        fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+            self.inner.function(name)
+        }
+        fn macro_text(&self, name: &str) -> Result<String, PredicateEnvError> {
+            let n = self.calls.get() + 1;
+            self.calls.set(n);
+            if n > self.cap {
+                return Err(PredicateEnvError::MacroDoesNotExist {
+                    name: name.to_string(),
+                });
+            }
+            self.inner.macro_text(name)
+        }
+    }
+
+    #[test]
+    fn macro_expansion_has_no_depth_guard_and_will_recurse_until_the_environment_stops_it() {
+        let inner = InMemoryPredicateEnv::new().with_macro("loop", "#loop(x)");
+        let capped = CountingMacroEnv {
+            inner: &inner,
+            calls: std::cell::Cell::new(0),
+            cap: 50,
+        };
+        let err = Predicate::new(&capped, "#loop(x)").unwrap_err();
+        // If the lexer had ANY self-imposed recursion limit, `calls` would stop well
+        // short of `cap + 1` -- it doesn't, proving `put_macro` really does keep calling
+        // `macro_text` with no limit of its own, matching Ruling 3's explicit
+        // instruction to port Java's total absence of one.
+        assert_eq!(
+            capped.calls.get(),
+            51,
+            "the lexer must keep re-expanding with no self-imposed limit"
+        );
+        assert!(matches!(
+            err,
+            LexError::Env(PredicateEnvError::MacroDoesNotExist { .. })
+        ));
     }
 }

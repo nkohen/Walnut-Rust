@@ -707,6 +707,187 @@ bug costs a silent wrong answer somewhere downstream.
   an input shape (a hand-authored word-automaton `.txt` file whose initial state isn't numbered
   `0`) that is plausible under Walnut's own documented usage, not an adversarial or degenerate
   input.
+---
+
+## WB-017 — `putWord`/`putFunction`'s empty-index/empty-argument errors omit `realStartingPosition`
+
+- **Where:** `Main/Predicate.java`, `putWord`'s per-index emptiness check (`:326-328`) and
+  `putFunction`'s per-argument emptiness check (`:479-483`). Both are inline `new
+  WalnutException(...)` calls (no `WalnutException.` static helper), and both use the bare
+  `matcher.start(1)` — the WORD's/FUNCTION's own name-group offset within *this* `Predicate`'s
+  string — instead of `realStartingPosition + matcher.start(1)`, the form every other position in
+  this file uses. Same defect CLASS as WB-015 (a raw, un-adjusted matcher offset reaching a
+  user-visible "char at N"), found at two different call sites while porting a different unit (U4,
+  not U3) — logged separately since it is a different pair of methods, not a re-occurrence of an
+  already-fixed bug.
+- **What:** for a TOP-LEVEL word/function occurrence (`realStartingPosition == 0`), the bug is
+  invisible — the correct and the buggy position coincide. It becomes observable the moment the
+  word/function occurrence is inside a NESTED `Predicate` (a function argument, a word index, a
+  macro expansion) with a non-zero `realStartingPosition`: the reported position is the offset
+  *within the nested predicate's own fragment*, not the true absolute offset into the user's query.
+- **Trigger (empirically confirmed against the real `walnut-java`, via the same kind of probe
+  WB-015 used — `new Predicate(line)`, printing the thrown message — run against
+  `target/Walnut-all.jar`, JDK 17, 2026-08-12; `endsIn2Zeros` and `F` are real fixtures in the
+  Global `Automata Library`/`Word Automata Library`):**
+  - word side: `new Predicate("$endsIn2Zeros(F[])")` throws `"index 1 of the word F cannot be
+    empty: char at 0"`. `F`'s true offset in the query is 14 (inside the function argument, which
+    has `realStartingPosition = 14`); the correct message would say `char at 14`.
+  - function side: `new Predicate("F[$endsIn2Zeros(a,)]")` throws `"argument 2 of the function
+    endsIn2Zeros cannot be empty: char at 1"`. `endsIn2Zeros`'s true offset in the query is 3
+    (inside the word index, `realStartingPosition = 2`); the correct message would say `char at 3`.
+- **Found:** Phase 3a, U4 (`crates/wr-logic/src/predicate.rs`, `Predicate::put_word`/
+  `Predicate::put_function`), 2026-08-12.
+- **Rust port:** `ported verbatim (quirk)`. `LexError::EmptyWordIndex`/`LexError::EmptyFunctionArgument`
+  both store `self.java_offset(name_span.start)` — UTF-16-converted but deliberately NOT run
+  through `self.position` (which would add `real_starting_position`) — matching Java's omission
+  exactly. Pinned by `wb017_empty_word_index_position_is_not_real_starting_position_adjusted` and
+  `wb017_empty_function_argument_position_is_not_real_starting_position_adjusted` (both reproduce
+  the two triggers above verbatim, including the expected *wrong* position), plus the two top-level
+  (non-distinguishing, `realStartingPosition == 0`) cases straight from `PredicateTest.java`
+  (`wordWithEmptyIndexThrows`, `functionCallWithEmptyArgumentAmongMultipleThrows`).
+- **Upstream:** not filed. Fix is mechanical at both sites: `realStartingPosition +
+  matcher.start(1)`, matching every sibling position in the same file.
+- **Severity:** low — diagnostics only, same class of damage as WB-015. Requires authoring a
+  malformed (empty) word index or function argument nested inside another construct to observe;
+  none of the golden corpus's `error*` fixtures exercise a nested empty index/argument (checked by
+  grepping the corpus's `reg`/`eval`/`def` command lines for `[]`/`(,`/`(,)`-shaped text inside a
+  `$`/word-index context — none found), so Tier 1 neither pins nor contradicts this entry.
+
+---
+
+## WB-018 — a word occurrence with a trailing, never-closed chained bracket silently drops the rest of the query
+
+- **Where:** `Main/Predicate.java`, `putWord` (`:296-333`). Once an index bracket closes and
+  `indices` already holds enough entries to satisfy the word's declared arity, `putWord` still
+  *tries* one more chained index (`m_leftBracket.find(i + 1)`, `:305`) — and if that next `[` is
+  found but is never closed, the enclosing `while (i < predicate.length())` loop (`:299`) simply
+  runs off the end of the string with `i == predicate.length()`, `indices` unchanged (the unclosed
+  attempt is never finalized/added). `putWord` then returns `i + 1` — one PAST the end of the
+  string — and the `Word` constructor's arity check passes, because `indices.size()` already
+  matched before the doomed extra bracket was even opened. No exception fires anywhere.
+- **What:** any syntactically-broken trailing text that starts with `[` immediately after a
+  word occurrence whose own arity is already satisfied is silently discarded in its entirety, with
+  no diagnostic — not a parse error, not a warning, nothing. This is a real "wrong output" bug in
+  the CLAUDE.md sense: a clearly malformed query (an unclosed bracket, or worse, unrelated trailing
+  predicate text that happens to start with `[`) is silently ACCEPTED as if the garbage were never
+  there.
+- **Trigger (empirically confirmed against `target/Walnut-all.jar`, JDK 17, 2026-08-12; `F` is a
+  real msd_fib, arity-1 fixture in the Global Word Automata Library):**
+  - `new Predicate("F[a][b")` succeeds, producing the SAME token stream as `new Predicate("F[a]")`
+    — the trailing `[b` (a syntactically dangling, unclosed bracket) vanishes with no error.
+  - `new Predicate("F[a][b=1")` succeeds identically — even though `[b=1` looks like it might be
+    intended as a second, differently-shaped construct, it too is silently dropped.
+- **Found:** Phase 3a, U4 (`crates/wr-logic/src/predicate.rs`, `Predicate::put_word`), 2026-08-12.
+- **Rust port:** `ported verbatim (quirk)`. `put_word`'s bracket-scanning loop returns `i + 1` in
+  BOTH the "closed cleanly, no more brackets" case and the "ran off the end without closing"
+  case, exactly mirroring Java's single `return i + 1;` — no extra check was added to distinguish
+  them, and none should be (the whole point is Java doesn't distinguish them either). Pinned by
+  `wb018_trailing_unclosed_bracket_after_satisfied_arity_is_silently_dropped`, reproducing both
+  triggers above and asserting the post-order is identical to the un-suffixed `F[a]` query (not an
+  error).
+- **Upstream:** not filed. A real fix needs a design decision (should a further unclosed bracket
+  after a satisfied word occurrence be an error, and if so which one — unbalanced bracket? operator
+  missing on whatever follows?), not just a one-line change, so this is flagged for a deliberate
+  upstream decision rather than a mechanical patch.
+- **Severity:** moderate — a real "wrong output" class defect (input a user would expect to be
+  rejected is silently accepted, and a suffix of their query is silently ignored), but requires an
+  already-malformed query (an unclosed bracket) to trigger, and the shipped golden corpus contains
+  no unclosed-bracket fixtures (grepped: no `reg`/`eval`/`def` command line has an unmatched `[`
+  after a word occurrence), so Tier 1 does not exercise it either way.
+
+---
+
+## WB-019 — `putMacro`'s `%N` argument substitution inherits `Matcher.appendReplacement`'s `$`/`\` escaping, crashing on a trailing backslash
+
+- **Where:** `Main/Predicate.java`, `putMacro` (`:435-437`): `macro =
+  new StringBuilder(macro.toString().replaceAll("%" + arg, arguments.get(arg)));`. Java's
+  `String.replaceAll(regex, replacement)` compiles `regex` as a pattern (harmless here — `"%" + arg`
+  is always plain digits, no metacharacters) but ALSO parses `replacement` through
+  `java.util.regex.Matcher.appendReplacement`'s own mini-language, where `$` introduces a group
+  reference and `\` escapes the next character. `replacement` here is `arguments.get(arg)` — the
+  RAW, VERBATIM text of a macro call's argument, exactly as the user typed it, with no escaping
+  applied before being handed to `replaceAll`.
+- **What:** a macro-call argument containing a literal `\` is not passed through as literal text.
+  Concretely: `\X` (any non-`\`/`$` character `X`) silently becomes just `X` (the backslash is
+  consumed as an escape, matching neither Java's regex dialect NOR Walnut's own predicate grammar,
+  which has no escape syntax at all); a LONE trailing `\` (nothing after it) makes the entire
+  substitution throw an uncaught `IllegalArgumentException` — not a `WalnutException`, so it
+  bypasses every one of Walnut's own error-formatting conventions and surfaces as a raw Java stack
+  trace. The `$`-group-reference half of the same underlying issue (`$1`..`$9` would throw
+  `IndexOutOfBoundsException`, since the pattern `"%" + arg` has zero capturing groups) turns out to
+  be UNREACHABLE in practice: `parseParenthesizedArguments` (`:356-358`) already rejects any `$`
+  (or `#`) appearing anywhere in a macro/function call's argument text, before `putMacro`'s
+  substitution ever runs — confirmed empirically (see triggers below).
+- **Trigger (empirically confirmed against `target/Walnut-all.jar`, JDK 17, 2026-08-12; using the
+  real `my_macro0.txt` fixture, body `%0`):**
+  - `new Predicate("#my_macro0(\\)")` (a single backslash as the sole argument) throws
+    `java.lang.IllegalArgumentException: character to be escaped is missing` — uncaught, not a
+    `WalnutException`.
+  - `new Predicate("#my_macro0(\\x)")` succeeds, producing the predicate text `"x"` — the backslash
+    silently vanished, and `\x` was NOT preserved as the two literal characters `\` and `x`.
+  - `new Predicate("#my_macro0($5)")` and `new Predicate("#my_macro0($0)")` BOTH throw
+    `"a function/macro cannot be called from inside another function/macro's argument list: char at
+    11"` (`WalnutException.internalMacro`) — confirming the `$`-group-reference half of this same
+    Java quirk is blocked upstream and never reaches `replaceAll` at all.
+- **Found:** Phase 3a, U4 (`crates/wr-logic/src/predicate.rs`, `Predicate::put_macro`), 2026-08-12.
+- **Rust port:** `ported verbatim (quirk)`. `java_replace_all_literal`/`expand_java_replacement`
+  reproduce `Matcher.appendReplacement`'s replacement-string parsing (specialized to the
+  zero-capturing-group case every real call here has), including the trailing-backslash failure and
+  the backslash-escapes-the-next-character behavior. Ported as a recoverable
+  `LexError::MacroArgumentReplacementError` (a `Result::Err`), not a Rust `panic!`: like
+  `ExprError`'s WB-013 entry, this is a real Java UNCHECKED exception that `Prover`'s top-level
+  `catch (RuntimeException)` recovers from (prints a stack trace, session continues) — a Rust
+  `panic!` here would abort the whole process instead, with no `catch_unwind` boundary yet to
+  mirror that recovery. Pinned by `wb019_macro_argument_trailing_backslash_reports_javas_exception_text`
+  and `wb019_macro_argument_backslash_escapes_the_following_character`, reproducing both empirical
+  triggers above; `macro_call_argument_containing_dollar_is_also_blocked` pins that the
+  `$`-group-reference half stays unreachable through this port's own call graph too (same ordering:
+  `parse_parenthesized_arguments`'s `#`/`$` check runs before substitution).
+- **Upstream:** not filed. Fix is mechanical: escape `arguments.get(arg)` for `replaceAll`'s
+  replacement-string dialect (`Matcher.quoteReplacement(...)`) before substituting, or switch to a
+  literal (non-regex) replace entirely, e.g. `StringBuilder`-based splicing.
+- **Severity:** low-moderate — an uncaught, unformatted crash on a plausible-if-unusual input (a
+  macro argument containing a stray trailing backslash), plus a silent, undocumented
+  character-dropping transformation on any argument containing `\` followed by another character.
+  Walnut's predicate grammar has no legitimate use for a literal `\` in a macro argument, so this
+  is unlikely to bite an ordinary user, but it is a real crash on input that is otherwise
+  syntactically unremarkable. No golden fixture uses a backslash in a macro-call argument.
+
+---
+
+## WB-020 — `Function.act`'s string representation has a spurious extra closing parenthesis
+
+- **Where:** `Main/EvalComputations/Token/Function.java`, `act` (`:72`): `stringValue +=
+  UtilityMethods.genericListString(expressions, ",") + "))";` — TWO closing parens, where the
+  surrounding `"("` (`:63`) and normal `name(args)` call syntax both call for exactly one.
+  `Word.act`'s equivalent string-building (`Word.java:60`, `"[" + expression + "]"` per argument)
+  has no such defect — this is specific to `Function`.
+- **What:** every `AutomatonExpression` produced by evaluating a `$name(...)` call carries a
+  DOUBLE closing paren in its printable form (`Expression.toString()`/`expressionInString`), e.g.
+  `phi(a,b))` instead of `phi(a,b)`. This is silent under normal evaluation (nothing rejects it),
+  but surfaces verbatim in any later error message that prints the operand — e.g.
+  `WalnutException.invalidOperator`/`invalidDualOperators`, raised whenever a function-call result
+  is combined with an operator it doesn't support.
+- **Trigger (empirically confirmed live through the real `walnut-java` CLI —
+  `java -cp target/Walnut-all.jar Main.Prover` with `--session-dir`, a temporary `Automata
+  Library/endsIn2Zeros.txt`, and the command file `eval trigger_bug "$endsIn2Zeros(a)=1";` — JDK
+  17, 2026-08-12):** the CLI prints `operator = cannot be applied to operands endsIn2Zeros(a)) and
+  1 of types Main.EvalComputations.Expressions.AutomatonExpression and
+  Main.EvalComputations.Expressions.NumberLiteralExpression respectively` — note `endsIn2Zeros(a))`,
+  the double paren, in real, user-visible CLI output (relational comparison rejects an
+  `AutomatonExpression` operand, exactly the kind `$`-calls produce).
+- **Found:** Phase 3a, U4 (`crates/wr-logic/src/token.rs`, `Function::act`), 2026-08-12.
+- **Rust port:** `ported verbatim (quirk)`. `Function::act` builds `string_value` as
+  `format!("{}({}))", self.name, joined)` — the double `)` is written explicitly and flagged at the
+  call site as WB-020, not a typo to fix silently. Pinned by
+  `function_act_conjoins_and_quantifies_producing_an_automaton_expression`
+  (`crates/wr-logic/src/token.rs`), which asserts the exact string `"phi(a,b))"`.
+- **Upstream:** not filed. Trivial one-character fix (`")"` instead of `"))"`).
+- **Severity:** low — cosmetic, diagnostics-only (no automaton/language decision reads this
+  string), but genuinely reaches real user-visible CLI output whenever a function-call result hits
+  a type-mismatched operator. No golden `error*` fixture happens to combine a `$`-call result with
+  an incompatible operator (checked: none of the corpus's `error*` fixtures invoke a `$`-defined
+  function at all), so Tier 1 neither pins nor contradicts this entry.
 
 ---
 

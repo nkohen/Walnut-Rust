@@ -71,15 +71,21 @@
 //! `Operator::act`, and nothing here forecloses that (a `&mut FreshIdentifiers`
 //! parameter added to a new method costs nothing today).
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::rc::Rc;
 
 use num_bigint::BigInt;
+use wr_core::automaton::Automaton;
+use wr_core::logicalops::and;
 use wr_core::numsys::{ArithmeticOp, NumberSystem, RelationalOp};
+use wr_core::quantify::QuantifyError;
 
 use crate::expr::{
-    AlphabetLetterExpression, Expression, NumberLiteralExpression, VariableExpression,
+    AlphabetLetterExpression, AutomatonExpression, ExprError, Expression, NumberLiteralExpression,
+    VariableExpression, WordExpression,
 };
+use crate::predicate_env::FreshIdentifiers;
 
 // ---------------------------------------------------------------------------
 // Operator symbol constants — `Operator`/`LogicalOperator`'s `public static final`
@@ -257,6 +263,69 @@ impl fmt::Display for TokenError {
 }
 
 impl std::error::Error for TokenError {}
+
+/// Every failure [`Token::act`] can report — U4 upgrades `act()` from an infallible
+/// method (U2's Variable/NumberLiteral/AlphabetLetter never fail) to a fallible one,
+/// because `Word.act`/`Function.act` (`Word.java:50-79`, `Function.java`'s own `act`)
+/// each open with `Token.validateArity(Stack, ...)` (a real, user-reachable
+/// `WalnutException` — an arity mismatch between the number of operands on the postfix
+/// stack and the token's own declared arity) and call straight through to the
+/// `Expression::act` overloads U2/U5 already ported in [`crate::expr`], several of which
+/// are themselves fallible ([`ExprError`]). [`Function::act`] additionally calls
+/// `AutomatonQuantification.quantify` (`wr_core::quantify::quantify`), so its own error
+/// type joins the union too.
+///
+/// A thin union, per this crate's established idiom (module-local enums, not one
+/// unified `WalnutError` — see `predicate.rs`'s `LexError` docs on the same point) rather
+/// than flattening every case into a single flat variant set.
+#[derive(Debug)]
+pub enum ActError {
+    Token(TokenError),
+    Expr(ExprError),
+    Quantify(QuantifyError),
+}
+
+impl From<TokenError> for ActError {
+    fn from(e: TokenError) -> Self {
+        ActError::Token(e)
+    }
+}
+
+impl From<ExprError> for ActError {
+    fn from(e: ExprError) -> Self {
+        ActError::Expr(e)
+    }
+}
+
+impl From<QuantifyError> for ActError {
+    fn from(e: QuantifyError) -> Self {
+        ActError::Quantify(e)
+    }
+}
+
+impl fmt::Display for ActError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ActError::Token(e) => write!(f, "{e}"),
+            ActError::Expr(e) => write!(f, "{e}"),
+            // Verbatim `WalnutException.notFreeVariable` for the one variant reachable in
+            // practice through `Function::act` (a name in the quantify list that isn't
+            // actually a track of the result -- shouldn't happen given how `quantify` is
+            // built here, but `wr_core::quantify::quantify` still reports it rather than
+            // assuming). The other two variants (`UnsupportedLsdFixup`, `Minimize`) are
+            // internal-invariant surfaces `wr_core::quantify` itself has no Java-text
+            // `Display` for yet, so they fall back to their `Debug` shape rather than this
+            // crate inventing wording Walnut never prints.
+            ActError::Quantify(QuantifyError::NotFreeVariable(s)) => write!(
+                f,
+                "Variable {s} in the list of quantified variables is not a free variable."
+            ),
+            ActError::Quantify(other) => write!(f, "{other:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ActError {}
 
 // ---------------------------------------------------------------------------
 // OperatorKind — the closed set `Operator.setPriority()` dispatches on
@@ -774,6 +843,329 @@ impl AlphabetLetter {
 }
 
 // ---------------------------------------------------------------------------
+// Word / Function — Phase 3a's U4
+// ---------------------------------------------------------------------------
+
+/// `wordAutomaton.getNS().get(i)` (`Word.java:62`), as honestly as this port can answer
+/// it today.
+///
+/// `wr-core`'s [`Automaton`] does not retain [`NumberSystem`] objects per track — only
+/// the two DERIVED facts `PORTING.md`'s "parallel vector" ruling settled on,
+/// [`Automaton::msd`] (direction) and [`Automaton::all_reps`] (custom-base restriction) —
+/// so `getNS().get(i)` cannot be a field read here. What it CAN be:
+///
+/// * a plain `msd_k`/`lsd_k` track (`all_reps[i]` is `None`, the common case) is
+///   reconstructed on the fly from its direction ([`Automaton::msd`]) and its alphabet
+///   size (`k`), via [`NumberSystem::new`]. This is semantically identical to Java's
+///   cached instance (same name, same automata) — it just isn't the SAME object, so it
+///   does not share [`NumberSystem`]'s U5 memoization with anything else in the formula.
+///   That divergence is invisible to a caller: [`VariableExpression::act`] only ever
+///   reads `ns.equality` here, never mutates or re-looks-up through it.
+/// * a `{...}`-declared track (`msd[i]` is `None`) has no numeration in Java either —
+///   correctly `None`, matching `getNS().get(i) == null` (see WB-013).
+/// * a CUSTOM-base track (`all_reps[i]` is `Some`, e.g. `msd_fib`) **cannot** be
+///   reconstructed this way: `wr-core` records only the valid-representations
+///   restriction automaton, not which named custom base produced it. This function
+///   conservatively returns `None` for that case too — a real, documented gap (not a
+///   Walnut bug; this is a port limitation, not something `docs/WALNUT-BUGS.md` covers).
+///   Consequence: a variable that indexes the SAME custom-base track twice
+///   (`Fib[i][i] = @1` for some custom-base word `Fib`) hits
+///   [`ExprError::RepeatedIdentifierMissingNumberSystem`] here even though real Walnut's
+///   `getNS().get(i)` is non-null there and would succeed. Flagged for whichever later
+///   unit gives `Automaton`/`PredicateEnv` a way to recover a custom base's identity.
+fn track_number_system(automaton: &Automaton, i: usize) -> Option<NumberSystem> {
+    if automaton.all_reps.get(i).and_then(|r| r.as_ref()).is_some() {
+        return None; // custom base -- known gap, see docs above
+    }
+    let is_msd = automaton.msd.get(i).copied().flatten()?;
+    let base = automaton.alphabet.get(i)?.len();
+    let name = if is_msd {
+        format!("msd_{base}")
+    } else {
+        format!("lsd_{base}")
+    };
+    NumberSystem::new(&name).ok()
+}
+
+/// `Token/Word.java` (80 LOC) — `T[i]`/`.NAME[i]`-style word/sequence occurrences.
+#[derive(Debug, Clone)]
+pub struct Word {
+    position_in_predicate: usize,
+    name: String,
+    word_automaton: Automaton,
+    /// `Word.arity` (via `Token.arity`, set from the constructor's `indexCount`
+    /// parameter, `Word.java:42`) — the number of index brackets this occurrence had,
+    /// NOT necessarily [`Self::word_automaton`]'s own arity (the constructor requires
+    /// them to be equal, but keeps both concepts distinct exactly as Java does).
+    arity: usize,
+}
+
+impl Word {
+    /// `Word(int position, String name, Automaton wordAutomaton, int indexCount)`
+    /// (`:38-44`). Fails with [`TokenError::WrongArgumentArity`] when `index_count`
+    /// doesn't match `word_automaton`'s real arity — `Token.validateArity(name,
+    /// wordAutomaton.getArity())`, an unchecked `WalnutException` in Java (called from
+    /// the constructor itself), so this is a `Result` here, not a panic: it is
+    /// user-triggered by any `T[i][j]...` whose bracket count doesn't match `T`'s
+    /// declared alphabet (`PredicateTest.wordWithMissingClosingBracketConsumesToEndOfInput`).
+    pub fn new(
+        position: usize,
+        name: impl Into<String>,
+        word_automaton: Automaton,
+        index_count: usize,
+    ) -> Result<Self, TokenError> {
+        let name = name.into();
+        let actual_arity = word_automaton.get_arity();
+        if actual_arity != index_count {
+            return Err(TokenError::WrongArgumentArity {
+                name,
+                expected_arity: actual_arity,
+                position,
+            });
+        }
+        Ok(Word {
+            position_in_predicate: position,
+            name,
+            word_automaton,
+            arity: index_count,
+        })
+    }
+
+    pub fn position_in_predicate(&self) -> usize {
+        self.position_in_predicate
+    }
+
+    pub fn arity(&self) -> usize {
+        self.arity
+    }
+
+    /// `Word.toString()` (`:46-48`): `return name;`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `Word.act(Stack<Expression> S)` (`:50-79`). `Logging.logAndPrint` calls are not
+    /// ported (Ruling 4 in `predicate_env.rs`: the logging context is threaded by U11's
+    /// executor, not grown piecemeal per `act()`), and the Java `expression == null`
+    /// branch has no Rust equivalent (an [`Expression`] can never be null).
+    pub fn act(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        // `super.validateArity(S, "word ", " indices")` (`Token.java:56-58`).
+        if stack.len() < self.arity {
+            return Err(TokenError::InsufficientStackOperands {
+                name1: "word ".to_string(),
+                token_display: self.name.clone(),
+                arity: self.arity,
+                name2: " indices".to_string(),
+            }
+            .into());
+        }
+        // `reverseStack(S)`: pop `arity` operands (rightmost first) onto a scratch
+        // stack, whose OWN top is then the leftmost operand -- so popping IT one at a
+        // time (below) yields the original left-to-right order.
+        let mut temp: Vec<Expression> = Vec::with_capacity(self.arity);
+        for _ in 0..self.arity {
+            temp.push(stack.pop().expect("validated arity above"));
+        }
+
+        let mut string_value = self.name.clone();
+        let mut identifiers: Vec<String> = Vec::new();
+        let mut quantify: Vec<String> = Vec::new();
+        let mut m = Automaton::true_false(true);
+        let mut word_automaton = self.word_automaton.clone();
+
+        for i in 0..self.arity {
+            let expression = temp.pop().expect("temp has exactly `arity` elements");
+            string_value.push('[');
+            string_value.push_str(&expression.to_string());
+            string_value.push(']');
+            match &expression {
+                Expression::Variable(ve) => {
+                    let ns = track_number_system(&word_automaton, i);
+                    m = ve.act(fresh, ns.as_ref(), &mut identifiers, m, &mut quantify)?;
+                }
+                Expression::Arithmetic(ae) => {
+                    m = ae.act(&mut identifiers, m, &mut quantify);
+                }
+                Expression::NumberLiteral(ne) => {
+                    m = ne.act(fresh, &mut identifiers, &mut quantify, m)?;
+                }
+                Expression::Automaton(ae) => {
+                    m = ae.act(&self.name, i, m, &mut identifiers)?;
+                }
+                // `AlphabetLetterExpression`/`WordExpression`: the Java `else` arm,
+                // `expression.act("argument " + (i + 1) + " of function " + this)` --
+                // always fails ([`Expression::act`]'s base-class fallback). Note Java's
+                // own hardcoded "function" wording even though `this` is a WORD, not a
+                // function -- a cosmetic Java quirk, ported verbatim (not a WB-worthy
+                // bug: the message is imprecise, never wrong about WHAT failed).
+                _ => {
+                    expression.act(&format!("argument {} of function {}", i + 1, self.name))?;
+                }
+            }
+        }
+        word_automaton.bind(identifiers);
+        stack.push(Expression::Word(Box::new(WordExpression::new(
+            string_value,
+            word_automaton,
+            m,
+            quantify,
+        ))));
+        Ok(())
+    }
+}
+
+/// `Token/Function.java` (99 LOC) — `$name(arg1, arg2, ...)` user-defined predicate
+/// calls.
+#[derive(Debug, Clone)]
+pub struct Function {
+    position_in_predicate: usize,
+    name: String,
+    automaton: Automaton,
+    arity: usize,
+    /// `Function.ns` (`Function.java:44`). Java builds this via `new
+    /// NumberSystem(number_system)` directly (`:52`) -- NOT through the shared
+    /// `NumberSystem.getComputeIfAbsent` cache every relational/arithmetic/number-literal
+    /// token resolves through. So, unlike everywhere else
+    /// [`crate::predicate_env::PredicateEnv::number_system`]'s `Rc`-shared handle is
+    /// used (Ruling 1), a `Function`'s own number system is genuinely a FRESH,
+    /// unmemoized instance in Java -- ported as an owned [`NumberSystem`] here, not an
+    /// `Rc`, to make that non-sharing visible in the type instead of silently "fixing"
+    /// it into sharing Java never does.
+    ns: NumberSystem,
+}
+
+impl Function {
+    /// `Function(String number_system, int position, String name, Automaton A, int
+    /// argCount)` (`:47-54`). See [`Word::new`]'s docs on why this is fallible, not a
+    /// panic. `ns` is the already-constructed [`NumberSystem`] Java's constructor builds
+    /// inline (`new NumberSystem(number_system)`) -- passed in here rather than built
+    /// from a bare name because building it can itself fail (an unresolvable `?ns`), and
+    /// [`crate::predicate::Predicate::put_function`] already has the machinery to map
+    /// that failure into a [`crate::predicate::LexError`] uniformly with every other
+    /// number-system resolution in this crate.
+    pub fn new(
+        position: usize,
+        name: impl Into<String>,
+        automaton: Automaton,
+        arg_count: usize,
+        ns: NumberSystem,
+    ) -> Result<Self, TokenError> {
+        let name = name.into();
+        let actual_arity = automaton.get_arity();
+        if actual_arity != arg_count {
+            return Err(TokenError::WrongArgumentArity {
+                name,
+                expected_arity: actual_arity,
+                position,
+            });
+        }
+        Ok(Function {
+            position_in_predicate: position,
+            name,
+            automaton,
+            arity: arg_count,
+            ns,
+        })
+    }
+
+    pub fn position_in_predicate(&self) -> usize {
+        self.position_in_predicate
+    }
+
+    pub fn arity(&self) -> usize {
+        self.arity
+    }
+
+    /// `Function.toString()` (`:56-58`): `return name;`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `Function.act(Stack<Expression> S)` (Java's own `act`, ~lines 60-98). Unlike
+    /// [`Word::act`], a `Function` immediately collapses to a single automaton (via
+    /// `AutomatonLogicalOps.and` + `AutomatonQuantification.quantify`) rather than
+    /// deferring to a later comparison -- see [`WordExpression`] vs [`AutomatonExpression`].
+    pub fn act(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        // `super.validateArity(S, "function ", " arguments")` (`Token.java:56-58`).
+        if stack.len() < self.arity {
+            return Err(TokenError::InsufficientStackOperands {
+                name1: "function ".to_string(),
+                token_display: self.name.clone(),
+                arity: self.arity,
+                name2: " arguments".to_string(),
+            }
+            .into());
+        }
+        let mut temp: Vec<Expression> = Vec::with_capacity(self.arity);
+        for _ in 0..self.arity {
+            temp.push(stack.pop().expect("validated arity above"));
+        }
+        // `Function.act`'s OWN second pop loop (`:69-71`), unlike `Word.act`'s single
+        // pass over `temp`: `expressions` is read TWICE below (once to build
+        // `stringValue`, once for the type-dispatch loop), so it must be a plain,
+        // left-to-right, re-readable list rather than something drained once.
+        let mut expressions: Vec<Expression> = Vec::with_capacity(self.arity);
+        for _ in 0..self.arity {
+            expressions.push(temp.pop().expect("temp has exactly `arity` elements"));
+        }
+
+        // `stringValue = this + "(" + genericListString(expressions, ",") + "))"`
+        // (`:72`) -- WB-020, ported verbatim: note the DOUBLE closing paren.
+        let joined = expressions
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let string_value = format!("{}({}))", self.name, joined);
+
+        let mut m = Automaton::true_false(true);
+        let mut identifiers: Vec<String> = Vec::new();
+        let mut quantify: Vec<String> = Vec::new();
+        for (i, expression) in expressions.iter().enumerate() {
+            match expression {
+                Expression::Variable(ve) => {
+                    m = ve.act(fresh, Some(&self.ns), &mut identifiers, m, &mut quantify)?;
+                }
+                Expression::Arithmetic(ae) => {
+                    m = ae.act(&mut identifiers, m, &mut quantify);
+                }
+                Expression::NumberLiteral(ne) => {
+                    m = ne.act(fresh, &mut identifiers, &mut quantify, m)?;
+                }
+                Expression::Automaton(ae) => {
+                    m = ae.act(&self.name, i, m, &mut identifiers)?;
+                }
+                // See `Word::act`'s matching arm docs -- same base-class fallback,
+                // same verbatim (if imprecise for a genuinely-word argument) wording.
+                _ => {
+                    expression.act(&format!("argument {} of function {}", i + 1, self.name))?;
+                }
+            }
+        }
+
+        let mut bound = self.automaton.clone();
+        bound.bind(identifiers);
+        let mut anded = and(&bound, &m).into_automaton();
+        let quantify_set: BTreeSet<String> = quantify.into_iter().collect();
+        wr_core::quantify::quantify(&mut anded, &quantify_set)?;
+
+        stack.push(Expression::Automaton(AutomatonExpression::new(
+            string_value,
+            anded,
+        )));
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token
 // ---------------------------------------------------------------------------
 
@@ -785,25 +1177,28 @@ pub enum Token {
     Variable(Variable),
     NumberLiteral(NumberLiteral),
     AlphabetLetter(AlphabetLetter),
+    Word(Word),
+    /// Boxed: `Function` (`NumberSystem` + `Automaton` + `String` + two `usize`s) makes
+    /// this variant far larger than its siblings, tripping `clippy::large_enum_variant`
+    /// — the same "box the large field" fix `PORTING.md`'s ruling already applied to
+    /// `Expression::Word` for the identical reason. Pure indirection; every call site
+    /// still reads through it via `Deref`.
+    Function(Box<Function>),
 }
 
 impl Token {
-    /// `Token.arity` (`protected int arity`, `:29`) — `0` for every leaf token THIS UNIT
-    /// PORTS (never set by `Variable`/`NumberLiteral`/`AlphabetLetter`'s constructors,
-    /// matching Java's `int` default), [`Operator::arity`] for an operator.
-    ///
-    /// **This `0` arm is only correct because `Word`/`Function` aren't modeled by
-    /// [`Token`] yet.** In real Java, `Word`/`Function` are the *other* two direct
-    /// `Token` subclasses (see the module docs) and their constructors DO set a nonzero
-    /// `arity` (`Word.java:42`: `this.arity = indexCount`; `Function.java`'s constructor
-    /// sets it from the declared argument count) — so when U4 adds `Token::Word`/
-    /// `Token::Function` variants, this match must grow real arms for them, NOT fall
-    /// into this `0` catch-all. Flagged explicitly so U4's author doesn't extend this arm
-    /// blindly by just adding the two new variants to the existing `0` case.
+    /// `Token.arity` (`protected int arity`, `:29`) — `0` for `Variable`/`NumberLiteral`/
+    /// `AlphabetLetter` (never set by their constructors, matching Java's `int`
+    /// default), [`Operator::arity`] for an operator, and — as of U4 — [`Word::arity`]/
+    /// [`Function::arity`] for the two remaining direct `Token` subclasses (`Word.java:42`:
+    /// `this.arity = indexCount`; `Function.java`'s constructor sets it from the declared
+    /// argument count).
     pub fn arity(&self) -> usize {
         match self {
             Token::Operator(op) => op.arity(),
             Token::Variable(_) | Token::NumberLiteral(_) | Token::AlphabetLetter(_) => 0,
+            Token::Word(w) => w.arity(),
+            Token::Function(f) => f.arity(),
         }
     }
 
@@ -814,6 +1209,8 @@ impl Token {
             Token::Variable(t) => t.position_in_predicate,
             Token::NumberLiteral(t) => t.position_in_predicate,
             Token::AlphabetLetter(t) => t.position_in_predicate,
+            Token::Word(w) => w.position_in_predicate(),
+            Token::Function(f) => f.position_in_predicate(),
         }
     }
 
@@ -823,23 +1220,31 @@ impl Token {
     }
 
     /// `Token.act(Stack<Expression> S)` (`:46`, no-op default) — overridden by
-    /// `Variable`/`NumberLiteral`/`AlphabetLetter` (ported below) and by
-    /// `LogicalOperator`/`RelationalOperator`/`ArithmeticOperator` (deferred to
-    /// U9/U10, so [`Token::Operator`] falls through to the inherited no-op here,
-    /// exactly matching Java's dispatch until those overrides exist). `Word`/`Function`
-    /// ALSO override this (`Word.java:50-79`, `Function.java`'s own `act`) — deferred to
-    /// U4 alongside their constructors (see the module docs) and, like the two
-    /// LogicalOperator-family overrides above, simply absent from this `match` rather
-    /// than modeled as a `Token` variant that falls through to a no-op; when U4 adds
-    /// `Token::Word`/`Token::Function` it must add real arms here too, not extend an
-    /// existing one.
-    pub fn act(&self, stack: &mut Vec<Expression>) {
+    /// `Variable`/`NumberLiteral`/`AlphabetLetter` (U2) and, as of U4, by `Word`/
+    /// `Function` (`Word.java:50-79`, `Function.java`'s own `act`). `Operator` itself
+    /// never overrides the inherited no-op directly — only its `LogicalOperator`/
+    /// `RelationalOperator`/`ArithmeticOperator` subclasses do (deferred to U9/U10), so
+    /// [`Token::Operator`] still falls through to `Ok(())` here.
+    ///
+    /// `fresh` is [`FreshIdentifiers`] (`predicate_env.rs`'s Ruling 4) — needed
+    /// transitively by `Word`/`Function::act` via the `Expression::act` overloads they
+    /// call, and now threaded through every arm even though the U2 leaf arms below
+    /// still ignore it, so this signature does not have to change again when U9/U10 add
+    /// `Operator::act` (which needs it too).
+    pub fn act(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
         match self {
             Token::Variable(t) => t.act(stack),
             Token::NumberLiteral(t) => t.act(stack),
             Token::AlphabetLetter(t) => t.act(stack),
             Token::Operator(_) => {}
+            Token::Word(w) => return w.act(fresh, stack),
+            Token::Function(f) => return f.act(fresh, stack),
         }
+        Ok(())
     }
 
     /// The tokenizer's own dispatch (`instanceof Operator` -> the 2-arg `put`, else
@@ -924,6 +1329,8 @@ impl fmt::Display for Token {
             Token::Variable(t) => write!(f, "{}", t.name),
             Token::NumberLiteral(t) => write!(f, "{}", t.value),
             Token::AlphabetLetter(t) => write!(f, "{}", t.value),
+            Token::Word(w) => write!(f, "{}", w.name()),
+            Token::Function(func) => write!(f, "{}", func.name()),
         }
     }
 }
@@ -1616,7 +2023,10 @@ mod tests {
     #[test]
     fn variable_token_act_pushes_variable_expression() {
         let mut stack = Vec::new();
-        Token::Variable(Variable::new(0, "x")).act(&mut stack);
+        let mut fresh = FreshIdentifiers::new();
+        Token::Variable(Variable::new(0, "x"))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
             Expression::Variable(v) => assert_eq!(v.identifier, "x"),
@@ -1627,8 +2037,11 @@ mod tests {
     #[test]
     fn number_literal_token_act_pushes_number_literal_expression_without_mutating_ns() {
         let mut stack = Vec::new();
+        let mut fresh = FreshIdentifiers::new();
         let n = ns("msd_2");
-        Token::NumberLiteral(NumberLiteral::new(0, BigInt::from(7), Rc::clone(&n))).act(&mut stack);
+        Token::NumberLiteral(NumberLiteral::new(0, BigInt::from(7), Rc::clone(&n)))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
             Expression::NumberLiteral(nl) => {
@@ -1642,7 +2055,10 @@ mod tests {
     #[test]
     fn alphabet_letter_token_act_pushes_alphabet_letter_expression() {
         let mut stack = Vec::new();
-        Token::AlphabetLetter(AlphabetLetter::new(0, -1)).act(&mut stack);
+        let mut fresh = FreshIdentifiers::new();
+        Token::AlphabetLetter(AlphabetLetter::new(0, -1))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
             Expression::AlphabetLetter(al) => assert_eq!(al.constant, -1),
@@ -1653,23 +2069,145 @@ mod tests {
     #[test]
     fn operator_token_act_is_a_noop_pending_u9_u10() {
         let mut stack = Vec::new();
-        Token::Operator(Operator::logical_connective(0, "&")).act(&mut stack);
+        let mut fresh = FreshIdentifiers::new();
+        Token::Operator(Operator::logical_connective(0, "&"))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
         assert!(stack.is_empty());
+    }
+
+    // ------------------------------------------------------------- Word / Function
+
+    /// A 2-track `msd_2` word automaton, unlabeled (as every word occurrence's automaton
+    /// is before `Word`/`Function::act` binds it). The transition table is empty --
+    /// irrelevant to what these tests check (arity/binding/dispatch, never the
+    /// automaton's language) — mirroring `expr.rs`'s own `labeled_automaton` helper.
+    fn stub_word_automaton() -> Automaton {
+        let fa = wr_core::fa::Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 4,
+            o: vec![1],
+            d: vec![std::collections::BTreeMap::new()],
+        };
+        Automaton::new(
+            fa,
+            vec![vec![0, 1], vec![0, 1]],
+            Vec::new(),
+            vec![Some(true), Some(true)],
+        )
+    }
+
+    #[test]
+    fn word_new_rejects_an_index_count_mismatch_with_the_automatons_own_arity() {
+        let err = Word::new(0, "T", stub_word_automaton(), 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "function T requires 2 arguments: char at 0"
+        );
+    }
+
+    #[test]
+    fn word_act_binds_variables_and_pushes_a_word_expression() {
+        let word = Word::new(0, "T", stub_word_automaton(), 2).unwrap();
+        let mut fresh = FreshIdentifiers::new();
+        // Push in source order (a, b) -- `Word::act` reverses internally, same contract
+        // as `Token::reverse_stack`.
+        let mut stack = vec![
+            Expression::Variable(VariableExpression::new("a")),
+            Expression::Variable(VariableExpression::new("b")),
+        ];
+        Token::Word(word).act(&mut fresh, &mut stack).unwrap();
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].to_string(), "T[a][b]");
+        match &stack[0] {
+            Expression::Word(w) => {
+                assert_eq!(
+                    w.word_automaton.label,
+                    vec!["a".to_string(), "b".to_string()]
+                );
+                assert!(w.identifiers_to_quantify.is_empty());
+            }
+            other => panic!("expected Word, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_new_rejects_an_arg_count_mismatch_with_the_automatons_own_arity() {
+        let err = Function::new(
+            1,
+            "phi",
+            stub_word_automaton(),
+            1,
+            NumberSystem::new("msd_2").unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "function phi requires 2 arguments: char at 1"
+        );
+    }
+
+    #[test]
+    fn function_act_conjoins_and_quantifies_producing_an_automaton_expression() {
+        let func = Function::new(
+            0,
+            "phi",
+            stub_word_automaton(),
+            2,
+            NumberSystem::new("msd_2").unwrap(),
+        )
+        .unwrap();
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![
+            Expression::Variable(VariableExpression::new("a")),
+            Expression::Variable(VariableExpression::new("b")),
+        ];
+        Token::Function(Box::new(func))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        assert_eq!(stack.len(), 1);
+        // WB-020: the double closing paren is Java's own text, ported verbatim.
+        assert_eq!(stack[0].to_string(), "phi(a,b))");
+        assert!(matches!(stack[0], Expression::Automaton(_)));
+    }
+
+    #[test]
+    fn word_and_function_act_reject_an_insufficient_stack() {
+        let word = Word::new(0, "T", stub_word_automaton(), 2).unwrap();
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![Expression::Variable(VariableExpression::new("a"))];
+        let err = Token::Word(word).act(&mut fresh, &mut stack).unwrap_err();
+        assert_eq!(err.to_string(), "word T requires 2 indices");
+
+        let func = Function::new(
+            0,
+            "phi",
+            stub_word_automaton(),
+            2,
+            NumberSystem::new("msd_2").unwrap(),
+        )
+        .unwrap();
+        let mut stack = vec![Expression::Variable(VariableExpression::new("a"))];
+        let err = Token::Function(Box::new(func))
+            .act(&mut fresh, &mut stack)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "function phi requires 2 arguments");
     }
 
     // --------------------------------------------------------------- validate_arity
 
     // NOTE on the next two tests: `Token::validate_arity_stack`/`Token::validate_arity`
     // exist in Java (`Token.java:56-63`) purely to support `Word`/`Function`'s
-    // constructors and `act()` bodies -- the ONLY real Java callers, and both classes
-    // are deferred to U4 (see the module docs). Since neither exists in THIS diff yet,
-    // these two tests exercise the shared mechanism generically against an `&` operator
-    // and a bare `Variable` -- shapes real Java code never actually calls these two
-    // methods on (an `Operator` validates arity via `Operator::validate_arity` /
-    // `Operator.validateArity(Stack)` instead, never `Token`'s two-arg overloads). They
-    // pin the message-formatting contract these methods must keep, not a Java-reachable
-    // call site -- U4 should add the real `Word`/`Function` call-site tests when it
-    // lands, rather than treating these as already covering that ground.
+    // constructors and `act()` bodies -- the ONLY real Java callers. `Word`/`Function`
+    // now exist (U4) and inline their OWN copy of the `Stack`-overload's logic directly
+    // in `act()` (see `Word::act`/`Function::act`'s docs) rather than calling through
+    // `Token::validate_arity_stack` on a not-yet-constructed `Token` -- so these two
+    // tests still exercise the shared mechanism generically against an `&` operator and
+    // a bare `Variable`, shapes real Java code never actually calls these two `Token`
+    // methods on. The real `Word`/`Function` call-site coverage for arity/message
+    // shape lives in the "Word / Function" tests further down instead.
     #[test]
     fn validate_arity_stack_reports_java_message_shape() {
         let t = Token::Variable(Variable::new(0, "T"));
