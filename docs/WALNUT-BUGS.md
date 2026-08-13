@@ -1057,6 +1057,116 @@ bug costs a silent wrong answer somewhere downstream.
   misleading there: it names an operand that is not the one that failed. No golden `error*` fixture
   combines a word-vs-arithmetic comparison result with a type-mismatched operator (checked), so
   Tier 1 neither pins nor contradicts this entry.
+## WB-024 — `reg`'s digit encoding collides with dk.brics' reserved characters, so an out-of-alphabet digit's effect depends on where it appears
+
+- **Where:** `Main/Commands/Reg.determineEncodedRegex` (`Reg.java:42-76`, specifically `:63`'s
+  `BricsConverter.convertEncodingForBrics(r.encode(L))`), acting on `Automata/RichAlphabet.encode`
+  (`RichAlphabet.java:109-115`) and `Automata/FA/BricsConverter.convertEncodingForBrics`
+  (`BricsConverter.java:158-165`).
+- **What:** `reg` rewrites every alphabet vector and every bare digit in the user's regex into a single
+  character standing for that input vector's *encoding*, so that `dk.brics` — which only understands
+  characters — can parse a multi-track regex at all. The two halves of that rewrite disagree about their
+  contract:
+  * `RichAlphabet.encode` computes `Σ encoder[i] * A.get(i).indexOf(l.get(i))`. `List.indexOf` returns
+    **`-1`** for a digit that is not in that track's alphabet, and nothing checks for it — so an
+    out-of-alphabet digit silently produces a **negative** encoding rather than an error.
+  * `convertEncodingForBrics` then does `vectorEncoding += 128; (char) vectorEncoding`, with the explicit
+    comment that `+128` is enough "to ensure that we have no conflicts" with dk.brics' reserved
+    characters, "All of these reserved characters have UTF-16 values between 0 and 127". That reasoning is
+    sound only for **non-negative** encodings; a negative one lands right back inside `0..127`, i.e. inside
+    the reserved range the offset exists to escape, and is then read as regex *syntax*.
+
+  The result is that whether an out-of-alphabet digit is harmless, silently wrong, or a hard crash depends
+  entirely on which reserved character its encoding happens to hit and on where in the regex it sits:
+  ```
+  reg foo {0,1,2,3} {0,1} "[9,9][0,0]";   ->  Set from brics:1 states   (empty language, no diagnostic)
+  reg foo {0,1,2,3} {0,1} "[0,0][9,9]";   ->  java.lang.IllegalArgumentException: integer expected at position 3
+  ```
+  Both regexes contain exactly the same two vectors; only their order differs. `[9,9]` encodes to
+  `1*(-1) + 4*(-1) = -5`, and `-5 + 128 = 123 = '{'`. In the first regex the `{` is a leading literal and
+  the language quietly comes out empty; in the second it *follows* an expression, where dk.brics'
+  `parseRepeatExp` reads it as the start of a `{n,m}` repeat count and throws. The reported position
+  (`3`) is an index into the internally-wrapped `"(" + regex + ")&[…]*"` string, so it does not even point
+  at the offending vector in the user's own input.
+  Two further faces of the same root cause, both confirmed by reading the code and reproduced by the port's
+  own tests: an encoding of `-119` yields character `9` (TAB), which
+  `determineEncodedRegex`'s closing `replaceAll("\\s", "")` then **deletes**, so the character disappears
+  with no diagnostic at all; and `[10]`-shaped input is swallowed by `RE_FOR_AN_ALPHABET_VECTOR` as the
+  one-element vector holding the integer `10` (not as a character class), which on a `{0,1}` alphabet takes
+  the same `-1` path and silently becomes the empty language.
+- **Trigger:** any `reg` command whose regex mentions a digit or vector component that is not in the
+  declared alphabet for that track — a plain user typo (`reg r {0,1} "[2,0]*"`), and, more insidiously, any
+  bracketed multi-digit run like `[10]` that a user reasonably reads as a character class.
+- **Found:** Phase 3a, U8 (`wr-core`'s regex engine), 2026-08-12. Pre-identified during the Phase-3 planning
+  research and re-confirmed live here against the real `walnut-java` CLI (`target/Walnut-all.jar`): both
+  commands above were run and produced exactly the quoted outputs.
+- **Rust port:** `ported verbatim (quirk)`. `wr_core::regex::encode_with_index_of` reproduces
+  `List.indexOf`'s `-1` deliberately (it exists *because* `Automaton::encode` panics on an out-of-alphabet
+  digit and therefore cannot be reused here), and `convert_encoding_for_brics` reproduces Java's truncating
+  `(char)` cast rather than range-checking. Pinned by `wb_024_*` in `crates/wr-core/src/regex/tests.rs`
+  (four tests: the encoding itself, the order-dependence end to end, the "every negative encoding lands in
+  the reserved range" invariant plus the whitespace-deletion face, and the `[10]` face) and by
+  `wb_024_alphabet_offset_collision_is_order_dependent` in
+  `tests/differential/tests/reg_brics_regex.rs`, which asserts the same two commands against the same
+  behavior the real jar produced.
+- **Upstream:** not filed. The minimal fix is a guard in `Reg.determineEncodedRegex` (or in
+  `RichAlphabet.encode`): reject a digit whose `indexOf` is `-1` with a real message naming the digit and
+  the track, instead of letting a negative encoding reach `convertEncodingForBrics`. Widening the offset
+  would not be sufficient on its own — the wrong-answer case (`[9,9][0,0]` quietly yielding the empty
+  language) is a missing *validation*, not a character-range problem.
+- **Severity:** moderate-to-high — this is a **silently wrong answer** on plausible user input in the most
+  common branch (a mistyped digit produces the empty language, and an empty-language `reg` result then
+  propagates into every `eval` that uses it), with the crash branch as a bonus. It is bounded only by
+  needing an out-of-alphabet digit in the first place; the `[10]`-as-a-vector face makes that easier to hit
+  than it looks, since nothing in the syntax warns that bracketed digit runs are vectors rather than
+  character classes.
+
+---
+
+## WB-025 — `BricsConverter.convertEncodingForBrics`'s `+128` offset itself overflows `char` for large, validator-legal alphabets, wrapping a legitimate symbol back into dk.brics' reserved range
+
+- **Where:** `Automata/FA/BricsConverter.convertEncodingForBrics` (`BricsConverter.java:158-165`)
+  together with its own guard, `BricsConverter.validateBricsAlphabetSize`/`MAX_BRICS_CHARACTER`
+  (`BricsConverter.java:151-156`), reached from `Reg.determineEncodedRegex` (`Reg.java:63`) and from
+  `BricsConverter.setFromBricsAutomaton` (`BricsConverter.java:54-80`).
+- **What:** This is the same underlying mechanism as WB-024 — the truncating `(char)(128 +
+  vectorEncoding)` cast — but triggered by a different, narrower condition: a perfectly legitimate,
+  in-alphabet symbol index rather than an out-of-alphabet digit. `validateBricsAlphabetSize` only
+  rejects `alphabetSize > MAX_BRICS_CHARACTER` where `MAX_BRICS_CHARACTER == (1<<16)-1 == 65535`, so
+  any `alphabetSize` up to and including `65535` passes validation, making every symbol index `x` in
+  `0..alphabetSize` (i.e. up to `65534`) validator-legal. But `char` is a 16-bit unsigned type in
+  Java, so `128 + x` for `x >= 65408` is `>= 65536` and wraps (via the narrowing cast, exactly as
+  WB-024's entry describes) back into `0..127` — dk.brics' own reserved range, the very range the
+  `+128` offset exists to escape. Concretely: `x = 65408` encodes to `(char) 65536 == 0` (the NUL
+  character), and `x = 65534` (the largest symbol index a `65535`-alphabet ever assigns) encodes to
+  `(char) 65662 == '~'` (`~`, dk.brics' complement operator). Every symbol index in
+  `[65408, 65534]` collides with a reserved character the same way WB-024's out-of-alphabet digits
+  do — the regex silently reads as different syntax than intended, or throws a Brics parse error
+  unrelated to the user's actual mistake — except here there IS no mistake: the alphabet and the
+  symbol index are both exactly what the validator was supposed to guarantee are safe.
+- **Trigger:** any `reg` command (or other caller of `setFromBricsAutomaton`) declaring a track
+  alphabet whose size is in `(65408, 65535]` — reachable, if implausible in ordinary hand-written
+  queries, since nothing before `validateBricsAlphabetSize` rejects it, and generated/large-alphabet
+  automata are exactly the kind of input this code is otherwise supposed to tolerate up to its
+  documented `65535` limit.
+- **Found:** Phase 3a, U8 adversarial review (`wr-core`'s regex engine), 2026-08-12. Same
+  `(1<<16)-1` bound and same truncating cast confirmed live against the real `BricsConverter.java`
+  source (`:151-165`); not a hypothetical reading, the arithmetic is unconditional once
+  `alphabetSize` is in the affected range.
+- **Rust port:** `ported verbatim (quirk)`. `wr_core::regex::convert_encoding_for_brics` reproduces
+  Java's `(char)` narrowing cast exactly via `vector_encoding.wrapping_add(128) as u16`, and
+  `validate_brics_alphabet_size` reproduces `MAX_BRICS_CHARACTER == (1<<16)-1` verbatim, so the same
+  wraparound reproduces at the same boundary. Pinned by
+  `wb_025_a_legitimate_large_alphabet_symbol_wraps_into_the_reserved_range` in
+  `crates/wr-core/src/regex/tests.rs`, right next to the WB-024 tests.
+- **Upstream:** not filed. The minimal fix is tightening `MAX_BRICS_CHARACTER` (or
+  `validateBricsAlphabetSize`'s bound) to `65535 - 128 = 65407`, so every validator-accepted symbol
+  index's `+128` offset stays inside `char`'s range — narrower than WB-024's fix (which is a missing
+  *validation* of the encoding's sign), this is a missing validation of the encoding's *magnitude*.
+- **Severity:** low-to-moderate — same silently-wrong-answer/spurious-parse-error shape as WB-024,
+  but gated behind an alphabet size (`> 65408`) far outside any plausible hand-written Walnut query;
+  realistic exposure is through generated/fuzzed or programmatically-constructed large alphabets, not
+  everyday use.
 
 ---
 

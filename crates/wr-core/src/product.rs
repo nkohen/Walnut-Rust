@@ -167,7 +167,12 @@ use crate::fa::Fa;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// `ProductStrategies.NOT_SAME_INPUT_IN_BOTH` (`ProductStrategies.java:29`).
-const NOT_SAME_INPUT_IN_BOTH: i32 = -1;
+///
+/// `pub(crate)` since U8: `crate::regex`'s intersection operator builds its own
+/// `all_inputs_of_axb` table for [`cross_product_internal`] (both operands read the same
+/// single dense track, so only the diagonal is legal) and needs the same sentinel value
+/// rather than a second, independently-maintained `-1` literal.
+pub(crate) const NOT_SAME_INPUT_IN_BOTH: i32 = -1;
 
 /// The four boolean connectives that reach `ProductStrategies.crossProduct*` via a
 /// `LogicalOperator` op string in Java — see module docs for why this crate defines
