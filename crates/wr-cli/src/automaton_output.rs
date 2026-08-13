@@ -34,8 +34,11 @@ use wr_io::writer::{write_automaton_gv, write_automaton_txt};
 
 use crate::session::Session;
 
-/// `Automaton.GV_EXTENSION` — not ported anywhere else yet (no other unit needed it).
-const GV_EXTENSION: &str = ".gv";
+/// `Automaton.GV_EXTENSION` (also referenced directly as `Prover.GV_EXTENSION` at
+/// `EvalDef.java:74`, the same string constant) — `pub(crate)` since U15's `eval_def`
+/// needs it too, to build `TestCase`'s `gv_address` field without a second,
+/// independently-drifting copy of `".gv"`.
+pub(crate) const GV_EXTENSION: &str = ".gv";
 
 /// `Automaton.writeAutomata(String predicate, String outLibrary, String name, boolean
 /// isDFAO)`. `is_dfao_for_gv` is Java's `isDFAO` parameter — note both real callers
