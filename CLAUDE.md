@@ -299,7 +299,10 @@ correct against real `walnut-java`. **Not verified**: the `I` (infinitely-often)
 `lsd` — it dispatches through `wr_core::infinite::infinite`, a code path that never calls
 `quantify` at all, so this fix neither touched nor tested it; and `reg` over `lsd_*`, which also
 never routes through `quantify` (Thompson construction + determinize only) and has its own,
-separate, pre-existing `lsd` coverage in `reg_and_alphabet_commands.rs`.
+separate, pre-existing `lsd` coverage in `reg_and_alphabet_commands.rs`. **User priority signal
+(2026-08-13): `I`-over-`lsd` is explicitly "could be nice to have," not a hard requirement like the
+`lsd_k` fix above was — the user chose to leave it as a tracked backlog item rather than fix it
+immediately. Revisit when picking up related work or if it starts blocking something, not before.**
 
 Not yet started: the rest of **Phase 3b** (the remaining `wr-core` primitives — `Morphism`, `convertNS`,
 `Search/ProductBFS`, `Transducer` — the real `Prover.java` dispatch/REPL/`MetaCommands` wiring
