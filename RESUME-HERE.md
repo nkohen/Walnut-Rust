@@ -19,12 +19,30 @@ no-op `DeterminizeContext` hook), all remaining `Commands/*` (batched — `Combi
 consuming `walnut-java/phase0-artifacts/subset-filter.json`) — the actual DESIGN.md Phase-3 exit
 criterion ("Tier 1 green; eval/def/reg work").
 
-**A real, open item from Phase 3a to fold into Phase 3b's planning**: `eval`/`def`/`reg` over
-`lsd_*` numeration combined with any quantifier (`E`/`A`/`I`) currently fails
-(`QuantifyError::UnsupportedLsdFixup`, `wr-core::quantify`) — pre-existing Phase-2 scope debt, not
-new, but now confirmed live and worth a deliberate fix-now-vs-schedule decision before Phase 3b's
-golden-corpus harness hits an `lsd`+quantifier fixture (it will — 18%+ of golden fixtures use
-custom/alternate bases per earlier phase counts, and `lsd` is common among them).
+**RESOLVED (Phase 3b, L1) — was the one real open item Phase 3a left behind — scope corrected
+below, read it before assuming this covers more than it does.** `eval`/`def` over `lsd_*`
+numeration used to fail with `QuantifyError::UnsupportedLsdFixup` (`wr-core::quantify`),
+pre-existing Phase-2 scope debt confirmed live by Phase 3a's exit checkpoint. It was reported as
+"lsd + a quantifier", but the real blast radius was wider: because `wr_core::numsys` calls
+`quantify` to build its own automata, *any* `lsd_k` comparison or arithmetic against a constant
+`>= 2` failed too — `?lsd_2 x >= 2`, with no user-written quantifier anywhere. L1 wired
+`AutomatonLogicalOps.fixTrailingZerosProblem` into `quantify`'s `Some(false)` arm (the plain port
+of Java's `AutomatonQuantification.java:46`, which U5 had already made available and U6 chose not
+to call), deleted the now-unconstructible `UnsupportedLsdFixup` variant, flipped the four tests
+that pinned the rejection into tests of the computed language, and added the positive coverage
+that had never existed: `wr-core`'s `quantify_on_an_lsd_automaton_runs_the_trailing_zero_fixup`
+(msd/lsd contrast on one transition table), `numsys`'s
+`lsd_composed_constructions_compute_the_right_language` +
+`msd_and_lsd_composed_constructions_agree_after_reversal` (Tier 4), `wr-logic`'s
+`lsd_numeration_evaluates_end_to_end`, and `tests/differential/tests/lsd_numeration.rs` (five
+cases against real `walnut-java` output, incl. a three-track `lsd_3` one).
+**Scope, precisely** (a first draft of this note overclaimed and was corrected on review): verified
+for `lsd_k` only (not `lsd_fib`/custom-base) — `∃` and closed `∀` (`¬∃¬`) both confirmed correct.
+**Not verified**: the `I` quantifier over `lsd` (dispatches through `wr_core::infinite::infinite`,
+which never calls `quantify` — this fix neither touched nor tested it), and `reg` over `lsd_*`
+(also never routes through `quantify`; has its own separate, pre-existing coverage in
+`reg_and_alphabet_commands.rs`). Phase 3b's golden-corpus harness can take `lsd_k` `eval`/`def`
+fixtures now, but an `lsd`+`I` or custom-base-`lsd` fixture is still untested ground.
 
 ## Process lessons from this phase, worth carrying into Phase 3b
 

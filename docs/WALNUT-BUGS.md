@@ -59,7 +59,17 @@ bug costs a silent wrong answer somewhere downstream.
   (`automaton.rs`). Faithful to Java (same bug, same call site), so ported verbatim, not fixed with
   an undeclared extra `trim`. No guard exists at the `minimize` API boundary itself (flagged, not
   yet acted on, by the Phase-1 final integration review, commit `52e0bcf`'s discussion) — this
-  finding makes that gap concretely reachable rather than hypothetical.
+  finding makes that gap concretely reachable rather than hypothetical. **Update (Phase 3b, L1):
+  one further reach path, added by wiring the lsd branch of `wr_core::quantify::quantify` up to
+  `fix_trailing_zeros_problem`.** That fixup closes with `justMinimize` (which never trims),
+  unlike its msd sibling `fixLeadingZerosProblem`, which closes with
+  `determinizeAndMinimize(IntSet)` and so re-establishes the reachability precondition via subset
+  construction. It is unreachable on the ordinary path (`quantifyHelper`'s own
+  determinize+minimize leaves every state reachable from `q0`) and only opens up when the helper
+  short-circuits — empty label set, or a label-less automaton — on an input that already had an
+  unreachable state. Java has the identical shape at the identical call site
+  (`AutomatonQuantification.java:46`), so ported verbatim, not guarded; recorded here so the
+  call-site inventory above stays complete.
 - **Upstream:** not filed. A ~3-line guard (`if blocks.loc[q0] >= rr` after the reachability pass,
   route to the canonical dead-automaton case) would fix it in Java too.
 - **Severity:** **critical** — silent wrong answer (not a crash), in the automaton engine's most

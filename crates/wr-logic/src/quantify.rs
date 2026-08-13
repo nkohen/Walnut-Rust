@@ -206,17 +206,40 @@ mod tests {
         }
     }
 
+    /// **This test used to pin a rejection** (`Err(QuantifyError::UnsupportedLsdFixup)`):
+    /// before Phase 3b's L1, `wr_core::quantify`'s lsd arm was a hard error instead of a
+    /// call to `fixTrailingZerosProblem`. It now pins the computed result.
+    ///
+    /// The automaton is `less_than_msd(2)` with its two tracks *declared* lsd — a
+    /// deliberately mismatched fixture (the transition table still reads
+    /// most-significant-first), kept from the pre-L1 version so the diff stays honest
+    /// about what changed. What it checks is the branch, not the numeration semantics:
+    /// projecting `i` away yields "the word contains a 1", the trailing-zero fixup is a
+    /// no-op on that language (no state reaches an accepting state by reading zeros
+    /// that isn't accepting already), and the surviving track keeps its lsd marking.
+    /// Real lsd *semantics* is covered where the real lsd automata are built —
+    /// `wr_core::numsys`'s `lsd_composed_constructions_compute_the_right_language` /
+    /// `msd_and_lsd_composed_constructions_agree_after_reversal`,
+    /// `wr_core::quantify`'s `quantify_on_an_lsd_automaton_runs_the_trailing_zero_fixup`,
+    /// and `crate::eval`'s `lsd_numeration_evaluates_end_to_end`.
     #[test]
-    fn lsd_tracks_are_rejected_rather_than_mishandled() {
+    fn lsd_tracks_are_quantified_rather_than_rejected() {
         let mut a = less_than_msd(2);
         a.label = vec!["i".to_string(), "x".to_string()];
         a.msd = vec![Some(false), Some(false)];
-        assert_eq!(
-            exists(&mut a, &labels(&["i"])),
-            Err(QuantifyError::UnsupportedLsdFixup)
-        );
-        // The projection itself still happened (Java sequences it before the fixup).
+
+        exists(&mut a, &labels(&["i"])).unwrap();
+
         assert_eq!(a.label, vec!["x".to_string()]);
+        assert_eq!(a.msd, vec![Some(false)], "the track stays lsd");
+        // Same language as the msd run of this fixture ("contains a 1"), because the
+        // trailing-zero fixup is a no-op here -- it only ever widens the accepting set,
+        // and nothing reaches acceptance by reading zeros that is not accepting already.
+        assert!(!a.fa.accepts_word(&word1(&a, &[0])));
+        assert!(!a.fa.accepts_word(&word1(&a, &[0, 0])));
+        assert!(a.fa.accepts_word(&word1(&a, &[1])));
+        assert!(a.fa.accepts_word(&word1(&a, &[1, 0])));
+        assert!(a.fa.accepts_word(&word1(&a, &[0, 1])));
     }
 
     #[test]

@@ -66,10 +66,12 @@
 //!
 //! Three separate command-file runs (the CLI's `reg` grammar takes an UNQUOTED alphabet
 //! token list, so `msd_fib` cannot share a line with the quoted-regex cases; `func_quant`
-//! needed a second pass after an initial `lsd_2` attempt hit the known
+//! needed a second pass after an initial `lsd_2` attempt hit the then-open
 //! `UnsupportedLsdFixup` gap documented at
 //! [`function_token_combined_with_quantifier_matches_real_walnut`] and was switched to
-//! `msd_2`):
+//! `msd_2` — that gap is closed as of Phase 3b's L1, and `tests/lsd_numeration.rs` is
+//! the differential suite that now covers `lsd_k`, but this file's captures were not
+//! re-taken):
 //!
 //! ```bash
 //! cd ~/dev/walnut-java
@@ -399,16 +401,19 @@ fn word_token_combined_with_quantifier_matches_real_walnut() {
 /// **Why `msd_2`, not `lsd_2`:** an earlier draft of this test used the real Walnut example
 /// `$endsIn2Zeros(i)` (an `lsd_2` automaton, from `IntegrationTest.java`) with an `Ei`
 /// quantifier. That combination -- `∃` elimination over an `lsd`-numeration variable --
-/// currently returns `QuantifyError::UnsupportedLsdFixup` in this port: `wr_core::quantify`'s
-/// leading-zero fixup after ∃-projection is implemented for `msd` systems only so far,
-/// a pre-existing, already-documented scope gap (see `wr_core::quantify`/`wr_core::numsys`'s
-/// own module docs, and `wr_logic::eval`'s docs on `evaluate`'s `lsd`-quantification caveat)
-/// predating this checkpoint -- **not** a new finding from this file, and not logged as a
-/// fresh `WALNUT-BUGS.md` entry (it is the Rust port's own known-incomplete surface, not a
-/// Java behavioral divergence). This test was switched to an `msd_2` function target instead
-/// of chasing that gap, since exercising "function token + quantifier" is this case's actual
-/// point, not `lsd`-quantification specifically (which has zero coverage here either way and
-/// remains open Phase-3b-or-later work).
+/// returned `QuantifyError::UnsupportedLsdFixup` in this port when this checkpoint was
+/// written: `wr_core::quantify`'s post-∃-projection zero fixup was wired up for `msd`
+/// systems only, a pre-existing Phase-2 scope gap predating this checkpoint -- **not** a
+/// new finding from this file, and not a `WALNUT-BUGS.md` entry (it was the Rust port's own
+/// known-incomplete surface, not a Java behavioral divergence). This test was switched to an
+/// `msd_2` function target rather than chasing that gap, since exercising "function token +
+/// quantifier" is this case's actual point.
+///
+/// **That gap is now closed** (Phase 3b's L1 wired `fixTrailingZerosProblem` in; see
+/// `wr_core::quantify`'s "The lsd fixup" section). `lsd_k` differential coverage lives in
+/// `tests/lsd_numeration.rs`, deliberately as its own file with its own captures rather
+/// than by re-taking this checkpoint's fixtures -- this file is a *Phase 3a* exit record
+/// and is left as captured.
 #[test]
 fn function_token_combined_with_quantifier_matches_real_walnut() {
     let (session, dir) = temp_session("func-quant");

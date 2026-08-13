@@ -148,17 +148,20 @@
 //! [`tests::forall_closed_formula_logs_a_zero_state_count_a_known_divergence`]) here
 //! rather than fixed here.
 //!
-//! ## Scope note: `msd` only — the `lsd` half of KEEP-scope numeration is unreachable
+//! ## Scope note (RESOLVED in Phase 3b's L1): `lsd_k` numeration
 //!
-//! "Composes end-to-end", above, means **`msd` numeration**. Every `lsd_k` query
-//! currently fails at [`wr_core::quantify`] with `QuantifyError::UnsupportedLsdFixup`
-//! (real Walnut evaluates e.g. `?lsd_2 x >= 2` fine): Phase 2 never wired
-//! `fixTrailingZerosProblem` into `quantify`. That is **pre-existing `wr-core` scope
-//! debt**, not something this unit introduced or can fix (the fix is a `wr-core::quantify`
-//! unit), but it is roughly half of KEEP-scope numeration, so it is stated here rather
-//! than left implicit. [`tests::lsd_numeration_is_currently_rejected_pre_existing_wr_core_gap`]
-//! pins the current rejecting behavior; the gap must close before any `lsd`-using golden
-//! fixture is exercised in Phase 3b.
+//! When this module landed, "composes end-to-end" meant **`msd` numeration only**: every
+//! `lsd_k` query beyond a bare variable-to-variable comparison failed at
+//! [`wr_core::quantify`] with a `QuantifyError::UnsupportedLsdFixup`, because Phase 2
+//! never wired `fixTrailingZerosProblem` into `quantify`. That was pre-existing `wr-core`
+//! scope debt this module's own unit could neither introduce nor fix, and it was much
+//! wider than "lsd + an explicit quantifier": `wr_core::numsys` calls `quantify` to build
+//! its own automata, so `?lsd_2 x >= 2` — no user-written quantifier anywhere — failed
+//! too.
+//!
+//! Phase 3b's L1 wired the branch up (see [`wr_core::quantify`]'s "The lsd fixup"
+//! section). [`tests::lsd_numeration_evaluates_end_to_end`] is the flipped regression
+//! test — it used to assert the rejection and now asserts the computed language.
 //!
 //! # `LoggableError for ActError`
 //!
@@ -360,9 +363,9 @@ impl LoggableError for ActError {
             ActError::Token(_) | ActError::RemoveLeadingZeros(_) => true,
             ActError::Expr(e) => expr_error_is_handled(e),
             ActError::NumberSystem(e) => num_sys_error_is_handled(e),
-            // `wr_core::quantify`'s errors have no Java exception behind them at all — they
-            // are this port's own internal-invariant surfaces (`UnsupportedLsdFixup`,
-            // `Minimize`) plus one real `WalnutException` (`NotFreeVariable`). Reported as
+            // `wr_core::quantify`'s errors are one real `WalnutException`
+            // (`NotFreeVariable`) plus this port's own internal-invariant surface
+            // (`Minimize`), which has no Java exception behind it at all. Reported as
             // `handled` so they render as a message-only line rather than inventing JVM
             // frames this port cannot produce.
             ActError::Quantify(_) => true,
@@ -1097,29 +1100,87 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // Scope: `msd` only. See this module's docs' "Scope note".
+    // `lsd_k` numeration. See this module's docs' "Scope note".
     // ------------------------------------------------------------------------
 
-    /// **Pins a currently-REJECTING behavior that real Walnut accepts.** `?lsd_2 x >= 2`
-    /// evaluates fine in real `walnut-java`; here it fails, because Phase 2 never wired
-    /// `fixTrailingZerosProblem` into `wr_core::quantify`. Pre-existing `wr-core` scope
-    /// debt, not a defect in this unit — but roughly half of KEEP-scope numeration is
-    /// unreachable through this integration checkpoint because of it, so it gets a test
-    /// rather than only a doc sentence.
-    #[test]
-    fn lsd_numeration_is_currently_rejected_pre_existing_wr_core_gap() {
-        use wr_core::numsys::NumSysError;
-        use wr_core::quantify::QuantifyError;
-
-        let env = wr_logic_test_env();
-        let err = evaluate(&env, "?lsd_2 x >= 2").unwrap_err();
-        match &err {
-            EvalError::Act {
-                source:
-                    ActError::NumberSystem(NumSysError::Quantify(QuantifyError::UnsupportedLsdFixup)),
-                ..
-            } => {}
-            other => panic!("expected the lsd fixup deferral, got {other:?}"),
+    /// `i`'s lsd-first binary digits in exactly `width` positions (least-significant
+    /// digit first), or `None` if `i` doesn't fit. Deliberately NOT `msd_2_digits`
+    /// reversed-on-the-fly at the call site: writing the reversal once, here, and
+    /// asserting its own convention in `lsd_2_digits_writes_the_least_significant_digit_first`
+    /// is what stops the whole lsd section from silently agreeing on a flipped
+    /// convention with itself.
+    fn lsd_2_digits(mut i: u32, width: usize) -> Option<Vec<i32>> {
+        let mut out = Vec::with_capacity(width);
+        for _ in 0..width {
+            out.push((i & 1) as i32);
+            i >>= 1;
         }
+        if i == 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn lsd_2_digits_writes_the_least_significant_digit_first() {
+        assert_eq!(lsd_2_digits(6, 4), Some(vec![0, 1, 1, 0]));
+        assert_eq!(lsd_2_digits(1, 3), Some(vec![1, 0, 0]));
+        assert_eq!(lsd_2_digits(0, 2), Some(vec![0, 0]));
+        assert_eq!(lsd_2_digits(9, 3), None);
+    }
+
+    /// **This test used to pin a REJECTION.** `?lsd_2 x >= 2` evaluates fine in real
+    /// `walnut-java`, but until Phase 3b's L1 it failed here with
+    /// `ActError::NumberSystem(NumSysError::Quantify(QuantifyError::UnsupportedLsdFixup))`,
+    /// because Phase 2 never wired `fixTrailingZerosProblem` into `wr_core::quantify`.
+    /// Note the query contains no user-written quantifier at all — `x >= 2` is a
+    /// comparison against a constant `>= 2`, which `NumberSystem` builds by quantifying a
+    /// bound copy of the constant away, so the gap reached far past "lsd + `E`/`A`/`I`".
+    /// L1 closed it; this now checks the computed language.
+    #[test]
+    fn lsd_numeration_evaluates_end_to_end() {
+        let env = wr_logic_test_env();
+
+        // No user-written quantifier: the `quantify` call is `NumberSystem`'s own.
+        let result = evaluate(&env, "?lsd_2 x >= 2").expect("lsd comparison must evaluate");
+        assert!(!result.fa.is_true_false_automaton());
+        assert_eq!(result.label, vec!["x".to_string()]);
+        for i in 0..12u32 {
+            let digits = lsd_2_digits(i, 4).unwrap();
+            assert_eq!(
+                accepts_single_track_msd(&result, &digits),
+                i >= 2,
+                "x = {i} (lsd digits {digits:?})"
+            );
+        }
+        // The msd spelling of a value the two directions disagree on: 4 is lsd "0010"
+        // and msd "0100". Feeding "0100" asks about the value 2 in lsd (>= 2, accepted)
+        // while feeding "0010" asks about 4. An engine that silently built the msd
+        // automaton would answer these the other way round for `x = 1` ("1000" lsd = 1,
+        // rejected; read msd it is 8, which would be accepted) -- already covered by the
+        // loop above, and restated here because it is the assertion that fails first if
+        // the trailing-zero fixup is swapped for the leading-zero one.
+        assert!(!accepts_single_track_msd(&result, &[1, 0, 0, 0]));
+
+        // A user-written quantifier over an lsd variable, which is what the gap was
+        // originally reported as. `Ex (x < 5 & x >= 2 & y = x)` is `y in {2, 3, 4}`.
+        let result = evaluate(&env, "?lsd_2 Ex (x < 5 & x >= 2 & y = x)")
+            .expect("lsd quantifier elimination must evaluate");
+        assert_eq!(result.label, vec!["y".to_string()]);
+        for i in 0..12u32 {
+            let digits = lsd_2_digits(i, 4).unwrap();
+            assert_eq!(
+                accepts_single_track_msd(&result, &digits),
+                (2..5).contains(&i),
+                "y = {i} (lsd digits {digits:?})"
+            );
+        }
+
+        // And a closed lsd formula, so the `A`/`¬∃¬` path is exercised too.
+        let result = evaluate(&env, "?lsd_2 Ax (x >= 0)").expect("lsd forall must evaluate");
+        assert!(result.fa.is_true_false_automaton() && result.fa.is_true_automaton());
+        let result = evaluate(&env, "?lsd_2 Ax (x >= 5)").expect("lsd forall must evaluate");
+        assert!(result.fa.is_true_false_automaton() && !result.fa.is_true_automaton());
     }
 }

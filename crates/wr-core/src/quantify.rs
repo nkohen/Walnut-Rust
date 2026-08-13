@@ -52,10 +52,11 @@
 //!    whole mathematical content of ∃-elimination.
 //! 2. **Determinize + minimize** (`Automaton.determinizeAndMinimize()`, the no-arg
 //!    overload).
-//! 3. **Fix leading zeros** ([`crate::logicalops::fix_leading_zeros_problem`]), so the
-//!    result accepts `0*x` whenever it used to accept `x` — necessary because projecting
-//!    a track away can strand a representation behind a run that only existed for the
-//!    quantified track's longer representation.
+//! 3. **Fix the padding zeros** — [`crate::logicalops::fix_leading_zeros_problem`] on an
+//!    msd automaton, [`crate::logicalops::fix_trailing_zeros_problem`] on an lsd one, so
+//!    the result accepts `0*x` (resp. `x0*`) whenever it used to accept `x` — necessary
+//!    because projecting a track away can strand a representation behind a run that only
+//!    existed for the quantified track's longer representation.
 //!
 //! # Deliberate divergences from a literal transliteration
 //!
@@ -81,15 +82,29 @@
 //!   (ported in U2) reproduces Java's conditional trim faithfully and is *not* used here,
 //!   precisely so this pre-existing Phase-1 divergence is not silently altered by the U6
 //!   refactor. Reconciling the two is a deliberate later decision, not this unit's.
-//! * **The lsd fixup is not wired up here.** Java's `:46` calls
-//!   `AutomatonLogicalOps.fixTrailingZerosProblem`, and this crate *does* now have that
-//!   function ([`crate::logicalops::fix_trailing_zeros_problem`], landed in U5) — but
-//!   turning the lsd branch on would change this function's observable behavior on an
-//!   lsd automaton from "reject" to "compute", which is a scope decision, not a
-//!   refactoring step. So the branch still yields
-//!   [`QuantifyError::UnsupportedLsdFixup`], and enabling it stays an explicit,
-//!   separately-reviewed change (no lsd numeration system exists in
-//!   [`crate::numsys`] to exercise it against yet either).
+//!
+//! (The lsd fixup used to be a third divergence here, and is no longer — see the next
+//! section.)
+//!
+//! # The lsd fixup: deferred in Phase 2, wired up in Phase 3b (L1)
+//!
+//! Phase 2's U6 landed this module with its `Some(false)` arm returning a
+//! `QuantifyError::UnsupportedLsdFixup` instead of calling
+//! [`crate::logicalops::fix_trailing_zeros_problem`] (which U5 had already ported, and
+//! which Java's `AutomatonQuantification.java:46` calls). The stated reason was that
+//! flipping "reject" to "compute" is a scope decision rather than a refactoring step,
+//! and that no lsd numeration system existed in [`crate::numsys`] to exercise it against
+//! — the second half of which went stale the moment U7 landed `NumberSystem`'s full
+//! msd/lsd surface one unit later.
+//!
+//! The cost of leaving it turned off turned out to be far wider than "explicit `E`/`A`/`I`
+//! over an lsd variable": [`crate::numsys`] calls [`quantify`] ten times to *build* its
+//! own automata, so on an lsd system every comparison or arithmetic against a constant
+//! `>= 2`, every `get_constant`/`get_multiplication`/`get_division`, and therefore nearly
+//! every `lsd_k` query more complex than `x < y` failed here. That was found by Phase
+//! 3a's exit checkpoint and closed by this unit; the branch is now the plain port of
+//! Java's `else fixTrailingZerosProblem(A)`, and `QuantifyError` no longer has an
+//! `UnsupportedLsdFixup` variant to return.
 //!
 //! # U0 behavior change: all-tracks-quantified now yields a TRUE/FALSE automaton
 //!
@@ -133,7 +148,7 @@
 //!   [`crate::logicalops::zero_reachable_states`].
 
 use crate::automaton::Automaton;
-use crate::logicalops::fix_leading_zeros_problem;
+use crate::logicalops::{fix_leading_zeros_problem, fix_trailing_zeros_problem};
 use crate::minimize::{minimize, MinimizeError};
 use crate::numsys::determine_msd;
 use crate::trim::trim;
@@ -145,10 +160,6 @@ pub enum QuantifyError {
     /// `WalnutException.notFreeVariable` (thrown from
     /// `AutomatonQuantification.validateLabels`, `:110-116`).
     NotFreeVariable(String),
-    /// The surviving tracks are lsd, which would need
-    /// [`crate::logicalops::fix_trailing_zeros_problem`] — not wired up (see module
-    /// docs).
-    UnsupportedLsdFixup,
     /// Propagated from [`crate::minimize::minimize`] inside [`quantify_helper`]. Both
     /// variants should be unreachable there (subset construction always yields a
     /// deterministic automaton), but they are surfaced rather than `unwrap`ped:
@@ -167,7 +178,8 @@ impl From<MinimizeError> for QuantifyError {
 ///
 /// Ports `AutomatonQuantification.quantify(Automaton, Set<String>)` (`:37-47`): project
 /// the labelled tracks away, determinize + minimize, then apply the
-/// numeration-system-dependent leading-zero fixup. `labels` must be a subset of `a.label`
+/// numeration-system-dependent padding-zero fixup (leading zeros on an msd system,
+/// trailing zeros on an lsd one). `labels` must be a subset of `a.label`
 /// (else [`QuantifyError::NotFreeVariable`]).
 ///
 /// Naming *every* track is legal and turns `a` into a TRUE/FALSE automaton — see this
@@ -218,7 +230,46 @@ pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Quan
             fix_leading_zeros_problem(a);
             Ok(())
         }
-        Some(false) => Err(QuantifyError::UnsupportedLsdFixup),
+        Some(false) => {
+            // `AutomatonLogicalOps.fixTrailingZerosProblem(A)` (`:46`) — the lsd branch,
+            // wired up in Phase 3b's L1 (it was a Phase-2 scope cut; see the module docs'
+            // "The lsd fixup" section for the history).
+            //
+            // Unlike its msd sibling this one needs no guard of its own at this call
+            // site, and deliberately has none (matching Java, which likewise gives it no
+            // `isTRUE_FALSE_AUTOMATON()` check — see `fix_trailing_zeros_problem`'s own
+            // docs). The two shapes that would fault are both excluded here:
+            // * TRIVIAL (`true_false.is_some()`): `quantify` already returned above, at
+            //   its `is_true_false_automaton()` guard, so the stale-`q` trivial shape
+            //   never reaches this arm.
+            // * ZERO-STATE (`fa.q == 0`, flag unset): reachable — `quantify_helper`'s
+            //   `a.fa.q == 0` early return fires *after* its empty-label-set return, so
+            //   `quantify(a, &{})` on a 0-state automaton lands here. It is nonetheless
+            //   safe, and for a stronger reason than "the caller checks": unlike
+            //   `zero_reachable_states` (which unconditionally indexes `fa.d[fa.q0]` and
+            //   is exactly why `fix_leading_zeros_problem` needs its own `fa.q == 0`
+            //   guard), `set_states_reachable_to_final_states_by_zeros` only ever indexes
+            //   inside `for q in 0..fa.q`, so on a 0-state automaton every one of its
+            //   loops is empty, it reports `altered == false`, and the whole call is a
+            //   silent no-op. `determine_zero()` is likewise total (`encode(&[])` is `0`
+            //   with no indexing). Pinned by
+            //   `quantify_on_a_zero_state_lsd_automaton_is_a_silent_noop`.
+            //
+            // One asymmetry worth recording here rather than rediscovering later: this
+            // arm can reach `docs/WALNUT-BUGS.md` WB-001 where the msd arm cannot.
+            // `fix_trailing_zeros_problem` closes with `just_minimize`, which never trims
+            // (Java's `justMinimize` doesn't either — see `logicalops.rs`'s note on that
+            // helper), whereas `fix_leading_zeros_problem` closes with
+            // `determinize_and_minimize_from`, whose subset construction re-establishes
+            // `minimize`'s reachability precondition on the way through. The ordinary
+            // path is unaffected — `quantify_helper`'s own determinize+minimize leaves
+            // every state reachable from `q0` — so this can only bite when the helper
+            // SHORT-CIRCUITED (empty label set, or a label-less automaton) on an input
+            // that already had an unreachable state. Java has the identical shape at the
+            // identical call site, so it is ported verbatim, not guarded.
+            fix_trailing_zeros_problem(a);
+            Ok(())
+        }
     }
 }
 
@@ -486,6 +537,118 @@ mod tests {
             "one label, two tracks -> ordinary projection"
         );
         assert_eq!(a.label, vec!["y".to_string()], "one track survives");
+    }
+
+    // ------------------------------------------------- the lsd branch (Phase 3b, L1)
+
+    /// Three tracks' worth of structure in two: `(y, x)` over `{0,1}`, accepting exactly
+    /// the words `x = 1 0^k` with `k >= 1` (for either value of `y` on the first symbol).
+    /// The two `y`-values on that first symbol collapse onto one projected symbol, so
+    /// `∃y` really does exercise the projection, and the projected language `1 0+` is
+    /// **not** closed under trailing zeros at its left end — `"1"` alone is rejected —
+    /// which is exactly what [`crate::logicalops::fix_trailing_zeros_problem`] repairs.
+    fn two_track_needing_the_trailing_fixup(msd: bool) -> Automaton {
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 3,
+                alphabet_size: 4,
+                o: vec![0, 0, 1],
+                d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["y".to_string(), "x".to_string()],
+            vec![Some(msd), Some(msd)],
+        );
+        let s = |a: &Automaton, y: i32, x: i32| a.encode(&[y, x]);
+        let (y0x1, y1x1, y0x0) = (s(&a, 0, 1), s(&a, 1, 1), s(&a, 0, 0));
+        a.fa.d[0].insert(y0x1, vec![1]);
+        a.fa.d[0].insert(y1x1, vec![1]);
+        a.fa.d[1].insert(y0x0, vec![2]);
+        a.fa.d[2].insert(y0x0, vec![2]);
+        a
+    }
+
+    /// The lsd arm of `quantify`'s tail (`AutomatonQuantification.java:46`), wired up in
+    /// Phase 3b's L1 — it used to be a hard `UnsupportedLsdFixup` error, so this test
+    /// replaces a pinned rejection with a pinned *result*.
+    ///
+    /// The same automaton is quantified twice, once declared msd and once lsd, and the
+    /// two answers must DIFFER in the specific way the two fixups differ. That is what
+    /// makes this more than "it no longer errors": a branch that ran
+    /// `fix_leading_zeros_problem` on both directions, or ran neither, fails here.
+    #[test]
+    fn quantify_on_an_lsd_automaton_runs_the_trailing_zero_fixup() {
+        let word = |a: &Automaton, digits: &[i32]| -> Vec<i32> {
+            digits.iter().map(|&d| a.encode(&[d])).collect()
+        };
+
+        let mut lsd = two_track_needing_the_trailing_fixup(false);
+        quantify(&mut lsd, &labels(&["y"])).unwrap();
+        assert_eq!(lsd.label, vec!["x".to_string()]);
+        // `1 0+` right-quotiented by `0*` is `1 0*`: the trailing zeros became optional.
+        assert!(
+            lsd.fa.accepts_word(&word(&lsd, &[1])),
+            "the trailing-zero fixup must make \"1\" accepted"
+        );
+        assert!(lsd.fa.accepts_word(&word(&lsd, &[1, 0])));
+        assert!(lsd.fa.accepts_word(&word(&lsd, &[1, 0, 0])));
+        assert!(!lsd.fa.accepts_word(&word(&lsd, &[])));
+        assert!(!lsd.fa.accepts_word(&word(&lsd, &[0])));
+        assert!(!lsd.fa.accepts_word(&word(&lsd, &[0, 1])));
+        assert!(!lsd.fa.accepts_word(&word(&lsd, &[1, 1])));
+
+        // The msd control on the identical transition table. `fixLeadingZerosProblem`
+        // instead left-quotients by `0*` and closes under PREPENDING zeros, so "1" stays
+        // rejected while "01 0" becomes accepted -- the mirror image of the assertions
+        // above, and impossible to satisfy with the same fixup.
+        let mut msd = two_track_needing_the_trailing_fixup(true);
+        quantify(&mut msd, &labels(&["y"])).unwrap();
+        assert!(
+            !msd.fa.accepts_word(&word(&msd, &[1])),
+            "the LEADING-zero fixup must not make \"1\" accepted"
+        );
+        assert!(msd.fa.accepts_word(&word(&msd, &[1, 0])));
+        assert!(msd.fa.accepts_word(&word(&msd, &[0, 1, 0])));
+        assert!(!msd.fa.accepts_word(&word(&msd, &[0, 1])));
+    }
+
+    /// The one shape that reaches the lsd arm with a degenerate automaton:
+    /// `quantify_helper`'s `labels.is_empty()` early return fires *before* its
+    /// `a.fa.q == 0` one, so a 0-state automaton with an lsd track lands in
+    /// `fix_trailing_zeros_problem` — which, unlike `fix_leading_zeros_problem`, has no
+    /// `fa.q == 0` guard of its own. It needs none (its helper only ever indexes inside
+    /// `for q in 0..fa.q`), and this pins that: no panic, no change.
+    #[test]
+    fn quantify_on_a_zero_state_lsd_automaton_is_a_silent_noop() {
+        let empty = || {
+            Automaton::new(
+                Fa {
+                    true_false: None,
+                    q0: 0,
+                    q: 0,
+                    alphabet_size: 4,
+                    o: vec![],
+                    d: vec![],
+                },
+                vec![vec![0, 1], vec![0, 1]],
+                vec!["y".to_string(), "x".to_string()],
+                vec![Some(false), Some(false)],
+            )
+        };
+
+        // Via the empty-label-set early return (the only path that skips the `q == 0`
+        // guard in `quantify_helper`).
+        let mut a = empty();
+        quantify(&mut a, &BTreeSet::new()).unwrap();
+        assert_eq!(a.fa.q, 0);
+        assert_eq!(a.label, vec!["y".to_string(), "x".to_string()]);
+
+        // And via the `q == 0` guard itself, with a real label to quantify.
+        let mut a = empty();
+        quantify(&mut a, &labels(&["y"])).unwrap();
+        assert_eq!(a.fa.q, 0);
     }
 
     #[test]

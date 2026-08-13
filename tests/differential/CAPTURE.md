@@ -237,3 +237,54 @@ Rust pipeline does **not** — `?msd_2 x + y = z` comes back labeled `["z", "x",
 label permutation with matching per-position alphabets (U8's documented limitation) and
 will silently return a wrong verdict instead of an error. `fixtures/u11/addition_three_track.txt`
 exists partly to pin exactly that: without the sort, its test reports `Ok(false)`.
+
+---
+
+# Ground-truth capture: `fixtures/lsd/*.txt`
+
+Phase 3b's L1 (wiring `AutomatonLogicalOps.fixTrailingZerosProblem` into
+`wr_core::quantify`'s lsd branch, which Phase 2 had left as a hard
+`QuantifyError::UnsupportedLsdFixup`) is checked against real `walnut-java` `eval` output
+by `tests/lsd_numeration.rs`. Before L1 the port had **zero** positive `lsd_k` end-to-end
+coverage — every existing test pinned the rejection — so these are the fixtures that
+close that gap. Full rationale (including why each of the seven cases fails for a
+different reason if the fixup is wired up wrongly) is in that test file's own module
+docs; summarized here for consistency with this document's other entries:
+
+```bash
+cd ~/dev/walnut-java
+cat > "Command Files/lsd_capture.txt" <<'EOF'
+eval lsdge2 "?lsd_2 x >= 2";
+eval lsdquant "?lsd_2 Ex (x < 5 & x >= 2 & y = x)";
+eval lsdmult "?lsd_2 y = 3*x";
+eval lsdclosed "?lsd_2 Ax (x >= 5)";
+eval lsdclosedtrue "?lsd_2 Ax Ey (y > x)";
+eval lsd3addcmp "?lsd_3 x + y = z & z < 4";
+EOF
+java -jar target/Walnut-all.jar lsd_capture.txt < /dev/null
+S="Session/<timestamp>/Automata Library"
+cp "$S/lsdge2.txt"     ~/dev/walnut-rs/tests/differential/fixtures/lsd/ge_two.txt
+cp "$S/lsdquant.txt"   ~/dev/walnut-rs/tests/differential/fixtures/lsd/exists_quantified.txt
+cp "$S/lsdmult.txt"    ~/dev/walnut-rs/tests/differential/fixtures/lsd/mult_two_track.txt
+cp "$S/lsd3addcmp.txt" ~/dev/walnut-rs/tests/differential/fixtures/lsd/base3_addition_and_compare.txt
+
+# A second run, for the `def`-then-reuse case (`def` must land in `Automata Library/`
+# before the query that references it).
+cat > "Command Files/lsd_capture2.txt" <<'EOF'
+def lsdge2d "?lsd_2 x >= 2";
+eval lsdusedef "?lsd_2 $lsdge2d(y) & y < 5";
+EOF
+java -jar target/Walnut-all.jar lsd_capture2.txt < /dev/null
+cp "Session/<timestamp2>/Automata Library/lsdusedef.txt" \
+   ~/dev/walnut-rs/tests/differential/fixtures/lsd/def_then_reuse.txt
+```
+
+The two closed-formula cases produce no `.txt` fixture: `lsdclosed` prints `____` then
+`FALSE`, `lsdclosedtrue` prints `____` then `TRUE`, and `tests/lsd_numeration.rs` checks
+those printed verdicts directly against `Automaton::fa::is_true_automaton()` — same
+convention as the `u11closed` entry above. The command file and
+`Session/<timestamp>/` directory were deleted from the `walnut-java` checkout afterward.
+
+The alphabetical-track-order note above applies here too (`lsd3addcmp` is three-track),
+as does the totalize-before-comparing step: real Walnut's automaton for a free-variable
+predicate is partial.

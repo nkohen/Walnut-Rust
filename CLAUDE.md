@@ -266,14 +266,42 @@ pipeline — compared against real `walnut-java` CLI output via `wr_core::equiv`
 divergences found. `cargo test --workspace` green throughout (920+ tests); `cargo fmt`/`clippy`
 clean.
 
-**Known limitation, flagged not silently accepted**: `eval`/`def`/`reg` over `lsd_*` numeration
-combined with any quantifier (`E`/`A`/`I`) currently fails
-(`QuantifyError::UnsupportedLsdFixup`) — a pre-existing Phase-2 `wr-core::quantify` scope cut
-(the leading/trailing-zero fixup exists as a function but was never wired in), first surfaced as
-a real functional gap by Phase 3a's exit checkpoint. Not yet scheduled; a real decision (fix now
-vs. explicitly schedule) is still open.
+**Phase 3b, L1 — `lsd_*` numeration (the one limitation Phase 3a left open) is RESOLVED.**
+Phase 3a's exit checkpoint surfaced it as "`eval`/`def`/`reg` over `lsd_*` combined with any
+quantifier fails with `QuantifyError::UnsupportedLsdFixup`"; investigation for this unit found
+the blast radius was substantially wider than that framing. `wr_core::numsys` calls
+`quantify` ten times to build its *own* automata, so on an `lsd_k` system every comparison or
+arithmetic against a constant `>= 2`, and every `get_constant`/`get_multiplication`/
+`get_division`, failed as well — `?lsd_2 x >= 2`, containing no user-written quantifier at all,
+was already broken. Root cause was a single Phase-2 (U6) scope cut: `quantify`'s `Some(false)`
+arm returned an error instead of calling `AutomatonLogicalOps.fixTrailingZerosProblem`, which
+U5 had already ported. That module's own docs flagged the flip as "an explicit, separately
+reviewed change" and justified the deferral partly on "no lsd numeration system exists in
+`crate::numsys` to exercise it against yet" — a clause that went stale one unit later, when U7
+landed `NumberSystem`'s full msd/lsd surface. L1 is that separately-reviewed change: the arm is
+now the plain port of Java's `AutomatonQuantification.java:46`, the now-unconstructible
+`UnsupportedLsdFixup` variant is deleted, the four tests that pinned the rejection are flipped
+to assert the computed language (none deleted), and the positive coverage that never existed is
+added — `wr-core`'s `quantify_on_an_lsd_automaton_runs_the_trailing_zero_fixup` (the two fixups
+contrasted on one transition table, since they are genuinely *not* mirror images), `numsys`'s
+`lsd_composed_constructions_compute_the_right_language` and the new Tier-4
+`msd_and_lsd_composed_constructions_agree_after_reversal`, `wr-logic`'s
+`lsd_numeration_evaluates_end_to_end`, and a new differential suite
+(`tests/differential/tests/lsd_numeration.rs`, five cases incl. a three-track `lsd_3` one)
+against freshly captured real `walnut-java` output — zero divergences. No new Walnut (Java) bug
+found: Java's asymmetry between the two fixups (leading closes under prepending zeros; trailing
+only right-quotients) is correct in context and is ported verbatim.
 
-Not yet started: **Phase 3b** (the remaining `wr-core` primitives — `Morphism`, `convertNS`,
+**Scope of what "RESOLVED" actually covers** (narrowed after adversarial review found the first
+draft of this note overclaimed): verified for `lsd_k` (not custom-base `lsd_fib`/similar) through
+`eval`/`def` — `∃` (genuine quantifier elimination) and closed `∀` (the `¬∃¬` path) both confirmed
+correct against real `walnut-java`. **Not verified**: the `I` (infinitely-often) quantifier over
+`lsd` — it dispatches through `wr_core::infinite::infinite`, a code path that never calls
+`quantify` at all, so this fix neither touched nor tested it; and `reg` over `lsd_*`, which also
+never routes through `quantify` (Thompson construction + determinize only) and has its own,
+separate, pre-existing `lsd` coverage in `reg_and_alphabet_commands.rs`.
+
+Not yet started: the rest of **Phase 3b** (the remaining `wr-core` primitives — `Morphism`, `convertNS`,
 `Search/ProductBFS`, `Transducer` — the real `Prover.java` dispatch/REPL/`MetaCommands` wiring
 real values into Phase 3a's U0c no-op hook, all remaining `Commands/*`, and the Tier-1
 golden-corpus harness) — needs the user's explicit go-ahead per

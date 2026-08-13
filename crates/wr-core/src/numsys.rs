@@ -94,21 +94,25 @@
 //!   real, shipped, file-backed base. It is now rejected on purpose and by name:
 //!   [`NumSysError::UnsupportedNegativeBase`].
 //!
-//! ## DEFERRED: the `lsd` half of the composed constructions
+//! ## The `lsd` half of the composed constructions (deferred by U7, delivered in 3b/L1)
 //!
 //! `msd_k` and `lsd_k` *both* build their adder / comparator / equality / `0` / `1`
 //! automata here (the lsd direction is `AutomatonLogicalOps.reverse` of the msd one,
 //! exactly as Java does it at `:333`/`:378`). But every construction that composes
 //! them through ∃-elimination — `getConstant(n)` for `n >= 2`, `comparison`/
 //! `arithmetic` against a constant, `multiplication`, `division` — routes through
-//! [`crate::quantify::quantify`], whose lsd branch is deliberately still
-//! [`crate::quantify::QuantifyError::UnsupportedLsdFixup`] (see that module's docs:
-//! turning it on is "a scope decision, not a refactoring step", to be made in a
-//! separately reviewed change). Those calls therefore surface
-//! [`NumSysError::Quantify`] on an lsd system today. **This unit does not flip that
-//! switch**; it only removes the other half of the stated blocker ("no lsd numeration
-//! system exists in `crate::numsys` to exercise it against yet either" — now one
-//! does).
+//! [`crate::quantify::quantify`], whose lsd branch was, when U7 landed, still a hard
+//! `UnsupportedLsdFixup` error (a Phase-2 scope cut in `quantify` itself, not here).
+//! Every one of those constructions therefore failed on an `lsd_k` system, which is
+//! most of what an `lsd_k` query *is* — U7 removed only the other half of that
+//! blocker ("no lsd numeration system exists in `crate::numsys` to exercise it against
+//! yet either").
+//!
+//! Phase 3b's L1 wired the fixup up (see [`crate::quantify`]'s "The lsd fixup"
+//! section), so the whole composed family works on `lsd_k` now.
+//! `lsd_composed_constructions_compute_the_right_language` and
+//! `msd_and_lsd_composed_constructions_agree_after_reversal` in this file's test
+//! module are the direct coverage.
 //!
 //! ## Scoped-down operator enums
 //!
@@ -136,6 +140,10 @@
 //!   `multiplication_automaton_computes_real_multiplication`,
 //!   `division_matches_truncating_integer_division_over_a_small_table` — the same
 //!   biconditional discipline for the three composed families.
+//! * `msd_and_lsd_composed_constructions_agree_after_reversal` (Phase 3b, L1) — the
+//!   composed-construction analogue of `msd_and_lsd_agree_after_reversal`, i.e. the
+//!   same reversal correspondence for the families that route through
+//!   [`crate::quantify::quantify`] and therefore through its lsd fixup.
 
 use crate::automaton::Automaton;
 use crate::fa::Fa;
@@ -342,9 +350,15 @@ pub enum NumSysError {
     DivisionByZero,
     /// `"multiplication(0)"` (`:978`).
     MultiplicationByZero,
-    /// Propagated from [`crate::quantify::quantify`]. In particular an lsd number
-    /// system currently yields `Quantify(UnsupportedLsdFixup)` from every composed
-    /// construction — see module docs.
+    /// Propagated from [`crate::quantify::quantify`]. Both of that enum's remaining
+    /// variants are unreachable from the call sites here —
+    /// [`QuantifyError::NotFreeVariable`] because each of them quantifies away a fresh
+    /// name it has just bound itself, and [`QuantifyError::Minimize`] for the reasons
+    /// that variant's own docs give — so this is a "can't happen" surfaced as an `Err`
+    /// per `PORTING.md`'s error-mapping rule rather than a live failure mode. It was
+    /// NOT one before Phase 3b's L1: until then `quantify`'s lsd branch was a hard
+    /// `UnsupportedLsdFixup` error and this variant was how every composed construction
+    /// failed on an `lsd_k` system (see module docs).
     Quantify(QuantifyError),
     /// **A deliberate divergence from Java, decided in Phase 3a's U5**, not a ported
     /// `WalnutException`: any name containing `_neg_` (`msd_neg_fib`, `lsd_neg_3`, …) is
@@ -2862,26 +2876,214 @@ mod tests {
         assert!(accepts_digits(&lt, &[("p", "10"), ("q", "01")]));
     }
 
-    /// The lsd blocker, pinned so it is a deliberate, visible state of the port rather
-    /// than a surprise (see module docs): every construction that composes through
-    /// ∃-elimination currently reports `UnsupportedLsdFixup` on an lsd system, while
-    /// the non-composed ones (adder, comparator, equality, constants 0 and 1) work.
+    /// **This test used to pin the opposite outcome.** Until Phase 3b's L1 every
+    /// construction here that composes through ∃-elimination — `getConstant(n)` for
+    /// `n >= 2`, comparison/arithmetic against a constant, multiplication, division —
+    /// returned `NumSysError::Quantify(UnsupportedLsdFixup)` on an `lsd_k` system,
+    /// because `crate::quantify`'s lsd branch was a hard error rather than a call to
+    /// `fix_trailing_zeros_problem` (see this module's and `crate::quantify`'s docs).
+    /// Only the non-composed constructions (adder, comparator, equality, the constants
+    /// `0` and `1`) worked. L1 wired the fixup up; this now checks that the composed
+    /// family computes the RIGHT lsd language, not merely that it stopped erroring.
+    ///
+    /// Every digit string below is least-significant-digit-FIRST, and every expected
+    /// value is stated in the comment so a reversed-convention bug cannot hide behind a
+    /// self-consistent fixture (the same discipline
+    /// `lsd_adder_and_comparator_read_least_significant_digit_first` above uses).
     #[test]
-    fn lsd_composed_constructions_report_the_unsupported_fixup() {
+    fn lsd_composed_constructions_compute_the_right_language() {
         let ns = NumberSystem::new("lsd_2").unwrap();
-        // Non-composed: fine.
+        // Non-composed: fine before L1 as well as after.
         assert!(ns.get_constant(&big(0)).is_ok());
         assert!(ns.get_constant(&big(1)).is_ok());
         assert!(ns.arithmetic("a", "b", "c", ArithmeticOp::Plus).is_ok());
-        // Composed: blocked at `quantify`.
-        assert_eq!(
-            ns.get_constant(&big(5)).unwrap_err(),
-            NumSysError::Quantify(QuantifyError::UnsupportedLsdFixup)
-        );
-        assert_eq!(
-            ns.get_multiplication(&big(3)).unwrap_err(),
-            NumSysError::Quantify(QuantifyError::UnsupportedLsdFixup)
-        );
+
+        // --- getConstant(6): the recursive-halving case (6 = 3 + 3, 3 = 1 + 2, ...),
+        // three levels of ∃-elimination deep, so every one of them ran the lsd fixup.
+        // 6 is msd "110", i.e. lsd "011".
+        let six = ns.get_constant(&big(6)).unwrap();
+        assert!(accepts_tuples(&six, &single_track("011")));
+        // ... closed under TRAILING zeros (the lsd analogue of leading zeros).
+        assert!(accepts_tuples(&six, &single_track("0110")));
+        assert!(accepts_tuples(&six, &single_track("01100")));
+        // ... and NOT under leading ones: "0011" read lsd is 12, not 6.
+        assert!(!accepts_tuples(&six, &single_track("0011")));
+        // "110" read lsd is 3.
+        assert!(!accepts_tuples(&six, &single_track("110")));
+        // The msd spelling of 6 ("110") having been rejected above is the sharp check:
+        // an lsd system that silently computed the msd constant would accept it.
+        assert!(!accepts_tuples(&six, &single_track("111"))); // 7
+        assert!(!accepts_tuples(&six, &single_track("101"))); // 5
+
+        // --- multiplication: `y = 3x`, two tracks.
+        let times_three = ns
+            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Mult)
+            .unwrap();
+        // x = 2 ("0100" lsd), y = 6 ("0110" lsd)
+        assert!(accepts_digits(
+            &times_three,
+            &[("x", "0100"), ("y", "0110")]
+        ));
+        // x = 2, y = 7 ("1110" lsd) -- not 3*2
+        assert!(!accepts_digits(
+            &times_three,
+            &[("x", "0100"), ("y", "1110")]
+        ));
+        // x = 0, y = 0
+        assert!(accepts_digits(
+            &times_three,
+            &[("x", "0000"), ("y", "0000")]
+        ));
+        // x = 5 ("1010" lsd), y = 15 ("1111" lsd)
+        assert!(accepts_digits(
+            &times_three,
+            &[("x", "1010"), ("y", "1111")]
+        ));
+        // the msd spellings of the same fact must NOT be accepted (5 = "0101" msd,
+        // 15 = "1111" msd): read lsd, "0101" is 10 and "1111" is 15, and 3*10 != 15.
+        assert!(!accepts_digits(
+            &times_three,
+            &[("x", "0101"), ("y", "1111")]
+        ));
+
+        // --- comparison against a constant >= 2: `x >= 2`, the exact shape
+        // `wr_logic::eval`'s own `?lsd_2 x >= 2` regression test evaluates.
+        let ge_two = ns
+            .comparison_const_b("x", &big(2), RelationalOp::GreaterEqThan)
+            .unwrap();
+        assert!(!accepts_tuples(&ge_two, &single_track("00"))); // 0
+        assert!(!accepts_tuples(&ge_two, &single_track("10"))); // 1
+        assert!(accepts_tuples(&ge_two, &single_track("01"))); // 2
+        assert!(accepts_tuples(&ge_two, &single_track("11"))); // 3
+        assert!(accepts_tuples(&ge_two, &single_track("0100"))); // 2, trailing zeros
+        assert!(!accepts_tuples(&ge_two, &single_track("1000"))); // 1, trailing zeros
+
+        // --- division, the deepest composition here (`a/n = b` needs two extra
+        // quantified variables plus two range comparisons).
+        let div_three = ns
+            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Div)
+            .unwrap();
+        // 6/3 = 2 : x = "0110" lsd (6), y = "0100" lsd (2)
+        assert!(accepts_digits(&div_three, &[("x", "0110"), ("y", "0100")]));
+        // 7/3 = 2 (truncating)
+        assert!(accepts_digits(&div_three, &[("x", "1110"), ("y", "0100")]));
+        // 7/3 != 3
+        assert!(!accepts_digits(&div_three, &[("x", "1110"), ("y", "1100")]));
+    }
+
+    /// **Tier-4, and the sharpest available check on `quantify`'s lsd fixup (Phase 3b
+    /// L1):** every composed construction's `lsd_k` automaton must accept exactly the
+    /// digit-reversal of what its `msd_k` twin accepts — AND must independently agree
+    /// with the integer facts, so the property cannot be satisfied by two uniformly
+    /// wrong sides. This is the composed-construction analogue of
+    /// `msd_and_lsd_agree_after_reversal` (which covers only the non-composed adder and
+    /// comparator, neither of which routes through `quantify`).
+    ///
+    /// Why the correspondence is a legitimate oracle *here* but not for `quantify` in
+    /// general: `fixLeadingZerosProblem` and `fixTrailingZerosProblem` are NOT mirror
+    /// images (the former left-quotients by `0*` and then closes the result under
+    /// prepending zeros, via `zeroReachableStates`'s injected `q0` self-loop; the
+    /// latter only right-quotients, adding no transitions — see
+    /// `crate::logicalops`'s docs on the asymmetry). So `reverse(quantify_msd(A))` and
+    /// `quantify_lsd(reverse(A))` genuinely differ on an arbitrary `A`. They agree on
+    /// the automata `NumberSystem` actually quantifies, because those are already
+    /// closed under padding on the significant end, which is exactly the regime the
+    /// asymmetry does not touch — and it is that regime, not the arbitrary one, that
+    /// every real query exercises.
+    #[test]
+    fn msd_and_lsd_composed_constructions_agree_after_reversal() {
+        let width = 5usize;
+        for base in [2u32, 3u32] {
+            let msd = NumberSystem::new(&format!("msd_{base}")).unwrap();
+            let lsd = NumberSystem::new(&format!("lsd_{base}")).unwrap();
+
+            // getConstant(n), for n in the recursive-halving range.
+            for n in 2u32..8 {
+                let cm = msd.get_constant(&BigInt::from(n)).unwrap();
+                let cl = lsd.get_constant(&BigInt::from(n)).unwrap();
+                for m in 0u32..12 {
+                    let Some(d) = msd_digits(m, base, width) else {
+                        continue;
+                    };
+                    let fwd: Vec<Vec<i32>> = d.iter().map(|&x| vec![x]).collect();
+                    let rev: Vec<Vec<i32>> = d.iter().rev().map(|&x| vec![x]).collect();
+                    assert_eq!(
+                        accepts_tuples(&cm, &fwd),
+                        m == n,
+                        "msd getConstant({n}) on {m}, base {base}"
+                    );
+                    assert_eq!(
+                        accepts_tuples(&cl, &rev),
+                        m == n,
+                        "lsd getConstant({n}) on {m}, base {base}"
+                    );
+                }
+            }
+
+            // `y = n*x` and `x >= n`, the two other composed families.
+            for n in 2u32..5 {
+                let mm = msd
+                    .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
+                    .unwrap();
+                let ml = lsd
+                    .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
+                    .unwrap();
+                for x in 0u32..6 {
+                    for y in 0u32..12 {
+                        let (Some(xd), Some(yd)) =
+                            (msd_digits(x, base, width), msd_digits(y, base, width))
+                        else {
+                            continue;
+                        };
+                        let build = |a: &Automaton, rev: bool| -> Vec<Vec<i32>> {
+                            (0..width)
+                                .map(|i| {
+                                    let i = if rev { width - 1 - i } else { i };
+                                    a.label
+                                        .iter()
+                                        .map(|l| if l == "x" { xd[i] } else { yd[i] })
+                                        .collect()
+                                })
+                                .collect()
+                        };
+                        assert_eq!(
+                            accepts_tuples(&mm, &build(&mm, false)),
+                            y == n * x,
+                            "msd {n}*{x}=={y}, base {base}"
+                        );
+                        assert_eq!(
+                            accepts_tuples(&ml, &build(&ml, true)),
+                            y == n * x,
+                            "lsd {n}*{x}=={y}, base {base}"
+                        );
+                    }
+                }
+
+                let gm = msd
+                    .comparison_const_b("x", &BigInt::from(n), RelationalOp::GreaterEqThan)
+                    .unwrap();
+                let gl = lsd
+                    .comparison_const_b("x", &BigInt::from(n), RelationalOp::GreaterEqThan)
+                    .unwrap();
+                for x in 0u32..12 {
+                    let Some(d) = msd_digits(x, base, width) else {
+                        continue;
+                    };
+                    let fwd: Vec<Vec<i32>> = d.iter().map(|&v| vec![v]).collect();
+                    let rev: Vec<Vec<i32>> = d.iter().rev().map(|&v| vec![v]).collect();
+                    assert_eq!(
+                        accepts_tuples(&gm, &fwd),
+                        x >= n,
+                        "msd {x} >= {n}, base {base}"
+                    );
+                    assert_eq!(
+                        accepts_tuples(&gl, &rev),
+                        x >= n,
+                        "lsd {x} >= {n}, base {base}"
+                    );
+                }
+            }
+        }
     }
 
     // =========================================================================

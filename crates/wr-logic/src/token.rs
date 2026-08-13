@@ -424,10 +424,10 @@ impl fmt::Display for ActError {
             // practice through `Function::act` (a name in the quantify list that isn't
             // actually a track of the result -- shouldn't happen given how `quantify` is
             // built here, but `wr_core::quantify::quantify` still reports it rather than
-            // assuming). The other two variants (`UnsupportedLsdFixup`, `Minimize`) are
-            // internal-invariant surfaces `wr_core::quantify` itself has no Java-text
-            // `Display` for yet, so they fall back to their `Debug` shape rather than this
-            // crate inventing wording Walnut never prints.
+            // assuming). The one other variant (`Minimize`) is an internal-invariant
+            // surface `wr_core::quantify` itself has no Java-text `Display` for yet, so it
+            // falls back to its `Debug` shape rather than this crate inventing wording
+            // Walnut never prints.
             ActError::Quantify(QuantifyError::NotFreeVariable(s)) => write!(
                 f,
                 "Variable {s} in the list of quantified variables is not a free variable."
