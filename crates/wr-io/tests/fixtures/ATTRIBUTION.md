@@ -12,6 +12,27 @@ literally the single word `true` / `false`, with no trailing newline. They are t
 the 85 such fixtures in the corpus, kept byte-for-byte (rather than hand-written) so the
 reader is exercised against the real no-trailing-newline shape Walnut's writer emits.
 
+## Custom-base fixtures (`msd_fib*.txt`)
+
+`msd_fib.txt` and `msd_fib_addition.txt` are copied verbatim from `walnut-java`'s own
+`Custom Bases/msd_fib.txt` / `Custom Bases/msd_fib_addition.txt` — the real
+Zeckendorf-representation number system Walnut ships, part of
+[Walnut](https://walnut-theorem-prover.github.io/) (GPLv3, Mousavi et al.) — see `NOTICE`
+at the repo root. Used by `reader.rs`'s `crates::wr_io::reader::tests` as
+`read_automaton_txt_with_custom_bases`/`load_custom_base` fixtures (Phase 3a's U13); no
+walnut-java source code is included. `msd_fib` has no shipped `_less_than.txt` file —
+verified by listing `Custom Bases/` — so only these two files are copied; the comparator
+is built programmatically from the loaded adder's alphabet, exactly as
+`NumberSystem.setLessThanAutomaton`'s "no file found" fallback does.
+
+## Transducer fixture (`RUNSUM2.txt`)
+
+`RUNSUM2.txt` is copied verbatim from `walnut-java`'s own
+`Transducer Library/RUNSUM2.txt` (part of [Walnut](https://walnut-theorem-prover.github.io/),
+GPLv3, Mousavi et al. — see `NOTICE`), a genuine shipped DFST (a base-2 running-sum
+transducer), used as a `read_transducer_txt` fixture (Phase 3a's U13). No walnut-java
+source code is included.
+
 ## Writer fixtures (`writer_*`)
 
 `writer_sample.gv`, `writer_true.gv`, `writer_false.gv`, `writer_sample.ba`,

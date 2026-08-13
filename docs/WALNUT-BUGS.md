@@ -929,6 +929,68 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-022 — `read_automaton_txt_impl` (Rust) has no `isFAO`/`nonDeterministicO` guard, unlike the Java it ports; a genuine-NFAO `.txt` file is silently determinized to boolean instead of rejected
+
+- **Note on this entry's shape:** unlike WB-001–WB-021, the Java side here is *correct* — this
+  entry tracks a **Rust-port scope gap that diverges from correct Java behavior**, not a Java
+  defect. Logged under this doc's "log every deliberate replicate-vs-diverge decision" charter
+  anyway (per `CLAUDE.md`'s hard rule and this unit's own review), since the alternative — an
+  agent quietly deciding the gap doesn't matter — is exactly what this doc exists to prevent.
+- **Where:**
+  - Java (correct): `Automata/AutomatonReader.java`, `readAutomaton` (`:88-98`) — after
+    `A.fa.setFieldsFromFile(...)`, if `!A.fa.getT().isDeterministic()`, Java branches: if
+    `!A.getFa().isFAO()` it determinizes; otherwise ("unexpected case — NFAO") it throws
+    `WalnutException.nonDeterministicO()`. The `isFAO()` check runs **before** any determinizing
+    attempt, since a DFAO's per-state output values cannot be soundly merged by subset
+    construction.
+  - Rust (gap): `crates/wr-io/src/reader.rs`, `read_automaton_txt_impl`'s auto-determinize step
+    (`if !automaton.fa.is_deterministic() { ... determinize ... minimize }`) — no `is_fao()` check
+    anywhere in this function. It unconditionally auto-determinizes ANY nondeterministic parsed
+    automaton, DFAO or not.
+- **What:** a hand-authored `.txt` file whose transition table is genuinely nondeterministic (some
+  state has more than one destination for the same input symbol) AND carries real DFAO output
+  (some state's declared output is `> 1`, not just plain 0/1 accept/reject — `wr_core::automaton::
+  Automaton::is_fao`) is, in Java, a hard, correct rejection (`nonDeterministicO`). In this port,
+  the same file is silently accepted, subset-constructed, and minimized — which collapses every
+  state's output to plain boolean acceptance (`wr_core::determinize::subset_construction`'s own
+  docs confirm this is exactly what determinizing does to output). The result is not an error, it
+  is a silently DIFFERENT, wrong automaton: the real per-state DFAO outputs the file declared are
+  gone, replaced by 0/1 acceptance.
+  - Note the check is present, correctly, one layer up: `wr_core::automaton::AutomatonDFA::
+    require_dfa_storage` DOES have an `is_fao()` guard that panics with Java's exact
+    `nonDeterministicO` message. But by the time `AutomatonDFA::from` (and therefore
+    `require_dfa_storage`) ever sees the automaton coming out of `read_automaton_dfa_txt`,
+    `read_automaton_txt` has already forced it deterministic — so that guard's
+    `!automaton.fa.is_deterministic()` branch, and the `is_fao()` check inside it, are **provably
+    unreachable** through this call path. The real gap is one level down, in
+    `read_automaton_txt_impl` itself, which has no equivalent check before it determinizes.
+- **Trigger:** a hand-authored genuine-NFAO `.txt` file, fed through either `read_automaton_txt` or
+  (more visibly, since the DFA-typed wrapper's whole contract is "guaranteed deterministic, real
+  DFAO inputs should be rejected, not silently reinterpreted") `read_automaton_dfa_txt`. No shipped
+  `walnut-java` golden-corpus fixture or custom-base file this port has encountered exercises this
+  shape (checked while porting this unit) — so it is not live against the real corpus, but it is a
+  plausible hand-written input.
+- **Found:** Phase 3a, U13 review (adversarial-reviewer pass), 2026-08-12, while checking a prior
+  draft's in-code claim that this was "a known, already-documented gap" — that claim was false (no
+  `WALNUT-BUGS.md` entry existed for it before this one; confirmed by grepping the file for
+  `NFAO`/`is_fao`/`nonDeterministicO` and finding nothing). Confirmed by reading
+  `AutomatonReader.java:88-98` directly, not inferred.
+- **Rust port:** `not yet reached` — the underlying gap is in `read_automaton_txt_impl` (pre-dates
+  this unit; U13 only added a new, more visible caller in `read_automaton_dfa_txt`), and is
+  currently unaddressed. Pinned, not silently left unnoticed, by
+  `read_automaton_dfa_txt_on_a_genuine_nfao_file_silently_determinizes_instead_of_erroring_wb022`
+  in `crates/wr-io/src/reader.rs`, which asserts the CURRENT (divergent) behavior explicitly, so
+  a future fix (adding the `is_fao()` guard to `read_automaton_txt_impl`, before the
+  auto-determinize step) is a visible, intentional behavior change — the test will fail and have
+  to be updated — rather than something nobody notices moving.
+- **Upstream:** not applicable — Java's behavior here is the one to replicate, not fix.
+- **Severity:** moderate — silent, information-losing wrong output (not a crash) on a plausible
+  hand-written input shape; bounded by the fact that no real corpus fixture hits it and that
+  `AutomatonDFA`'s own `is_fao()` guard is one `read_automaton_txt_impl` fix away from covering
+  this too (the check already exists correctly in one place, it's just not reached first).
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

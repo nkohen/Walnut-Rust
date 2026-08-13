@@ -5,9 +5,20 @@
 //!
 //! Ports `Automata/AutomatonReader.java` + the alphabet/state/transition regexes of
 //! `Automata/ParseMethods.java` — the parsing half only (see `Automata/Writer/
-//! AutomatonWriter.java` for the writer, not yet ported: the Phase-1 spike only needs
-//! to read real `walnut-java` output for differential comparison, see
-//! `.claude/plans/fluttering-foraging-spindle.md`).
+//! AutomatonWriter.java` for the writer, `wr-io`'s `writer` module, Phase 3a's U12).
+//!
+//! # U13 additions: custom-base headers, `readTransducer`/`readComments`, `AutomatonDFA(String)`
+//!
+//! Three things `AutomatonReader.java` also owns, folded into this unit
+//! (`.claude/plans/synthetic-prancing-aurora.md`):
+//!
+//! - [`read_automaton_txt_with_custom_bases`] — the `msd_fib`-style header support
+//!   [`read_automaton_txt`] itself still declines (see the header bullet below).
+//! - [`read_transducer_txt`]/[`read_comments`] — `AutomatonReader.readTransducer`/
+//!   `readComments` (`:196-294`). `readTransducer`'s DFST parsing logic belongs here
+//!   (it is pure `.txt`-format I/O), even though nothing consumes its output yet — the
+//!   `Transducer` automaton type itself, and `transduce`, are Phase 3b's U20/U26.
+//! - [`read_automaton_dfa_txt`] — `AutomatonDFA(String address)` (`AutomatonDFA.java:27-32`).
 //!
 //! # Grammar, verified against `ParseMethods`'s actual regexes (not guessed)
 //!
@@ -23,16 +34,18 @@
 //!   (`:146-151`) — the trivial line is NOT merely a header the rest of the file may
 //!   extend.
 //! - The **header** line declares one token per track: either an explicit set
-//!   `{v1, v2, ...}`, or a numeration spec. **This reader supports only `msd_<k>`,
-//!   `lsd_<k>`, bare `msd` (= `msd_2`), and bare `lsd` (= `lsd_2`)** — real Walnut
-//!   also accepts custom-base names (`msd_fib`, ...) via `NumberSystem.
-//!   getComputeIfAbsent`, which constructs a whole `NumberSystem` (adder/comparator
-//!   automata and all) by reading more files out of `Custom Bases/`. `wr-core` gained the
-//!   ability to build those as of Phase 3a's U5
-//!   (`wr_core::numsys::NumberSystem::with_custom_base_files`), but only from
-//!   already-loaded automata — supplying them is this crate's side of the boundary and is
-//!   U13's unit, not done here. So any other token is still
-//!   [`ReadError::UnsupportedNumeration`], never silently misread.
+//!   `{v1, v2, ...}`, or a numeration spec. Plain `msd_<k>`/`lsd_<k>`/bare `msd`
+//!   (= `msd_2`)/bare `lsd` (= `lsd_2`) are always supported. **As of U13, custom-base
+//!   names (`msd_fib`, ...) are supported too, but only via
+//!   [`read_automaton_txt_with_custom_bases`]** — plain [`read_automaton_txt`] has no
+//!   directory to resolve `Custom Bases/*.txt` against (this crate has no `Session` yet;
+//!   that's `wr-cli`'s Phase-3a U14, so the caller supplies the directory explicitly) and
+//!   still rejects them with [`ReadError::UnsupportedNumeration`]. See
+//!   [`read_automaton_txt_with_custom_bases`]'s own doc for the exact file-resolution
+//!   order (`wr_core::numsys::NumberSystem::with_custom_base_files`, Phase 3a's U5, owns
+//!   the *decision* logic; this module supplies the actual file reads). Any OTHER
+//!   unrecognized token is still [`ReadError::UnsupportedNumeration`], never silently
+//!   misread.
 //! - Then repeated state blocks: `<id> <output>` (first declared block's `id` becomes
 //!   `q0`, **not necessarily `0`**), each followed by zero or more transition lines
 //!   `<sym1> <sym2> ... -> <dest1> [<dest2> ...]` (one token per track, each a signed
@@ -64,10 +77,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-use wr_core::automaton::Automaton;
+use wr_core::automaton::{Automaton, AutomatonDFA};
 use wr_core::fa::Fa;
 use wr_core::minimize::{minimize, MinimizeError};
+use wr_core::numsys::{self, CustomBaseCandidates, CustomBaseFiles, NumSysError, NumberSystem};
 use wr_core::trim::trim;
+
+use crate::parse_methods;
 
 #[derive(Debug)]
 pub enum ReadError {
@@ -106,6 +122,23 @@ pub enum ReadError {
     NonDenseStateIds,
     /// Propagated from the auto-determinize-on-load step.
     Minimize(MinimizeError),
+    /// Propagated from custom-base [`NumberSystem`] construction (U13): a header token
+    /// named a syntactically-plausible custom base whose files failed to resolve into a
+    /// valid number system (missing files falling back to a non-numeric name, a
+    /// malformed name, a `_neg_` name, or a structurally invalid loaded automaton — see
+    /// [`NumSysError`]). Only reachable through
+    /// [`read_automaton_txt_with_custom_bases`]/[`read_automaton_dfa_txt_with_custom_bases`];
+    /// plain [`read_automaton_txt`] never attempts a custom-base load at all, so it can
+    /// never produce this variant.
+    NumSys(NumSysError),
+    /// A custom-base name was re-entered while its own resolution was still in progress —
+    /// e.g. `Custom Bases/msd_fib_addition.txt`'s own header declares `msd_fib` again (or,
+    /// transitively, some other custom base whose own chain leads back to `msd_fib`). Guards
+    /// [`load_custom_base`]'s recursion into [`read_automaton_txt_impl`] against unbounded
+    /// (stack-overflowing) recursion on a malformed self-referential custom-base file; see
+    /// that function's own doc for why this is a real, distinct-from-WB-014 gap this port
+    /// needed to close. The payload is the re-entered name.
+    CustomBaseCycle(String),
 }
 
 impl fmt::Display for ReadError {
@@ -128,11 +161,84 @@ impl From<MinimizeError> for ReadError {
     }
 }
 
+impl From<NumSysError> for ReadError {
+    fn from(e: NumSysError) -> Self {
+        ReadError::NumSys(e)
+    }
+}
+
 /// Reads a Walnut `.txt` automaton file into an [`Automaton`]. Track labels default to
 /// placeholders (`"0"`, `"1"`, ...) — the file format itself carries no variable
 /// names, matching Java (labels are a `Prover`/query-binding concept, not part of the
 /// `.txt` grammar); relabel via `automaton.label` after loading if needed.
+///
+/// A custom-base header (`msd_fib`, ...) is [`ReadError::UnsupportedNumeration`] here —
+/// use [`read_automaton_txt_with_custom_bases`] to resolve those.
 pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadError> {
+    read_automaton_txt_impl(path.as_ref(), None, &mut BTreeSet::new())
+}
+
+/// Like [`read_automaton_txt`], but a header token that isn't `msd_<k>`/`lsd_<k>`/bare
+/// `msd`/bare `lsd` is resolved as a **custom-base** numeration name (`msd_fib`, ...)
+/// against `custom_bases_dir`, instead of failing with
+/// [`ReadError::UnsupportedNumeration`].
+///
+/// # File resolution, matching `NumberSystem`'s constructor exactly (`NumberSystem.java:132-163`)
+///
+/// For each of the three probes a `NumberSystem` constructor makes — the adder
+/// (`<name>_addition.txt`), the comparator (`<name>_less_than.txt`), and the "set of all
+/// representations" restriction (`<name>.txt`) — in that order:
+///
+/// 1. If `custom_bases_dir/<name><extension>` exists, it is read (recursively, through
+///    this same function, with the same `custom_bases_dir`) and used AS-IS — never
+///    reversed, even for an lsd system.
+/// 2. Otherwise, if `custom_bases_dir/<opposite>_<base><extension>` exists (the SAME base
+///    under the OPPOSITE msd/lsd direction — Java's "when the number system does not
+///    exist, we try its complement", `NumberSystem.java:305-306`), it is read and its
+///    language **reversed** (declared direction left alone).
+/// 3. Otherwise the probe is absent, and [`NumberSystem::with_custom_base_files`] falls
+///    back to Java's usual "no file → error" behavior for that piece (`NotDefined` for a
+///    missing adder; a missing comparator/all-representations file just means "build it
+///    programmatically" / "no restriction").
+///
+/// File-name resolution and the precedence/fallback logic above are
+/// [`wr_core::numsys::custom_base_candidate_names`]/[`CustomBaseCandidates::resolve`]
+/// (Phase 3a's U5) — this function supplies only the actual `Path::is_file`/file-read
+/// steps, matching `wr-core`'s "no file I/O" boundary (see that module's docs). A `_neg_`
+/// name (`msd_neg_fib`) is rejected up front, before any file is even probed, mirroring
+/// `NumberSystem`'s own line order (`isNeg` checked at `:137`, before `setAdditionAutomaton`
+/// at `:142`) — see [`load_custom_base`].
+///
+/// # Recursion and `docs/WALNUT-BUGS.md` WB-014
+///
+/// A loaded custom-base file's OWN header may itself declare a numeration (standard or
+/// another custom base) — handled by recursing through [`read_automaton_txt_impl`] with
+/// the same `custom_bases_dir`. Real Walnut's equivalent path (`NumberSystem.
+/// getComputeIfAbsent` re-entering its own static cache mid-`computeIfAbsent`) crashes
+/// with `ConcurrentModificationException` on exactly this shape (WB-014). This port has
+/// no shared mutable cache to re-enter here — each recursive call is a plain, independent
+/// function call — so THAT SPECIFIC crash mode is provably unreachable by construction, not
+/// by luck; WB-014's own entry already names this as the intended, recorded divergence for
+/// this unit.
+///
+/// That does not mean this recursion is unconditionally safe, though: a self-referential
+/// (or mutually-referential) malformed custom-base file — one whose own header names itself,
+/// or a cycle of names — would recurse with no depth/cycle limit, an uncatchable Rust stack
+/// overflow, a DIFFERENT crash mode from WB-014's. [`load_custom_base`] closes that gap with
+/// an explicit in-progress-name guard ([`ReadError::CustomBaseCycle`]) — see its own doc for
+/// the mechanism.
+pub fn read_automaton_txt_with_custom_bases<P: AsRef<Path>>(
+    path: P,
+    custom_bases_dir: &Path,
+) -> Result<Automaton, ReadError> {
+    read_automaton_txt_impl(path.as_ref(), Some(custom_bases_dir), &mut BTreeSet::new())
+}
+
+fn read_automaton_txt_impl(
+    path: &Path,
+    custom_bases_dir: Option<&Path>,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<Automaton, ReadError> {
     let content = std::fs::read_to_string(path)?;
 
     let mut lines = content.lines().enumerate();
@@ -159,7 +265,7 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
     }
 
     let trimmed_header = header_line.trim();
-    let (alphabet, msd) = parse_header(trimmed_header)?;
+    let (alphabet, msd) = parse_header(trimmed_header, custom_bases_dir, in_progress)?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -316,13 +422,27 @@ fn parse_true_false(line: &str) -> Option<bool> {
 
 enum HeaderToken {
     Set(Vec<i32>),
-    Ns { msd: bool, base: i32 },
+    /// `alphabet` is the track's full alphabet — `0..base` for a standard `msd_<k>`/
+    /// `lsd_<k>` base, or [`NumberSystem::get_alphabet`]'s value for a custom base (not
+    /// necessarily contiguous-from-zero in general, though every shipped custom base
+    /// declares its alphabet as a `{...}` set counting up from `0` — most are `{0, 1}`,
+    /// but not all: `msd_kim`/`msd_pell` are `{0, 1, 2}`, `msd_ns`/`msd_tib` are
+    /// `{0, 1, 2, 3}` — verified against the real `walnut-java` `Custom Bases/*.txt`
+    /// files, not assumed).
+    Ns {
+        msd: bool,
+        alphabet: Vec<i32>,
+    },
 }
 
 /// Per-track alphabet, and per-track msd/lsd (`None` for an explicit-set track).
 type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>);
 
-fn parse_header(line: &str) -> Result<HeaderSpec, ReadError> {
+fn parse_header(
+    line: &str,
+    custom_bases_dir: Option<&Path>,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<HeaderSpec, ReadError> {
     let mut alphabet = Vec::new();
     let mut msd = Vec::new();
     let mut rest = line.trim();
@@ -353,15 +473,18 @@ fn parse_header(line: &str) -> Result<HeaderSpec, ReadError> {
                 .unwrap_or(rest.len());
             let word = &rest[..end];
             rest = &rest[end..];
-            parse_ns_token(word)?
+            parse_ns_token(word, custom_bases_dir, in_progress)?
         };
         match token {
             HeaderToken::Set(values) => {
                 alphabet.push(values);
                 msd.push(None);
             }
-            HeaderToken::Ns { msd: is_msd, base } => {
-                alphabet.push((0..base).collect());
+            HeaderToken::Ns {
+                msd: is_msd,
+                alphabet: track_alphabet,
+            } => {
+                alphabet.push(track_alphabet);
                 msd.push(Some(is_msd));
             }
         }
@@ -372,27 +495,159 @@ fn parse_header(line: &str) -> Result<HeaderSpec, ReadError> {
     Ok((alphabet, msd))
 }
 
-fn parse_ns_token(word: &str) -> Result<HeaderToken, ReadError> {
+fn parse_ns_token(
+    word: &str,
+    custom_bases_dir: Option<&Path>,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<HeaderToken, ReadError> {
     if let Some(rest) = word.strip_prefix("msd_") {
-        return rest
-            .parse::<i32>()
-            .map(|base| HeaderToken::Ns { msd: true, base })
-            .map_err(|_| ReadError::UnsupportedNumeration(word.to_string()));
+        return match rest.parse::<i32>() {
+            Ok(base) => Ok(HeaderToken::Ns {
+                msd: true,
+                alphabet: (0..base).collect(),
+            }),
+            Err(_) => custom_base_token(word, custom_bases_dir, in_progress),
+        };
     }
     if let Some(rest) = word.strip_prefix("lsd_") {
-        return rest
-            .parse::<i32>()
-            .map(|base| HeaderToken::Ns { msd: false, base })
-            .map_err(|_| ReadError::UnsupportedNumeration(word.to_string()));
+        return match rest.parse::<i32>() {
+            Ok(base) => Ok(HeaderToken::Ns {
+                msd: false,
+                alphabet: (0..base).collect(),
+            }),
+            Err(_) => custom_base_token(word, custom_bases_dir, in_progress),
+        };
     }
     match word {
-        "msd" => Ok(HeaderToken::Ns { msd: true, base: 2 }),
+        "msd" => Ok(HeaderToken::Ns {
+            msd: true,
+            alphabet: vec![0, 1],
+        }),
         "lsd" => Ok(HeaderToken::Ns {
             msd: false,
-            base: 2,
+            alphabet: vec![0, 1],
         }),
         _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
     }
+}
+
+/// The non-numeric-base fallback shared by both `msd_`/`lsd_`-prefixed branches of
+/// [`parse_ns_token`]: without a `custom_bases_dir`, preserves the pre-U13
+/// [`ReadError::UnsupportedNumeration`] behavior exactly (every existing caller/test).
+/// With one, attempts [`load_custom_base`] and propagates any failure as
+/// [`ReadError::NumSys`] rather than downgrading it back to `UnsupportedNumeration` —
+/// once a directory is supplied, "this looked like a custom-base name but failed to
+/// load" is a real, reportable error, not silent unsupported-numeration territory.
+fn custom_base_token(
+    word: &str,
+    custom_bases_dir: Option<&Path>,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<HeaderToken, ReadError> {
+    let Some(dir) = custom_bases_dir else {
+        return Err(ReadError::UnsupportedNumeration(word.to_string()));
+    };
+    let ns = load_custom_base(word, dir, in_progress)?;
+    Ok(HeaderToken::Ns {
+        msd: ns.is_msd(),
+        alphabet: ns.get_alphabet().to_vec(),
+    })
+}
+
+/// Builds the [`NumberSystem`] named `name` by reading `Custom Bases/`-style files out of
+/// `dir` — see [`read_automaton_txt_with_custom_bases`]'s doc for the exact resolution
+/// order this implements.
+///
+/// # Recursion guard
+///
+/// This recurses back into [`read_automaton_txt_impl`] (via [`probe_custom_base_candidate`])
+/// to load `name`'s own `_addition.txt`/`_less_than.txt`/`.txt` files, and THOSE files' own
+/// headers may themselves name a custom base — including, on a malformed self-referential
+/// input, `name` itself again. `in_progress` tracks every custom-base name currently being
+/// resolved on the current call stack (pushed on entry, popped on every exit path via the
+/// closure below); re-entering a name already in progress is [`ReadError::CustomBaseCycle`]
+/// instead of unbounded recursion. No real shipped `walnut-java` `Custom Bases/*.txt` file
+/// triggers this (all use explicit-set `{...}` headers, verified) — so it is not live
+/// against the real corpus — but a malformed hand-written custom-base file could otherwise
+/// recurse without limit, an uncatchable Rust stack overflow. This is a DIFFERENT crash mode
+/// from WB-014 (Java's `ConcurrentModificationException` from `NumberSystem.
+/// getComputeIfAbsent` re-entering its own static cache): this port has no shared mutable
+/// cache to re-enter, so WB-014's specific crash is provably unreachable here — but that
+/// alone does not rule out a plain unbounded-recursion stack overflow for the same
+/// malformed-input shape, which is what this guard closes.
+fn load_custom_base(
+    name: &str,
+    dir: &Path,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<NumberSystem, ReadError> {
+    // Mirrors `NumberSystem`'s own constructor order (`isNeg` checked at `:137`, BEFORE
+    // any file is consulted at `:142`): avoids probing/reading `Custom Bases/msd_neg_*`
+    // files for a name that's going to be rejected anyway.
+    if name.contains(numsys::UNDERSCORE_NEG_UNDERSCORE) {
+        return Err(NumSysError::UnsupportedNegativeBase(name.to_string()).into());
+    }
+    if !in_progress.insert(name.to_string()) {
+        return Err(ReadError::CustomBaseCycle(name.to_string()));
+    }
+    let result = (|| {
+        let addition = probe_custom_base_candidate(
+            name,
+            numsys::UNDERSCORE_ADDITION_AUTOMATON,
+            dir,
+            in_progress,
+        )?;
+        let less_than = probe_custom_base_candidate(
+            name,
+            numsys::UNDERSCORE_LESS_THAN_AUTOMATON,
+            dir,
+            in_progress,
+        )?;
+        let all_representations =
+            probe_custom_base_candidate(name, numsys::TXT_EXTENSION, dir, in_progress)?;
+        let files = CustomBaseFiles {
+            addition,
+            less_than,
+            all_representations,
+        };
+        Ok(NumberSystem::with_custom_base_files(name, files)?)
+    })();
+    in_progress.remove(name);
+    result
+}
+
+/// One `NumberSystem.loadAutomatonOrNull` probe (`:299-319`), minus the decision logic
+/// (that's [`CustomBaseCandidates::resolve`], called INSIDE
+/// [`NumberSystem::with_custom_base_files`], not here): stats and, if present, reads the
+/// main file; stats and reads the complement file ONLY if the main one is absent (Java's
+/// `else if`, not two independent probes) — matching `loadAutomatonOrNull`'s exact
+/// short-circuit rather than reading both unconditionally.
+fn probe_custom_base_candidate(
+    name: &str,
+    extension: &str,
+    dir: &Path,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<CustomBaseCandidates, ReadError> {
+    let (main_name, complement_name) = numsys::custom_base_candidate_names(name, extension)?;
+    let main_path = dir.join(&main_name);
+    let main = if main_path.is_file() {
+        Some(read_automaton_txt_impl(&main_path, Some(dir), in_progress)?)
+    } else {
+        None
+    };
+    let complement = if main.is_none() {
+        let complement_path = dir.join(&complement_name);
+        if complement_path.is_file() {
+            Some(read_automaton_txt_impl(
+                &complement_path,
+                Some(dir),
+                in_progress,
+            )?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(CustomBaseCandidates { main, complement })
 }
 
 /// `<id> <output>`, both integers, output optionally signed, nothing else on the
@@ -459,6 +714,256 @@ fn expand_wildcards(input: &[Option<i32>], alphabet: &[Vec<i32>]) -> Vec<Vec<i32
     results
 }
 
+// ---------------------------------------------------------------------------
+// readTransducer (U13)
+// ---------------------------------------------------------------------------
+
+/// The result of [`read_transducer_txt`] — everything `AutomatonReader.readTransducer`
+/// (`:196-274`) parses out of a `.txt` DFST file. Not `wr_core`'s eventual `Transducer`
+/// type (that type, and `transduce` itself, are Phase 3b's U20/U26) — a plain data
+/// struct capturing the parse result, matching this unit's scope ("the parsing logic
+/// belongs here", per the Phase 3a plan's U13 row).
+#[derive(Debug, Clone)]
+pub struct TransducerData {
+    /// Per-track alphabet (same shape as [`Automaton::alphabet`]).
+    pub alphabet: Vec<Vec<i32>>,
+    /// Per-track msd/lsd (`None` for an explicit-set track) — same shape as
+    /// [`Automaton::msd`].
+    pub msd: Vec<Option<bool>>,
+    /// The declared alphabet's total encoded size (product of per-track sizes).
+    pub alphabet_size: usize,
+    /// The first declared state's id (Java: `q0`, not necessarily `0`).
+    pub q0: usize,
+    /// The number of declared states.
+    pub q: usize,
+    /// Per-state transition table, keyed by encoded input symbol
+    /// ([`Automaton::encode`]) — `Transducer.fa.d`'s shape. Transducers are read AS-IS,
+    /// with no auto-determinize step (`readTransducer` has none, unlike `readAutomaton`
+    /// — DFSTs are used directly, determinism is the file author's responsibility).
+    pub d: Vec<BTreeMap<i32, Vec<usize>>>,
+    /// Per-state, per-encoded-input-symbol OUTPUT value — `Transducer.sigma`
+    /// (`currentStateTransitionOutputs`, `:211-253`). State output itself is meaningless
+    /// for a transducer ("state output does not matter for transducers", `:237`) and is
+    /// not represented here at all, matching Java discarding it (`currentStateOutput = 0`
+    /// unconditionally).
+    pub sigma: Vec<BTreeMap<i32, i32>>,
+}
+
+/// `AutomatonReader.readTransducer(Transducer, String)` (`:196-274`).
+///
+/// Shares [`parse_header`]'s grammar (`firstParse`'s alphabet-declaration half) but,
+/// matching Java's `trueFalseSingleton == null` call (`:203`), **never** treats a bare
+/// `true`/`false` header line specially — transducers have no trivial-automaton
+/// shortcut, so such a line is parsed (and rejected) as an ordinary numeration token
+/// instead. No custom-base directory parameter: no shipped `Transducer Library/*.txt`
+/// fixture declares one (every real transducer header this port has seen is an explicit
+/// set or a plain `msd_k`/`lsd_k`), so this is scoped to [`read_automaton_txt`]'s
+/// custom-base-free default; a future caller that needs one can extend this the same way
+/// [`read_automaton_txt_with_custom_bases`] extends the automaton reader.
+pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, ReadError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut lines = content.lines().enumerate();
+    let (_, header_line) = lines
+        .by_ref()
+        .find(|(_, l)| !should_skip(l))
+        .ok_or(ReadError::EmptyFile)?;
+
+    let trimmed_header = header_line.trim();
+    let (alphabet, msd) = parse_header(trimmed_header, None, &mut BTreeSet::new())?;
+    let num_tracks = alphabet.len();
+    let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
+    let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
+
+    // Scratch `Automaton`, used only for its `encode` (mixed-radix, position-in-alphabet)
+    // — same precedent as `read_automaton_txt_impl`'s placeholder `Fa`.
+    let scratch = Automaton::new(
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 0,
+            alphabet_size,
+            o: vec![],
+            d: vec![],
+        },
+        alphabet.clone(),
+        label,
+        msd.clone(),
+    );
+
+    let mut d: BTreeMap<usize, BTreeMap<i32, Vec<usize>>> = BTreeMap::new();
+    let mut sigma: BTreeMap<usize, BTreeMap<i32, i32>> = BTreeMap::new();
+    let mut declaration_order: Vec<usize> = Vec::new();
+    let mut current_state: Option<usize> = None;
+    let mut dest_states_used: BTreeSet<usize> = BTreeSet::new();
+
+    for (i, raw_line) in lines {
+        let lineno = i + 1;
+        if should_skip(raw_line) {
+            continue;
+        }
+
+        if let Some(id) = parse_methods::parse_transducer_state_declaration(raw_line) {
+            let id = id as usize;
+            d.entry(id).or_default();
+            sigma.entry(id).or_default();
+            declaration_order.push(id);
+            current_state = Some(id);
+        } else if let Some(t) = parse_methods::parse_transducer_transition(raw_line) {
+            let cur = current_state.ok_or(ReadError::TransitionBeforeState(lineno))?;
+            if t.input.len() != num_tracks {
+                return Err(ReadError::ArityMismatch {
+                    line: lineno,
+                    expected: num_tracks,
+                    got: t.input.len(),
+                });
+            }
+            // `parseTransducerTransition`'s output group always yields exactly one
+            // element by construction (see `parse_methods::TransducerTransition`'s own
+            // doc) -- Java's `if (output.size() != 1) throw` guard is dead code, not
+            // ported as a reachable error.
+            debug_assert_eq!(t.output.len(), 1);
+            let output = t.output[0];
+            let dest: Vec<usize> = t.dest.iter().map(|&x| x as usize).collect();
+            dest_states_used.extend(dest.iter().copied());
+            for digits in expand_wildcards(&t.input, &alphabet) {
+                let sym = scratch.encode(&digits);
+                // `AutomatonReader.readTransducer` (`:249-250`):
+                // `currentStateTransitions.put(encode(i), dest)` — Java `Map.put`
+                // REPLACES any prior entry for the same encoded symbol, it does not
+                // accumulate. So when two separate transition lines from the same
+                // state declare the same input symbol, the LATER line's destination
+                // silently wins and the earlier one is discarded — unlike
+                // `read_automaton_txt_impl`'s `d` table (which genuinely accumulates,
+                // matching `readAutomaton`'s own `computeIfAbsent(...).addAll(dest)` at
+                // `:66-67`). Nondeterminism in a transducer's `d` is still fully
+                // expressible — just WITHIN one line's `dest` list (`"0 -> 0 1 / 0"`),
+                // not across repeated-symbol lines. Overwrite here, matching `sigma`'s
+                // existing (correct) overwrite semantics right below.
+                d.get_mut(&cur)
+                    .expect("current_state always has a d entry")
+                    .insert(sym, dest.clone());
+                sigma
+                    .get_mut(&cur)
+                    .expect("current_state always has a sigma entry")
+                    .insert(sym, output);
+            }
+        } else {
+            return Err(ReadError::UnexpectedLine(lineno));
+        }
+    }
+
+    for &dst in &dest_states_used {
+        if !d.contains_key(&dst) {
+            return Err(ReadError::UndeclaredDestState(dst));
+        }
+    }
+
+    let q = declaration_order.len();
+    if q == 0 {
+        return Err(ReadError::NoStates);
+    }
+    if d.len() != q || (0..q).any(|i| !d.contains_key(&i)) {
+        return Err(ReadError::NonDenseStateIds);
+    }
+    let q0 = declaration_order[0];
+
+    let mut d_vec: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); q];
+    let mut sigma_vec: Vec<BTreeMap<i32, i32>> = vec![BTreeMap::new(); q];
+    for (id, row) in d {
+        d_vec[id] = row;
+    }
+    for (id, row) in sigma {
+        sigma_vec[id] = row;
+    }
+
+    Ok(TransducerData {
+        alphabet,
+        msd,
+        alphabet_size,
+        q0,
+        q,
+        d: d_vec,
+        sigma: sigma_vec,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// readComments (U13)
+// ---------------------------------------------------------------------------
+
+/// `AutomatonReader.readComments(String address)` (`:279-294`): "Usually we skip
+/// comments. Here we skip everything else and return them." Collects every comment line
+/// (`ParseMethods.PATTERN_COMMENT`, [`parse_methods::is_comment_line`]) anywhere in the
+/// file, in original order, joined by `\n` (Java: `System.lineSeparator()` — this port
+/// targets `\n`-emitting platforms, matching every other line-oriented function in this
+/// module), then trimmed top and bottom (`String.strip()` -> `str::trim`).
+pub fn read_comments<P: AsRef<Path>>(path: P) -> Result<String, ReadError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut out = String::new();
+    for line in content.lines() {
+        if parse_methods::is_comment_line(line) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    Ok(out.trim().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// AutomatonDFA(String) / readAutomatonDFAFromFile (U13)
+// ---------------------------------------------------------------------------
+
+/// `AutomatonDFA(String address)` (`AutomatonDFA.java:27-32`): `readAutomaton(this,
+/// address); requireDfaStorage();`.
+///
+/// In practice a thin wrapper over [`read_automaton_txt`]: `readAutomaton` (this reader's
+/// own auto-determinize-on-load step) already guarantees the parsed automaton is
+/// deterministic — or, for a genuine NFAO, see the gap noted below — before
+/// `requireDfaStorage` ([`AutomatonDFA::from`]) ever runs, so the only Java-observable
+/// difference from a bare [`read_automaton_txt`] call is the TYPE-LEVEL promise the
+/// caller gets back (see [`AutomatonDFA`]'s own doc comment for why that promise is
+/// enforced more strongly here than in Java).
+///
+/// `AutomatonDFA.readAutomatonDFAFromFile(String automataName)`'s extra step — resolving
+/// `automataName` to a path via `Session.getReadFileForAutomataLibrary` — is `wr-cli`'s
+/// job (`Session`, Phase 3a's U14): this function, like every other one in this module,
+/// takes an already-resolved path.
+///
+/// # `docs/WALNUT-BUGS.md` WB-022: a real gap, now logged (not just noted inline)
+///
+/// Real Walnut's `readAutomaton` throws `WalnutException.nonDeterministicO` when a file
+/// describes a genuine NFAO (nondeterministic transitions AND some state output `> 1`) —
+/// checked BEFORE auto-determinizing, since a DFAO's per-state output values cannot be
+/// soundly merged by subset construction. [`read_automaton_txt_impl`] has no such check
+/// and unconditionally auto-determinizes every nondeterministic input regardless of its
+/// outputs, collapsing them to plain 0/1 acceptance (`wr_core::determinize::
+/// subset_construction`'s own docs confirm this is exactly what it does) — a silently
+/// DIFFERENT, wrong automaton, not the error Java would produce. So `AutomatonDFA::from`'s
+/// matching `is_fao()` guard (`"NFAOs are not supported.."` panic) is PROVABLY UNREACHABLE
+/// through this specific call path — by the time it runs, `read_automaton_txt` has already
+/// forced determinism. No real custom-base or golden-corpus fixture this port has
+/// encountered exercises the genuine-NFAO shape, so this is not live against the real
+/// corpus — but it is a plausible hand-written input, hence WB-022 (`docs/WALNUT-BUGS.md`),
+/// pinned by
+/// [`tests::read_automaton_dfa_txt_on_a_genuine_nfao_file_silently_determinizes_instead_of_erroring_wb022`].
+pub fn read_automaton_dfa_txt<P: AsRef<Path>>(path: P) -> Result<AutomatonDFA, ReadError> {
+    Ok(AutomatonDFA::from(read_automaton_txt(path)?))
+}
+
+/// Like [`read_automaton_dfa_txt`], but with [`read_automaton_txt_with_custom_bases`]'s
+/// custom-base header support — Java's `readAutomaton` is shared code between the
+/// `Automaton(String)` and `AutomatonDFA(String)` constructors, so custom-base
+/// resolution applies equally to both.
+pub fn read_automaton_dfa_txt_with_custom_bases<P: AsRef<Path>>(
+    path: P,
+    custom_bases_dir: &Path,
+) -> Result<AutomatonDFA, ReadError> {
+    Ok(AutomatonDFA::from(read_automaton_txt_with_custom_bases(
+        path,
+        custom_bases_dir,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,33 +1009,36 @@ mod tests {
 
     #[test]
     fn bare_msd_defaults_to_base_2() {
-        let (alphabet, msd) = parse_header("msd").unwrap();
+        let (alphabet, msd) = parse_header("msd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(true)]);
     }
 
     #[test]
     fn bare_lsd_defaults_to_base_2() {
-        let (alphabet, msd) = parse_header("lsd").unwrap();
+        let (alphabet, msd) = parse_header("lsd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(false)]);
     }
 
     #[test]
     fn msd_k_and_lsd_k_parse_explicit_bases() {
-        let (alphabet, msd) = parse_header("msd_5 lsd_3").unwrap();
+        let (alphabet, msd) = parse_header("msd_5 lsd_3", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1, 2, 3, 4], vec![0, 1, 2]]);
         assert_eq!(msd, vec![Some(true), Some(false)]);
     }
 
     #[test]
     fn unsupported_numeration_is_explicit_not_silent() {
+        // Without a `custom_bases_dir`, `msd_fib` is still `UnsupportedNumeration`,
+        // exactly as before U13 -- see `custom_base_header_is_resolved_with_a_dir` below
+        // for the WITH-a-directory case.
         assert!(matches!(
-            parse_header("msd_fib"),
+            parse_header("msd_fib", None, &mut BTreeSet::new()),
             Err(ReadError::UnsupportedNumeration(_))
         ));
         assert!(matches!(
-            parse_header("msd5"), // no-underscore form — deliberately unsupported
+            parse_header("msd5", None, &mut BTreeSet::new()), // no-underscore form — deliberately unsupported
             Err(ReadError::UnsupportedNumeration(_))
         ));
     }
@@ -711,5 +1219,390 @@ mod tests {
             Err(ReadError::NoStates)
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- custom-base header parsing (U13) ------------------------------------
+
+    #[test]
+    fn reads_custom_base_header_msd_fib_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-fib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cb_dir = dir.join("Custom Bases");
+        std::fs::create_dir_all(&cb_dir).unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), cb_dir.join("msd_fib.txt")).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            cb_dir.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+
+        let path = dir.join("main.txt");
+        // Content is irrelevant to header resolution -- a single-track automaton over
+        // the (real, {0,1}-alphabet) msd_fib numeration, self-looping on everything.
+        std::fs::write(&path, "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+
+        let a = read_automaton_txt_with_custom_bases(&path, &cb_dir).unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.msd, vec![Some(true)]);
+        assert!(a.fa.is_accepting(a.fa.q0));
+
+        // Same file through the plain (no-directory) entry point is unaffected --
+        // U13 is additive, not a behavior change to the pre-existing one.
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::UnsupportedNumeration(ref s)) if s == "msd_fib"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_header_round_trips_an_alphabet_larger_than_two() {
+        // Not every shipped custom base is `{0, 1}` -- `msd_kim`/`msd_pell` are
+        // `{0, 1, 2}`, `msd_ns`/`msd_tib` are `{0, 1, 2, 3}` (verified against the real
+        // `walnut-java` `Custom Bases/*.txt` files). This proves
+        // `HeaderToken::Ns::alphabet` (and therefore the resulting `Automaton::alphabet`)
+        // genuinely round-trips a size-3 custom-base alphabet, not just the `{0, 1}`
+        // shape every OTHER fixture in this test module happens to use. A hand-authored
+        // (not walnut-java-sourced) 3-track adder is enough -- `NumberSystem::
+        // with_custom_base_files` only structurally validates the adder (exactly 3
+        // tracks, alphabet contains 0 and 1, all three tracks' alphabets set-equal), it
+        // never checks the transition table actually computes addition.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-wide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("msd_wide_addition.txt"),
+            "{0, 1, 2} {0, 1, 2} {0, 1, 2}\n\n0 1\n* * * -> 0\n",
+        )
+        .unwrap();
+
+        let path = dir.join("main.txt");
+        std::fs::write(&path, "msd_wide\n\n0 1\n0 -> 0\n1 -> 0\n2 -> 0\n").unwrap();
+
+        let a = read_automaton_txt_with_custom_bases(&path, &dir).unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1, 2]]);
+        assert_eq!(a.msd, vec![Some(true)]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_automaton_dfa_txt_with_custom_bases_resolves_the_header_too() {
+        // `readAutomaton` (and therefore custom-base resolution) is shared between the
+        // `Automaton(String)` and `AutomatonDFA(String)` constructors in Java.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-dfa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cb_dir = dir.join("Custom Bases");
+        std::fs::create_dir_all(&cb_dir).unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), cb_dir.join("msd_fib.txt")).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            cb_dir.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+
+        let path = dir.join("main.txt");
+        std::fs::write(&path, "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+
+        let dfa = read_automaton_dfa_txt_with_custom_bases(&path, &cb_dir).unwrap();
+        assert!(dfa.automaton().fa.is_deterministic());
+        assert_eq!(dfa.automaton().alphabet, vec![vec![0, 1]]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_complement_fallback_reverses_the_opposite_direction_file() {
+        // Only the MSD-direction file exists; loading "lsd_test" must fall back to the
+        // "msd_test" complement and reverse it (`NumberSystem.loadAutomatonOrNull`'s
+        // "try the complement" branch, `:313-316`).
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-cb-complement-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            dir.join("msd_test_addition.txt"),
+        )
+        .unwrap();
+
+        let ns = load_custom_base("lsd_test", &dir, &mut BTreeSet::new()).unwrap();
+        // `isMsd` comes from the NAME passed in, independent of which file was actually
+        // loaded (Java: `isMsd = msdOrLsd.equals(MSD)`, computed before any file I/O).
+        assert!(!ns.is_msd());
+        assert_eq!(ns.name(), "lsd_test");
+        assert_eq!(ns.get_alphabet(), &[0, 1]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_negative_name_is_rejected_before_any_file_io() {
+        // An empty directory: if the `_neg_` check ran AFTER file probing, this would
+        // fail with a `NotDefined`/file-not-found error instead of the intended
+        // `UnsupportedNegativeBase` -- pins the ordering, not just the outcome.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-neg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            load_custom_base("msd_neg_fib", &dir, &mut BTreeSet::new()),
+            Err(ReadError::NumSys(NumSysError::UnsupportedNegativeBase(_)))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_name_with_no_matching_files_is_not_defined() {
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-cb-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap(); // empty: no files at all
+        assert!(matches!(
+            load_custom_base("msd_nonexistent", &dir, &mut BTreeSet::new()),
+            Err(ReadError::NumSys(NumSysError::NotDefined(_)))
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_self_referential_addition_file_is_a_clean_cycle_error_not_a_stack_overflow() {
+        // `Custom Bases/msd_selfref_addition.txt`'s OWN header names `msd_selfref` again --
+        // resolving `msd_selfref` would otherwise recurse into resolving `msd_selfref`
+        // resolving `msd_selfref`... forever. No real shipped `walnut-java` custom-base
+        // file does this (verified while porting U13), but a malformed hand-written one
+        // could, and without a guard that's an uncatchable Rust stack overflow rather than
+        // a normal `Result`. The cycle is caught before the recursively-read file's own
+        // BODY is ever parsed (the re-entrant `load_custom_base` call happens while parsing
+        // that file's header), so the body content here is irrelevant to the test.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("msd_selfref_addition.txt"),
+            "msd_selfref\n\n0 0\n0 0 0 -> 0\n",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            load_custom_base("msd_selfref", &dir, &mut BTreeSet::new()),
+            Err(ReadError::CustomBaseCycle(ref s)) if s == "msd_selfref"
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn custom_base_cycle_guard_does_not_reject_the_same_name_resolved_twice_sequentially() {
+        // The guard tracks names currently IN PROGRESS on the call stack, not every name
+        // ever seen -- resolving `msd_fib` twice in a row (e.g. two header tracks that both
+        // name it) must succeed both times, not fail the second time as a false-positive
+        // "cycle".
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-cb-cycle-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), dir.join("msd_fib.txt")).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            dir.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+
+        let mut in_progress = BTreeSet::new();
+        assert!(load_custom_base("msd_fib", &dir, &mut in_progress).is_ok());
+        assert!(in_progress.is_empty(), "guard must clean up after success");
+        assert!(load_custom_base("msd_fib", &dir, &mut in_progress).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- readTransducer / readComments (U13) ---------------------------------
+
+    #[test]
+    fn reads_the_real_runsum2_transducer_fixture() {
+        // `Transducer Library/RUNSUM2.txt`: {0,1}, two states, each transition negates
+        // the input bit as its output on a self/cross loop:
+        //   0: 0 -> 0 / 0, 1 -> 1 / 1
+        //   1: 0 -> 1 / 1, 1 -> 0 / 0
+        // The alphabet is exactly {0, 1} in that order, so encoded symbol == digit value
+        // (position-in-alphabet), and destination/state ids are exactly 0 and 1 as
+        // declared -- both asserted directly below rather than re-deriving an encoder.
+        let t = read_transducer_txt(fixture("RUNSUM2.txt")).unwrap();
+        assert_eq!(t.alphabet, vec![vec![0, 1]]);
+        assert_eq!(t.msd, vec![None]); // explicit-set alphabet, not a numeration
+        assert_eq!(t.q, 2);
+        assert_eq!(t.q0, 0);
+
+        assert_eq!(t.d[0].get(&0), Some(&vec![0]));
+        assert_eq!(t.d[0].get(&1), Some(&vec![1]));
+        assert_eq!(t.d[1].get(&0), Some(&vec![1]));
+        assert_eq!(t.d[1].get(&1), Some(&vec![0]));
+
+        assert_eq!(t.sigma[0].get(&0), Some(&0));
+        assert_eq!(t.sigma[0].get(&1), Some(&1));
+        assert_eq!(t.sigma[1].get(&0), Some(&1));
+        assert_eq!(t.sigma[1].get(&1), Some(&0));
+    }
+
+    #[test]
+    fn transducer_transitions_are_not_auto_determinized() {
+        // Unlike `read_automaton_txt`, `readTransducer` has no auto-determinize step --
+        // MULTIPLE destinations declared on a SINGLE transition line survive as genuine
+        // nondeterminism in `d` (`AutomatonReader.readTransducer`'s `dest` list, `:249`,
+        // is stored as-is via `Map.put`; a line's own dest list is never collapsed).
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-transducer-nfa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfa_transducer.txt");
+        std::fs::write(
+            &path,
+            "{0, 1}\n\n0\n0 -> 0 1 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 0\n",
+        )
+        .unwrap();
+        let t = read_transducer_txt(&path).unwrap();
+        assert_eq!(t.d[0].get(&0), Some(&vec![0, 1]));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transducer_repeated_symbol_across_lines_is_last_line_wins_not_a_union() {
+        // `AutomatonReader.readTransducer` (`:249-250`):
+        // `currentStateTransitions.put(encode(i), dest)` -- Java `Map.put` REPLACES,
+        // it does not accumulate. Two separate transition lines from the same state
+        // declaring the SAME input symbol must leave only the LATER line's destination
+        // in `d`, discarding the earlier one -- unlike `read_automaton_txt`'s NFA `d`
+        // table, which genuinely unions repeated-symbol lines.
+        let dir = std::env::temp_dir().join(format!(
+            "wr-io-test-transducer-last-wins-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("last_wins_transducer.txt");
+        std::fs::write(
+            &path,
+            "{0, 1}\n\n0\n0 -> 0 / 0\n0 -> 1 / 1\n\n1\n0 -> 1 / 0\n",
+        )
+        .unwrap();
+        let t = read_transducer_txt(&path).unwrap();
+        // The later line ("0 -> 1 / 1") wins outright: destination AND output.
+        assert_eq!(t.d[0].get(&0), Some(&vec![1]));
+        assert_eq!(t.sigma[0].get(&0), Some(&1));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transducer_arity_mismatch_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "wr-io-test-transducer-arity-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.txt");
+        std::fs::write(&path, "{0, 1} {0, 1}\n\n0\n0 -> 0 / 0\n").unwrap();
+        assert!(matches!(
+            read_transducer_txt(&path),
+            Err(ReadError::ArityMismatch {
+                expected: 2,
+                got: 1,
+                ..
+            })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_comments_collects_every_comment_line_in_order() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-comments-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("commented.txt");
+        std::fs::write(
+            &path,
+            "# first comment\nmsd_2\n\n0 0\n# a mid-file comment\n0 -> 0\n1 -> 0\n#trailing, no space\n",
+        )
+        .unwrap();
+        let comments = read_comments(&path).unwrap();
+        assert_eq!(
+            comments,
+            "# first comment\n# a mid-file comment\n#trailing, no space"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_comments_on_a_file_with_no_comments_is_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-comments-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain.txt");
+        std::fs::write(&path, "msd_2\n\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
+        assert_eq!(read_comments(&path).unwrap(), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- AutomatonDFA(String) / readAutomatonDFAFromFile (U13) ---------------
+
+    #[test]
+    fn read_automaton_dfa_txt_on_an_already_deterministic_fixture() {
+        let dfa = read_automaton_dfa_txt(fixture("automaton2.txt")).unwrap();
+        assert!(dfa.automaton().fa.is_deterministic());
+        assert_eq!(dfa.automaton().alphabet, vec![vec![0, 1, 2]; 4]);
+    }
+
+    #[test]
+    fn read_automaton_dfa_txt_auto_determinizes_an_nfa_file() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-dfa-nfa-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfa.txt");
+        std::fs::write(
+            &path,
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+        let dfa = read_automaton_dfa_txt(&path).unwrap();
+        assert!(dfa.automaton().fa.is_deterministic());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_automaton_dfa_txt_on_a_genuine_nfao_file_silently_determinizes_instead_of_erroring_wb022(
+    ) {
+        // `docs/WALNUT-BUGS.md` WB-022: real Java's `readAutomaton` would throw
+        // `WalnutException.nonDeterministicO` for this file -- nondeterministic
+        // transitions (state 0 has two destinations for symbol 0) AND a genuine DFAO
+        // output (state 1's declared output is 2, not just 0/1). This port has no
+        // `is_fao` guard in `read_automaton_txt_impl` and silently determinizes instead,
+        // collapsing the real output 2 down to plain boolean acceptance. This test pins
+        // the CURRENT (divergent) behavior explicitly, so a future fix that adds the
+        // missing guard is a visible, intentional change (this test will fail and need
+        // updating), not something nobody notices moving.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-nfao-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfao.txt");
+        std::fs::write(
+            &path,
+            "msd_2\n\n0 0\n0 -> 0\n0 -> 1\n1 -> 0\n\n1 2\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        // Sanity: the parsed shape really is a genuine NFAO before determinizing --
+        // confirms the test fixture actually exercises the gap, not some other shape.
+        // (Read directly via the plain, non-DFA-typed entry point is not possible here
+        // since `read_automaton_txt` itself already auto-determinizes; instead this
+        // just documents the fixture's intent above and relies on the DFA-typed
+        // result's boolean-only acceptance below as the observable symptom.)
+
+        let dfa = read_automaton_dfa_txt(&path).unwrap();
+        assert!(dfa.automaton().fa.is_deterministic());
+        // The real output value 2 is gone -- collapsed to plain 0/1 acceptance. Real
+        // Walnut would have thrown `nonDeterministicO` instead of reaching this point.
+        assert!(dfa.automaton().fa.o.iter().all(|&o| o == 0 || o == 1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_automaton_dfa_txt_true_false_fixtures() {
+        let dfa_true = read_automaton_dfa_txt(fixture("automaton189.txt")).unwrap();
+        assert!(dfa_true.automaton().is_true_false_automaton());
+        assert!(dfa_true.automaton().is_true_automaton());
+
+        let dfa_false = read_automaton_dfa_txt(fixture("automaton214.txt")).unwrap();
+        assert!(dfa_false.automaton().is_true_false_automaton());
+        assert!(!dfa_false.automaton().is_true_automaton());
     }
 }
