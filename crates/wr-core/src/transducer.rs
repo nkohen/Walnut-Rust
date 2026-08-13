@@ -85,6 +85,22 @@
 //! `Automaton::encode` here would panic on the exact `RUNSUM`-on-a-partial-automaton
 //! shape Walnut supports.
 //!
+//! # Cost: the BFS is uncapped and genuinely can be exponential
+//!
+//! Neither loop below is bounded. The first runs until the iterate-vector sequence
+//! repeats, and its lag-plus-period `p + q` is capped only by the number of distinct
+//! vectors of maps `S_T -> S_T` over `M`'s states, i.e. `Q_T^(Q_T · Q_M)`; a BFS state is
+//! then a pair `(M-state, [phi_i]_{i<p+q})`, so the state count is capped only by
+//! `Q_M · Q_T^(Q_T · (p+q))`. On top of that, `create_iterates`' `dests` word grows by a
+//! factor of `alphabet_size` per iterate. Ordinary library inputs are tiny (RUNSUM2 on
+//! Thue-Morse is 8 BFS states, sub-millisecond), but hand-built transducers with a few
+//! states and a rich transition monoid measurably run for seconds or more even in release
+//! mode. This is **faithful** — Java pays the same cost through the same unbounded loops,
+//! so it is not a port regression and is deliberately not "fixed" here. It does mean the
+//! cap belongs at the *caller's* layer: whoever wires `transduce` into `wr-cli` (U26)
+//! needs `CLAUDE.md`'s "per-test resource caps, never hangs" wall-time/peak-state guard
+//! around this call, not inside it.
+//!
 //! # WB-035: `minOutput` is used both as an encoded INPUT symbol and as an OUTPUT marker
 //!
 //! See `docs/WALNUT-BUGS.md`. `transduceNonDeterministic`'s partial-automaton path
@@ -92,6 +108,13 @@
 //! it, unencoded, as (a) an encoded input symbol of the transducer and (b) the marker
 //! output whose states are deleted from the *result*. Both are category errors that
 //! only work by coincidence; both are ported verbatim and pinned by tests below.
+//!
+//! # WB-034: a track with no number system NPEs before the transduction even starts
+//!
+//! See `docs/WALNUT-BUGS.md` and [`Transducer::transduce_non_deterministic`]'s doc.
+//! `Transducer.java:286` dereferences `M.getNS().get(0)` unguarded, and that entry is
+//! `null` for any track declared with an explicit `{…}` alphabet. Ported verbatim as
+//! [`TransduceError::NoNumberSystem`].
 //!
 //! # Logging
 //!
@@ -124,7 +147,8 @@ use std::time::Instant;
 
 /// The errors `Transducer.java` raises, as a typed enum rather than Walnut's
 /// stringly-typed `WalnutException` (`PORTING.md`'s type/error mapping table). The
-/// first three carry Java's message text verbatim; the fourth has no Java
+/// first three carry Java's message text verbatim; [`TransduceError::NoNumberSystem`]
+/// carries Java's `NullPointerException` text verbatim (WB-034); the last has no Java
 /// counterpart — see its own doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransduceError {
@@ -137,6 +161,19 @@ pub enum TransduceError {
     /// `Transducer.java:343` — `isTotalized` found a state/input pair with more than
     /// one destination.
     MultipleTransitionsPerInput,
+    /// **WB-034** (`docs/WALNUT-BUGS.md`) — `Transducer.java:286`'s
+    /// `M.getNS().get(0).isMsd()` dereferences a `null` `NumberSystem`, which is what
+    /// `ParseMethods.parseAlphabetDeclaration` puts in `NS` for a track declared with an
+    /// explicit alphabet (`{0,1}`) rather than `msd_k`/`lsd_k`. This crate's stand-in
+    /// for that `null` is `Automaton::msd[0] == None`, so the guard is `is_none()`.
+    ///
+    /// Ported verbatim as a *rejection*, not a divergence: Java's NPE is an unchecked
+    /// `RuntimeException` that `Prover.dispatch`'s top-level `catch (RuntimeException)`
+    /// recovers from — the message prints and the session continues — so a `Result::Err`
+    /// whose `Display` is Java's own NPE text is more faithful than a Rust `panic!`
+    /// would be (this port has no `catch_unwind` boundary; a panic would kill the
+    /// process). Same treatment, and the same defect class, as WB-033/WB-013.
+    NoNumberSystem,
     /// **No Java counterpart as a checked error.** `transduceMsdDeterministic` has no
     /// guard at all against a `TRUE_FALSE_AUTOMATON` input: such an automaton has zero
     /// states and an empty `O`, so Java's very first BFS step (`:187-188`,
@@ -167,6 +204,13 @@ impl fmt::Display for TransduceError {
                     "Automaton must have at most one transition per input per state."
                 )
             }
+            // Java's own NPE text, reproduced verbatim (captured from
+            // `Walnut-all.jar`, 2026-08-13) so CLI output still matches. See WB-034.
+            TransduceError::NoNumberSystem => write!(
+                f,
+                "Cannot invoke \"Automata.NumberSystem.isMsd()\" because the return value of \
+                 \"java.util.List.get(int)\" is null"
+            ),
             TransduceError::TrivialAutomaton => write!(
                 f,
                 "a TRUE/FALSE automaton has no states or tracks and cannot be transduced"
@@ -405,9 +449,12 @@ impl Transducer {
         // The other half of this crate's per-track `NumberSystem` stand-in
         // (`PORTING.md`'s parallel-vector ruling): Java's single `getNS().add(...)`
         // moves the msd/lsd direction and the all-representations automaton together,
-        // so this must too. Guarded rather than asserted because `clonePartialFields`
-        // itself tolerates a shorter `NS` list, and hand-built automata in tests may
-        // have one.
+        // so this must too. Guarded rather than asserted only for the port's own
+        // convenience: hand-built automata in tests may carry short parallel vectors.
+        // Java is NOT this tolerant — `clonePartialFields` loops to `richAlphabet.getA()
+        // .size()` and indexes `getNS().get(i)` unconditionally, so a shorter `NS` list
+        // throws `IndexOutOfBoundsException` there. On the well-formed input every
+        // real caller produces, the two behave identically.
         if m.all_reps.len() == m.alphabet.len() && m.msd.len() == m.alphabet.len() {
             n.set_all_reps(m.all_reps.clone());
         }
@@ -514,7 +561,14 @@ impl Transducer {
             // look at the states that this state transitions to.
             let symbols: Vec<i32> = m.fa.d[curr_state.state].keys().copied().collect();
             for di in symbols {
-                let di_index = di as usize;
+                // Java indexes `stateMorphed` with the raw `int` key. A negative key is
+                // only reachable from an ill-formed transition table (`encode`'s `-1`
+                // never lands in `M.fa.d`), and would be an
+                // `ArrayIndexOutOfBoundsException` in Java; a checked conversion here so
+                // it is a diagnosable panic rather than a silently wrapped `as usize`
+                // index that panics confusingly further down.
+                let di_index = usize::try_from(di)
+                    .unwrap_or_else(|_| panic!("negative encoded symbol {di} in M's transitions"));
 
                 // make new state string
                 let mut new_state_string = new_string.clone();
@@ -592,13 +646,18 @@ impl Transducer {
     ///
     /// # `M.getNS().get(0).isMsd()` and this crate's `msd: Vec<Option<bool>>`
     ///
-    /// Java reads a `NumberSystem` object and would NPE if the track had none. This
-    /// crate stores the derived fact as an `Option<bool>` (see [`Automaton::msd`]), so
-    /// the `None` ("no number system / non-arithmetic track") case has no Java
-    /// counterpart to be faithful to. It is treated as msd — i.e. the same
-    /// "skip the numeration-specific handling" reading `crate::quantify` already gives
-    /// `None` — rather than as a panic, since nothing downstream of the reversal needs
-    /// a number system.
+    /// Java reads a `NumberSystem` object out of `M.getNS()` and calls `.isMsd()` on it
+    /// with no null check (`Transducer.java:286`). A track declared with an **explicit
+    /// alphabet** (`{0,1}`) rather than `msd_k`/`lsd_k` has a literal `null` there
+    /// (`ParseMethods.parseAlphabetDeclaration:91-96`), and such a file is perfectly
+    /// valid input everywhere else — so real Walnut throws
+    /// `NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()" …` on it.
+    /// That is **WB-034**, and it is reachable straight from `wr_io::reader`'s
+    /// `HeaderToken::Set(..)` branch, which is exactly what produces `msd[0] == None`.
+    ///
+    /// This port replicates it as [`TransduceError::NoNumberSystem`] rather than
+    /// silently treating `None` as msd — see that variant's doc for why a `Result::Err`
+    /// (not a `panic!`) is the faithful representation of Java's unchecked NPE here.
     pub fn transduce_non_deterministic(
         &self,
         m: &mut Automaton,
@@ -623,7 +682,15 @@ impl Transducer {
         // make sure the number system is lsd.
         let mut to_lsd = false;
 
-        if m.msd[0] == Some(false) {
+        // WB-034: `Transducer.java:286` calls `.isMsd()` on `M.getNS().get(0)` with no
+        // null check, and an explicit-alphabet track's `NumberSystem` *is* null. Ported
+        // verbatim as a rejection at exactly Java's position — after the arity and
+        // alphabet-compatibility guards, before the reversal.
+        let Some(is_msd) = m.msd[0] else {
+            return Err(TransduceError::NoNumberSystem);
+        };
+
+        if !is_msd {
             logging.log_message("Automaton number system is lsd, reversing");
             to_lsd = true;
             logging.indent();
@@ -756,6 +823,52 @@ mod tests {
         word_automaton(&[0, 1], &[&[(0, 0), (1, 1)], &[(0, 1), (1, 0)]])
     }
 
+    /// `Word Automata Library/PR.txt` — the regular paperfolding sequence as a 4-state
+    /// **`lsd_2`** DFAO, transcribed verbatim from `walnut-java`'s copy.
+    fn paperfolding_lsd() -> Automaton {
+        let mut a = word_automaton(
+            &[0, 0, 0, 1],
+            &[
+                &[(0, 1), (1, 0)],
+                &[(0, 2), (1, 3)],
+                &[(0, 2), (1, 2)],
+                &[(0, 3), (1, 3)],
+            ],
+        );
+        a.msd = vec![Some(false)];
+        a
+    }
+
+    /// The `k`-digit msd-first base-2 representation of `n` (leading zeros kept).
+    fn msd_digits(n: u32, k: u32) -> Vec<i32> {
+        (0..k).rev().map(|b| ((n >> b) & 1) as i32).collect()
+    }
+
+    /// An **independent** brute-force oracle for Dekking's construction, written
+    /// straight from the definition with no reference to the BFS above: feed the
+    /// transducer `m`'s output sequence one letter at a time, left to right, and read
+    /// off `sigma` at the last position.
+    ///
+    /// Positions live inside `h^k(q0)` for a fixed word length `k`, so the letter at
+    /// position `i` is `m`'s output on the `k`-digit representation of `i`, and the
+    /// position of `word` is its base-2 value. `m` must be total.
+    fn dekking_oracle(t: &Transducer, m: &Automaton, k: u32, word: &[i32]) -> i32 {
+        assert_eq!(word.len(), k as usize);
+        let letter_at = |i: u32| -> i32 {
+            let mut s = m.fa.q0;
+            for sym in msd_digits(i, k) {
+                s = m.fa.d[s][&sym][0];
+            }
+            m.fa.o[s]
+        };
+        let position = word.iter().fold(0u32, |acc, &b| acc * 2 + b as u32);
+        let mut ts = t.automaton.fa.q0;
+        for i in 0..position {
+            ts = t.automaton.fa.d[ts][&t.encode_input(letter_at(i))][0];
+        }
+        t.sigma[ts][&t.encode_input(letter_at(position))]
+    }
+
     /// Walks a deterministic word automaton and returns the output at the state
     /// reached by `word`, or `None` if the walk falls off a missing transition.
     fn word_output(a: &Automaton, word: &[i32]) -> Option<i32> {
@@ -801,10 +914,18 @@ mod tests {
             [2, 3],
         ];
         assert_eq!(c.fa.q, expected.len());
-        let actual: Vec<[usize; 2]> = (0..c.fa.q)
-            .map(|q| [c.fa.d[q][&0][0], c.fa.d[q][&1][0]])
-            .collect();
-        assert_eq!(actual, expected.to_vec());
+        // Check the WHOLE per-state table, not two probed keys: a spurious third symbol
+        // or a second destination in any list must fail here.
+        for (q, row_expected) in expected.iter().enumerate() {
+            let row = &c.fa.d[q];
+            assert_eq!(
+                row.keys().copied().collect::<Vec<i32>>(),
+                vec![0, 1],
+                "state {q} must have exactly the symbols 0 and 1, no more"
+            );
+            assert_eq!(row[&0], vec![row_expected[0]], "state {q} on symbol 0");
+            assert_eq!(row[&1], vec![row_expected[1]], "state {q} on symbol 1");
+        }
     }
 
     /// The same result, checked semantically rather than structurally (`CLAUDE.md`'s
@@ -854,6 +975,71 @@ mod tests {
                 word_output(&c, &word),
                 Some((n.count_ones() % 2) as i32),
                 "identity transduction at n = {n}"
+            );
+        }
+    }
+
+    /// **Composition order.** Everything above is blind to the direction
+    /// [`Transducer::create_map_so_far`] folds in: RUNSUM2's transition monoid is
+    /// `Z/2` (abelian) and the identity/relabelling transducers have one state, so a
+    /// reversed fold computes the same maps. This transducer's monoid is `S_3` —
+    /// letter `0` acts as the 3-cycle `(0 1 2)`, letter `1` as the transposition
+    /// `(0 1)` — which is emphatically non-commutative, and `sigma` depends on the
+    /// state reached, so the order is observable. Checked against
+    /// [`dekking_oracle`], an independent left-to-right reading of the definition.
+    #[test]
+    fn transduction_respects_composition_order_for_a_noncommutative_transducer() {
+        let mut logging = Logging::new();
+        let t = transducer(
+            &[0, 1],
+            &[
+                // (input value, destination, output)
+                &[(0, 1, 0), (1, 1, 10)],
+                &[(0, 2, 1), (1, 0, 11)],
+                &[(0, 0, 2), (1, 2, 12)],
+            ],
+        );
+        let reference = thue_morse();
+        let mut m = thue_morse();
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        let k = 5u32;
+        for n in 0..(1u32 << k) {
+            let word = msd_digits(n, k);
+            assert_eq!(
+                word_output(&c, &word),
+                Some(dekking_oracle(&t, &reference, k, &word)),
+                "S_3 transduction of Thue-Morse at position {n}"
+            );
+        }
+    }
+
+    /// **`minimize_self_with_output` is load-bearing.** This transducer has RUNSUM2's
+    /// exact transition structure — so the BFS builds the very same 8 `StateTuple`s the
+    /// headline test above pins — but both its states emit the *input letter*, so the
+    /// transduced sequence is Thue-Morse again and those 8 tuples must collapse to 2.
+    /// Dropping the post-BFS minimization leaves 8 states here.
+    #[test]
+    fn the_bfs_result_is_minimized_with_output() {
+        let mut logging = Logging::new();
+        let t = transducer(&[0, 1], &[&[(0, 0, 0), (1, 1, 1)], &[(0, 1, 0), (1, 0, 1)]]);
+        let mut m = thue_morse();
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        assert_eq!(
+            c.fa.q, 2,
+            "the BFS over-generates 8 tuples here; without minimize_self_with_output \
+             all 8 survive"
+        );
+        for n in 0u32..16 {
+            let word: Vec<i32> = format!("{n:b}")
+                .bytes()
+                .map(|b| (b - b'0') as i32)
+                .collect();
+            assert_eq!(
+                word_output(&c, &word),
+                Some((n.count_ones() % 2) as i32),
+                "the minimized result must still be Thue-Morse, at n = {n}"
             );
         }
     }
@@ -931,6 +1117,54 @@ mod tests {
         );
     }
 
+    /// **WB-034** (`docs/WALNUT-BUGS.md`). A track declared with an explicit `{0,1}`
+    /// alphabet instead of `msd_k`/`lsd_k` has a `null` `NumberSystem` in Java, and
+    /// `Transducer.java:286` dereferences it unguarded. Empirically confirmed against
+    /// the real `walnut-java` CLI (`target/Walnut-all.jar`, 2026-08-13): a `{0,1}` word
+    /// automaton through `transduce … RUNSUM2 …` prints
+    /// `java.lang.NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()"
+    /// because the return value of "java.util.List.get(int)" is null / at
+    /// Automata.Transducer.transduceNonDeterministic(Transducer.java:286)` and returns
+    /// to the REPL. Ported verbatim as a rejection carrying that very message.
+    #[test]
+    fn wb034_a_track_with_no_number_system_is_rejected() {
+        let mut logging = Logging::new();
+        let mut m = thue_morse();
+        // What `wr_io::reader`'s `HeaderToken::Set(..)` branch produces for `{0,1}`.
+        m.msd = vec![None];
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic(&mut m, &mut logging)
+                .unwrap_err(),
+            TransduceError::NoNumberSystem
+        );
+        assert_eq!(
+            TransduceError::NoNumberSystem.to_string(),
+            "Cannot invoke \"Automata.NumberSystem.isMsd()\" because the return value \
+             of \"java.util.List.get(int)\" is null"
+        );
+
+        // The guard sits at Java's own position — after the arity check (`:271`) and
+        // after the alphabet-compatibility loop (`:276-281`) — so both still win when
+        // they also apply.
+        let mut two_track = thue_morse();
+        two_track.msd = vec![None, None];
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic(&mut two_track, &mut logging)
+                .unwrap_err(),
+            TransduceError::NotSingleInput
+        );
+        let mut bad_alphabet = word_automaton(&[0, 7], &[&[(0, 0), (1, 1)], &[(0, 1), (1, 0)]]);
+        bad_alphabet.msd = vec![None];
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic(&mut bad_alphabet, &mut logging)
+                .unwrap_err(),
+            TransduceError::IncompatibleAlphabet
+        );
+    }
+
     #[test]
     fn a_genuinely_nondeterministic_automaton_is_rejected() {
         let mut logging = Logging::new();
@@ -971,6 +1205,66 @@ mod tests {
         assert_eq!(word_output(&c, &[0, 1]), Some(5));
         // The one genuinely undefined transition of the input stays undefined.
         assert_eq!(word_output(&c, &[1]), None);
+    }
+
+    /// The same partial automaton through a **multi-state** transducer (RUNSUM2), so the
+    /// `for q in 0..t_new.automaton.fa.q` loop that installs the dead letter really does
+    /// iterate: a bug that wrote to a fixed index instead of `q` would only show up
+    /// here, not in the one-state cases above.
+    ///
+    /// Ground truth captured from the real `walnut-java` CLI (`target/Walnut-all.jar`,
+    /// 2026-08-13) as `transduce PARTOUT RUNSUM2 PARTIAL;` with
+    /// `Word Automata Library/PARTIAL.txt` = `msd_2` / `0 0 / 0 -> 1` / `1 1 / 0 -> 1,
+    /// 1 -> 0`; the 8-state table below is that output verbatim, state numbering
+    /// included.
+    #[test]
+    fn partial_automaton_through_a_multi_state_transducer_matches_java() {
+        let mut logging = Logging::new();
+        let mut m = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+        let c = runsum2()
+            .transduce_non_deterministic(&mut m, &mut logging)
+            .unwrap();
+
+        assert_eq!(c.fa.o, vec![0, 1, 1, 0, 1, 1, 0, 0]);
+        let expected: [&[(i32, usize)]; 8] = [
+            &[(0, 1)],
+            &[(0, 1), (1, 2)],
+            &[(0, 3)],
+            &[(0, 4), (1, 5)],
+            &[(0, 6), (1, 0)],
+            &[(0, 4)],
+            &[(0, 3), (1, 7)],
+            &[(0, 6)],
+        ];
+        assert_eq!(c.fa.q, expected.len());
+        for (q, row_expected) in expected.iter().enumerate() {
+            let actual: Vec<(i32, usize)> = c.fa.d[q]
+                .iter()
+                .map(|(&sym, dests)| {
+                    assert_eq!(dests.len(), 1, "state {q} on symbol {sym} must be a DFA");
+                    (sym, dests[0])
+                })
+                .collect();
+            assert_eq!(actual, row_expected.to_vec(), "state {q}");
+        }
+
+        // ... and semantically: RUNSUM2's running sum, with the dead letter looping in
+        // place (so undefined positions contribute nothing), and the result undefined
+        // exactly where the input was.
+        let k = 4u32;
+        for n in 0..(1u32 << k) {
+            let letter_at = |i: u32| word_output(&m, &msd_digits(i, k));
+            let mut running = 0i32;
+            for i in 0..n {
+                running = (running + letter_at(i).unwrap_or(0)) % 2;
+            }
+            let expected = letter_at(n).map(|a| (running + a) % 2);
+            assert_eq!(
+                word_output(&c, &msd_digits(n, k)),
+                expected,
+                "partial running sum at position {n}"
+            );
+        }
     }
 
     /// **WB-035** (`docs/WALNUT-BUGS.md`), half two. Literally the same input
@@ -1024,10 +1318,68 @@ mod tests {
     // lsd input (the `reverseWithOutput` round trip)
     // -------------------------------------------------------------------
 
+    /// **Walnut's own golden `lsd` transduce fixture**, and the test that actually pins
+    /// the two `reverse_with_output` calls: `IntegrationTest.java:674`'s
+    /// `transduce test529 RUNSUM2 PR;` — RUNSUM2 applied to the `lsd_2` paperfolding
+    /// word automaton — whose expected output is
+    /// `walnut-java/src/test/resources/integrationTests/Global/Word Automata Library/
+    /// test529.txt`, transcribed verbatim below (state numbering included). Unlike the
+    /// single-state relabelling round-trip below, RUNSUM2's output genuinely depends on
+    /// the direction the sequence is read, so deleting *either* reversal changes the
+    /// answer.
+    #[test]
+    fn transduce_runsum2_over_paperfolding_lsd_matches_javas_golden_fixture() {
+        let mut logging = Logging::new();
+        let pr = paperfolding_lsd();
+        let mut m = paperfolding_lsd();
+        let c = runsum2()
+            .transduce_non_deterministic(&mut m, &mut logging)
+            .unwrap();
+
+        // test529.txt: `lsd_2`, seven states.
+        assert_eq!(c.fa.q, 7);
+        assert_eq!(c.fa.o, vec![0, 0, 0, 1, 0, 1, 1]);
+        let expected: [[usize; 2]; 7] = [[1, 2], [1, 3], [4, 5], [6, 3], [1, 4], [3, 5], [6, 4]];
+        for (q, row_expected) in expected.iter().enumerate() {
+            let row = &c.fa.d[q];
+            assert_eq!(
+                row.keys().copied().collect::<Vec<i32>>(),
+                vec![0, 1],
+                "state {q} must have exactly the symbols 0 and 1"
+            );
+            assert_eq!(row[&0], vec![row_expected[0]], "state {q} on symbol 0");
+            assert_eq!(row[&1], vec![row_expected[1]], "state {q} on symbol 1");
+        }
+        assert_eq!(
+            c.msd,
+            vec![Some(false)],
+            "the result is reversed back to lsd on the way out"
+        );
+
+        // ... and semantically: read lsd-first, the result is the running sum mod 2 of
+        // the paperfolding sequence.
+        let mut running = 0i32;
+        for n in 0u32..24 {
+            let lsd_rep: Vec<i32> = format!("{n:b}")
+                .bytes()
+                .rev()
+                .map(|b| (b - b'0') as i32)
+                .collect();
+            running = (running + word_output(&pr, &lsd_rep).expect("PR is total")) % 2;
+            assert_eq!(
+                word_output(&c, &lsd_rep),
+                Some(running),
+                "running sum of the paperfolding sequence at n = {n}"
+            );
+        }
+    }
+
     /// An `lsd_2` input takes the reverse-transduce-reverse path (`:286-292`,
     /// `:325-327`). Applied to a transducer that only relabels outputs (single-state,
     /// so the reversal cannot change which output a word gets), the result must agree
-    /// with relabelling the input directly.
+    /// with relabelling the input directly. **Deliberately weak** — it is the
+    /// *structure* test for the lsd path (that `M` is left rewritten in place); the
+    /// reversals themselves are pinned by the golden fixture above, not here.
     #[test]
     fn lsd_input_round_trips_through_reverse_with_output() {
         let mut logging = Logging::new();
@@ -1210,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn is_totalized_distinguishes_the_three_shapes() {
+    fn is_totalized_distinguishes_the_four_shapes() {
         assert_eq!(Transducer::is_totalized(&thue_morse().fa), Ok(true));
 
         let partial = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
@@ -1221,6 +1573,18 @@ mod tests {
         assert_eq!(
             Transducer::is_totalized(&nfa.fa),
             Err(TransduceError::MultipleTransitionsPerInput)
+        );
+
+        // The quirk `is_totalized`'s `Some(_) => {}` arm encodes: an entry that is
+        // PRESENT but has an EMPTY destination list is neither `null` nor `size() > 1`,
+        // so Java leaves `totalized` alone and calls this automaton total — even though
+        // the transition is every bit as undefined as a missing key.
+        let mut empty_dests = thue_morse();
+        empty_dests.fa.d[0].insert(1, Vec::new());
+        assert_eq!(
+            Transducer::is_totalized(&empty_dests.fa),
+            Ok(true),
+            "an empty destination list falls through both of Java's branches"
         );
     }
 

@@ -1532,6 +1532,66 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-034 — `Transducer.transduceNonDeterministic` NPEs on an automaton whose track was declared with an explicit alphabet instead of a number system
+
+- **Where:** `Automata/Transducer.java`, `transduceNonDeterministic` (`:286`) —
+  `if (!M.getNS().get(0).isMsd()) { … }`, with no null check.
+- **What:** `Automaton.NS` holds one entry per track, populated by
+  `ParseMethods.parseAlphabetDeclaration` (`Automata/ParseMethods.java:84-109`): an `msd_k`/`lsd_k`
+  token adds a real `NumberSystem` (`:98-103`), but an explicit-alphabet token like `{0,1}` adds a
+  literal `null` (`:91-96`, `bases.add(null)`). A single-track `{0,1}` word automaton is perfectly
+  valid input everywhere else, and `transduceNonDeterministic`'s own arity guard (`:271`,
+  `M.getNS().size() != 1`) passes for such a file — the list *does* have exactly one entry, it just
+  happens to be `null`. The very next thing the method does after the alphabet-compatibility loop
+  is dereference it. Nothing downstream actually needs the `NumberSystem` object: the only use is
+  the boolean `isMsd()`, which decides whether to reverse. So this is a missing guard, not a
+  missing capability.
+
+  Same defect **class** as WB-013 and WB-033 — a `null` `NumberSystem` from a `{...}`-declared track
+  reaching an unguarded dereference — in a third method. That is now three, which is the real
+  finding: `getNS().get(i)` is nullable by design and essentially no caller in Walnut treats it
+  that way.
+- **Trigger:** any `transduce` whose input word automaton's alphabet line is `{...}` rather than
+  `msd_k`/`lsd_k`. **Confirmed live** against `Walnut-all.jar` (2026-08-13):
+  - `Word Automata Library/NSLESS.txt` = `{0,1}` then `0 0 / 0 -> 0, 1 -> 1` then
+    `1 1 / 0 -> 1, 1 -> 0` (Thue-Morse, with an explicit alphabet instead of `msd_2`).
+  - `transduce NSOUT RUNSUM2 NSLESS;` prints
+    `java.lang.NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()" because the
+    return value of "java.util.List.get(int)" is null / at
+    Automata.Transducer.transduceNonDeterministic(Transducer.java:286)`, and the session continues
+    into the REPL (`Prover.dispatch`'s top-level `catch (RuntimeException)` recovers).
+  - Control: the identical automaton with `msd_2` on line 1 transduces fine.
+- **Found:** Phase 3b, U20 review (`crates/wr-core/src/transducer.rs`, the `Transducer` port),
+  2026-08-13. The port's first draft had silently *diverged* here — treating the port's `msd[0] ==
+  None` stand-in for a null `NumberSystem` as "msd, carry on" and documenting the case as having
+  "no Java counterpart to be faithful to." Adversarial review falsified that claim against the real
+  jar with the input above; the divergence was unauthorized (no user sign-off) and is now removed.
+- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than a
+  `panic!` — `wr_core::transducer::TransduceError::NoNumberSystem`, whose `Display` reproduces
+  Java's NPE message verbatim so CLI output still matches. The reasoning is WB-033's and WB-013's,
+  unchanged: Java's NPE is an unchecked `RuntimeException` that `Prover.dispatch` (`Prover.java:390`)
+  catches and prints before continuing the session, so an uncaught Rust `panic!` would be *less*
+  faithful, not more (this port has no `catch_unwind` boundary; a panic would kill the process).
+  The guard sits at Java's own position — after the arity check and after the
+  alphabet-compatibility loop — so those two still win when they also apply. Pinned by
+  `wb034_a_track_with_no_number_system_is_rejected`, which also asserts the message text and that
+  ordering.
+- **Reachability in this port:** live, not theoretical. `crates/wr-io/src/reader.rs`'s
+  `HeaderToken::Set(..)` branch is exactly what produces `msd: None` for an explicit-alphabet
+  track, so U26's `transduce` CLI command hits this the moment it is wired up.
+- **Upstream:** not filed. A two-line guard (throw a real `WalnutException` naming the automaton
+  when `M.getNS().get(0) == null`, e.g. "the automaton to transduce must have a number system") is
+  the minimal fix; the more useful fix is arguably to *support* the case — a track with no
+  numeration has no msd/lsd direction, so "don't reverse" is a defensible default — but that is a
+  semantic decision, not a bug fix, and should not be made silently in the port. Best fixed
+  together with WB-013 and WB-033, since all three are the same missing null check.
+- **Severity:** low-to-moderate — a loud crash rather than a silently wrong answer, and the session
+  survives it; but it fires on valid, ordinary input (an explicit-alphabet word automaton is a
+  normal thing to have in `Word Automata Library/`) with no adversarial shape at all, and the
+  message names an internal class rather than telling the user what is wrong with their file.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has
