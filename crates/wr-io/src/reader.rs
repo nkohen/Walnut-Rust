@@ -37,9 +37,13 @@
 //!   `{v1, v2, ...}`, or a numeration spec. Plain `msd_<k>`/`lsd_<k>`/bare `msd`
 //!   (= `msd_2`)/bare `lsd` (= `lsd_2`) are always supported. **As of U13, custom-base
 //!   names (`msd_fib`, ...) are supported too, but only via
-//!   [`read_automaton_txt_with_custom_bases`]** — plain [`read_automaton_txt`] has no
-//!   directory to resolve `Custom Bases/*.txt` against (this crate has no `Session` yet;
-//!   that's `wr-cli`'s Phase-3a U14, so the caller supplies the directory explicitly) and
+//!   [`read_automaton_txt_with_custom_bases`]** (or, inside a session, its
+//!   [`CustomBaseResolver`]-injecting twin
+//!   [`read_automaton_txt_with_custom_base_resolver`], which is what lets `wr-cli` apply
+//!   Java's per-file session-overrides-global precedence to a NESTED header token, exactly
+//!   as Java does) — plain [`read_automaton_txt`] has no way to resolve `Custom Bases/*.txt`
+//!   at all (this crate has no `Session` concept and deliberately never will; that's
+//!   `wr-cli`'s Phase-3a U14, so the caller supplies the directory or the resolver) and
 //!   still rejects them with [`ReadError::UnsupportedNumeration`]. See
 //!   [`read_automaton_txt_with_custom_bases`]'s own doc for the exact file-resolution
 //!   order (`wr_core::numsys::NumberSystem::with_custom_base_files`, Phase 3a's U5, owns
@@ -75,7 +79,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use wr_core::automaton::{Automaton, AutomatonDFA};
 use wr_core::fa::Fa;
@@ -167,6 +171,43 @@ impl From<NumSysError> for ReadError {
     }
 }
 
+/// Resolves one `Custom Bases/` file **name** (`"msd_fib_addition.txt"`) to the address this
+/// reader should try to open — the injected half of custom-base header resolution.
+///
+/// Java needs no such abstraction: `NumberSystem`'s constructor reaches the static
+/// `Session.getReadAddressForCustomBases(fileName)` directly (`NumberSystem.java:299-319`
+/// → `Session.java:164-166` → `Session.globalOrSessionFile`), so its resolution is
+/// hard-wired to the ambient session and is therefore **session-aware for nested library
+/// headers exactly as much as it is for a top-level `?msd_fib` query token — there is no
+/// split between the two in Java.**
+///
+/// This crate deliberately has no `Session` concept of its own (that is `wr-cli`'s
+/// `session` module, Phase 3a's U14, and `wr-io` must not grow a second copy of it), so the
+/// *policy* — which directory, and whether a session copy shadows the global one — is
+/// injected through this trait, while the *file I/O* stays here. `wr-cli` implements it
+/// with `SessionPaths::read_address_for_custom_bases`, i.e. real `globalOrSessionFile`
+/// precedence; standalone callers use [`CustomBasesDir`].
+///
+/// The address is returned whether or not it exists (Java's `globalOrSessionFile` likewise
+/// returns a non-existent global address as its fallback); the caller stats it.
+pub trait CustomBaseResolver {
+    /// `filename` is a bare file name, never a path — the reader composes it from the
+    /// custom-base name and one of `_addition.txt`/`_less_than.txt`/`.txt`
+    /// (`wr_core::numsys::custom_base_candidate_names`).
+    fn resolve(&self, filename: &str) -> PathBuf;
+}
+
+/// The degenerate [`CustomBaseResolver`]: every custom-base file is looked up in one fixed
+/// directory, with no session override. What [`read_automaton_txt_with_custom_bases`] uses,
+/// and what a caller outside a session (this crate's own tests, a one-off tool) wants.
+pub struct CustomBasesDir<'a>(pub &'a Path);
+
+impl CustomBaseResolver for CustomBasesDir<'_> {
+    fn resolve(&self, filename: &str) -> PathBuf {
+        self.0.join(filename)
+    }
+}
+
 /// Reads a Walnut `.txt` automaton file into an [`Automaton`]. Track labels default to
 /// placeholders (`"0"`, `"1"`, ...) — the file format itself carries no variable
 /// names, matching Java (labels are a `Prover`/query-binding concept, not part of the
@@ -231,12 +272,31 @@ pub fn read_automaton_txt_with_custom_bases<P: AsRef<Path>>(
     path: P,
     custom_bases_dir: &Path,
 ) -> Result<Automaton, ReadError> {
-    read_automaton_txt_impl(path.as_ref(), Some(custom_bases_dir), &mut BTreeSet::new())
+    read_automaton_txt_with_custom_base_resolver(path, &CustomBasesDir(custom_bases_dir))
+}
+
+/// As [`read_automaton_txt_with_custom_bases`], but each custom-base file name is resolved to
+/// an address by `resolver` instead of being joined onto one fixed directory.
+///
+/// This is the form a **session** needs: Java resolves every `Custom Bases/` file through
+/// `Session.globalOrSessionFile` (session copy shadows the global one, per file), and it does
+/// so for a nested header token inside a library `.txt` exactly as it does for a top-level
+/// `?msd_fib` query token — `ParseMethods.parseAlphabetDeclaration` (reached from
+/// `AutomatonReader.firstParse` while reading ANY library file) and `Predicate`'s query
+/// tokenizer both land in the same `NumberSystem.getComputeIfAbsent(name)` →
+/// `NumberSystem(String)` → `Session.getReadAddressForCustomBases` path. A caller that
+/// resolved nested headers against a bare global directory would silently apply the WRONG
+/// number system's semantics to a session-overridden base. See [`CustomBaseResolver`].
+pub fn read_automaton_txt_with_custom_base_resolver<P: AsRef<Path>>(
+    path: P,
+    resolver: &dyn CustomBaseResolver,
+) -> Result<Automaton, ReadError> {
+    read_automaton_txt_impl(path.as_ref(), Some(resolver), &mut BTreeSet::new())
 }
 
 fn read_automaton_txt_impl(
     path: &Path,
-    custom_bases_dir: Option<&Path>,
+    custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<Automaton, ReadError> {
     let content = std::fs::read_to_string(path)?;
@@ -265,7 +325,7 @@ fn read_automaton_txt_impl(
     }
 
     let trimmed_header = header_line.trim();
-    let (alphabet, msd) = parse_header(trimmed_header, custom_bases_dir, in_progress)?;
+    let (alphabet, msd) = parse_header(trimmed_header, custom_bases, in_progress)?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -440,7 +500,7 @@ type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>);
 
 fn parse_header(
     line: &str,
-    custom_bases_dir: Option<&Path>,
+    custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<HeaderSpec, ReadError> {
     let mut alphabet = Vec::new();
@@ -473,7 +533,7 @@ fn parse_header(
                 .unwrap_or(rest.len());
             let word = &rest[..end];
             rest = &rest[end..];
-            parse_ns_token(word, custom_bases_dir, in_progress)?
+            parse_ns_token(word, custom_bases, in_progress)?
         };
         match token {
             HeaderToken::Set(values) => {
@@ -497,7 +557,7 @@ fn parse_header(
 
 fn parse_ns_token(
     word: &str,
-    custom_bases_dir: Option<&Path>,
+    custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<HeaderToken, ReadError> {
     if let Some(rest) = word.strip_prefix("msd_") {
@@ -506,7 +566,7 @@ fn parse_ns_token(
                 msd: true,
                 alphabet: (0..base).collect(),
             }),
-            Err(_) => custom_base_token(word, custom_bases_dir, in_progress),
+            Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
     }
     if let Some(rest) = word.strip_prefix("lsd_") {
@@ -515,7 +575,7 @@ fn parse_ns_token(
                 msd: false,
                 alphabet: (0..base).collect(),
             }),
-            Err(_) => custom_base_token(word, custom_bases_dir, in_progress),
+            Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
     }
     match word {
@@ -532,30 +592,30 @@ fn parse_ns_token(
 }
 
 /// The non-numeric-base fallback shared by both `msd_`/`lsd_`-prefixed branches of
-/// [`parse_ns_token`]: without a `custom_bases_dir`, preserves the pre-U13
+/// [`parse_ns_token`]: without a resolver, preserves the pre-U13
 /// [`ReadError::UnsupportedNumeration`] behavior exactly (every existing caller/test).
 /// With one, attempts [`load_custom_base`] and propagates any failure as
 /// [`ReadError::NumSys`] rather than downgrading it back to `UnsupportedNumeration` —
-/// once a directory is supplied, "this looked like a custom-base name but failed to
+/// once a resolver is supplied, "this looked like a custom-base name but failed to
 /// load" is a real, reportable error, not silent unsupported-numeration territory.
 fn custom_base_token(
     word: &str,
-    custom_bases_dir: Option<&Path>,
+    custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<HeaderToken, ReadError> {
-    let Some(dir) = custom_bases_dir else {
+    let Some(resolver) = custom_bases else {
         return Err(ReadError::UnsupportedNumeration(word.to_string()));
     };
-    let ns = load_custom_base(word, dir, in_progress)?;
+    let ns = load_custom_base(word, resolver, in_progress)?;
     Ok(HeaderToken::Ns {
         msd: ns.is_msd(),
         alphabet: ns.get_alphabet().to_vec(),
     })
 }
 
-/// Builds the [`NumberSystem`] named `name` by reading `Custom Bases/`-style files out of
-/// `dir` — see [`read_automaton_txt_with_custom_bases`]'s doc for the exact resolution
-/// order this implements.
+/// Builds the [`NumberSystem`] named `name` by reading the `Custom Bases/`-style files
+/// `resolver` points each candidate name at — see [`read_automaton_txt_with_custom_bases`]'s
+/// doc for the exact resolution order this implements.
 ///
 /// # Recursion guard
 ///
@@ -576,7 +636,7 @@ fn custom_base_token(
 /// malformed-input shape, which is what this guard closes.
 fn load_custom_base(
     name: &str,
-    dir: &Path,
+    resolver: &dyn CustomBaseResolver,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<NumberSystem, ReadError> {
     // Mirrors `NumberSystem`'s own constructor order (`isNeg` checked at `:137`, BEFORE
@@ -592,17 +652,17 @@ fn load_custom_base(
         let addition = probe_custom_base_candidate(
             name,
             numsys::UNDERSCORE_ADDITION_AUTOMATON,
-            dir,
+            resolver,
             in_progress,
         )?;
         let less_than = probe_custom_base_candidate(
             name,
             numsys::UNDERSCORE_LESS_THAN_AUTOMATON,
-            dir,
+            resolver,
             in_progress,
         )?;
         let all_representations =
-            probe_custom_base_candidate(name, numsys::TXT_EXTENSION, dir, in_progress)?;
+            probe_custom_base_candidate(name, numsys::TXT_EXTENSION, resolver, in_progress)?;
         let files = CustomBaseFiles {
             addition,
             less_than,
@@ -623,22 +683,26 @@ fn load_custom_base(
 fn probe_custom_base_candidate(
     name: &str,
     extension: &str,
-    dir: &Path,
+    resolver: &dyn CustomBaseResolver,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<CustomBaseCandidates, ReadError> {
     let (main_name, complement_name) = numsys::custom_base_candidate_names(name, extension)?;
-    let main_path = dir.join(&main_name);
+    let main_path = resolver.resolve(&main_name);
     let main = if main_path.is_file() {
-        Some(read_automaton_txt_impl(&main_path, Some(dir), in_progress)?)
+        Some(read_automaton_txt_impl(
+            &main_path,
+            Some(resolver),
+            in_progress,
+        )?)
     } else {
         None
     };
     let complement = if main.is_none() {
-        let complement_path = dir.join(&complement_name);
+        let complement_path = resolver.resolve(&complement_name);
         if complement_path.is_file() {
             Some(read_automaton_txt_impl(
                 &complement_path,
-                Some(dir),
+                Some(resolver),
                 in_progress,
             )?)
         } else {
@@ -964,6 +1028,17 @@ pub fn read_automaton_dfa_txt_with_custom_bases<P: AsRef<Path>>(
     )?))
 }
 
+/// [`read_automaton_dfa_txt_with_custom_bases`]'s resolver-injecting form — see
+/// [`read_automaton_txt_with_custom_base_resolver`] for why a session needs it.
+pub fn read_automaton_dfa_txt_with_custom_base_resolver<P: AsRef<Path>>(
+    path: P,
+    resolver: &dyn CustomBaseResolver,
+) -> Result<AutomatonDFA, ReadError> {
+    Ok(AutomatonDFA::from(
+        read_automaton_txt_with_custom_base_resolver(path, resolver)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,6 +1331,65 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The [`CustomBaseResolver`] seam really is consulted **per file name**, not collapsed
+    /// back into one directory — the property `wr-cli`'s session needs in order to give a
+    /// nested header the same session-shadows-global precedence Java's `globalOrSessionFile`
+    /// gives a top-level query token.
+    ///
+    /// Modelled on that layout: two directories, the "session" one holding only ONE of the two
+    /// files `msd_fib` needs. A resolver that preferred a single directory wholesale (either
+    /// one) would fail — the pieces must be picked up from different places.
+    #[test]
+    fn a_resolver_is_consulted_per_file_name_not_per_directory() {
+        struct SplitResolver {
+            preferred: PathBuf,
+            fallback: PathBuf,
+        }
+        impl CustomBaseResolver for SplitResolver {
+            fn resolve(&self, filename: &str) -> PathBuf {
+                let p = self.preferred.join(filename);
+                if p.is_file() {
+                    p
+                } else {
+                    self.fallback.join(filename)
+                }
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-split-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let (global, session) = (dir.join("global"), dir.join("session"));
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&session).unwrap();
+        // The adder only in "global", the all-representations file only in "session".
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            global.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), session.join("msd_fib.txt")).unwrap();
+
+        let path = dir.join("main.txt");
+        std::fs::write(&path, "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+
+        let resolver = SplitResolver {
+            preferred: session.clone(),
+            fallback: global.clone(),
+        };
+        let a = read_automaton_txt_with_custom_base_resolver(&path, &resolver).unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.msd, vec![Some(true)]);
+
+        // Neither directory alone is sufficient: the adder is mandatory, so the
+        // session-only view cannot resolve `msd_fib` at all.
+        assert!(matches!(
+            read_automaton_txt_with_custom_bases(&path, &session),
+            Err(ReadError::NumSys(NumSysError::NotDefined(_)))
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn custom_base_header_round_trips_an_alphabet_larger_than_two() {
         // Not every shipped custom base is `{0, 1}` -- `msd_kim`/`msd_pell` are
@@ -1325,7 +1459,7 @@ mod tests {
         )
         .unwrap();
 
-        let ns = load_custom_base("lsd_test", &dir, &mut BTreeSet::new()).unwrap();
+        let ns = load_custom_base("lsd_test", &CustomBasesDir(&dir), &mut BTreeSet::new()).unwrap();
         // `isMsd` comes from the NAME passed in, independent of which file was actually
         // loaded (Java: `isMsd = msdOrLsd.equals(MSD)`, computed before any file I/O).
         assert!(!ns.is_msd());
@@ -1343,7 +1477,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wr-io-test-cb-neg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(matches!(
-            load_custom_base("msd_neg_fib", &dir, &mut BTreeSet::new()),
+            load_custom_base("msd_neg_fib", &CustomBasesDir(&dir), &mut BTreeSet::new()),
             Err(ReadError::NumSys(NumSysError::UnsupportedNegativeBase(_)))
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1355,7 +1489,11 @@ mod tests {
             std::env::temp_dir().join(format!("wr-io-test-cb-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap(); // empty: no files at all
         assert!(matches!(
-            load_custom_base("msd_nonexistent", &dir, &mut BTreeSet::new()),
+            load_custom_base(
+                "msd_nonexistent",
+                &CustomBasesDir(&dir),
+                &mut BTreeSet::new()
+            ),
             Err(ReadError::NumSys(NumSysError::NotDefined(_)))
         ));
         std::fs::remove_dir_all(&dir).ok();
@@ -1380,7 +1518,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(
-            load_custom_base("msd_selfref", &dir, &mut BTreeSet::new()),
+            load_custom_base("msd_selfref", &CustomBasesDir(&dir), &mut BTreeSet::new()),
             Err(ReadError::CustomBaseCycle(ref s)) if s == "msd_selfref"
         ));
 
@@ -1404,9 +1542,9 @@ mod tests {
         .unwrap();
 
         let mut in_progress = BTreeSet::new();
-        assert!(load_custom_base("msd_fib", &dir, &mut in_progress).is_ok());
+        assert!(load_custom_base("msd_fib", &CustomBasesDir(&dir), &mut in_progress).is_ok());
         assert!(in_progress.is_empty(), "guard must clean up after success");
-        assert!(load_custom_base("msd_fib", &dir, &mut in_progress).is_ok());
+        assert!(load_custom_base("msd_fib", &CustomBasesDir(&dir), &mut in_progress).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
     }

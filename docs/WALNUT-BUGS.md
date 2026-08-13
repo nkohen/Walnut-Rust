@@ -226,11 +226,21 @@ bug costs a silent wrong answer somewhere downstream.
      `globalSession=false` — sticky in one direction only.
 - **Found:** Phase 0, Item 4 second wave (`globalSession`) and first wave (`setPathsAndNames`),
   2026-08-08.
-- **Rust port:** `not yet reached` — this is exactly the kind of global mutable state `wr-cli`'s
-  planned `Session` context struct refactor (`CLAUDE.md`'s "one sanctioned deviation from
-  mechanical fidelity") is meant to make impossible by construction; tracked here mainly so the
-  refactor's design explicitly accounts for "called more than once" as a real case to get right,
-  not just "called once per process" as Java implicitly assumes.
+- **Rust port:** `diverged (structurally inapplicable)` — resolved by Phase 3a's **U14**
+  (`crates/wr-cli/src/session.rs`), the `Session` context-struct refactor this entry anticipated
+  (`CLAUDE.md`'s sanctioned deviation from mechanical fidelity). `SessionPaths` has no setter and
+  no `&mut self` method: `name`, `main_walnut_dir`, `session_walnut_dir` and `global_session` are
+  all computed once in `SessionPaths::new` from that call's own arguments and are immutable
+  afterwards, so "a second setup call" is "a second, independent value" and there is no surviving
+  state for either defect to act on — `name` and `session_walnut_dir` are always derived together
+  (defect 1), and `global_session` is a plain constructor argument (defect 2). Not merely unlikely:
+  a mutator would have to be *added* back to reintroduce it, and the guarantee is structural (no
+  `&mut self` method exists on `SessionPaths`) rather than test-enforced —
+  `session.rs`'s `a_second_session_is_fully_independent_wb_005` pins the consequence (two
+  independently built values never share or drift), but, since it only ever constructs, it would
+  not by itself catch a newly added setter. Note this is
+  a divergence in the port's *shape*, not a behavior fix — every single-setup invocation (i.e. all
+  real Walnut usage) behaves identically.
 - **Upstream:** not filed.
 - **Severity:** minor — no impact on any real single-invocation CLI usage.
 
@@ -1167,6 +1177,64 @@ bug costs a silent wrong answer somewhere downstream.
   but gated behind an alphabet size (`> 65408`) far outside any plausible hand-written Walnut query;
   realistic exposure is through generated/fuzzed or programmatically-constructed large alphabets, not
   everyday use.
+
+---
+
+## WB-024 — `Prover.parseArgs` validates the command file BEFORE `Session.setPathsAndNames` runs, so `--home-dir=` is ignored and a valid invocation crashes
+
+- **Where:** `Main/Prover.java`, `parseArgs(String[])` — the `else if (filename == null)` arm's
+  `UtilityMethods.validateFile(Session.getReadAddressForCommandFiles(filename))` (`:318`), which
+  runs inside the argument loop, i.e. **before** `Session.setPathsAndNames(sessionDir, homeDir,
+  globalSession)` at `:321`.
+- **What:** `Session.mainWalnutDir` is still its static initializer's `""` (`Session.java:42`) when
+  `:318` calls `getReadAddressForCommandFiles`, so the command file is resolved as
+  `"Command Files/<name>"` — relative to the process's working directory — regardless of what
+  `--home-dir=` said. `validateFile` throws an unchecked `IllegalArgumentException` when that path
+  is not a file (`UtilityMethods.java:153-158`), and nothing catches it, so Walnut dies with a
+  stack trace before it ever reads a command. The validation is also **redundant**: `run(filename)`
+  re-runs the identical `validateFile(getReadAddressForCommandFiles(filename))` at `:326`, that
+  time *after* setup, i.e. correctly. So `:318` can only ever produce a false negative (reject a
+  file that is really there) or a false positive (accept a same-named file in the working
+  directory that is not the one that will actually be run) — it never adds a check `:326` does not
+  already make.
+- **Trigger (empirically confirmed live through the real `walnut-java` CLI —
+  `java -cp target/Walnut-all.jar Main.Prover`; JDK 17, 2026-08-12):** with a home directory
+  `whome/` containing `Command Files/probe.txt`, running from `whome`'s *parent*:
+
+  ```
+  $ java -cp target/Walnut-all.jar Main.Prover --home-dir=whome probe.txt
+  Exception in thread "main" java.lang.IllegalArgumentException: File does not exist or is not a
+    valid file: Command Files/probe.txt
+        at Main.UtilityMethods.validateFile(UtilityMethods.java:156)
+        at Main.Prover.parseArgs(Prover.java:318)
+        at Main.Prover.main(Prover.java:289)
+  ```
+
+  — note the reported path has no `whome/` prefix at all. The same command file runs fine when
+  invoked from inside `whome` with no `--home-dir` (verified: it evaluates and prints `TRUE`), so
+  the file is genuinely present and readable; only the premature resolution is at fault. Argument
+  order does not help — the loop always reaches `:318` before `:321`.
+- **Found:** Phase 3a, U14 (`crates/wr-cli/src/session.rs`, the `Session.java` port), 2026-08-12,
+  while reading `parseArgs` to establish who is responsible for appending the trailing `/` to
+  `--home-dir=`/`--session-dir=` values (`Prover.java:304-313`) that `Session`'s string
+  concatenation assumes.
+- **Rust port:** `not yet reached` — the defect is in `Prover.parseArgs`, which is **U21**, not in
+  `Session.java`. U14 ports only `Session`'s path builders, and the builder involved
+  (`SessionPaths::read_address_for_command_files`) is faithful; nothing in `wr-cli` calls it yet.
+  Recorded here so U21's author makes an explicit replicate-vs-diverge call instead of "naturally"
+  writing the correct order (parse all args → build the `SessionPaths` → validate), which is what a
+  from-scratch Rust arg parser would do by default and would silently diverge. Per
+  `CLAUDE.md`'s mechanical-port rule the default is to replicate — but note that replicating means
+  deliberately constructing a throwaway `SessionPaths` with no home directory just to run a check
+  whose result is discarded, which is unusual enough to deserve the user's sign-off either way.
+- **Upstream:** not filed. Fix is a one-line deletion: drop `:318` entirely and let `run`'s `:326`
+  do the validation (it already does, correctly). If an early "unknown file" diagnostic is wanted,
+  it has to move below `:321`.
+- **Severity:** moderate — a hard crash with a misleading path in the message, on a documented,
+  plausible invocation (`--home-dir=` is one of only three flags Walnut accepts, and it exists
+  precisely to run against a home tree that is not the working directory). No golden fixture
+  exercises it (the corpus harness runs command files from the repo root, where the working
+  directory *is* the home directory), which is why Phase 0's coverage work did not surface it.
 
 ---
 
