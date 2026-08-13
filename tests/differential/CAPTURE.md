@@ -190,3 +190,50 @@ needs `morphism`/`image`/`combine`, none of which are ported yet.
 
 Command files and session directories were deleted from the `walnut-java` checkout
 afterward, per this file's established practice.
+
+---
+
+# Ground-truth capture: `fixtures/u11/*.txt`
+
+Phase 3a U11 (`wr_logic::eval`, the postfix-token executor + final `Predicate`
+assembly) is spot-checked against real `walnut-java` `eval` output by
+`tests/u11_eval_composition.rs`. Full recipe (and the fixture-less closed-formula case)
+is in that test file's own module docs; summarized here for consistency with this
+document's other entries:
+
+```bash
+cd ~/dev/walnut-java
+cat > "Command Files/u11_capture.txt" <<'EOF'
+eval u11check "?msd_2 x>=2 & x<5";
+EOF
+java -jar target/Walnut-all.jar u11_capture.txt < /dev/null
+cp "Session/<timestamp>/Automata Library/u11check.txt" \
+   ~/dev/walnut-rs/tests/differential/fixtures/u11/boolean_relational.txt
+
+cat > "Command Files/u11_capture3.txt" <<'EOF'
+eval u11xyz "?msd_2 x + y = z";
+def zphi "?msd_2 a < b";
+EOF
+java -jar target/Walnut-all.jar u11_capture3.txt < /dev/null
+cp "Session/<timestamp>/Automata Library/u11xyz.txt" \
+   ~/dev/walnut-rs/tests/differential/fixtures/u11/addition_three_track.txt
+cp "Session/<timestamp>/Automata Library/zphi.txt" \
+   ~/dev/walnut-rs/tests/differential/fixtures/u11/zphi_a_lt_b.txt
+```
+
+The companion closed-formula case (`eval u11closed "?msd_2 Ex (x < 5 & x >= 2)";`)
+prints `____` then `TRUE` on stdout — no `.txt` fixture, since a trivial automaton has
+no meaningful body; `tests/u11_eval_composition.rs` checks the printed verdict directly
+against `Automaton::fa::is_true_automaton()`.
+
+## Every fixture here is in ALPHABETICAL track order — normalize before comparing
+
+`AutomatonWriter.writeToTxtFormat` calls `automaton.canonize()`
+(`Automata/Writer/AutomatonWriter.java:52`) → `sortLabel()` (`Automata/Automaton.java:328`,
+`:348-379`), so a captured multi-track `.txt` always lists its tracks sorted by label. The
+Rust pipeline does **not** — `?msd_2 x + y = z` comes back labeled `["z", "x", "y"]`. Call
+`Automaton::sort_label()` on the port's result before handing it to
+`wr_core::equiv::automaton_language_equivalent`, which by design does **not** detect a
+label permutation with matching per-position alphabets (U8's documented limitation) and
+will silently return a wrong verdict instead of an error. `fixtures/u11/addition_three_track.txt`
+exists partly to pin exactly that: without the sort, its test reports `Ok(false)`.

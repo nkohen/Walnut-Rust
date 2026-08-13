@@ -13,6 +13,7 @@
 //! quantifier ALTERNATION (each ∃ is a projection→NFA→determinize); see
 //! DESIGN.md §5.
 
+pub mod eval;
 pub mod expr;
 pub mod predicate;
 pub mod predicate_env;
