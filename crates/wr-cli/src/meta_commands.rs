@@ -29,8 +29,18 @@
 //! this struct instead: [`MetaCommands::using_otf`],
 //! [`MetaCommands::early_exist_termination`], and `current_eval_name` (set by
 //! `crate::prover::Prover`'s `eval`/`def` arm, exactly where Java assigns the static).
-//! Since Java rebuilds `MetaCommands` at the top of every `parseSetup`, "constructor
-//! resets the statics" and "fresh struct" are the same thing.
+//!
+//! **Two of those three are per-command; the third is not, and the difference is easy to
+//! get wrong.** Java rebuilds `MetaCommands` at the top of every `parseSetup`, and its
+//! constructor resets `usingOTF` and `earlyExistTermination` — so for *those two*, "the
+//! constructor resets the static" and "a fresh struct" really are the same thing.
+//! `currentEvalName` is different: the constructor does **not** touch it, and nothing else
+//! writes it except `evalDefCommands` (`Prover.java:599`). It therefore survives from one
+//! command to the next, so `eval myname "…"::` followed later by
+//! `[export * gv] someothercommand::` exports to `myname_0_pre.gv`, not to `export_…`.
+//! A fresh struct would silently lose that; `Prover::parse_setup` re-seeds each new
+//! `MetaCommands` with [`MetaCommands::set_current_eval_name`] to reproduce the
+//! static's lifetime.
 //!
 //! # OTF strategies are rejected, not accepted
 //!
@@ -187,6 +197,14 @@ impl LoggableError for MetaCommandError {
 
 /// Java's six enum members, in `Strategy.values()` order, as
 /// `(name, is_otf, aliases_without_the_name)`.
+///
+/// **The middle column is `isOTFStrategy()` (`DeterminizationStrategies.java:65-67`), NOT
+/// the `doSimulation` constructor field it resembles.** The two do not agree: `CCL` and
+/// `Brzozowski-CCL` are constructed with `doSimulation == false` and are nonetheless OTF
+/// strategies. Nothing reads this column today (OTF-ness is decided by name in
+/// [`strategy_from_string`]); it is carried so that whoever un-defers the OTF family has
+/// the classification already written down — and labelled, so they do not mistake it for
+/// `doSimulation` and wire the wrong flag.
 ///
 /// Java's constructor appends `name` to the alias list (`:48`), which is why `SC`/`CCL`/
 /// `CCLS` end up with their name listed twice; that duplication is harmless and is
@@ -445,25 +463,30 @@ impl MetaCommands {
             // yes, the whole command doubles as the "command name" in the error message.
             let caps = prover::find(&prover::patterns().meta_cmd, &command)
                 .ok_or_else(|| MetaCommandError::InvalidCommandUse(command.clone()))?;
-            let meta_command_string = prover::group(&caps, &command, GROUP_META_CMD)
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // `.strip()` (`:90`) -- [`prover::java_strip`], not `str::trim`; see its docs.
+            let meta_command_string =
+                prover::java_strip(prover::group(&caps, &command, GROUP_META_CMD).unwrap_or(""))
+                    .to_string();
             if !meta_command_string.is_empty() && !print_details {
                 return Err(MetaCommandError::RequiresDoubleColon);
             }
 
-            command = prover::group(&caps, &command, GROUP_FINAL_CMD)
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            // `.strip()` (`:95`).
+            command =
+                prover::java_strip(prover::group(&caps, &command, GROUP_FINAL_CMD).unwrap_or(""))
+                    .to_string();
 
             let parts = split_java(&meta_command_string);
-            if parts.len() != 3 && (parts.len() != 1 || parts[0] != EARLY_EXIST_TERMINATION) {
+            // `parts[0]` in Java, but `split_java` can legitimately return an EMPTY vector
+            // (all-whitespace input -- see its docs), and Java's own `&&`/`||` would have
+            // short-circuited before indexing. `.first()` keeps the same truth value
+            // without an index that could panic if the arity check is ever reordered.
+            let first = parts.first().map(String::as_str).unwrap_or("");
+            if parts.len() != 3 && (parts.len() != 1 || first != EARLY_EXIST_TERMINATION) {
                 return Err(MetaCommandError::InvalidCommandUse(meta_command_string));
             }
 
-            match parts[0].as_str() {
+            match first {
                 // example: strategy 15 CCL
                 STRATEGY => {
                     let strategy = strategy_from_string(&parts[2])?;
@@ -505,6 +528,17 @@ fn is_java_regex_whitespace(c: char) -> bool {
 /// a substitute. (Java also keeps a leading empty field when the string *starts* with
 /// whitespace; the only caller strips first, so that case cannot arise, but the helper
 /// reproduces it anyway rather than depending on the caller.)
+///
+/// Three lengths to keep straight, all of them Java's:
+///
+/// | input | `"a b"` | `""` | `"   "` |
+/// |---|---|---|---|
+/// | result | `["a","b"]` | `[""]` | `[]` |
+///
+/// The last is the trap: an all-whitespace string splits into one leading empty field and
+/// one trailing empty field, and trailing-empty removal (limit `0`) then eats **both** —
+/// `"   ".split("\\s+").length == 0`, not `1`. The removal loop below therefore runs down
+/// to an empty vector, not down to one element.
 fn split_java(s: &str) -> Vec<String> {
     if s.is_empty() {
         return vec![String::new()];
@@ -525,7 +559,9 @@ fn split_java(s: &str) -> Vec<String> {
     }
     parts.push(current);
     // Java drops TRAILING empty strings (`split` with limit 0); it keeps leading ones.
-    while parts.len() > 1 && parts.last().is_some_and(|p| p.is_empty()) {
+    // Note `!parts.is_empty()`, not `parts.len() > 1`: the loop must be able to empty the
+    // vector completely (the all-whitespace case in this function's docs).
+    while !parts.is_empty() && parts.last().is_some_and(|p| p.is_empty()) {
         parts.pop();
     }
     parts
@@ -825,6 +861,22 @@ mod tests {
         // Java drops trailing empties, keeps a leading one.
         assert_eq!(split_java("a "), vec!["a"]);
         assert_eq!(split_java(" a"), vec!["", "a"]);
+        // ...and an ALL-whitespace string drops to length ZERO, not to `[""]`: it splits
+        // into a leading empty and a trailing empty, and the trailing-empty removal eats
+        // both. This is the case `"".split(…)` (which yields `[""]`) does NOT generalize.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(split_java("   "), empty);
+        assert_eq!(split_java("\t\n"), empty);
+    }
+
+    /// The all-whitespace case cannot currently be *reached* (the caller strips first, so
+    /// a whitespace-only metacommand arrives here as `""` and takes [`split_java`]'s empty
+    /// early return), but the arity check must survive a zero-length array anyway — this
+    /// pins that it reports `InvalidCommandUse` rather than panicking on `parts[0]`.
+    #[test]
+    fn a_whitespace_only_metacommand_is_rejected_without_indexing_an_empty_split() {
+        let err = meta(true, "[   ]cmd").unwrap_err();
+        assert_eq!(err, MetaCommandError::InvalidCommandUse(String::new()));
     }
 
     // -- DeterminizeContext ---------------------------------------------------

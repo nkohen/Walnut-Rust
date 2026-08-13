@@ -118,7 +118,28 @@ and add a property test that the result is order-independent.
   parenthesis and skip `(?:…)`, so Java's `static int GROUP_… = 20` constants port as
   literal group indices — but pin each one with a test against a real input rather than
   re-counting parens by eye (`crates/wr-cli/src/prover.rs`'s
-  `*_group_numbers_match_javas_constants` tests).
+  `*_group_numbers_match_javas_constants` /
+  `every_command_pattern_pins_its_group_indices` tests).
+- **`String.strip()` is NOT `str::trim()`, and `String.split("\\s+")` is not
+  `str::split_whitespace()`.** Two separate Java string APIs that each look like they have
+  an obvious Rust twin, and each of which is wrong in a way that only shows up on input
+  nobody writes by hand. Added in Phase 3b's U21 (`Prover.java` `.strip()`s three command
+  strings, `MetaCommands.java` two more).
+  1. **`.strip()` vs `.trim()` — they disagree in BOTH directions**, because `.strip()`
+     is defined by `Character.isWhitespace` and `str::trim` by `char::is_whitespace`.
+     Java does *not* count the three non-breaking spaces `U+00A0`/`U+2007`/`U+202F` (nor
+     `U+0085` NEL) as whitespace; Rust strips all four. Java *does* count the four
+     information separators `U+001C`–`U+001F`; Rust leaves them. Use
+     `wr_cli::prover::java_strip` (whose docs carry the full rule) rather than `.trim()`
+     wherever the Java said `.strip()`. Note Java's `.trim()` is a *third* function again
+     (everything `<= U+0020`) — check which one the source actually called.
+  2. **`\s` inside a Java REGEX is a different set again**: ASCII-only
+     `[ \t\n\x0B\f\r]`, per Ruling 2. So `split("\\s+")` is neither `.strip()`'s notion
+     nor `split_whitespace`'s. It also keeps a leading empty field, drops *all* trailing
+     empty ones (limit `0`), and consequently has three lengths worth memorizing:
+     `"a b"` → 2, `""` → **1** (`[""]`), `"   "` → **0** (empty array). The `""` and
+     `"   "` cases go opposite ways; `split_whitespace` gives 0 for both.
+     `crates/wr-cli/src/meta_commands.rs`'s `split_java` is the reference implementation.
 - **A lexer never borrows the string it's lexing; it owns a `String` buffer.** Java's
   `Predicate.putMacro` rewrites the predicate string mid-lex and rebuilds all its
   matchers over the new string. The Rust lexer instead owns `src: String` (not `&'a str`),

@@ -504,6 +504,40 @@ pub fn group<'h>(caps: &Captures, hay: &'h str, index: usize) -> Option<&'h str>
     caps.get_group(index).map(|span| &hay[span])
 }
 
+/// `Character.isWhitespace(int)` — **not** `char::is_whitespace`, which disagrees on eight
+/// code points (four each way; see [`java_strip`]).
+///
+/// Java's rule, verbatim from its javadoc: a character is whitespace if it is a Unicode
+/// space character (`Zs`/`Zl`/`Zp`) that is *not* one of the three non-breaking spaces
+/// `U+00A0`/`U+2007`/`U+202F`, **or** it is one of `U+0009`–`U+000D` (HT, LF, VT, FF, CR)
+/// or `U+001C`–`U+001F` (FS, GS, RS, US).
+///
+/// The `Zs`/`Zl`/`Zp` set is closed and small, so it is written out rather than pulled in
+/// as a Unicode-table dependency: `U+0020`, `U+1680`, `U+2000`–`U+200A`, `U+2028`,
+/// `U+2029`, `U+205F`, `U+3000` (minus the two non-breaking members `U+2007`/`U+202F`, and
+/// `U+00A0`).
+pub fn is_java_whitespace(c: char) -> bool {
+    matches!(c,
+        // The eleven ASCII control characters `isWhitespace` names explicitly. Note
+        // `U+001C`-`U+001F` are NOT `char::is_whitespace` in Rust.
+        '\u{9}'..='\u{D}' | '\u{1C}'..='\u{1F}'
+        // `Zs` minus U+00A0/U+2007/U+202F, plus `Zl` (U+2028) and `Zp` (U+2029).
+        | ' ' | '\u{1680}' | '\u{2000}'..='\u{2006}' | '\u{2008}'..='\u{200A}'
+        | '\u{2028}' | '\u{2029}' | '\u{205F}' | '\u{3000}')
+}
+
+/// `String.strip()` — **the correct spelling of Java's "Unicode-aware trim"**, and *not*
+/// `str::trim`.
+///
+/// `PORTING.md`'s "Phase 3 rulings" entry on this: the two functions disagree in both
+/// directions. `str::trim` strips `U+00A0`/`U+0085`/`U+2007`/`U+202F`, which
+/// `Character.isWhitespace` does not; `String.strip` strips `U+001C`–`U+001F`, which
+/// `str::trim` does not. Every `s.strip()` in `Prover.java` (`:366`, `:448`, `:457`) and
+/// `MetaCommands.java` (`:90`, `:95`) goes through here.
+pub fn java_strip(s: &str) -> &str {
+    s.trim_matches(is_java_whitespace)
+}
+
 /// `ProverHelper.matchOrFail(Pattern, String, String)` (`ProverHelper.java:35-41`) — see
 /// `crate::prover_helper`'s docs for why it lives here rather than there.
 pub fn match_or_fail(re: &Regex, input: &str, command_name: &str) -> Result<Captures, ProverError> {
@@ -526,6 +560,12 @@ pub enum ProverError {
     /// `UtilityMethods.validateFile`'s `IllegalArgumentException`
     /// (`UtilityMethods.java:153-158`).
     InvalidFile(String),
+    /// A `Main.WalnutException` whose message is already formatted by
+    /// [`crate::walnut_exception`]. Currently only `Session.createSubdirectories`'s
+    /// `"Couldn't create directory:" + s` (`Session.java:132`) — which is a
+    /// `WalnutException`, *not* the `IllegalArgumentException` that
+    /// [`ProverError::InvalidFile`] models.
+    WalnutMessage(String),
     Meta(MetaCommandError),
     EvalDef(EvalDefError),
     Reg(RegError),
@@ -552,6 +592,7 @@ impl std::fmt::Display for ProverError {
             ProverError::NoSuchCommand => write!(f, "{}", msg::no_such_command()),
             ProverError::InvalidCommandUse(c) => write!(f, "{}", msg::invalid_command_use(c)),
             ProverError::InvalidFile(m) => write!(f, "{m}"),
+            ProverError::WalnutMessage(m) => write!(f, "{m}"),
             ProverError::Meta(e) => write!(f, "{e}"),
             ProverError::EvalDef(e) => write!(f, "{e}"),
             ProverError::Reg(e) => write!(f, "{e}"),
@@ -578,7 +619,8 @@ impl LoggableError for ProverError {
         match self {
             ProverError::InvalidCommand(_)
             | ProverError::NoSuchCommand
-            | ProverError::InvalidCommandUse(_) => true,
+            | ProverError::InvalidCommandUse(_)
+            | ProverError::WalnutMessage(_) => true,
             // `IllegalArgumentException`, not a `WalnutException`.
             ProverError::InvalidFile(_) => false,
             ProverError::Meta(e) => e.is_handled(),
@@ -732,6 +774,17 @@ impl Prover {
     /// configure logging.
     fn parse_setup(&mut self, s: &str) -> Result<String, ProverError> {
         self.meta_commands = MetaCommands::with_paths(self.session.paths_rc());
+        // **`currentEvalName` SURVIVES the rebuild.** `new MetaCommands()`
+        // (`MetaCommands.java:22-25`) resets exactly two `Prover` statics, `usingOTF` and
+        // `earlyExistTermination`; `Prover.currentEvalName` (`:252`) is written only by
+        // `evalDefCommands` (`:599`) and by nothing else, ever. So in Java the name set by
+        // an earlier `eval`/`def` is still what `getExportName` (`MetaCommands.java:68`)
+        // reads on EVERY later command -- `eval myname "…"::` followed by
+        // `[export * gv] somecommand::` exports to `myname_0_pre.gv`. This port keeps the
+        // name on the session-lifetime `Prover` (which is the faithful part) and must
+        // re-seed each per-command `MetaCommands` with it (this line).
+        self.meta_commands
+            .set_current_eval_name(self.current_eval_name.as_deref());
         self.print_details = false;
         self.print_flag = false;
 
@@ -749,9 +802,9 @@ impl Prover {
         // `s.substring(0, s.length() - endingToRemove)` -- the removed characters are `;`
         // and `:`, both ASCII, so byte and char arithmetic agree here.
         let s = &s[..s.len() - ending_to_remove];
-        // `s.strip()` (Unicode-aware) -- `str::trim` is the same idea; see
-        // `crate::eval_def`'s note on the `isBlank`/`trim` correspondence.
-        let s = s.trim();
+        // `s.strip()` (`:448`) -- [`java_strip`], NOT `str::trim`; the two disagree on
+        // eight code points (see that function's docs and `PORTING.md`).
+        let s = java_strip(s);
 
         let s = self
             .meta_commands
@@ -802,7 +855,8 @@ impl Prover {
         s: &str,
         _msg: &str,
     ) -> Result<Option<TestCase>, ProverError> {
-        let s = s.trim();
+        // `s.strip()` (`:457`) -- see [`java_strip`].
+        let s = java_strip(s);
         let original_command = s.to_string();
         let s = self.parse_setup(s)?;
 
@@ -1191,8 +1245,14 @@ impl Prover {
                 return true;
             }
             // `BufferedReader.readLine` strips the terminator; `read_line` keeps it, and
-            // the following `strip()` removes it either way.
-            let s = line.trim();
+            // the following `strip()` (`:366`, i.e. [`java_strip`]) removes it either way.
+            //
+            // One residual, deliberately NOT papered over: `readLine` also treats a BARE
+            // `\r` as a line terminator, while `BufRead::read_line` splits on `\n` only.
+            // A classic-Mac-style file would therefore arrive here as one long line. Noted
+            // rather than fixed -- it would mean hand-rolling the reader, and no Walnut
+            // command file in the corpus is `\r`-terminated.
+            let s = java_strip(&line);
             if s.starts_with('#') {
                 let _ = writeln!(self.out, "{s}");
                 continue;
@@ -1213,6 +1273,18 @@ impl Prover {
             match self.dispatch(&command) {
                 Ok(true) => {}
                 Ok(false) => return false,
+                // **The two catch clauses are not the same clause.** Java's INNER
+                // `catch (RuntimeException e)` (`:390-392`) sits inside the `while`, so an
+                // unchecked exception is logged and the NEXT line is read. But `dispatch`
+                // is declared `throws IOException` (`:401`), and a checked `IOException`
+                // is not a `RuntimeException` -- it escapes to the OUTER
+                // `catch (IOException e)` (`:394-396`), which is outside the loop, so the
+                // loop ENDS and `readBuffer` returns `true` (no further line of the file
+                // or of the REPL is executed).
+                Err(e) if is_io_class_error(&e) => {
+                    self.logging.print_truncated_stack_trace(&e);
+                    return true;
+                }
                 Err(e) => self.logging.print_truncated_stack_trace(&e),
             }
         }
@@ -1270,6 +1342,36 @@ impl Prover {
 
         self.read_buffer(console_input, true);
         Ok(())
+    }
+}
+
+/// Is this error one that Java would have thrown as a **checked `IOException`** rather
+/// than as an unchecked `RuntimeException`?
+///
+/// The distinction is invisible in Rust (one `Result`, one error enum) but load-bearing in
+/// `Prover.readBuffer`, whose two `catch` clauses do opposite things — see the call site.
+///
+/// Only [`ProverError::Io`] qualifies today, and nothing constructs it yet: every command
+/// currently wired up is a Java method that does *not* declare `throws IOException`. The
+/// four that do — `morphismCommand` (`:632`), `promoteCommand` (`:637`), `imageCommand`
+/// (`:652`) and `transduce` — belong to U24/U26, so this classification has to be right
+/// *before* those land, not after.
+fn is_io_class_error(e: &ProverError) -> bool {
+    match e {
+        ProverError::Io(_) => true,
+        // Exhaustive on purpose: a new variant must make this decision deliberately.
+        ProverError::InvalidCommand(_)
+        | ProverError::NoSuchCommand
+        | ProverError::InvalidCommandUse(_)
+        | ProverError::InvalidFile(_)
+        | ProverError::WalnutMessage(_)
+        | ProverError::Meta(_)
+        | ProverError::EvalDef(_)
+        | ProverError::Reg(_)
+        | ProverError::Alphabet(_)
+        | ProverError::Helper(_)
+        | ProverError::UnsupportedCommand { .. }
+        | ProverError::NotYetImplemented { .. } => false,
     }
 }
 
@@ -1358,9 +1460,11 @@ pub fn parse_args(args: &[String]) -> Result<ArgsOutcome, ProverError> {
 
     // `Session.setPathsAndNames(sessionDir, homeDir, globalSession);` (`:321`).
     let paths = SessionPaths::new(session_dir.as_deref(), home_dir.as_deref(), global_session);
+    // `Session.createSubdirectories`'s failure is a `WalnutException` (`Session.java:132`),
+    // not `validateFile`'s `IllegalArgumentException`.
     paths
         .create_subdirectories()
-        .map_err(ProverError::InvalidFile)?;
+        .map_err(ProverError::WalnutMessage)?;
     Ok(ArgsOutcome::Run {
         filename,
         session: Session::from_paths(paths),
@@ -1524,44 +1628,294 @@ mod tests {
         assert_eq!(group(&caps, s, GROUP_CONVERT_OLD_NAME), Some("old"));
     }
 
+    /// Every remaining command's group constants, pinned to the **actual captured text**
+    /// of a well-formed invocation.
+    ///
+    /// These 23 constants are what U23–U26 will use to pull arguments out of a command, so
+    /// an off-by-one here is a silent wrong-argument bug in a unit that has not been
+    /// written yet — and "the pattern matched" (which is all this test used to assert)
+    /// catches none of them, because every one of these patterns matches regardless of how
+    /// its groups are numbered. Two families deserve the scrutiny particularly:
+    /// `GROUP_RSPLIT_AUTOMATA`/`GROUP_RSPLIT_INPUT`, which are documented as being out of
+    /// numeric order (4 and 2), and `GROUP_MORPHISM_DEFINITION`, which is Java's
+    /// never-assigned `int` field and therefore group **0**, the whole match.
     #[test]
-    fn the_remaining_command_patterns_match_a_well_formed_invocation() {
-        let cases: Vec<(&Regex, &str)> = vec![
-            (&patterns().load, "load cmds.txt"),
-            (&patterns().macro_cmd, r#"macro m "x = 1""#),
-            (&patterns().ost, "ost o [1 2] [3]"),
-            (&patterns().combine, "combine c a=1 b=2"),
-            (&patterns().morphism, r#"morphism h "0->01,1->10""#),
-            (&patterns().promote, "promote P h"),
-            (&patterns().image, "image I h T"),
-            (&patterns().inf, "inf T"),
-            (&patterns().split, "split S T [+][-]"),
-            (&patterns().rsplit, "rsplit S [+][-] T"),
-            (&patterns().join, "join J A [x] B [y]"),
-            (&patterns().test, "test T 5"),
-            (&patterns().transduce, "transduce N T $M"),
-            (&patterns().reverse, "reverse R $M"),
-            (&patterns().minimize, "minimize N M"),
-            (&patterns().fixleadzero, "fixleadzero N $M"),
-            (&patterns().fixtrailzero, "fixtrailzero N $M"),
-            (&patterns().union, "union U A B"),
-            (&patterns().intersect, "intersect I A B"),
-            (&patterns().star, "star S A"),
-            (&patterns().concat, "concat C A B"),
-            (&patterns().rightquo, "rightquo Q A B"),
-            (&patterns().leftquo, "leftquo Q A B"),
-            (&patterns().export, "export $M gv"),
-            (&patterns().describe, "describe $M"),
+    fn every_command_pattern_pins_its_group_indices() {
+        /// One compiled pattern, one well-formed invocation of it, and the
+        /// `(group index, captured text)` pairs that invocation must produce.
+        type GroupCase<'a> = (&'a Regex, &'a str, Vec<(usize, &'a str)>);
+
+        let p = patterns();
+        let cases: Vec<GroupCase> = vec![
+            (&p.load, "load cmds.txt", vec![(L_FILENAME, "cmds.txt")]),
+            (
+                &p.macro_cmd,
+                r#"macro m "x = 1""#,
+                vec![(M_NAME, "m"), (M_DEFINITION, "x = 1")],
+            ),
+            (
+                &p.ost,
+                "ost o [1 2] [3]",
+                vec![
+                    (GROUP_OST_NAME, "o"),
+                    (GROUP_OST_PREPERIOD, "1 2"),
+                    (GROUP_OST_PERIOD, "3"),
+                ],
+            ),
+            (
+                &p.combine,
+                "combine c a=1 b=2",
+                vec![
+                    (GROUP_COMBINE_NAME, "c"),
+                    (GROUP_COMBINE_AUTOMATA, " a=1 b=2"),
+                ],
+            ),
+            (
+                &p.morphism,
+                r#"morphism h "0->01,1->10""#,
+                vec![
+                    (GROUP_MORPHISM_NAME, "h"),
+                    // Group 0 -- the WHOLE match, quotes and command name and all. Not a
+                    // typo: Java's `GROUP_MORPHISM_DEFINITION` is never assigned.
+                    (GROUP_MORPHISM_DEFINITION, r#"morphism h "0->01,1->10""#),
+                ],
+            ),
+            (
+                &p.promote,
+                "promote P h",
+                vec![(GROUP_PROMOTE_NAME, "P"), (GROUP_PROMOTE_MORPHISM, "h")],
+            ),
+            (
+                &p.image,
+                "image I h T",
+                vec![
+                    (GROUP_IMAGE_NEW_NAME, "I"),
+                    (GROUP_IMAGE_MORPHISM, "h"),
+                    (GROUP_IMAGE_OLD_NAME, "T"),
+                ],
+            ),
+            (&p.inf, "inf T", vec![(GROUP_INF_NAME, "T")]),
+            (
+                &p.split,
+                "split S T [+][-]",
+                vec![
+                    (GROUP_SPLIT_NAME, "S"),
+                    (GROUP_SPLIT_AUTOMATA, "T"),
+                    (GROUP_SPLIT_INPUT, " [+][-]"),
+                ],
+            ),
+            (
+                &p.rsplit,
+                "rsplit S [+][-] T",
+                vec![
+                    (GROUP_RSPLIT_NAME, "S"),
+                    // The out-of-order pair: the INPUT list is group 2 and the automaton
+                    // name is group 4, because the bracket list precedes the name here.
+                    (GROUP_RSPLIT_INPUT, " [+][-]"),
+                    (GROUP_RSPLIT_AUTOMATA, "T"),
+                ],
+            ),
+            (
+                &p.join,
+                "join J A [x] B [y]",
+                vec![
+                    (GROUP_JOIN_NAME, "J"),
+                    (GROUP_JOIN_AUTOMATA, " A [x] B [y]"),
+                ],
+            ),
+            (
+                &p.test,
+                "test T 5",
+                vec![(GROUP_TEST_NAME, "T"), (GROUP_TEST_NUM, "5")],
+            ),
+            (
+                &p.transduce,
+                "transduce N T $M",
+                vec![
+                    (GROUP_TRANSDUCE_NEW_NAME, "N"),
+                    (GROUP_TRANSDUCE_TRANSDUCER, "T"),
+                    (GROUP_TRANSDUCE_DOLLAR_SIGN, "$"),
+                    (GROUP_TRANSDUCE_OLD_NAME, "M"),
+                ],
+            ),
+            (
+                &p.reverse,
+                "reverse R $M",
+                vec![
+                    (GROUP_REVERSE_NEW_NAME, "R"),
+                    (GROUP_REVERSE_DOLLAR_SIGN, "$"),
+                    (GROUP_REVERSE_OLD_NAME, "M"),
+                ],
+            ),
+            (
+                &p.minimize,
+                "minimize N M",
+                vec![
+                    (GROUP_MINIMIZE_NEW_NAME, "N"),
+                    (GROUP_MINIMIZE_OLD_NAME, "M"),
+                ],
+            ),
+            (
+                &p.fixleadzero,
+                "fixleadzero N $M",
+                vec![
+                    (GROUP_FIXLEADZERO_NEW_NAME, "N"),
+                    (GROUP_FIXLEADZERO_OLD_NAME, "M"),
+                ],
+            ),
+            (
+                &p.fixtrailzero,
+                "fixtrailzero N $M",
+                vec![
+                    (GROUP_FIXTRAILZERO_NEW_NAME, "N"),
+                    (GROUP_FIXTRAILZERO_OLD_NAME, "M"),
+                ],
+            ),
+            (
+                &p.union,
+                "union U A B",
+                vec![(GROUP_UNION_NAME, "U"), (GROUP_UNION_AUTOMATA, " A B")],
+            ),
+            (
+                &p.intersect,
+                "intersect I A B",
+                vec![
+                    (GROUP_INTERSECT_NAME, "I"),
+                    (GROUP_INTERSECT_AUTOMATA, " A B"),
+                ],
+            ),
+            (
+                &p.star,
+                "star S A",
+                vec![(GROUP_STAR_NEW_NAME, "S"), (GROUP_STAR_OLD_NAME, "A")],
+            ),
+            (
+                &p.concat,
+                "concat C A B",
+                vec![(GROUP_CONCAT_NAME, "C"), (GROUP_CONCAT_AUTOMATA, " A B")],
+            ),
+            (
+                &p.rightquo,
+                "rightquo Q A B",
+                vec![
+                    (GROUP_QUO_NEW_NAME, "Q"),
+                    (GROUP_QUO_OLD_NAME1, "A"),
+                    (GROUP_QUO_OLD_NAME2, "B"),
+                ],
+            ),
+            (
+                &p.leftquo,
+                "leftquo Q A B",
+                vec![
+                    (GROUP_QUO_NEW_NAME, "Q"),
+                    (GROUP_QUO_OLD_NAME1, "A"),
+                    (GROUP_QUO_OLD_NAME2, "B"),
+                ],
+            ),
+            (
+                &p.export,
+                "export $M gv",
+                vec![
+                    (GROUP_EXPORT_DOLLAR_SIGN, "$"),
+                    (GROUP_EXPORT_NAME, "M"),
+                    (GROUP_EXPORT_TYPE, "gv"),
+                ],
+            ),
+            (
+                &p.describe,
+                "describe $M",
+                vec![
+                    (GROUP_DESCRIBE_DOLLAR_SIGN, "$"),
+                    (GROUP_DESCRIBE_NAME, "M"),
+                ],
+            ),
         ];
-        for (re, s) in cases {
-            assert!(find(re, s).is_some(), "pattern should match {s:?}");
+        for (re, s, expected) in cases {
+            let caps = find(re, s).unwrap_or_else(|| panic!("pattern should match {s:?}"));
+            for (index, want) in expected {
+                assert_eq!(
+                    group(&caps, s, index),
+                    Some(want),
+                    "group {index} of {s:?} must capture {want:?}"
+                );
+            }
         }
+    }
+
+    /// The `$`-marker groups again, with the marker ABSENT — `DOLLAR`'s second alternative
+    /// (`\s*`) then captures the empty string rather than failing to participate, which is
+    /// what every `is_dfao`-style caller compares against `"$"`.
+    #[test]
+    fn an_absent_dollar_marker_captures_the_empty_string_not_nothing() {
+        let p = patterns();
+        let s = "reverse R M";
+        let caps = find(&p.reverse, s).unwrap();
+        assert_eq!(group(&caps, s, GROUP_REVERSE_DOLLAR_SIGN), Some(""));
+        assert_eq!(group(&caps, s, GROUP_REVERSE_OLD_NAME), Some("M"));
     }
 
     #[test]
     fn the_split_input_and_set_element_patterns_work() {
         assert!(find(&patterns().input_in_split, "[ + ]").is_some());
         assert!(find(&patterns().single_element_of_a_set, "- 3").is_some());
+    }
+
+    // ------------------------------------------------------ java_strip / errors
+
+    /// `String.strip()` and `str::trim` are NOT the same function, in either direction.
+    /// Both disagreements are pinned, because a port that reaches for `.trim()` compiles,
+    /// passes every ASCII test, and is wrong only on input nobody thinks to write.
+    #[test]
+    fn java_strip_is_not_str_trim() {
+        // Ordinary ASCII: identical.
+        assert_eq!(java_strip("  eval x \t\r\n"), "eval x");
+        assert_eq!(java_strip(""), "");
+        assert_eq!(java_strip("   "), "");
+
+        // Rust strips these, `Character.isWhitespace` does not: the three non-breaking
+        // spaces and NEL.
+        for c in ['\u{A0}', '\u{2007}', '\u{202F}', '\u{85}'] {
+            let s = format!("{c}x{c}");
+            assert_eq!(java_strip(&s), s, "{c:?} is NOT Java whitespace");
+            assert_eq!(
+                s.trim(),
+                "x",
+                "...but str::trim strips it -- that is the trap"
+            );
+        }
+
+        // Java strips these, Rust does not: the four ASCII information separators.
+        for c in ['\u{1C}', '\u{1D}', '\u{1E}', '\u{1F}'] {
+            let s = format!("{c}x{c}");
+            assert_eq!(java_strip(&s), "x", "{c:?} IS Java whitespace");
+            assert_eq!(s.trim(), s, "...but str::trim leaves it");
+        }
+
+        // The Unicode space separators both agree on.
+        assert_eq!(java_strip("\u{2000}\u{3000}x\u{2028}"), "x");
+    }
+
+    /// Java's `readBuffer` has two `catch` clauses that do OPPOSITE things, and only the
+    /// checked-`IOException` one ends the loop. Nothing constructs [`ProverError::Io`]
+    /// yet, so this pins the classification directly rather than through `read_buffer`.
+    #[test]
+    fn only_io_errors_are_classified_as_javas_checked_exception() {
+        assert!(is_io_class_error(&ProverError::Io(io::Error::other(
+            "boom"
+        ))));
+        for e in [
+            ProverError::NoSuchCommand,
+            ProverError::InvalidCommand("x".to_string()),
+            ProverError::InvalidCommandUse("x".to_string()),
+            ProverError::InvalidFile("x".to_string()),
+            ProverError::WalnutMessage("x".to_string()),
+            ProverError::NotYetImplemented {
+                command: "star",
+                unit: "U23",
+            },
+        ] {
+            assert!(!is_io_class_error(&e), "{e} must not end the read loop");
+        }
     }
 
     // ------------------------------------------------------------- parseSetup
@@ -1665,6 +2019,78 @@ mod tests {
         assert!(p.dispatch("def lt x y \"?msd_2 x < y\";").unwrap());
         assert!(dir.join("Automata Library").join("lt.txt").is_file());
         assert_eq!(p.current_eval_name(), Some("lt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Prover.currentEvalName` is a static that `new MetaCommands()` does NOT reset, so
+    /// the name set by an `eval`/`def` is still the export name for every LATER command —
+    /// even one that is not an `eval` at all. `parse_setup` rebuilds `MetaCommands` per
+    /// command, so it has to re-seed the name or `getExportName` silently falls back to
+    /// the `"export"` placeholder.
+    #[test]
+    fn the_eval_name_survives_into_the_next_commands_meta_commands() {
+        let (mut p, dir, _) = prover("evalnamecarry");
+        p.dispatch("def myname x \"?msd_2 x = 1\";").unwrap();
+        assert_eq!(p.current_eval_name(), Some("myname"));
+
+        // A LATER, unrelated command with an export metacommand. Java would name its dump
+        // `myname_0_pre.gv`, not `export_0_pre.gv`.
+        let _ = p.dispatch("[export * gv] star S A::");
+        assert_eq!(
+            p.meta_commands().get_export_name(0).as_deref(),
+            Some("myname")
+        );
+
+        // And with no `eval`/`def` ever run, the placeholder is what Java uses.
+        let (mut fresh, dir2, _) = prover("evalnamefresh");
+        let _ = fresh.dispatch("[export * gv] star S A::");
+        assert_eq!(
+            fresh.meta_commands().get_export_name(0).as_deref(),
+            Some(crate::meta_commands::DEFAULT_EXPORT_NAME)
+        );
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&dir2).ok();
+    }
+
+    /// **A tripwire, not an endorsement.** `[export …]` is parsed, validated and accepted,
+    /// but no `MetaCommands` is threaded into `wr_core::determinize` yet (see the module
+    /// docs), so the pre-determinization dumps Java writes — `<name>_0_pre.gv`,
+    /// `<name>_1_pre.gv`, … — are silently not produced. Every other unimplemented surface
+    /// in this crate fails loudly with `NotYetImplemented`; this one accepts and discards,
+    /// which is exactly the kind of gap that stays invisible.
+    ///
+    /// So pin the CURRENT behavior: the day the determinize context is wired through, this
+    /// test goes red and must be rewritten to assert the files that now appear.
+    #[test]
+    fn export_metacommands_are_accepted_but_write_no_pre_determinization_files_yet() {
+        let (mut p, dir, _) = prover("exportnoop");
+        assert!(p
+            .dispatch("[export * gv] eval e \"?msd_2 Ei i < x\"::")
+            .unwrap());
+
+        // Parsed and accepted...
+        assert_eq!(
+            p.meta_commands().get_export_format(0).as_deref(),
+            Some("gv")
+        );
+        assert_eq!(p.meta_commands().get_export_name(0).as_deref(), Some("e"));
+        assert!(p.meta_commands().export_failures().is_empty());
+        // ...and yet the determinizer never called back even once: no automaton index was
+        // consumed (the counter is still at its initial value).
+        assert_eq!(p.meta_commands_mut().increment_automata_index(), 0);
+
+        // ...and no `_pre` file was written, though the ordinary result file was.
+        let stray: Vec<String> = fs::read_dir(dir.join("Result"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("_pre"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the export metacommand is still a no-op; if these appeared, WIRE THIS TEST \
+             UP TO THE NEW BEHAVIOR: {stray:?}"
+        );
+        assert!(dir.join("Result").join("e.txt").is_file());
         fs::remove_dir_all(&dir).ok();
     }
 

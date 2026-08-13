@@ -22,8 +22,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         // `System.out.println(usageMessage); System.exit(0);` (`Prover.java:301-302`).
+        // `println`, not `print`: `usageMessage` already ends in a newline, so Java's
+        // output ends in TWO. Byte-compared against the real jar.
         Ok(ArgsOutcome::Help) => {
-            print!("{USAGE_MESSAGE}");
+            println!("{USAGE_MESSAGE}");
             ExitCode::SUCCESS
         }
         Ok(ArgsOutcome::Run { filename, session }) => {
