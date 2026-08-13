@@ -69,7 +69,29 @@ bug costs a silent wrong answer somewhere downstream.
   short-circuits — empty label set, or a label-less automaton — on an input that already had an
   unreachable state. Java has the identical shape at the identical call site
   (`AutomatonQuantification.java:46`), so ported verbatim, not guarded; recorded here so the
-  call-site inventory above stays complete.
+  call-site inventory above stays complete. **Update (Phase 3b, U18, 2026-08-13): a fourth live
+  call site — `convertNS`'s `k -> k^j` regrouping** (`AutomatonLogicalOps.java:513-522`;
+  `wr_core::logicalops::convert_ns` -> `convert_msd_base_to_exponent`), found independently by both
+  adversarial reviewers of that unit. Regrouping re-keys the transition table by digit GROUPS, so
+  any state reachable only *mid*-group becomes unreachable from `q0`; the very next statement
+  (`:521`, `minimizeSelfWithOutput`) bottoms out in Valmari with no intervening trim, and WB-001
+  fires. **This one is the easiest of the four to hit from the command line**, because the
+  stranding is a property of the *conversion*, not of an already-malformed input: any automaton
+  whose accepting behaviour depends on length parity strands its odd-phase state the moment two
+  binary digits are grouped into one base-4 digit.
+  **Minimal reproducer, verified live against `Walnut-all.jar`** (`Word Automata Library/u18even.txt`:
+  two states, `0` with output `1` and `1` with output `0`, every digit toggling between them — i.e.
+  "the input has even length"):
+  ```
+  convert evenmsd4 msd_4 u18even;
+  ```
+  Every base-4 word corresponds to an even-length binary word, so the correct result is the
+  constant-`1` DFAO. Walnut writes the constant-**`0`** DFAO. Swapping the two outputs (odd parity,
+  correct answer constant-`0`) makes Walnut write constant-`1`: the corruption inverts, it is not a
+  lucky constant. Faithful to Java, so ported verbatim, not guarded; pinned by
+  `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` (`logicalops.rs`). The Tier-4
+  round-trip test next to it had to be rescoped as a result — "convert away and back is the
+  identity on the language" is **not** universally true in either engine, and its doc now says so.
 - **Upstream:** not filed. A ~3-line guard (`if blocks.loc[q0] >= rr` after the reachability pass,
   route to the canonical dead-automaton case) would fix it in Java too.
 - **Severity:** **critical** — silent wrong answer (not a crash), in the automaton engine's most
@@ -1608,10 +1630,10 @@ bug costs a silent wrong answer somewhere downstream.
   `int exponent = (int) (Math.log(fromBase) / Math.log(commonRoot));` (`:504`) and the same
   expression on `toBase` (`:519`).
 - **What:** the exponent `j` in `base == root^j` is computed in IEEE-754 double and then **truncated**
-  by the `(int)` cast. `Math.log` is correctly rounded but the *quotient* of two correctly-rounded
-  logarithms is not exact: for several `(root, exponent)` pairs it lands a fraction of an ulp below
-  the integer it should be, and the truncating cast then rounds it DOWN by a whole unit. The
-  smallest case is `ln(1000) / ln(10) == 2.9999999999999996`, yielding `2` instead of `3`.
+  by the `(int)` cast. The *quotient* of two logarithms is not exact: for many `(root, exponent)`
+  pairs it lands a fraction of an ulp below the integer it should be, and the truncating cast then
+  rounds it DOWN by a whole unit. The smallest case is `Math.log(1000) / Math.log(10) ==
+  2.9999999999999996`, yielding `2` instead of `3`.
   Consequences depend on which of the two call sites hits it:
   - `:519` (`toBase != commonRoot`, the `k -> k^j` regrouping): **silently wrong output**.
     `convertMsdBaseToExponent` groups two digits instead of three, sets the number system to
@@ -1621,10 +1643,26 @@ bug costs a silent wrong answer somewhere downstream.
     `convertLsdBaseToRoot`'s own `base != root^exponent` guard (`:570-572`) then fires with
     `Base mismatch: expected 100, found 1000`.
 
-  The full affected set for bases up to `10^9`, as `(root, exponent)` pairs:
-  `(10,3) (3,5) (10,6) (11,7) (12,7) (3,10) (9,5) (10,9)` — i.e. bases `1000, 243, 10^6, 11^7,
-  12^7, 3^10, 9^5, 10^9`. Everything else (including every power of 2, the overwhelmingly common
-  case) is unaffected, which is why this has gone unnoticed.
+  **The affected set (corrected 2026-08-13 — the original figures in this entry were wrong).**
+  Swept over every `(root, exponent)` with `root <= 46340` and `root^exponent <= 2^31` (the largest
+  base an `int` alphabet can hold), evaluating the real `(int)(Math.log(x)/Math.log(root))` on a
+  real JVM:
+  - **343** affected pairs in total; **241** of them have `root^exponent <= 10^9`; **170** have
+    `root <= 1000`.
+  - The smallest affected base is **`1000`** (`root = 10, exponent = 3`) — every base below it is
+    computed correctly.
+  - Affected `(root, exponent)` pairs with `root <= 100`, in full:
+    `(9,5) (10,3) (10,6) (10,9) (11,7) (12,7) (17,3) (17,6) (22,5) (31,3) (31,6) (34,3) (34,6)
+    (41,3) (46,5) (52,3) (52,5) (54,5) (55,5) (56,3) (56,5) (69,5) (83,3) (88,3) (93,3) (98,3)
+    (100,3)` — i.e. ordinary bases such as `1000`, `4913 = 17^3`, `29791 = 31^3`, `10^6`.
+    From `root = 154` upward the `exponent = 3` cases become common (the bulk of the 170), and
+    125 perfect squares are affected too, the smallest being `34225 = 185^2`.
+  - **Every power of 2 is safe** (`log(2^n)/log(2)` is exact in binary floating point), and
+    `(root, 2)` is safe for every `root < 185`. That — plus the fact that base-2 and base-4 are the
+    overwhelmingly common cases — is why this has gone unnoticed.
+  - The entry previously listed `(3,5)` and `(3,10)` (i.e. `243` and `3^10`) as affected. **They are
+    not**: `Math.log(243)/Math.log(3)` is exactly `5.0` in Java. That claim came from a Rust
+    `f64::ln` computation, which is not the same function — see the "Rust port" note below.
 - **Trigger:** `convert $y msd_1000 $x;` where `x.txt` is any `msd_10` automaton.
 - **Found:** Phase 3b, U18 (porting `convertNS`), 2026-08-13. **Confirmed live** against
   `walnut-java`'s `Walnut-all.jar`: `def base10 "?msd_10 x < 15"; convert $b10msd1000 msd_1000
@@ -1634,21 +1672,42 @@ bug costs a silent wrong answer somewhere downstream.
   `ProductStrategies.computeAllInputsOfAxB` with `NegativeArraySizeException` on the `1000^2`
   cross-product alphabet — a separate, already-known scaling limit, not this bug.)
 - **Rust port:** `ported verbatim (quirk)`. `wr_core::logicalops::truncated_log_ratio` reproduces
-  the exact expression, and two tests pin it: `truncated_log_ratio_reproduces_wb032` (which also
-  asserts the raw quotient is `< 3.0`, so it fails loudly rather than silently diverging on a
-  platform whose `ln` is not correctly rounded) and the end-to-end
+  the exact expression.
+
+  **Reproducing it required porting `Math.log` itself** (`wr_core::logicalops::java_log`), and the
+  first draft of this port got that wrong. The draft used Rust's `f64::ln` and justified it with
+  "the value is libm-independent as long as `ln` is correctly rounded" — **a false premise, because
+  Java's `Math.log` is specifically NOT correctly rounded.** It is FDLIBM-derived and specified only
+  as "within 1 ulp", and it really does differ: on 1,940 of the 199,999 integers in `2..=200_000`,
+  `ln(3)` among them (Java `0x1.193ea7aad030ap0`, correctly rounded `0x1.193ea7aad030bp0`). Over the
+  sweep above, the two disagree on the computed exponent for **149** `(root, exponent)` pairs — in
+  both directions. The starkest: `convert t243 msd_243 t3;` on an `msd_3` automaton, where real
+  Walnut correctly produces `msd_243` and the `f64::ln` draft produced **`msd_81`** — a silently
+  wrong base on an ordinary input, i.e. a port bug rather than a faithful reproduction of this one.
+  `java_log` is a transliteration of FDLIBM 5.3's `__ieee754_log` (the source `StrictMath.log` is
+  derived from) and was verified **bit-for-bit against a real JVM on every integer in `2..=200_000`,
+  0 mismatches** (`openjdk 11.0.16.1`, `aarch64`, where `Math.log` and `StrictMath.log` were also
+  confirmed identical over that range). `int_pow`'s use of `powf` for `(int) Math.pow` was checked
+  the same way over the same sweep — exact on both sides, no divergence.
+
+  Three tests pin the result: `java_log_matches_real_java_bit_for_bit` (raw
+  `doubleToRawLongBits` values captured from the JVM, including the three where `f64::ln` differs,
+  so a regression to `ln` fails loudly), `truncated_log_ratio_agrees_with_real_java` (the whole
+  `root <= 1000` slice of the sweep, expectations captured from the JVM — 2,406 pairs, 170 of them
+  WB-032 hits), and the end-to-end
   `wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines` in
   `tests/differential/tests/convert_ns.rs`, which compares the port's wrong answer against the real
-  engine's wrong answer. Verified portable: the double nearest `ln(1000)` divided by the double
-  nearest `ln(10)` **is** `2.9999999999999996`, so any correctly-rounded libm (macOS, glibc) and
-  Java's `Math.log` all agree.
+  engine's wrong answer.
 - **Upstream:** not filed. The fix in Java is to compute the exponent with integer arithmetic
   (repeated division by `commonRoot` until the quotient is 1, verifying exactness on the way) rather
   than `Math.log`; `UtilityMethods.commonRoot` already walks exactly that recursion and could return
   the exponent alongside the root.
 - **Severity:** moderate — a silently wrong answer (not a crash) from a supported command on valid
-  input, but confined to a small, unusual set of bases; every power of 2 and every base below 243 is
-  correct.
+  input. **The original "confined to a small, unusual set of bases" framing understated it**: 343
+  `(root, exponent)` pairs are affected, including `1000`, `10^6`, `17^3`, `31^3` and 125 perfect
+  squares. It stays *moderate* rather than *high* only because every power of 2 is correct and
+  bases 2/4/8/16 are what essentially all real usage converts between; a user working in base 10
+  hits it on the third power.
 
 ---
 

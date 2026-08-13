@@ -136,8 +136,8 @@
 //! `parseBase()`/`new NumberSystem(name)`. Both blockers are gone: Phase 3a's U6 landed
 //! [`crate::word_automaton`] (and, as its own hard dependency, [`combine`] below), and the
 //! `NumberSystem`-shaped inputs are handled by this crate's established per-track stand-in
-//! — see [`convert_ns`]'s `from_base` parameter for the exact substitution and its one
-//! declared limitation. Phase 3b's U18 ports the rest, so nothing in
+//! — see [`convert_ns`]'s doc comment for the exact substitution (`parseBase()` is derived
+//! from the track's own alphabet). Phase 3b's U18 ports the rest, so nothing in
 //! `AutomatonLogicalOps.java` is unported now.
 //!
 //! **The three `*Morphism` helpers have nothing to do with [`crate::morphism::Morphism`]**
@@ -1257,27 +1257,183 @@ fn int_pow(base: i32, exponent: i32) -> i32 {
     f64::from(base).powf(f64::from(exponent)) as i32
 }
 
+/// **Java's `Math.log`, transliterated** — i.e. FDLIBM's `__ieee754_log`, which is what
+/// `StrictMath.log` is and what `Math.log` resolves to on the platforms this port is
+/// checked against.
+///
+/// # Why this exists instead of `f64::ln`
+///
+/// [`truncated_log_ratio`] below is bug-for-bug sensitive to the LAST BIT of the logarithm
+/// (it truncates a quotient of two of them), so "same to within an ulp" is not good enough:
+/// the port has to compute the *same double* Java does.
+///
+/// **`f64::ln` does not.** Rust's `ln` is the platform libm's, which on macOS/glibc is
+/// correctly rounded; Java's `Math.log` is FDLIBM-derived and is **not** — it is documented
+/// only as "within 1 ulp", and it really does differ. It differs on 1,940 of the 199,999
+/// integers in `2..=200_000` (`ln(3)`, `ln(185)` and `ln(196)` among them: for `3`, Java
+/// gives `0x1.193ea7aad030ap0` where the correctly-rounded value is `0x1.193ea7aad030bp0`).
+///
+/// Those last bits propagate: swept over every `(root, exponent)` with `root <= 46340` and
+/// `root^exponent <= 2^31`, `(int)(ln(x)/ln(root))` computed with Rust's `ln` disagrees with
+/// the same expression computed with Java's on **149** pairs. The starkest is
+/// `root = 3, exponent = 5`: real Walnut converts an `msd_3` automaton to `msd_243`, while a
+/// `f64::ln`-based port converted it to `msd_81` — a silently different, wrong base on a
+/// perfectly ordinary input. (This module's first draft did exactly that, on the false
+/// premise that "the value is libm-independent as long as `ln` is correctly rounded".)
+///
+/// # The algorithm
+///
+/// A direct transliteration of FDLIBM 5.3's `e_log.c` (`__ieee754_log`), the same source
+/// OpenJDK's `StrictMath.log` is derived from: argument-reduce `x = 2^k * (1+f)` with
+/// `sqrt(2)/2 < 1+f < sqrt(2)`, then evaluate `log(1+f)` from the odd polynomial in
+/// `s = f/(2+f)`. Constants are given as raw bit patterns (the same ones FDLIBM lists in
+/// its comments) so no decimal-literal rounding can creep in.
+///
+/// # Verification (this is the whole point of the function, so it is checked, not asserted)
+///
+/// `java_log_matches_real_java_bit_for_bit` pins a spread of captured
+/// `Double.doubleToRawLongBits(Math.log(v))` values, and the port was checked exhaustively
+/// off-line against a dump from the real JVM: **0 mismatches over every integer in
+/// `2..=200_000`**, on `openjdk 11.0.16.1` / `aarch64`, where `Math.log` and
+/// `StrictMath.log` were also verified to agree bit-for-bit over the same range. (On x86-64
+/// HotSpot can substitute an Intel-LIBM intrinsic for `Math.log`; should that ever be shown
+/// to differ from FDLIBM on an input this file feeds it, this function is the single place
+/// to record the divergence.)
+///
+/// Only the ordinary finite-positive path is ever exercised here — every argument is a
+/// small positive integer base — but the subnormal/zero/negative/NaN branches are ported
+/// too rather than replaced with a panic, so the function is a faithful `Math.log` and not
+/// a partial one.
+#[allow(clippy::excessive_precision)]
+fn java_log(x: f64) -> f64 {
+    // FDLIBM's file-scope constants, given as the raw bit patterns its own comments list.
+    // `let`, not `const`, only because `f64::from_bits` is not const-callable below Rust
+    // 1.83 and this workspace's MSRV is 1.75; the values are compile-time constants in
+    // every other sense.
+    let ln2_hi = f64::from_bits(0x3FE6_2E42_FEE0_0000);
+    let ln2_lo = f64::from_bits(0x3DEA_39EF_3579_3C76);
+    let two54 = f64::from_bits(0x4350_0000_0000_0000);
+    let lg1 = f64::from_bits(0x3FE5_5555_5555_5593);
+    let lg2 = f64::from_bits(0x3FD9_9999_9997_FA04);
+    let lg3 = f64::from_bits(0x3FD2_4924_9422_9359);
+    let lg4 = f64::from_bits(0x3FCC_71C5_1D8E_78AF);
+    let lg5 = f64::from_bits(0x3FC7_4664_96CB_03DE);
+    let lg6 = f64::from_bits(0x3FC3_9A09_D078_C69F);
+    let lg7 = f64::from_bits(0x3FC2_F112_DF3E_5244);
+
+    /// FDLIBM's `__HI(x)`: the high 32 bits, read as a SIGNED int (its `hx` is an `int`,
+    /// and both the `hx < 0` sign test and the `hx >> 20` exponent extraction rely on that).
+    fn high_word(x: f64) -> i32 {
+        (x.to_bits() >> 32) as u32 as i32
+    }
+    /// FDLIBM's `__LO(x)`: the low 32 bits, unsigned (only ever tested for zero).
+    fn low_word(x: f64) -> u32 {
+        x.to_bits() as u32
+    }
+    /// FDLIBM's `__HI(x) = h` assignment: replace the high word, keep the low one.
+    fn with_high_word(x: f64, h: i32) -> f64 {
+        f64::from_bits((u64::from(h as u32) << 32) | u64::from(low_word(x)))
+    }
+
+    let mut x = x;
+    let mut hx = high_word(x);
+    let lx = low_word(x);
+    let mut k: i32 = 0;
+
+    if hx < 0x0010_0000 {
+        // x < 2^-1022
+        if ((hx & 0x7fff_ffff) as u32 | lx) == 0 {
+            return -two54 / 0.0; // log(+-0) = -inf
+        }
+        if hx < 0 {
+            // FDLIBM's `(x-x)/zero` idiom for "log of a negative is NaN" — deliberately
+            // NOT simplified to `f64::NAN`, so the sign/payload it produces is whatever
+            // the hardware produces, exactly as in Java.
+            #[allow(clippy::eq_op)]
+            return (x - x) / 0.0;
+        }
+        k -= 54;
+        x *= two54; // subnormal: scale up
+        hx = high_word(x);
+    }
+    if hx >= 0x7ff0_0000 {
+        return x + x; // +inf / NaN
+    }
+    k += (hx >> 20) - 1023;
+    hx &= 0x000f_ffff;
+    let i = (hx + 0x9_5f64) & 0x10_0000;
+    x = with_high_word(x, hx | (i ^ 0x3ff0_0000)); // normalize x or x/2
+    k += i >> 20;
+    let f = x - 1.0;
+    let dk: f64;
+
+    if (0x000f_ffff & (2 + hx)) < 3 {
+        // |f| < 2^-20
+        if f == 0.0 {
+            if k == 0 {
+                return 0.0;
+            }
+            dk = f64::from(k);
+            return dk * ln2_hi + dk * ln2_lo;
+        }
+        let r = f * f * (0.5 - 0.33333333333333333 * f);
+        if k == 0 {
+            return f - r;
+        }
+        dk = f64::from(k);
+        return dk * ln2_hi - ((r - dk * ln2_lo) - f);
+    }
+
+    let s = f / (2.0 + f);
+    dk = f64::from(k);
+    let z = s * s;
+    let mut i = hx - 0x6_147a;
+    let w = z * z;
+    let j = 0x6_b851 - hx;
+    let t1 = w * (lg2 + w * (lg4 + w * lg6));
+    let t2 = z * (lg1 + w * (lg3 + w * (lg5 + w * lg7)));
+    i |= j;
+    let r = t2 + t1;
+    if i > 0 {
+        let hfsq = 0.5 * f * f;
+        if k == 0 {
+            f - (hfsq - s * (hfsq + r))
+        } else {
+            dk * ln2_hi - ((hfsq - (s * (hfsq + r) + dk * ln2_lo)) - f)
+        }
+    } else if k == 0 {
+        f - s * (f - r)
+    } else {
+        dk * ln2_hi - ((s * (f - r) - dk * ln2_lo) - f)
+    }
+}
+
 /// Java's `(int) (Math.log(x) / Math.log(root))` (`:504`, `:519`) — "the `j` such that
 /// `x == root^j`", computed in floating point and **truncated**.
 ///
+/// Uses [`java_log`], not `f64::ln`; see that function for why the difference is
+/// load-bearing rather than cosmetic.
+///
 /// # This is `docs/WALNUT-BUGS.md` WB-032, ported verbatim
 ///
-/// The truncation is not safe: `ln(x)/ln(root)` can land a fraction of an ulp *below* the
+/// The truncation is not safe: `log(x)/log(root)` can land a fraction of an ulp *below* the
 /// integer it should be, and `as i32` then rounds it DOWN by a whole unit. The smallest
 /// affected pair is `(x, root) = (1000, 10)`, where the quotient is `2.9999999999999996`
 /// and this returns `2` instead of `3` — so `convert $y msd_1000 $x` on an `msd_10`
-/// automaton silently produces an `msd_100` one (confirmed live against
-/// `Walnut-all.jar`). The full affected set for bases up to `10^9` is
-/// `(10,3) (3,5) (10,6) (11,7) (12,7) (3,10) (9,5) (10,9)` as `(root, exponent)` pairs.
+/// automaton silently produces an `msd_100` one (confirmed live against `Walnut-all.jar`).
+///
+/// The affected set is larger than an eyeball estimate suggests: **343** `(root, exponent)`
+/// pairs with `root <= 46340` and `root^exponent <= 2^31`, of which 170 have `root <= 1000`
+/// and 241 have `root^exponent <= 10^9`. Every power of 2 is safe (`log(2^n)/log(2)` is
+/// exact in binary floating point), which is why it has gone unnoticed; the smallest
+/// affected base is `1000` itself. `docs/WALNUT-BUGS.md` WB-032 carries the full
+/// characterization.
 ///
 /// Kept bug-for-bug rather than replaced with an exact integer logarithm, per `CLAUDE.md`'s
-/// mechanical-port rule; `truncated_log_ratio_reproduces_wb032` below pins it, and would
-/// fail loudly if a platform's `ln` were less accurate than the correctly-rounded one Java,
-/// macOS libm and glibc all provide here (verified: the double nearest `ln(1000)` divided by
-/// the double nearest `ln(10)` IS `2.9999999999999996`, so the value is libm-independent as
-/// long as `ln` is correctly rounded).
+/// mechanical-port rule. `truncated_log_ratio_agrees_with_real_java` below pins the whole
+/// `root <= 1000` slice of that sweep against expectations captured from the real JVM.
 fn truncated_log_ratio(x: i32, root: i32) -> i32 {
-    (f64::from(x).ln() / f64::from(root).ln()) as i32
+    (java_log(f64::from(x)) / java_log(f64::from(root))) as i32
 }
 
 /// The `msd_k`/`lsd_k` name Java would have built for a track, used only to fill in
@@ -1629,39 +1785,60 @@ fn convert_lsd_base_to_root(
 /// 5. `if (toMsd == currentlyReversed) reverseWithOutput` (`:525-527`) — one final
 ///    reversal that simultaneously undoes step 3's and delivers the requested direction.
 ///
-/// # `from_base`: this crate's stand-in for `A.getNS().get(0).parseBase()`
+/// # The source base: this crate's stand-in for `A.getNS().get(0).parseBase()`
 ///
 /// Java reads the source base off the track's `NumberSystem` object. `wr-core`'s
 /// `Automaton` deliberately carries no `NumberSystem` (`automaton.rs`'s field docs: that
 /// would be circular, since a `NumberSystem` owns three `Automaton`s), only the two facts
-/// ported code reads off one — and the *base* is not among them. It is therefore threaded
-/// in as a parameter, supplied by the `wr-io`/`wr-cli` caller that read the `msd_k`/`lsd_k`
-/// header in the first place (`crate::numsys::parse_base_of` is the exact port of Java's
-/// `parseBase`, including its `> 1 && is-an-integer` validation, so the caller reports
-/// that error rather than this function).
+/// ported code reads off one — and the *base* is not among them. It is therefore
+/// **derived from the automaton's own alphabet**, `a.alphabet[0].len()`.
 ///
-/// The msd/lsd half of the same `NumberSystem` IS carried, as `a.msd[0]`, and is read from
-/// there — so the two facts cannot drift apart mid-conversion the way two parameters
-/// could. The base is re-threaded explicitly through the helpers for the same reason
-/// (each is passed the base the automaton actually has at that point, which Java re-reads
-/// from the `NumberSystem` it just replaced).
+/// That derivation is exact, not an approximation: a track whose number system is `msd_k`
+/// or `lsd_k` always has alphabet `[0, 1, ..., k-1]` — Java's own
+/// `Automaton(String address)` builds it that way from the header
+/// (`NumberSystem.getBaseAlphabet`), and this crate's `wr-io` reader and
+/// [`set_number_system_and_alphabet`] below both do the same — so
+/// `alphabet[0].len() == parseBase()` for every input `convertNS` can legally receive. A
+/// track declared with an EXPLICIT alphabet instead (`{0,1,3}`) has no number system at
+/// all in Java, and takes [`ConvertNsError::NoNumberSystem`] (WB-033) before the base is
+/// ever used.
 ///
-/// A caller that hands in a `from_base` disagreeing with the automaton's actual alphabet
-/// gets the same garbage Java would from a mislabelled `.txt` header; the invariant
-/// `alphabet[0] == [0..from_base-1]` is the caller's to maintain, exactly as in Java.
+/// **This used to be a caller-supplied `from_base` parameter, and that was a real defect**
+/// (found in review): nothing tied it to the automaton, so a caller could pass a base
+/// disagreeing with the actual alphabet and reach a failure mode Java has no counterpart
+/// for — in Java `fromBase` comes from the very token that built the alphabet, so the two
+/// cannot disagree. The doc comment used to claim such a call got "the same garbage Java
+/// would from a mislabelled header"; it did not. It reached an unrelated `expect()` deep in
+/// [`convert_lsd_base_to_root`] ("automaton must be total") or a corrupted-intermediate
+/// panic in `product.rs`. Deriving the base removes the failure mode rather than
+/// documenting it.
+///
+/// The msd/lsd half of the same `NumberSystem` is carried as `a.msd[0]` and read from
+/// there, so both halves now come off the automaton. The base is still re-threaded
+/// explicitly through the two helpers, for the reason Java re-reads it: each is passed the
+/// base the automaton actually has *at that point*, which is not the one it started with.
 ///
 /// # `docs/WALNUT-BUGS.md` WB-032 lives on this path
 ///
-/// See [`truncated_log_ratio`]: for a handful of base pairs (`msd_10 -> msd_1000` being the
-/// smallest) the exponent is computed one too low, and the automaton is silently converted
-/// to the wrong base. Ported verbatim.
-pub fn convert_ns(
-    a: &mut Automaton,
-    from_base: i32,
-    to_msd: bool,
-    to_base: i32,
-) -> Result<(), ConvertNsError> {
-    if a.msd.len() != 1 {
+/// See [`truncated_log_ratio`]: for 343 `(root, exponent)` pairs (`msd_10 -> msd_1000`
+/// being the smallest) the exponent is computed one too low, and the automaton is silently
+/// converted to the wrong base. Ported verbatim.
+///
+/// # `docs/WALNUT-BUGS.md` WB-001 also lives on this path
+///
+/// The `k -> k^j` regrouping step can strand states: re-keying the transition table by
+/// digit GROUPS makes any state reachable only "mid-group" unreachable from `q0`, and the
+/// `minimizeSelfWithOutput` that immediately follows it (`:521`) bottoms out in Valmari
+/// minimization with no intervening trim — exactly WB-001's precondition violation. Java
+/// has the identical defect at the identical call site, so it is ported verbatim, not
+/// guarded; `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` pins it against the
+/// behaviour of the real engine.
+pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), ConvertNsError> {
+    // Java's guard is `A.getNS().size() != 1` alone; `alphabet.len()` is checked with it
+    // because this crate reads the source base off the alphabet (see the doc comment
+    // above) and Java's `NS`/`richAlphabet` lists are always the same length, so no
+    // Java-reachable input can take one arm without the other.
+    if a.msd.len() != 1 || a.alphabet.len() != 1 {
         return Err(ConvertNsError::NotSingleInput);
     }
     // `NumberSystem ns = A.getNS().get(0); int fromBase = ns.parseBase();` (`:460-462`) —
@@ -1669,6 +1846,7 @@ pub fn convert_ns(
     let Some(from_msd) = a.msd[0] else {
         return Err(ConvertNsError::NoNumberSystem);
     };
+    let from_base = a.alphabet[0].len() as i32;
 
     // If the old and new bases are the same, check if only MSD/LSD is changing.
     if from_base == to_base {
@@ -3820,7 +3998,7 @@ mod tests {
         let mut a = epsilon_only(2, true);
         assert_eq!(simulate(&a.fa, &[]), 1, "language before: {{epsilon}} only");
 
-        convert_ns(&mut a, 2, false, 2).expect("the flip must succeed");
+        convert_ns(&mut a, false, 2).expect("the flip must succeed");
 
         assert_eq!(a.msd, vec![Some(false)], "number system must now be lsd_2");
         assert_eq!(
@@ -3839,7 +4017,7 @@ mod tests {
     fn convert_ns_base_conversion_from_lsd() {
         let mut a = epsilon_only(4, false);
 
-        convert_ns(&mut a, 4, true, 2).expect("the conversion must succeed");
+        convert_ns(&mut a, true, 2).expect("the conversion must succeed");
 
         assert_eq!(a.msd, vec![Some(true)], "number system must now be msd_2");
         assert_eq!(a.alphabet, vec![vec![0, 1]]);
@@ -3901,7 +4079,7 @@ mod tests {
     fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
         let mut a = epsilon_only(2, true);
         a.msd = vec![None];
-        let err = convert_ns(&mut a, 2, true, 4).expect_err("Java NPEs here");
+        let err = convert_ns(&mut a, true, 4).expect_err("Java NPEs here");
         assert_eq!(err, ConvertNsError::NoNumberSystem);
         assert_eq!(
             err.to_string(),
@@ -3916,27 +4094,138 @@ mod tests {
         for t in [true, false] {
             let mut a = Automaton::true_false(t);
             assert_eq!(
-                convert_ns(&mut a, 2, true, 4),
+                convert_ns(&mut a, true, 4),
                 Err(ConvertNsError::NotSingleInput)
             );
         }
     }
 
-    /// `docs/WALNUT-BUGS.md` WB-032, pinned at the arithmetic level (the differential suite
-    /// pins it end-to-end). `ln(1000)/ln(10)` is `2.9999999999999996` in IEEE-754 double,
-    /// so Java's `(int)` cast — and therefore this port — yields `2`.
+    /// [`java_log`] must return the SAME `double` Java's `Math.log` does, bit for bit —
+    /// that is its entire reason for existing (see its doc comment).
     ///
-    /// The `assert!` on the raw quotient is what makes this test a genuine platform check
-    /// rather than a tautology: it would fail loudly on a libm whose `ln` is not correctly
-    /// rounded, which is exactly the condition under which the port would silently stop
-    /// matching Java.
+    /// Every expectation below is a raw
+    /// `Double.doubleToRawLongBits(Math.log(v))` **captured from a real JVM**
+    /// (`openjdk 11.0.16.1`, `aarch64`), not recomputed from a formula. The captured values
+    /// were also checked against `StrictMath.log` on the same JVM (identical for every
+    /// integer in `2..=200_000`) and against this function exhaustively over that whole
+    /// range off-line, with zero mismatches.
+    ///
+    /// `3`, `185` and `196` are here specifically because `f64::ln` gets those WRONG
+    /// relative to Java (it returns the correctly-rounded neighbour, one ulp away), so this
+    /// test fails loudly if the implementation is ever "simplified" back to `f64::ln`.
+    #[test]
+    fn java_log_matches_real_java_bit_for_bit() {
+        // (v, Double.doubleToRawLongBits(Math.log(v)) as captured from the JVM)
+        const CAPTURED: &[(i32, u64)] = &[
+            (2, 0x3fe6_2e42_fefa_39ef),
+            (3, 0x3ff1_93ea_7aad_030a), // f64::ln gives ...030b
+            (4, 0x3ff6_2e42_fefa_39ef),
+            (8, 0x4000_a2b2_3f3b_ab73),
+            (9, 0x4001_93ea_7aad_030b),
+            (10, 0x4002_6bb1_bbb5_5516),
+            (16, 0x4006_2e42_fefa_39ef),
+            (17, 0x4006_aa6b_c1fa_7f7a),
+            (100, 0x4012_6bb1_bbb5_5516),
+            (185, 0x4014_e1a4_f518_c72c), // f64::ln gives ...c72b
+            (196, 0x4015_1cca_16d7_bba8), // f64::ln gives ...bba7
+            (243, 0x4015_f8e5_1958_43cd),
+            (1000, 0x401b_a18a_998f_ffa0),
+            (4913, 0x4020_ffd0_d17b_df9b),
+            (34225, 0x4024_e1a4_f518_c72b),
+            (59049, 0x4025_f8e5_1958_43cd),
+            (100_000, 0x4027_069e_2aa2_aa5b),
+        ];
+        for &(v, bits) in CAPTURED {
+            assert_eq!(
+                java_log(f64::from(v)).to_bits(),
+                bits,
+                "java_log({v}) must be bit-identical to real Java's Math.log({v})"
+            );
+        }
+    }
+
+    /// The `(root, exponent)` pairs on which `docs/WALNUT-BUGS.md` WB-032 fires — i.e. on
+    /// which real Java's `(int)(Math.log(root^e) / Math.log(root))` returns `e - 1` instead
+    /// of `e` — for every `root <= 1000` with `root^e <= 2^31`.
+    ///
+    /// **Captured from a real JVM**, by running that exact Java expression over the same
+    /// sweep; deliberately NOT recomputed with Rust's `ln`, which would have re-introduced
+    /// the very divergence [`java_log`] exists to remove (it disagrees with Java on 29 of
+    /// the pairs in this range: it misses `(3,5)`, `(3,10)`, `(3,13)`, `(3,15)`, `(3,17)`,
+    /// `(48,3)`, … and invents `(185,2)`, `(196,2)`, `(220,2)`, `(343,3)`, …).
+    #[rustfmt::skip]
+    const WB032_AFFECTED_ROOT_LE_1000: &[(i32, i32)] = &[
+        (9, 5), (10, 3), (10, 6), (10, 9), (11, 7), (12, 7), (17, 3), (17, 6), (22, 5),
+        (31, 3), (31, 6), (34, 3), (34, 6), (41, 3), (46, 5), (52, 3), (52, 5), (54, 5),
+        (55, 5), (56, 3), (56, 5), (69, 5), (83, 3), (88, 3), (93, 3), (98, 3), (100, 3),
+        (154, 3), (166, 3), (170, 3), (171, 3), (175, 3), (183, 3), (185, 2), (185, 3),
+        (185, 4), (186, 3), (196, 2), (196, 3), (196, 4), (216, 3), (220, 2), (223, 3),
+        (226, 3), (236, 3), (237, 3), (238, 3), (239, 3), (242, 3), (245, 3), (253, 3),
+        (266, 3), (271, 3), (272, 3), (283, 3), (285, 3), (289, 3), (293, 3), (295, 3),
+        (297, 3), (304, 3), (305, 3), (318, 3), (328, 3), (340, 3), (343, 3), (348, 3),
+        (355, 3), (358, 3), (373, 3), (374, 3), (385, 3), (387, 3), (390, 3), (397, 3),
+        (402, 3), (404, 3), (410, 3), (418, 3), (426, 3), (453, 3), (454, 3), (458, 3),
+        (460, 3), (467, 3), (468, 3), (470, 3), (489, 3), (494, 3), (496, 3), (505, 3),
+        (508, 3), (523, 3), (527, 3), (539, 3), (540, 3), (548, 3), (551, 3), (557, 3),
+        (563, 3), (564, 3), (565, 3), (573, 3), (575, 3), (579, 3), (582, 3), (587, 3),
+        (605, 3), (612, 3), (620, 3), (630, 3), (644, 3), (661, 2), (661, 3), (662, 3),
+        (666, 3), (669, 3), (672, 3), (675, 3), (679, 3), (680, 2), (685, 3), (689, 3),
+        (691, 3), (720, 3), (721, 3), (736, 3), (745, 3), (754, 3), (756, 3), (761, 3),
+        (764, 3), (768, 3), (772, 3), (773, 3), (776, 3), (790, 3), (791, 3), (796, 3),
+        (798, 3), (802, 3), (807, 3), (820, 2), (824, 3), (831, 3), (833, 3), (835, 2),
+        (845, 3), (847, 3), (849, 3), (854, 3), (871, 3), (876, 3), (878, 3), (881, 3),
+        (886, 3), (892, 3), (894, 3), (926, 3), (931, 3), (939, 3), (950, 3), (954, 3),
+        (961, 3), (969, 3), (971, 3), (985, 3), (989, 3), (990, 3), (991, 3),
+    ];
+
+    /// The real pin on [`truncated_log_ratio`]: a bounded sweep asserting the port computes
+    /// **exactly what real Java computes**, right answers and WB-032's wrong ones alike, for
+    /// every `(root, exponent)` with `root <= 1000` and `root^exponent <= 2^31`.
+    ///
+    /// This is the test the module's first draft lacked. That draft checked only a handful
+    /// of hand-picked pairs and a `< 3.0` guard on the `ln(1000)/ln(10)` quotient — neither
+    /// of which can see a last-bit disagreement with Java on some *other* base, which is
+    /// precisely how the `f64::ln` bug survived (`msd_3 -> msd_243` converted to `msd_81`).
+    #[test]
+    fn truncated_log_ratio_agrees_with_real_java() {
+        let affected: HashSet<(i32, i32)> = WB032_AFFECTED_ROOT_LE_1000.iter().copied().collect();
+        let mut swept = 0usize;
+        let mut wrong = 0usize;
+        for root in 2i64..=1000 {
+            let mut x = root;
+            for exponent in 2i32.. {
+                x *= root;
+                if x > i64::from(i32::MAX) {
+                    break;
+                }
+                let expected = if affected.contains(&(root as i32, exponent)) {
+                    wrong += 1;
+                    exponent - 1 // WB-032 fires: Java truncates a whole unit off
+                } else {
+                    exponent
+                };
+                assert_eq!(
+                    truncated_log_ratio(x as i32, root as i32),
+                    expected,
+                    "root {root}^{exponent} = {x}: disagrees with real walnut-java"
+                );
+                swept += 1;
+            }
+        }
+        // Guards against the sweep silently collapsing (a bad bound would make the
+        // assertions above vacuous) and against the captured table going stale.
+        assert_eq!(swept, 2406, "the swept range changed");
+        assert_eq!(
+            wrong,
+            WB032_AFFECTED_ROOT_LE_1000.len(),
+            "every captured WB-032 pair must be inside the swept range"
+        );
+    }
+
+    /// `docs/WALNUT-BUGS.md` WB-032's headline case, kept as its own named test because it
+    /// is the one quoted throughout the docs (the differential suite pins it end-to-end).
     #[test]
     fn truncated_log_ratio_reproduces_wb032() {
-        assert!(
-            f64::from(1000).ln() / f64::from(10).ln() < 3.0,
-            "this platform's ln() is not the correctly-rounded one Java uses; WB-032 \
-             would not reproduce and the port would diverge from walnut-java"
-        );
         assert_eq!(truncated_log_ratio(1000, 10), 2, "WB-032: should be 3");
 
         // The unaffected neighbours, so the test also proves the truncation is not
@@ -3945,6 +4234,9 @@ mod tests {
         assert_eq!(truncated_log_ratio(8, 2), 3);
         assert_eq!(truncated_log_ratio(100, 10), 2);
         assert_eq!(truncated_log_ratio(9, 3), 2);
+        // `3^5 = 243` is the case an `f64::ln`-based port got WRONG (it returned 4): Java
+        // computes this one correctly, and so must the port.
+        assert_eq!(truncated_log_ratio(243, 3), 5);
     }
 
     /// `computeStringValue` (`:671-677`) reads its digit list **least**-significant-first,
@@ -4060,10 +4352,86 @@ mod tests {
         assert_eq!(a.label, vec!["x".to_string()], "the track keeps its name");
     }
 
+    /// `docs/WALNUT-BUGS.md` WB-001, reached through `convertNS`'s `k -> k^j` regrouping —
+    /// a call site neither engine guards, found by adversarial review of this unit.
+    ///
+    /// The fixture is the 2-state parity automaton over `msd_2`: `q0` accepts (even
+    /// length), state 1 rejects, every digit toggles. Converting it to `msd_4` groups two
+    /// binary digits into one base-4 digit, and every base-4 digit therefore returns each
+    /// state to itself — so state 1 becomes unreachable from `q0`, and
+    /// `minimizeSelfWithOutput` (`:521`) runs Valmari on a table violating its
+    /// reachability precondition. The parity automaton's own length parity is what makes
+    /// this bite: **every** even-length binary word is a legal base-4 word, so the correct
+    /// answer is the constant-`1` DFAO (accept everything).
+    ///
+    /// Both engines instead return the constant-`0` DFAO (accept nothing). Verified live
+    /// against `Walnut-all.jar`: `convert evenmsd4 msd_4 u18even;` on exactly this
+    /// automaton writes a one-state `msd_4` DFAO with output `0`, and the complementary
+    /// odd-parity fixture (outputs swapped) likewise writes output `1` where the correct
+    /// answer is `0` — the outputs come out inverted in both directions.
+    ///
+    /// Ported verbatim, not fixed (`CLAUDE.md`'s mechanical-port rule); this test exists so
+    /// that a later refactor which happens to "fix" it — an added `trim`, a different
+    /// minimizer — fails loudly and becomes a deliberate, logged decision.
+    #[test]
+    fn convert_ns_reaches_wb_001_when_regrouping_strands_a_state() {
+        // q0 accepts (even length), state 1 rejects; both digits toggle.
+        let parity = |even_accepts: i32, odd_accepts: i32| {
+            Automaton::new(
+                Fa {
+                    true_false: None,
+                    q0: 0,
+                    q: 2,
+                    alphabet_size: 2,
+                    o: vec![even_accepts, odd_accepts],
+                    d: vec![
+                        BTreeMap::from([(0, vec![1]), (1, vec![1])]),
+                        BTreeMap::from([(0, vec![0]), (1, vec![0])]),
+                    ],
+                },
+                vec![vec![0, 1]],
+                vec!["x".to_string()],
+                vec![Some(true)],
+            )
+        };
+
+        let mut even = parity(1, 0);
+        convert_ns(&mut even, true, 4).expect("the conversion must succeed");
+        assert_eq!(even.msd, vec![Some(true)]);
+        assert_eq!(even.alphabet, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(
+            even.fa.o[even.fa.q0], 0,
+            "WB-001: should be 1 (every base-4 word has even binary length), and real \
+             walnut-java is wrong in exactly the same direction"
+        );
+
+        // The complementary fixture, to show the corruption is not a lucky constant: the
+        // correct answer flips to 0 here, and both engines flip to 1.
+        let mut odd = parity(0, 1);
+        convert_ns(&mut odd, true, 4).expect("the conversion must succeed");
+        assert_eq!(
+            odd.fa.o[odd.fa.q0], 1,
+            "WB-001: should be 0, and real walnut-java is wrong in the same direction"
+        );
+    }
+
     /// Tier 4 (Walnut-independent): converting away and back is the identity on the
-    /// LANGUAGE, for every combination of direction and base-power step this method
-    /// supports. Uses a non-trivial, non-reversal-symmetric language (`x < 5` over base 2)
-    /// so a dropped or doubled reversal cannot pass.
+    /// LANGUAGE **of this fixture** (`x < 5` over base 2 — non-trivial and not
+    /// reversal-symmetric, so a dropped or doubled reversal cannot pass), across every
+    /// direction/base-power step listed below.
+    ///
+    /// # This is NOT the universal round-trip property, and must not be re-worded as one
+    ///
+    /// An earlier draft of this test claimed the identity held "for every combination this
+    /// method supports". It does not, and the counterexample is not exotic:
+    /// `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` below round-trips
+    /// **wrongly** — `msd_2 -> msd_4` on a 2-state parity automaton corrupts the language
+    /// outright (WB-001), so converting back cannot restore it. This fixture passes because
+    /// its 5 states leave nothing stranded when digits are regrouped, not because the
+    /// property is universal.
+    ///
+    /// Both engines have the defect, so this is a *known exception* to the invariant rather
+    /// than a port bug; see WB-001's call-site inventory in `docs/WALNUT-BUGS.md`.
     #[test]
     fn convert_ns_round_trips_through_every_direction_and_base_step() {
         // `x < 5` over msd_2, total: states 0..4 count digits, 5 is a dead sink.
@@ -4090,12 +4458,12 @@ mod tests {
 
         for (msd_mid, base_mid) in [(false, 2), (true, 4), (false, 4), (true, 8), (false, 8)] {
             let mut there = original.clone();
-            convert_ns(&mut there, 2, msd_mid, base_mid).expect("forward conversion");
+            convert_ns(&mut there, msd_mid, base_mid).expect("forward conversion");
             assert_eq!(there.msd, vec![Some(msd_mid)]);
             assert_eq!(there.alphabet, vec![util::int_range_list(base_mid)]);
 
             let mut back = there.clone();
-            convert_ns(&mut back, base_mid, true, 2).expect("reverse conversion");
+            convert_ns(&mut back, true, 2).expect("reverse conversion");
             assert_eq!(back.msd, vec![Some(true)]);
             assert_eq!(back.alphabet, vec![vec![0, 1]]);
 

@@ -36,6 +36,7 @@
 //! | source is lsd, pre-reversal (`:495-497`) | `lt5_lsd4 -> msd_2`, `lt5_lsd4 -> lsd_2` |
 //! | ungroup `k^i -> k` (`:503-510`, `convertLsdBaseToRoot`) | `lt5_msd4 -> msd_2`, `lt5_lsd4 -> msd_2` |
 //! | regroup `k -> k^j` (`:513-522`, `convertMsdBaseToExponent`) | `even -> msd_4`, `even -> msd_8`, `mod3 -> msd_4/msd_8` |
+//! | **both** halves in one call (`fromBase != root != toBase`) | `lt5_msd4 -> msd_8/lsd_8`, `mod3msd4 -> msd_8/lsd_8` |
 //! | final reversal (`:525-527`) | every `-> lsd_*` case |
 //! | `exponent > 2` (three-digit grouping) | `even -> msd_8`, `mod3 -> msd_8` |
 //! | WB-032's truncated exponent | `lt15_msd10 -> msd_1000` |
@@ -91,8 +92,23 @@
 //! EOF
 //! java -jar target/Walnut-all.jar u18c.txt < /dev/null
 //!
-//! # 3. copy every produced .txt into fixtures/convert_ns/ under Walnut's own name
-//! #    (kept verbatim so a re-capture is a straight overwrite).
+//! # 3. the BOTH-halves cases (fromBase != commonRoot != toBase). Feed back the already
+//! #    captured msd_4 fixtures, so the sources are byte-identical to what this suite reads.
+//! cp <repo>/tests/differential/fixtures/convert_ns/m4.txt       "Automata Library/u18m4.txt"
+//! cp <repo>/tests/differential/fixtures/convert_ns/mod3msd4.txt "Word Automata Library/u18mod3msd4.txt"
+//! cat > "Command Files/u18d.txt" <<'EOF'
+//! convert $m4msd8 msd_8 $u18m4;
+//! convert $m4lsd8 lsd_8 $u18m4;
+//! convert mod3msd4to8 msd_8 u18mod3msd4;
+//! convert mod3msd4tolsd8 lsd_8 u18mod3msd4;
+//! EOF
+//! java -jar target/Walnut-all.jar u18d.txt < /dev/null
+//!
+//! # 4. copy every produced .txt into fixtures/convert_ns/ under Walnut's own name
+//! #    (kept verbatim so a re-capture is a straight overwrite). Note that this Walnut
+//! #    writes into Session/<timestamp>/{Automata,Word Automata} Library/, not into the
+//! #    top-level libraries, and prunes old session directories on the next start — so
+//! #    copy the outputs out in the SAME shell invocation that produced them.
 //! ```
 //!
 //! Captured 2026-08-13 against `walnut-java` at `Walnut v8.0-alpha`.
@@ -154,7 +170,18 @@ fn all_words(base: i32, max_len: usize) -> Vec<Vec<i32>> {
 /// output `0` (this crate's "missing transition ⇒ reject" convention), which is exactly
 /// how the two engines' own partial tables are read everywhere else.
 fn assert_same_outputs(ours: &Automaton, theirs: &Automaton, base: i32, what: &str) {
-    let max_len = if base <= 4 { 6 } else { 3 };
+    // `base^max_len` words are materialized, so the bound has to shrink as the base grows —
+    // `CLAUDE.md`'s "generate SMALL" guardrail. An earlier draft used a flat `3` for every
+    // base > 4, which meant 10^6 words for the base-100 WB-032 case: pure waste, since
+    // every automaton here has at most 6 states and length-2 words already saturate their
+    // reachable behaviour many times over.
+    let max_len = if base <= 4 {
+        6
+    } else if base <= 16 {
+        3
+    } else {
+        2
+    };
     for word in all_words(base, max_len) {
         let a = run_word(ours, &word).unwrap_or(0);
         let b = run_word(theirs, &word).unwrap_or(0);
@@ -169,21 +196,14 @@ fn assert_same_outputs(ours: &Automaton, theirs: &Automaton, base: i32, what: &s
 /// The whole comparison, for one conversion: read `input`, `convert_ns` it, and check the
 /// result against the captured `expected` fixture on all three axes described in this
 /// file's module docs.
-fn check_conversion(
-    input: &str,
-    from_base: i32,
-    to_msd: bool,
-    to_base: i32,
-    expected: &str,
-    expected_base: i32,
-) {
+fn check_conversion(input: &str, to_msd: bool, to_base: i32, expected: &str, expected_base: i32) {
     let mut ours = read_fixture(input);
     let what = format!(
         "{input} -> {}_{to_base}",
         if to_msd { "msd" } else { "lsd" }
     );
 
-    convert_ns(&mut ours, from_base, to_msd, to_base)
+    convert_ns(&mut ours, to_msd, to_base)
         .unwrap_or_else(|e| panic!("{what}: convert_ns must succeed, got {e}"));
 
     let theirs = read_fixture(expected);
@@ -239,7 +259,7 @@ fn check_conversion(
 /// would fail this.
 #[test]
 fn even_msd2_to_lsd2_matches_real_walnut() {
-    check_conversion("even.txt", 2, false, 2, "evenlsd2.txt", 2);
+    check_conversion("even.txt", false, 2, "evenlsd2.txt", 2);
 }
 
 /// `x < 5`, `msd_4 -> lsd_4`: the pure direction flip on a **partial** transition table
@@ -252,7 +272,7 @@ fn lt5_msd4_to_lsd4_matches_real_walnut() {
         !read_fixture("m4.txt").fa.is_deterministic_and_total(),
         "this fixture must stay partial, or it stops exercising the totalize guard"
     );
-    check_conversion("m4.txt", 4, false, 4, "m4lsd4.txt", 4);
+    check_conversion("m4.txt", false, 4, "m4lsd4.txt", 4);
 }
 
 /// The `mod3` DFAO, `msd_2 -> lsd_2`. Outputs `{0, 1, 2}` — the case that makes the
@@ -260,7 +280,7 @@ fn lt5_msd4_to_lsd4_matches_real_walnut() {
 /// would show up.
 #[test]
 fn mod3_dfao_msd2_to_lsd2_matches_real_walnut() {
-    check_conversion("mod3.txt", 2, false, 2, "mod3lsd2.txt", 2);
+    check_conversion("mod3.txt", false, 2, "mod3lsd2.txt", 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +289,7 @@ fn mod3_dfao_msd2_to_lsd2_matches_real_walnut() {
 
 #[test]
 fn even_msd2_to_msd4_matches_real_walnut() {
-    check_conversion("even.txt", 2, true, 4, "evenmsd4.txt", 4);
+    check_conversion("even.txt", true, 4, "evenmsd4.txt", 4);
 }
 
 /// `exponent == 3`, i.e. two extension rounds in `updateTransitionsFromMorphism` rather
@@ -277,27 +297,27 @@ fn even_msd2_to_msd4_matches_real_walnut() {
 /// break while leaving `msd_4` correct.
 #[test]
 fn even_msd2_to_msd8_matches_real_walnut() {
-    check_conversion("even.txt", 2, true, 8, "evenmsd8.txt", 8);
+    check_conversion("even.txt", true, 8, "evenmsd8.txt", 8);
 }
 
 #[test]
 fn even_msd2_to_lsd4_matches_real_walnut() {
-    check_conversion("even.txt", 2, false, 4, "evenlsd4.txt", 4);
+    check_conversion("even.txt", false, 4, "evenlsd4.txt", 4);
 }
 
 #[test]
 fn mod3_dfao_msd2_to_msd4_matches_real_walnut() {
-    check_conversion("mod3.txt", 2, true, 4, "mod3msd4.txt", 4);
+    check_conversion("mod3.txt", true, 4, "mod3msd4.txt", 4);
 }
 
 #[test]
 fn mod3_dfao_msd2_to_msd8_matches_real_walnut() {
-    check_conversion("mod3.txt", 2, true, 8, "mod3msd8.txt", 8);
+    check_conversion("mod3.txt", true, 8, "mod3msd8.txt", 8);
 }
 
 #[test]
 fn mod3_dfao_msd2_to_lsd4_matches_real_walnut() {
-    check_conversion("mod3.txt", 2, false, 4, "mod3lsd4.txt", 4);
+    check_conversion("mod3.txt", false, 4, "mod3lsd4.txt", 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,12 +328,12 @@ fn mod3_dfao_msd2_to_lsd4_matches_real_walnut() {
 /// half runs. The source is partial, so the `:488-489` totalize fires too.
 #[test]
 fn lt5_msd4_to_msd2_matches_real_walnut() {
-    check_conversion("m4.txt", 4, true, 2, "m4msd2.txt", 2);
+    check_conversion("m4.txt", true, 2, "m4msd2.txt", 2);
 }
 
 #[test]
 fn lt5_msd4_to_lsd2_matches_real_walnut() {
-    check_conversion("m4.txt", 4, false, 2, "m4lsd2.txt", 2);
+    check_conversion("m4.txt", false, 2, "m4lsd2.txt", 2);
 }
 
 /// Source is **lsd**, so `:495-497`'s pre-reversal runs before the ungrouping — the branch
@@ -321,12 +341,52 @@ fn lt5_msd4_to_lsd2_matches_real_walnut() {
 /// degenerate `{ε}` automaton.
 #[test]
 fn lt5_lsd4_to_msd2_matches_real_walnut() {
-    check_conversion("e4.txt", 4, true, 2, "e4msd2.txt", 2);
+    check_conversion("e4.txt", true, 2, "e4msd2.txt", 2);
 }
 
 #[test]
 fn lt5_lsd4_to_lsd2_matches_real_walnut() {
-    check_conversion("e4.txt", 4, false, 2, "e4lsd2.txt", 2);
+    check_conversion("e4.txt", false, 2, "e4lsd2.txt", 2);
+}
+
+// ---------------------------------------------------------------------------
+// BOTH steps: ungroup k^i -> k AND regroup k -> k^j in one call.
+//
+// Every case above has one side equal to the common root, so exactly one of the two
+// halves runs. These four are the only ones that chain the whole pipeline —
+// pre-reversal (lsd source), reverse, `convertLsdBaseToRoot`, minimize, reverse-undo,
+// `convertMsdBaseToExponent`, minimize, final reversal — with `currentlyReversed`
+// actually toggling twice. `commonRoot(4, 8) == 2`, so `4 -> 2 -> 8`.
+// ---------------------------------------------------------------------------
+
+/// `x < 5`, `msd_4 -> msd_8`. Also a partial source table, so the `:488-489` totalize runs
+/// ahead of both halves.
+#[test]
+fn lt5_msd4_to_msd8_matches_real_walnut() {
+    check_conversion("m4.txt", true, 8, "m4msd8.txt", 8);
+}
+
+/// The same, ending in **lsd** — so the closing `if (toMsd == currentlyReversed)` reversal
+/// at `:525-527` fires on a `currentlyReversed == false` automaton, the one arm of that
+/// condition the single-step cases below `msd_4 -> msd_2` never combine with a regrouping.
+#[test]
+fn lt5_msd4_to_lsd8_matches_real_walnut() {
+    check_conversion("m4.txt", false, 8, "m4lsd8.txt", 8);
+}
+
+/// The `mod3` DFAO already in `msd_4`, taken to `msd_8` — the both-steps path on genuine
+/// `{0, 1, 2}` outputs, so a step that silently dropped or remapped output values (which
+/// `wr_core::equiv` cannot see) is caught by the output-agreement check.
+#[test]
+fn mod3_dfao_msd4_to_msd8_matches_real_walnut() {
+    check_conversion("mod3msd4.txt", true, 8, "mod3msd4to8.txt", 8);
+}
+
+/// The same DFAO to `lsd_8`: both halves *and* a direction flip, on a 6-state result — the
+/// most-composed single call in this file.
+#[test]
+fn mod3_dfao_msd4_to_lsd8_matches_real_walnut() {
+    check_conversion("mod3msd4.txt", false, 8, "mod3msd4tolsd8.txt", 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +406,7 @@ fn lt5_lsd4_to_lsd2_matches_real_walnut() {
 #[test]
 fn wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines() {
     // Note the `100`, not `1000`, as the expected base: that IS the bug.
-    check_conversion("base10.txt", 10, true, 1000, "b10msd1000.txt", 100);
+    check_conversion("base10.txt", true, 1000, "b10msd1000.txt", 100);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +418,7 @@ fn wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines() {
 #[test]
 fn identical_number_systems_is_rejected_with_javas_message() {
     let mut a = read_fixture("even.txt");
-    let err = convert_ns(&mut a, 2, true, 2).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 2).expect_err("must reject");
     assert_eq!(
         err,
         ConvertNsError::IdenticalNumberSystems {
@@ -377,7 +437,7 @@ fn identical_number_systems_is_rejected_with_javas_message() {
 #[test]
 fn no_common_root_is_rejected_with_javas_message() {
     let mut a = read_fixture("even.txt");
-    let err = convert_ns(&mut a, 2, true, 6).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 6).expect_err("must reject");
     assert_eq!(err, ConvertNsError::NoCommonRoot);
     assert_eq!(
         err.to_string(),
@@ -406,7 +466,7 @@ fn multi_track_input_is_rejected_with_javas_message() {
         vec!["x".to_string(), "y".to_string()],
         vec![Some(true), Some(true)],
     );
-    let err = convert_ns(&mut a, 2, true, 4).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 4).expect_err("must reject");
     assert_eq!(err, ConvertNsError::NotSingleInput);
     assert_eq!(
         err.to_string(),
