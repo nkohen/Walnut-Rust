@@ -5,7 +5,7 @@ full unit breakdown — read it before doing anything else if this is a cold sta
 updated at each unit-merge checkpoint so a fresh session (after a pause, e.g. a usage-limit reset)
 can resume immediately without re-deriving state.
 
-## Done and merged (master is green at these units) — 20 of 22 Phase 3a units
+## Done and merged (master is green at these units) — 21 of 22 Phase 3a units
 
 - **U0** — `TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON` retrofit (`4758462`)
 - **U0a** — `Logging.java` port (`5d9f714`)
@@ -25,75 +25,79 @@ can resume immediately without re-deriving state.
 - **U8** — regex engine, Brics-dialect parser + Thompson construction (`2fb3f76`)
 - **U14** — `Session.java` as an explicit context struct, first real file-backed `PredicateEnv` impl (`3e1df51`)
 - **U10** — `LogicalOperator`'s connective dispatch + the quantifier-elimination driving logic
-  (`19c2c28`) — **the decision-procedure crux of the whole port**, cleared by both reviewers with
-  zero correctness findings
-- **U16** — `Reg.java` + the full `alphabet` command body (`991e8f4`, current `master` HEAD). Both
-  reviewers cleared it (no correctness-fatal/-risk); one hand-traced `Automaton.setAlphabet`'s full
-  assembly order line-by-line and empirically probed the one code path with zero test coverage
-  (the `is_dfao=true` branch) before signing off. Coordinator added a permanent unit test for that
-  branch (previously only covered by the reviewer's own temporary probe) and fixed a doc comment
-  this unit's own new call site made stale, both directly rather than via a fixer agent.
+  (`19c2c28`) — the decision-procedure crux of the whole port
+- **U16** — `Reg.java` + the full `alphabet` command body (`991e8f4`)
+- **U11** — the shared postfix executor + final `Predicate` assembly, **the Phase 3a integration
+  checkpoint** (`f2aa6ce`, current `master` HEAD). Two Opus-tier reviewers found the core
+  postfix-evaluation math correct (confirmed via a 40+-predicate differential sweep against the
+  real CLI, including cross-feature compositions no single earlier unit's tests exercised), but
+  found and a fixer resolved: a FALSE documentation claim that Java's operand-token `act()` calls
+  have no `Logging` side effects worth porting (they do — verified live, 6 of 10 expected log
+  lines were missing; now honestly documented as a deferred gap needed before Phase 3b's golden-
+  corpus unit, not before this unit, and pinned by a test asserting current behavior), plus a
+  differential-test methodology bug that could have silently produced a wrong verdict on the first
+  multi-track fixture (the port's raw track order vs. Walnut's always-`canonize()`'d fixture
+  output — fixed and verified load-bearing), plus several weaker/tautological tests strengthened.
 
-`cargo test --workspace` was green on `master` as of `991e8f4` (wr-cli 58, wr-core 444, wr-io 99,
-wr-logic 253, wr-cts 22, differential 4, wr-core-integration-tests 2 — all passing). `cargo fmt
+`cargo test --workspace` was green on `master` as of `f2aa6ce` (wr-cli 58, wr-core 444, wr-io 99,
+wr-logic 270, wr-cts 22, differential 8, wr-core-integration-tests 2 — all passing). `cargo fmt
 --all -- --check` clean, `cargo clippy --workspace --all-targets` clean. **27**
 genuine Walnut (Java) bugs found and logged so far (WB-001 through WB-027 — see
-`docs/WALNUT-BUGS.md`; U16 found no new genuine bug, only two faithfully-preserved quirks
-documented in code comments, correctly not logged since neither is a defect).
+`docs/WALNUT-BUGS.md`; U11/U16 found no new genuine Java bugs, only pre-existing/deferred gaps,
+correctly documented honestly rather than logged as Java bugs since they aren't Java defects).
 
 **Process notes for whoever resumes:**
-- **WB-number collisions remain routine when a unit adds new entries** — none this round (U16
-  didn't add any). Always grep `^## WB-` for duplicate/gapped numbers after ANY rebase touching
-  `docs/WALNUT-BUGS.md`, conflict-reported or not.
-- **A real coordinator mistake this round, caught before damage**: while investigating what looked
-  like a fleet-hygiene incident (U16's agent appearing to leave stray fixture files in the main
-  worktree), the coordinator's own shell had a STALE `cd` left over from a previous command and
-  ran a `git add`/`git commit` for `RESUME-HERE.md` from INSIDE a different worktree — the commit
-  silently no-op'd there (nothing destructive happened; `git add`/`commit`/`log` are non-destructive
-  even when misdirected) but had to be redone from the correct directory. **Lesson: after any
+- **WB-number collisions remain routine when a unit adds new entries** — none this round (neither
+  U16 nor U11 added any). Always grep `^## WB-` for duplicate/gapped numbers after ANY rebase
+  touching `docs/WALNUT-BUGS.md`, conflict-reported or not.
+- **U11's rebase had a real (non-WB) conflict** in `tests/differential/CAPTURE.md` — both U16 and
+  U11 appended a new capture-recipe section to the same file, at the same insertion point. Trivial
+  to resolve (both sections are independent prose, no actual content conflict) — just remove the
+  three-way markers and keep both sections in sequence. Same "grep for markers, don't assume a
+  reported conflict means real content conflict" discipline as the WB-number collisions.
+- **A real coordinator process-hygiene lesson from the U16 round is worth restating**: after any
   sequence of commands that `cd`s into a worktree for inspection, explicitly `cd` back to the
-  intended target directory before the next stateful command (`git add`/`commit`/`merge`) — don't
-  rely on remembering the last `cd` several tool calls back.** Relatedly, the "stray fixture files"
-  themselves turned out to be a false alarm on re-inspection (the main worktree was clean once
-  checked from the correct directory) — likely the coordinator's own earlier stale-cwd read, not a
-  real agent misbehavior. No actual fleet-hygiene violation occurred this round.
+  intended target directory before the next stateful command (`git add`/`commit`/`merge`) — a
+  stale shell cwd from several tool calls back caused one misdirected (but non-destructive) commit
+  attempt that round.
 - Several agent runs stalled on a 600s stream-watchdog timeout (infra hiccup, not a task problem)
   — relaunching the same unit fresh has resolved it every time so far.
 
-## In flight right now
+## In flight right now — the LAST Phase 3a unit
 
-- **U11** — the shared postfix-token executor (`EvalDef.compute`'s core, generalized) + final
-  `Predicate` assembly. Target `wr-logic` (`eval.rs`, new). **This is the Phase 3a integration
-  checkpoint** — its Done-when is literally "a test evaluates a literal predicate string end-to-end
-  to an `Automaton` using only `wr-logic`+`wr-core` — no `wr-cli`/`wr-io`," i.e. the first real
-  proof the whole parser (U2/U3/U4) + quantifier-elimination (U10) + operand-semantics (U9) stack
-  actually composes, not just that each piece passes its own isolated tests. Worktree
-  `/Users/nkohen/dev/walnut-rs/.claude/worktrees/agent-a7991d97d30d1af49` (branch
-  `worktree-agent-a7991d97d30d1af49`, based on `ba7389f` — now 1 commit behind `master`, will need
-  a rebase). Not yet returned as of this checkpoint. Sonnet tier per the plan (integration work
-  over already-reviewed primitives, not new algorithm design) — **still needs the full
-  two-reviewer loop** since it touches `wr-logic` (trust-critical).
+- **U15** — `EvalDef.java` (~185 LOC) as a `wr-cli` library function, the actual `eval`/`def`
+  command implementation, wired to the real `Session` (U14) and calling `wr-logic`'s
+  `evaluate`/`evaluate_with_logging` (U11). Needs to get right: Java's headless/non-headless split,
+  the `TRUE`/`FALSE` print branch (now real via U0's trivial-automaton support), and the CAS
+  matrix-export path per the plan's ALREADY-USER-DECIDED sign-off item #1 (write the automaton
+  output normally, never produce matrix side-files, don't reach the DROP-scope CAS machinery at
+  all). Sonnet tier, isolated subagent, worktree not yet known at this checkpoint (dispatched just
+  before this file was last written — check `git worktree list` if resuming cold). Depends on U11
+  (**done**) and U14 (**done**) — the last blocker just cleared, so this is the final unit standing
+  between here and the **Phase 3a exit checkpoint**.
 
-## Blocked until the above lands
+## After U15 lands: the Phase 3a exit checkpoint
 
-- **U15** (`EvalDef.java`, the actual `wr-cli`-level command) needs U11 AND U14 (**done**) — the
-  last remaining Phase 3a unit after U11 lands.
-
-Once U11 and U15 both land, the **Phase 3a exit checkpoint** is next: extend `tests/differential`
-with `eval`/`def`/`reg` cases (literal strings via `wr-cli`'s library API, using U0c's no-op
-strategy/export context) compared against real `walnut-java` CLI output through `wr_core::equiv`.
-See the plan file's "Phase 3a exit checkpoint" section for the full exit criteria.
+Per the plan: extend `tests/differential` with `eval`/`def`/`reg` cases (literal strings via
+`wr-cli`'s library API, using U0c's no-op strategy/export context) compared against real
+`walnut-java` CLI output through `wr_core::equiv`. `cargo test --workspace` green throughout; every
+genuine divergence logged to `docs/WALNUT-BUGS.md`, not silently resolved either way. This is
+**the actual completion of Phase 3a** — a real, meaningful milestone (the full FOL decider's
+engine + parser + CLI wiring, working end-to-end) worth flagging clearly to the user when reached,
+distinct from Phase 3b (the remaining `wr-core` primitives, the real `Prover` dispatch/REPL, the
+Tier-1 golden-corpus harness) which per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating doctrine
+still needs the user's explicit go-ahead before starting, same as Phase 3 itself did.
 
 ## Process notes for whoever resumes
 
 - Follow the same loop used for every unit so far: author (worktree-isolated background agent) →
-  two split-context adversarial reviewers (diff-only, model ≠ author where the file was authored
-  by a modeled subagent) → fixer if either review finds `correctness-fatal`/`correctness-risk` →
-  verify (`cargo test --workspace`/`fmt`/`clippy`) → commit in the worktree → rebase onto current
-  `master` → grep for WB-number duplicates/gaps regardless of whether the rebase reported conflicts
-  → fast-forward merge → `git worktree remove` + `git branch -d` to clean up.
-- **Always `cd` explicitly to the intended directory before a stateful git command** — see the
-  process note above. Don't trust a `cd` from several tool calls back.
-- This is the closest Phase 3a has been to done — only U11 (in flight) and U15 (blocked on it)
-  remain before the sub-phase's own exit checkpoint. Don't relax review rigor for the home stretch;
-  U8/U14/U16 all found real, fixable issues even in units that looked clean on first read.
+  two split-context adversarial reviewers (diff-only, model ≠ author — U11's author ran on the
+  session's default/Sonnet tier per the plan's own tiering, so its reviewers used an explicit Opus
+  override; check what tier U15's author actually runs on before picking reviewer models) → fixer
+  if either review finds `correctness-fatal`/`correctness-risk` → verify (`cargo test
+  --workspace`/`fmt`/`clippy`) → commit in the worktree → rebase onto current `master` → grep for
+  WB-number duplicates/gaps AND check for non-WB content conflicts (e.g. `CAPTURE.md`) regardless
+  of whether the rebase reported conflicts → fast-forward merge → `git worktree remove` +
+  `git branch -d` to clean up.
+- This is the home stretch of Phase 3a — U8/U14/U16/U11 all found real, fixable issues even in
+  units that looked clean on first read. Don't relax review rigor for U15 just because it's last.
