@@ -47,6 +47,7 @@ pub mod product;
 pub mod quantify;
 pub mod regex;
 pub mod search;
+pub mod transducer;
 pub mod trim;
 pub mod util;
 pub mod word_automaton;

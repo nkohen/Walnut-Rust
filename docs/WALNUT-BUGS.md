@@ -1450,6 +1450,88 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-035 — `Transducer.transduceNonDeterministic`'s dead-state marker `minOutput` is used un-encoded as a transducer INPUT symbol *and* as a marker in the RESULT's output alphabet, silently deleting real states (and crashing outright on a shifted alphabet)
+
+- **Where:** `Automata/Transducer.java`, `transduceNonDeterministic`'s partial-automaton branch
+  (`:303-323`) — specifically `Tnew.fa.getT().setNfaDTransition(q, minOutput, newList)` (`:315`),
+  `Tnew.sigma.get(q).put(minOutput, minOutput)` (`:316`), and
+  `AutomatonLogicalOps.removeStatesWithOutputRebuild(N.fa, minOutput)` (`:321`).
+- **What:** when the input automaton `M` has undefined transitions, Walnut totalizes it with a
+  distinguished dead state (`FA.addDistinguishedDeadState`, output `min(M.O) - 1`), extends the
+  transducer so that reading that dead letter loops in place and emits `minOutput`, transduces, and
+  finally deletes every result state whose output is `minOutput`. `minOutput` is a value from **`M`'s
+  output alphabet**. It is then used in two places where it is *not* a value in that space, with no
+  conversion at either:
+  1. **As an encoded transducer INPUT symbol.** Every other site in the file goes through
+     `richAlphabet.encode(List.of(v))` (`:188`, `:277`, `:397`), i.e. `A[0].indexOf(v)` — a *position*
+     in the transducer's input alphabet, not the value itself. `:315-316` skip that indirection
+     entirely and key the transducer's transition table and `sigma` on the raw `minOutput`.
+  2. **As a marker in the RESULT's OUTPUT alphabet.** `N`'s outputs come from `sigma`, i.e. the
+     *transducer's* output alphabet, which has nothing to do with `M`'s. If the transducer can
+     legitimately emit `minOutput` from a real state, `removeStatesWithOutputRebuild` deletes those
+     real states along with the intended dead ones.
+
+  (1) happens to be harmless in the single common case — `A[0] = [0, 1, …, k-1]` makes `indexOf(v) ==
+  v`, and `min(M.O) == 0` makes `minOutput == -1`, which `List.indexOf` also returns for an absent
+  value — so the two spaces coincide by coincidence. Shift either and it breaks.
+- **Trigger (both manifestations empirically confirmed against the real `walnut-java` CLI,
+  `target/Walnut-all.jar`, 2026-08-13):**
+  - **(2) silent wrong answer.** A partial `msd_2` word automaton with outputs `{0, 1}` (so
+    `minOutput == -1`), and a one-state transducer over `{0, 1}` that emits `-1` on letter `0`:
+    - `Word Automata Library/PARTIAL.txt`: `0 0 / 0 -> 1` then `1 1 / 0 -> 1, 1 -> 0` (state `0` has
+      no transition on symbol `1`, and only that one).
+    - `Transducer Library/NEG.txt`: `{0, 1}` then state `0` with `0 -> 0 / -1`, `1 -> 0 / 1`.
+    - `transduce OUTP NEG PARTIAL;` produces `0 -1 / 0 -> 1` and `1 1 / 0 -> 1` — **two**
+      transitions. The input's `1 -> 0` transition (perfectly well-defined in `PARTIAL`) is gone.
+    - Control, identical in every respect except the one colliding output value (`-1` becomes `5`):
+      `Transducer Library/POS.txt` with `0 -> 0 / 5`, `1 -> 0 / 1`. `transduce CTRL POS PARTIAL;`
+      produces `0 5 / 0 -> 1` and `1 1 / 0 -> 1, 1 -> 0` — **three** transitions, i.e. the correct
+      answer, keeping `1 -> 0`. Second control: running `NEG` against a *totalized* version of the
+      same automaton (add `1 -> 1` to state `0`) also keeps `1 -> 0`, confirming it is the
+      dead-state path plus the collision, not the `-1` output or the partiality alone.
+  - **(1) crash.** `M` with outputs `{1, 2}` and a transducer whose input alphabet is `{1, 2}` — the
+    compatibility check at `:276-281` passes, since both of `M`'s output values are in the alphabet.
+    `minOutput` is then `0`: `:315` writes encoded symbol `0` (which *means the letter `1`*,
+    clobbering a real transition of the transducer for every state), while `createMap` looks the dead
+    state up as `encode([0]) == -1`, which was never written. Real Walnut throws
+    `java.lang.NullPointerException: Cannot invoke "…IntList.getInt(int)" because the return value of
+    "Automata.FA.Transitions.getNfaStateDests(int, int)" is null at Automata.Transducer.createMap
+    (Transducer.java:400)`. Files used: `PARTIAL12.txt` = `0 1 / 0 -> 1` then `1 2 / 0 -> 1, 1 -> 0`;
+    `SHIFT.txt` = `{1, 2}` then state `0` with `1 -> 0 / 7`, `2 -> 0 / 8`.
+- **Why it's usually invisible:** the shipped `Transducer Library` transducers (`RUNSUM2`/`RUNSUM3`/
+  `RUNSUM4`) all declare `{0, 1, …}` alphabets and emit only non-negative outputs, and the word
+  automata they are used on (Thue-Morse and friends) are total, so the dead-state branch is never
+  taken at all. Both halves need a partial input automaton *plus* either a non-`0`-based input
+  alphabet or a transducer output equal to `min(M.O) - 1`.
+- **Found:** Phase 3b, U20 (`crates/wr-core/src/transducer.rs`, the `Transducer` port), 2026-08-13,
+  while working out why the port could not use `Automaton::encode` (which panics on an
+  out-of-alphabet digit) for `:188`/`:277`/`:397` — tracing that dependency on Java's silent
+  `indexOf` → `-1` surfaced the un-encoded `minOutput` two lines away. Both manifestations were then
+  reproduced against the real CLI before logging.
+- **Rust port:** `ported verbatim (bug)`. `Transducer::transduce_non_deterministic` writes
+  `min_output` straight into `t_new.automaton.fa.d[q]`/`t_new.sigma[q]` and passes it straight to
+  `logicalops::remove_states_with_output_rebuild`, with both halves flagged inline citing this entry;
+  `Transducer::encode_input` is a deliberate local port of `RichAlphabet.encode`'s `indexOf` → `-1`
+  fallback (see this module's docs) rather than a call to `Automaton::encode`, precisely so half (1)
+  reproduces rather than being masked by a different panic. Pinned by three tests in that module:
+  `wb035_partial_automaton_loses_states_whose_output_collides_with_the_marker` (asserts the WRONG
+  two-transition result), `partial_automaton_transduces_through_the_dead_state_path` (the
+  one-value-different control, asserting the correct three-transition result), and
+  `wb035_shifted_alphabet_panics_where_java_npes` (a `#[should_panic]` at the same point Java NPEs).
+- **Upstream:** not filed. The fix is not one line, which is part of why this is logged rather than
+  resolved here. Half (1) is mechanical — encode before use (`richAlphabet.encode(List.of(minOutput))`
+  at `:315-316`, matching `:397`) — but that alone is not enough, because the encoded symbol may
+  still collide with a real letter; the dead letter really wants to be a *fresh* symbol appended to
+  the transducer's input alphabet. Half (2) needs a marker outside the transducer's output alphabet
+  (e.g. `min(sigma values) - 1`, or a parallel "is dead" flag rather than an output sentinel) instead
+  of reusing `M`'s.
+- **Severity:** **high** where it applies — half (2) is a silent wrong answer in `transduce`'s core
+  construction, half (1) is an uncaught crash, and both are reachable from ordinary hand-authored
+  library files with no adversarial shape. Narrow in practice: only partial (non-total) input
+  automata reach the branch at all.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has
