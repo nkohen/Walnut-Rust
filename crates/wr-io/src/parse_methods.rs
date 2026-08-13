@@ -1199,12 +1199,13 @@ mod tests {
     // `Morphism`'s constructor (`Morphism.java:53-54`) is a thin wrapper that calls
     // `ParseMethods.parseMorphism(mapString)` straight into its `mapping` field, so
     // these three cases exercise this crate's `parse_morphism` directly by checking
-    // the same resulting map Java's `h.mapping` would hold. `Morphism` itself
-    // (`length`/`range` derivation, `toWordAutomaton`) is out of this unit's scope
-    // (deferred, per the Phase-3a plan) so those Morphism-level fields aren't
-    // asserted here -- only the parse result this unit IS responsible for.
+    // the same resulting map Java's `h.mapping` would hold. `Morphism`'s own
+    // derivations (`length`/`range`) are not this module's responsibility, so those
+    // three assert the parse result only; they are joined at the end of this section
+    // by `morphism_parse_then_from_mapping_seam`, which drives BOTH halves of Java's
+    // one-step constructor end to end now that `wr_core::morphism::Morphism` exists.
     // `testGamMorphism` additionally needs file-backed `Session`/morphism-library
-    // reading, unrelated to `parse_methods` itself, so it's not mirrored here.
+    // reading plus `toWordAutomaton` (still deferred), so it is not mirrored here.
 
     #[test]
     fn morphism_test_uniform_image_lengths() {
@@ -1240,6 +1241,59 @@ mod tests {
         assert_eq!(map.get(&10), None);
         assert_eq!(map.get(&11), Some(&vec![0, 1, 2]));
         assert_eq!(map.get(&12), Some(&vec![0, 2]));
+    }
+
+    #[test]
+    fn morphism_parse_then_from_mapping_seam() {
+        // Java's `Morphism(String mapString)` (`Morphism.java:53-59`) is ONE step:
+        // parse, then derive `range` and `length` from the parse result. This port
+        // splits it in two across a crate boundary -- `parse_morphism` here in
+        // `wr-io`, `Morphism::from_mapping` in `wr-core` (which cannot depend on
+        // `wr-io`) -- so the seam between them is a port-specific construct with no
+        // Java counterpart, and nothing else exercises both halves together:
+        // `wr-core`'s tests hand `from_mapping` a hand-built `BTreeMap`, and the
+        // mirrors above stop at the parse result. This test is the join.
+        use std::collections::BTreeSet;
+        use wr_core::morphism::Morphism;
+
+        // MorphismTest.testImageLength's uniform half, all the way through.
+        let h = Morphism::from_mapping(parse_morphism("0->01 1->21 2->03 3->23").unwrap());
+        assert_eq!(h.length, 2);
+        assert_eq!(h.mapping.get(&0), Some(&vec![0, 1]));
+        assert_eq!(h.mapping.get(&3), Some(&vec![2, 3]));
+        assert_eq!(h.range, BTreeSet::from([0, 1, 2, 3]));
+
+        // Its non-uniform half: `length` is the derived -1, not any image's length.
+        let h = Morphism::from_mapping(parse_morphism("0->0123 1->21 2->03 3->23").unwrap());
+        assert_eq!(h.length, -1);
+        assert_eq!(h.range, BTreeSet::from([0, 1, 2, 3]));
+
+        // MorphismTest.testBigAlphabet, including the `range.size() == 3` assertion
+        // Java makes there and the bracketed out-of-0..9 DOMAIN keys, which only
+        // this end-to-end path covers (parse must un-bracket them, `from_mapping`
+        // must key on the parsed integers).
+        let h = Morphism::from_mapping(parse_morphism("0->01 [11]->012 [12]->02").unwrap());
+        assert_eq!(h.length, -1);
+        assert_eq!(h.range.len(), 3);
+        assert_eq!(h.range, BTreeSet::from([0, 1, 2]));
+        assert_eq!(
+            h.mapping.keys().copied().collect::<Vec<_>>(),
+            vec![0, 11, 12]
+        );
+
+        // The class doc's own example (`Morphism.java:35`), whose image values run
+        // outside 0..=9 in both directions -- so `range` must carry -3 and 11, and
+        // `write` must round-trip the whole thing back to the input's escaping.
+        let h =
+            Morphism::from_mapping(parse_morphism("0 -> [-3]0102[11] 1 -> 2113 2 -> 314").unwrap());
+        assert_eq!(h.length, -1);
+        assert_eq!(h.range, BTreeSet::from([-3, 0, 1, 2, 3, 4, 11]));
+        let mut out = Vec::new();
+        h.write(&mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "0 -> [-3]0102[11]\n1 -> 2113\n2 -> 314\n"
+        );
     }
 
     // -- Deferred-parsing correctness (review findings, both reviewers) -------

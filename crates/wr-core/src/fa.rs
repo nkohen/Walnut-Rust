@@ -478,14 +478,27 @@ impl Fa {
     /// short-circuit — both are private fields **on `FA` itself** (`FA.java:47-50`,
     /// checked at `FA.java:149`). U0 added the `TRUE_FALSE_AUTOMATON` half to this
     /// crate ([`Fa::true_false`]) and the guard below now reproduces it exactly; the
-    /// `canonized` memo is still absent, so this always recomputes — safe (idempotent:
-    /// re-running on an already-BFS-ordered automaton is
-    /// a no-op transitions-and-output-wise) but behaviorally NOT identical: Java's
-    /// `canonized` guard means a stale-flagged `FA` is left un-renumbered even if its
-    /// actual state order has changed underneath it (pinned upstream by
+    /// `canonized` memo is still absent, so this always recomputes — idempotent
+    /// (re-running on an already-BFS-ordered automaton is a no-op
+    /// transitions-and-output-wise) but behaviorally NOT identical: Java's `canonized`
+    /// guard means a flagged `FA` is left un-renumbered even if its actual state order
+    /// has changed underneath it (pinned upstream by
     /// `FATest.canonizeInternal_alreadyCanonized_isNoOp`, not replicated here — the flag
-    /// doesn't exist on `Fa`). Language-preserving either way, so no differential/golden
-    /// comparison can observe it, but a future exact-state-numbering comparison would.
+    /// doesn't exist on `Fa`).
+    ///
+    /// **How much this can be observed — an earlier draft of this doc understated it.**
+    /// That draft claimed the gap was merely a renumbering, "so no differential/golden
+    /// comparison can observe it." That is false in general, because `canonized` is not
+    /// only a memo: Walnut also *sets it deliberately to suppress canonicalization*, and
+    /// canonicalization DROPS states BFS cannot reach from `q0` (see above). The known
+    /// counterexample is `Automata/Morphism.java:88`
+    /// (`promotion.fa.setCanonized(true)`, flagging a freshly promoted morphism
+    /// automaton whose states are domain letters, most typically unreachable) — running
+    /// canonicalization there would change the automaton's state count, not just its
+    /// numbering. That call site is not yet ported (`toWordAutomaton` is deferred; see
+    /// [`crate::morphism`]'s module docs), so nothing in this crate reaches it *today* —
+    /// but the blanket claim was wrong, and the follow-on unit that ports
+    /// `toWordAutomaton` must supply the flag or an equivalent guarantee.
     ///
     /// The zero-state guard below agrees with Java on every input Java can actually
     /// construct, but for a different reason than an earlier draft of this doc claimed:

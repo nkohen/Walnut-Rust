@@ -34,12 +34,24 @@
 //! morphism functionality," grouped with `buildTransitionsFromMorphism`/`convertNS`
 //! as later, `Automaton`-consuming work — see `logicalops.rs`'s "Not ported"
 //! section for the sibling helpers), it is deferred to a follow-on unit rather than
-//! built here. Note for that unit: unlike the other entries in `logicalops.rs`'s
-//! "Not ported" list, this is **not** blocked on a missing primitive —
+//! built here.
+//!
+//! **Note for that unit — one genuinely missing primitive.** Most of what
+//! `toWordAutomaton` needs already exists in this crate as of this unit:
 //! `Automaton::richAlphabet` (`automaton.rs`), `Fa::set_fields` (`fa.rs`), and
-//! `NumberSystem::MSD_UNDERSCORE`/its `msd_<k>` constructor (`numsys.rs`) all
-//! already exist in this crate as of this unit; the split is purely to keep this
-//! unit's surface to the standalone data primitive `Morphism` itself.
+//! `NumberSystem::MSD_UNDERSCORE`/its `msd_<k>` constructor (`numsys.rs`). But
+//! `Morphism.java:88` calls `promotion.fa.setCanonized(true)`, and [`crate::fa::Fa`]
+//! has **no `canonized` field at all** — the memo was cut in U0/U1 (see
+//! [`crate::fa::Fa::canonicalize`]'s doc). That is not a bookkeeping detail here:
+//! Java sets the flag precisely so the promoted automaton is never canonicalized
+//! ("this word automaton is purely symbolic in input and we want it in the exact
+//! order given", `:87`), and `canonizeInternal` *drops states BFS cannot reach from
+//! `q0`*. A promoted morphism's states are its domain letters, most of which are
+//! typically unreachable, so letting canonicalization run would change the
+//! automaton's state COUNT and its state↔letter correspondence — a language-level
+//! difference, not a renumbering. The follow-on unit must therefore either add a
+//! `canonized` flag to `Fa` or otherwise guarantee the promoted automaton is never
+//! auto-canonicalized; it cannot simply call `set_fields` and move on.
 //!
 //! # `escapedInt` / `write`
 //!
@@ -133,10 +145,28 @@ pub struct Morphism {
     pub mapping: BTreeMap<i32, Vec<i32>>,
     /// `Morphism.range` (`:48`): the set of values appearing in ANY image, i.e.
     /// the union of every `mapping` value. Java uses an unordered `IntOpenHashSet`
-    /// here (only `.size()` and membership are read off it directly; every
-    /// iteration site, e.g. `Image.image`, immediately copies-and-sorts before
-    /// iterating) — `BTreeSet` is a strictly stronger (sorted) guarantee, not a
-    /// behavior change.
+    /// here; this is a `BTreeSet` (sorted).
+    ///
+    /// **Known, accepted divergence — display-only, but real.** There are exactly
+    /// two readers of this field in Walnut:
+    ///
+    /// * `Main/Commands/Image.java:26-27` — the only *behavior-affecting* reader.
+    ///   It does `new ArrayList<>(h.range)` then `range.sort(Integer::compareTo)`,
+    ///   i.e. re-sorts before iterating, so the automaton `image` builds is
+    ///   unaffected by the set's iteration order. `BTreeSet` agrees with it.
+    /// * `Main/Commands/Morphism.java:14` — `System.out.print(M.range)`, which
+    ///   prints the raw `IntOpenHashSet` (fastutil *hash* order) straight to the
+    ///   `morphism` command's stdout. This one is NOT re-sorted, and a `BTreeSet`
+    ///   will print a different order: for `0->0123 1->21 2->03 3->23`, Java prints
+    ///   `{0, 2, 1, 3}` where this crate would print `{0, 1, 2, 3}`.
+    ///
+    /// So the future `wr-cli` `morphism` command's "and range …" output line will
+    /// differ from Java's, in element order only (same elements, same count).
+    /// Reproducing fastutil's hash order is deliberately not attempted: it is an
+    /// implementation detail of a third-party hash table, and per `CLAUDE.md`'s
+    /// semantic-equivalence rule the comparison bar is language equivalence plus
+    /// *normalized* text, not byte-identical stdout. Do not read this note as "no
+    /// divergence exists" — one does; it is confined to that one printed line.
     pub range: BTreeSet<i32>,
 }
 
@@ -257,7 +287,12 @@ fn determine_uniform_length(mapping: &BTreeMap<i32, Vec<i32>>) -> i32 {
             return -1;
         }
     }
-    expected as i32
+    // Java returns `entry.getValue().size()`, an `int`, so an image longer than
+    // `i32::MAX` is not representable there in the first place. `expected as i32`
+    // would silently truncate (and could even manufacture a bogus `-1`
+    // "non-uniform" answer); this cannot be reached from any real input, but a
+    // panic beats a wrong length.
+    i32::try_from(expected).expect("morphism image length exceeds i32::MAX")
 }
 
 #[cfg(test)]
@@ -268,8 +303,13 @@ mod tests {
         pairs.iter().map(|(k, v)| (*k, v.to_vec())).collect()
     }
 
-    // -- MorphismTest.testGamMorphism (partial: the file-backed length/mapping
-    // shape, not `toWordAutomaton` which this unit defers) -----------------------
+    // -- independent smoke test (NOT a port of MorphismTest.testGamMorphism) -------
+    //
+    // Java's `testGamMorphism` uses the real `gam` mapping `0->01 1->21 2->03 3->23`
+    // and asserts a transition table derived from `toWordAutomaton`; its substance is
+    // therefore deferred along with `toWordAutomaton` itself (see the module docs'
+    // "Not ported" section) and is NOT replicated by anything below. The mapping used
+    // here is Thue-Morse, not `gam`, and it only checks `from_mapping`'s own outputs.
 
     #[test]
     fn thue_morse_morphism_is_uniform_length_two() {
@@ -325,11 +365,21 @@ mod tests {
 
     #[test]
     fn empty_mapping_has_length_zero_and_empty_range() {
-        // Not reachable via the real `wr_io::parse_methods::parse_morphism` (it
-        // errors on an empty mapping), but `from_mapping` itself, like Java's
-        // `determineUniformLength`, is total and returns 0/empty here -- pinned
-        // since `from_mapping`'s contract is "already-parsed map", not
-        // "necessarily non-empty".
+        // Documents the TOTALITY of the split constructor -- NOT a supported
+        // "empty morphism" feature. In Java this state is unreachable: the only
+        // path into `Morphism`'s fields is the `Morphism(String)` constructor,
+        // which calls `ParseMethods.parseMorphism`, which throws
+        // `WalnutException("Morphism has no valid mappings.")` on an empty result
+        // (`ParseMethods.java:189-191`, ported as `parse_morphism`'s
+        // `morphism_no_valid_mappings_errors`). Splitting that constructor in two
+        // (parsing in `wr-io`, this in `wr-core` -- see the module docs) makes the
+        // empty map *representable* here, so this pins what `from_mapping` does
+        // with it rather than leaving it undefined: exactly what Java's
+        // `determineUniformLength` would do, i.e. `firstElement` never flips and
+        // `imageLength` stays 0. No `debug_assert!` is used to reject it -- this
+        // crate's stated convention (see `fa.rs`/`minimize.rs`/`equiv.rs` module
+        // docs) is that preconditions are hard errors or documented contracts,
+        // never `debug_assert!`, which vanishes in release builds.
         let h = Morphism::from_mapping(BTreeMap::new());
         assert_eq!(h.length, 0);
         assert!(h.range.is_empty());
@@ -399,6 +449,27 @@ mod tests {
     }
 
     #[test]
+    fn write_escapes_out_of_range_domain_keys_too() {
+        // As of Walnut 8 the square-bracket escape applies to the DOMAIN letter as
+        // well as the image (`Morphism.java:38`'s class doc; `write` calls
+        // `escapedInt` on `entry.getKey()` at `:65`, not just on the image at
+        // `:67`). Every other `write` test here uses keys in 0..=9, where
+        // `escapedInt` is the identity and the key-side escaping is invisible --
+        // this one makes dropping it a test failure.
+        //
+        // Also pins the on-disk round trip: the text below is exactly what
+        // `wr_io::parse_methods::parse_morphism` accepts back (`[-3] -> ...`), so
+        // the Morphism Library format survives a write/read cycle for such keys.
+        // And it pins `BTreeMap` key order: -3 sorts before 11 numerically, which
+        // is NOT the order they would take as strings.
+        let h = Morphism::from_mapping(map(&[(-3, &[0, 11]), (11, &[1]), (2, &[9, -1])]));
+        let mut out = Vec::new();
+        h.write(&mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "[-3] -> 0[11]\n2 -> 9[-1]\n[11] -> 1\n");
+    }
+
+    #[test]
     fn write_to_file_round_trips() {
         let dir = std::env::temp_dir().join(format!(
             "wr-core-morphism-write-test-{}",
@@ -449,6 +520,47 @@ mod tests {
         assert_eq!(
             predicate,
             "?msd_3 E q, r (n=3*q+r & r>=0 & r<3 & (L[q]= @0 => (r=0|r=1)))"
+        );
+    }
+
+    #[test]
+    fn make_inter_predicate_emits_out_of_range_keys_unescaped() {
+        // The escaped/raw ASYMMETRY between the two `mapping`-reading methods,
+        // pinned. `write` runs every key through `escapedInt` (`Morphism.java:65`),
+        // but `makeInterPredicate` appends `entry.getKey()` RAW (`:170`, `:180`) --
+        // it is generating predicate source for `Predicate`, not Morphism Library
+        // text, and `Predicate.PATTERN_FOR_ALPHABET_LETTER`
+        // (`Main/Predicate.java:105`, `@(\s*([+\-])?\s*\d+)`) matches a bare signed
+        // integer after `@`, with no bracket syntax. So `@11`, never `@[11]`.
+        // Faithful to Java, and previously unpinned: every other predicate test
+        // here uses keys in 0..=9, where escaped and raw coincide.
+        let h = Morphism::from_mapping(map(&[(11, &[2, 0]), (12, &[0, 2])]));
+        let predicate = h.make_inter_predicate(2, "L", "?msd_2");
+        assert_eq!(
+            predicate,
+            "?msd_2 E q, r (n=2*q+r & r>=0 & r<2 & (L[q]= @11 => (r=0)) & (L[q]= @12 => (r=1)))"
+        );
+        // The "!=" arm takes the key raw as well (`:180`).
+        let absent = h.make_inter_predicate(7, "L", "?msd_2");
+        assert_eq!(
+            absent,
+            "?msd_2 E q, r (n=2*q+r & r>=0 & r<2 & (L[q]!= @11) & (L[q]!= @12))"
+        );
+    }
+
+    #[test]
+    fn make_inter_predicate_emits_negative_domain_letters_unescaped() {
+        // "[-3]->[11]0 [12]->0[11]" -- a NEGATIVE domain letter, which
+        // `parse_morphism` accepts (bracketed) and which `makeInterPredicate` emits
+        // as `@-3`, unescaped, same as any other key. That is legitimate predicate
+        // syntax rather than a Walnut bug: `PATTERN_FOR_ALPHABET_LETTER`
+        // (`Main/Predicate.java:105`) explicitly allows an optional `[+\-]` sign.
+        // Note `-3` sorts before `12`, so its clause comes first.
+        let h = Morphism::from_mapping(map(&[(-3, &[11, 0]), (12, &[0, 11])]));
+        let predicate = h.make_inter_predicate(11, "L", "?msd_2");
+        assert_eq!(
+            predicate,
+            "?msd_2 E q, r (n=2*q+r & r>=0 & r<2 & (L[q]= @-3 => (r=0)) & (L[q]= @12 => (r=1)))"
         );
     }
 }
