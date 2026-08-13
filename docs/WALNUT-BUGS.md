@@ -1180,7 +1180,7 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
-## WB-024 — `Prover.parseArgs` validates the command file BEFORE `Session.setPathsAndNames` runs, so `--home-dir=` is ignored and a valid invocation crashes
+## WB-026 — `Prover.parseArgs` validates the command file BEFORE `Session.setPathsAndNames` runs, so `--home-dir=` is ignored and a valid invocation crashes
 
 - **Where:** `Main/Prover.java`, `parseArgs(String[])` — the `else if (filename == null)` arm's
   `UtilityMethods.validateFile(Session.getReadAddressForCommandFiles(filename))` (`:318`), which
