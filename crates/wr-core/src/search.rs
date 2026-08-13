@@ -3,7 +3,7 @@
 
 //! Shortest-witness BFS over `int[]`-tuple product states.
 //!
-//! Ports `Automata/Search/ProductBFS.java` (406 LOC) — the search PRIMITIVE behind
+//! Ports `Automata/Search/ProductBFS.java` (407 LOC) — the search PRIMITIVE behind
 //! the `test` command (`Main/Commands/Test.java`'s "find the first N shortlex-smallest
 //! accepted inputs"), not the command itself. `Test.java` is a later unit (U25); this
 //! module gives it exactly what Java's `ProductBFS` gives `Test.java`: a generic BFS
@@ -11,8 +11,19 @@
 //! automaton construction — `docs/BOUNDARY-MAP.md` §71 is explicit that this is *not*
 //! a `ProductStrategies` alternative), plus a dead-but-KEEP-scoped specialized DFA
 //! variant with reverse-reachability pruning (`docs/BOUNDARY-MAP.md` §71/§4.5;
-//! confirmed zero callers by `ProductBFSTest.java`'s own class doc comment, in both
-//! `main` and `test`).
+//! confirmed by `ProductBFSTest.java`'s own class doc comment to have **no production
+//! callers** anywhere in `main` — its only Java call sites at all are the 7 inside
+//! `ProductBFSTest.java`, which exist purely to characterize it).
+//!
+//! # Neither search function is resource-capped (matching Java)
+//!
+//! `ProductBFS` has no state/time budget: `shortestWitnessWordInt` explores the whole
+//! reachable product-state space, which is a *product* of the component state spaces
+//! and can blow up long before it terminates. This port deliberately reproduces that
+//! (it is not a new-vs-Java regression, and `CLAUDE.md`'s per-test resource caps are a
+//! requirement on *tests*, not on the primitive). Whoever wires U25 to real
+//! user-supplied automata is therefore responsible for imposing the cap at that layer
+//! — do not assume this module will bound anything for you.
 //!
 //! # Sanctioned deviation: static mutable singleton fields become owned locals
 //!
@@ -31,34 +42,126 @@
 //! `CompactDFA<Integer>` (AutomataLib's deterministic-automaton type) and returns
 //! `Word<Integer>`. Per U19's task brief, these have no Rust crate equivalent worth
 //! adding — [`shortest_witness_word_product`] instead operates on this crate's own
-//! [`crate::fa::Fa`] (assumed deterministic per component, exactly as `CompactDFA`
-//! is: [`dfa_successor`] reads at most one destination per `(state, symbol)`, mirroring
-//! `CompactDFA.getSuccessor`'s "-1 means no transition" contract) and both search
-//! functions return a plain `Vec<i32>` witness (`Word.epsilon()` -> `Vec::new()`,
-//! `Word.fromSymbols(..)` -> the symbols in order) rather than an AutomataLib `Word`.
+//! [`crate::fa::Fa`], with one consequence that has to be paid for explicitly:
+//! `CompactDFA<Integer>` makes non-determinism *unrepresentable*, whereas `Fa` is an
+//! NFA-shaped table, so what Java's parameter type guaranteed is instead **checked at
+//! run time** here and rejected as a [`SearchError`] (see [`dfa_successor`], which
+//! mirrors `CompactDFA.getSuccessor`'s "-1 means no transition" contract only once
+//! that check has passed). Both search functions return a plain `Vec<i32>` witness
+//! (`Word.epsilon()` -> `Vec::new()`, `Word.fromSymbols(..)` -> the symbols in order)
+//! rather than an AutomataLib `Word`.
 //!
-//! # Trivial (`TRUE`/`FALSE`) automaton inputs
+//! # The `Test.java` integration seam
 //!
 //! Java's `ProductBFS.java` itself has **zero** awareness of `Automaton`/`FA` at all
 //! — it is pure `int[]`-tuple BFS driven entirely by caller-supplied closures, so it
-//! cannot "assume every automaton has real states" in the first place; the guard
-//! lives at the call site instead (`Test.findNextAcceptedWord`'s own
-//! `M.fa.isTRUE_FALSE_AUTOMATON()` check *before* ever calling `ProductBFS`,
-//! `Test.java:73-77` — that guard is `Test.java`'s own logic, out of scope for this
-//! unit, deferred to U25 along with the rest of the `test` command). Because U25 will
-//! still need *some* automaton-aware entry point into this primitive, this module
-//! adds one small piece of genuinely new (not ported) glue for that integration
-//! seam: [`shortest_accepted_word`], a single-automaton convenience matching
-//! `Test.java`'s own call shape (search from `fa.q0`, take the first NFA
-//! destination per symbol, accept on `Fa::is_accepting`). It checks
-//! [`crate::automaton::Automaton::fa`]'s [`crate::fa::Fa::is_true_false_automaton`]
-//! explicitly up front rather than indexing into the empty/stale-`q` trivial `Fa`
-//! shapes `fa.rs`'s own module docs describe, so a `TRUE`/`FALSE` automaton input is
-//! handled cleanly rather than panicking.
+//! cannot "assume every automaton has real states" in the first place; the
+//! automaton-aware parts (the `TRUE`/`FALSE` guard, the product-state layout, the
+//! accepting predicate) all live at the call site, in `Test.findNextAcceptedWord`
+//! (`Test.java:71-95`). Because U25 will need *some* automaton-aware entry point into
+//! this primitive, this module adds one small piece of genuinely new (not ported)
+//! glue for that seam: [`shortest_accepted_word`].
+//!
+//! It is deliberately a **faithful specialization of `findNextAcceptedWord` to
+//! `previous == null`** (the first call of `findAccepted`'s loop), not a loose
+//! "shortest accepted word" helper — see its own docs for the state-layout
+//! correspondence and the two `Test.java` behaviors that a naive helper gets wrong
+//! (the `TRUE` automaton throws rather than answering `epsilon`; the empty word is
+//! never a result, because Java's accepting predicate begins `state[1] != 0`).
+//!
+//! What it deliberately does **not** do — because those are `findAccepted`'s
+//! responsibility, one level up, and belong to U25 with the rest of the `test`
+//! command: `randomLabel()`, the `removeLeadingZeros` pre-pass (`Test.java:41-42`),
+//! iterating for `n` results with a non-null `previous`, and
+//! `formatAcceptedWord`'s decoding. This returns *encoded* symbols, like
+//! `ProductBFS` itself does.
+//!
+//! # Test coverage
+//!
+//! 13 Tier-2 tests port `ProductBFSTest.java`'s cases — that is 13 of its 14 `@Test`
+//! methods; the fourteenth, `defaultConstructor_isCallable`, has no Rust analogue
+//! (this module is free functions, not a class with a constructor to cover). Alongside
+//! them are 11 tests with no Java counterpart: [`shortest_accepted_word`]'s own
+//! behavior (trivial automata, the never-epsilon rule, agreement with
+//! [`Fa::accepts_word`]), the precondition hard errors both entry points now raise
+//! where Java's types made the check unnecessary, and a Tier-4 property test asserting
+//! that Java's reverse-reachability pruning is a pure optimization (the pruned and
+//! unpruned searches return the identical witness on randomized small products).
 
 use crate::automaton::Automaton;
 use crate::fa::Fa;
 use std::collections::{HashMap, VecDeque};
+
+/// Precondition failures of the two [`Fa`]-taking entry points in this module.
+///
+/// Java gets these for free from its type system: `ProductBFS`'s specialized variant
+/// takes `CompactDFA<Integer>[]`, so non-determinism is structurally unrepresentable,
+/// and `Test.java`'s automaton is the `AutomatonDFA` that `AutomatonLogicalOps.and`
+/// returned (`AutomatonLogicalOps.java:41-55`, via `crossProductAndMinimize(..).asDFA()`),
+/// so `destinations.getInt(0)` is genuinely reading the *only* destination. This port's
+/// `&[Fa]`/`&Automaton` signatures can't express that, and `Fa` is an NFA-shaped table
+/// that constrains neither `dests.len()` nor destination range — so the checks Java's
+/// types made unnecessary are made explicitly here instead, as **hard errors**, per
+/// `fa.rs`'s module rule that determinism is the caller's to check and the crate
+/// convention of `MinimizeError`/`MooreError`/`EquivError`. Silently following
+/// `dests[0]` on an NFA would return a *wrong answer*, not a slow one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchError {
+    /// Some `(state, symbol)` pair of the component at this index has more than one
+    /// destination. The single-automaton entry point ([`shortest_accepted_word`])
+    /// reports component `0`.
+    NotDeterministic { component: usize },
+    /// The component at this index is structurally inconsistent — `o`/`d` length
+    /// disagrees with `q`, `q0` is out of range, or a transition names a destination
+    /// `>= q`. Without this check those become raw slice-index panics deep inside the
+    /// reverse-reachability precomputation.
+    MalformedComponent {
+        component: usize,
+        reason: &'static str,
+    },
+    /// The non-automaton arguments disagree with each other: `start`/`want_accept`
+    /// length vs. the component count, `symbol_maps` vs. `alphabet_size`, or a start
+    /// local state outside its own component.
+    MalformedInput(&'static str),
+    /// [`shortest_accepted_word`] was handed the TRUE automaton. Ports the
+    /// `WalnutException("Cannot enumerate accepted inputs of an unmaterialized true
+    /// automaton.")` throw at `Test.java:73-75` — the TRUE automaton has no
+    /// materialized alphabet to enumerate over, so "it accepts everything" cannot be
+    /// turned into a concrete accepted input.
+    UnmaterializedTrueAutomaton,
+}
+
+/// Checks the structural preconditions this module's `Fa`-driven searches need before
+/// any indexing happens: determinism (at most one destination per `(state, symbol)`,
+/// so `dfa_successor`'s "read the single destination" is honest) and internal
+/// consistency (`o`/`d` sized by `q`, every destination `< q`).
+///
+/// `q == 0` is *not* rejected here: a zero-state component is legitimate for
+/// [`shortest_witness_word_product`] as long as its start local state is the dead
+/// marker (`< 0`). [`shortest_accepted_word`], which must index `d[q0]`, checks
+/// `q0 < q` itself.
+fn check_component(fa: &Fa, component: usize) -> Result<(), SearchError> {
+    if fa.o.len() != fa.q || fa.d.len() != fa.q {
+        return Err(SearchError::MalformedComponent {
+            component,
+            reason: "o/d length disagrees with q",
+        });
+    }
+    for row in &fa.d {
+        for dests in row.values() {
+            if dests.len() > 1 {
+                return Err(SearchError::NotDeterministic { component });
+            }
+            if dests.iter().any(|&dest| dest >= fa.q) {
+                return Err(SearchError::MalformedComponent {
+                    component,
+                    reason: "transition destination >= q",
+                });
+            }
+        }
+    }
+    Ok(())
+}
 
 /// `ProductBFS.shortestWitnessWordInt(int[], int, IntStep, IntAccepting)`
 /// (`ProductBFS.java:89-149`).
@@ -172,10 +275,14 @@ fn reconstruct_word(mut state_id: usize, prev_id: &[Option<usize>], prev_sym: &[
 /// `CompactDFA.getSuccessor(int, int)`'s contract, as this port's stand-in for
 /// `net.automatalib`'s `CompactDFA<Integer>` (see this module's docs): the single
 /// destination of `(state, sym)` in a DETERMINISTIC component, or `None` if that
-/// transition is unset ("dead"). [`shortest_witness_word_product`] never calls this
-/// on a component whose [`Fa::is_deterministic`] doesn't hold -- callers are
-/// responsible for supplying deterministic components, exactly as Java's
-/// `CompactDFA<Integer>[]` type already guarantees at the call site.
+/// transition is unset ("dead").
+///
+/// "The single destination" is only meaningful because every caller in this module has
+/// already run [`check_component`] over `dfa` and returned
+/// [`SearchError::NotDeterministic`] otherwise — `Fa` itself is an NFA-shaped table and
+/// carries no such guarantee, unlike Java's `CompactDFA<Integer>`. Without that check
+/// `dests.first()` would silently pick one branch of a real nondeterministic choice and
+/// the search would answer questions about a *different* language than the caller's.
 fn dfa_successor(dfa: &Fa, state: usize, sym: i32) -> Option<usize> {
     dfa.d[state]
         .get(&sym)
@@ -185,10 +292,11 @@ fn dfa_successor(dfa: &Fa, state: usize, sym: i32) -> Option<usize> {
 /// `ProductBFS.shortestWitnessWordProduct(int[], int, CompactDFA<Integer>[],
 /// int[][], boolean[])` (`ProductBFS.java:161-260`, package-private in Java; `pub`
 /// here since this crate has no package-private visibility and a future `wr-cli`
-/// unit is this function's only plausible caller). Dead code today (zero callers in
-/// `main` or `test`, per `ProductBFSTest.java`'s own class doc comment) but
-/// KEEP-scoped (`docs/BOUNDARY-MAP.md` §71/§2), so it's ported and characterized
-/// here like any other KEEP file.
+/// unit is this function's only plausible caller). Dead code today (no production
+/// callers in `main`; its only Java call sites are `ProductBFSTest.java`'s own
+/// characterization tests, per that file's class doc comment) but KEEP-scoped
+/// (`docs/BOUNDARY-MAP.md` §71/§2), so it's ported and characterized here like any
+/// other KEEP file.
 ///
 /// Product of `dfas.len()` deterministic component automata, with per-global-symbol
 /// projection (`symbol_maps[global_sym][component_index]` is the local symbol
@@ -203,14 +311,56 @@ fn dfa_successor(dfa: &Fa, state: usize, sym: i32) -> Option<usize> {
 /// Dead local state (`< 0`) is handled the same way Java's `-1` sentinel is: if
 /// `want_accept[component_index]` is `false`, dead is already good (a dead state can
 /// never accept again); if `true`, dead can never recover.
+///
+/// # Errors
+///
+/// Java's `CompactDFA<Integer>[]` parameter type makes a nondeterministic or
+/// out-of-range-destination component structurally unrepresentable; `&[Fa]` does not,
+/// so every component is validated up front ([`check_component`]) and the argument
+/// shapes are cross-checked against `dfas`/`alphabet_size`. See [`SearchError`]: an
+/// NFA component is a hard error, never silently searched along `dests[0]`.
 pub fn shortest_witness_word_product(
     start: &[i32],
     alphabet_size: usize,
     dfas: &[Fa],
     symbol_maps: &[Vec<i32>],
     want_accept: &[bool],
-) -> Option<Vec<i32>> {
+) -> Result<Option<Vec<i32>>, SearchError> {
     let component_count = dfas.len();
+
+    // --- preconditions (all checked before any indexing) ---
+    if start.len() != component_count {
+        return Err(SearchError::MalformedInput(
+            "start length != number of components",
+        ));
+    }
+    if want_accept.len() != component_count {
+        return Err(SearchError::MalformedInput(
+            "want_accept length != number of components",
+        ));
+    }
+    if symbol_maps.len() < alphabet_size {
+        return Err(SearchError::MalformedInput(
+            "symbol_maps has fewer entries than alphabet_size",
+        ));
+    }
+    if symbol_maps
+        .iter()
+        .any(|projected| projected.len() < component_count)
+    {
+        return Err(SearchError::MalformedInput(
+            "a symbol_maps row is shorter than the number of components",
+        ));
+    }
+    for (component_index, dfa) in dfas.iter().enumerate() {
+        check_component(dfa, component_index)?;
+        let start_local_state = start[component_index];
+        if start_local_state >= 0 && start_local_state as usize >= dfa.q {
+            return Err(SearchError::MalformedInput(
+                "a start local state is >= its component's q",
+            ));
+        }
+    }
 
     let projected_syms_by_component = projected_syms_by_component(symbol_maps, component_count);
 
@@ -230,14 +380,14 @@ pub fn shortest_witness_word_product(
 
         if start_local_state < 0 {
             if want_accept[component_index] {
-                return None;
+                return Ok(None);
             }
         } else if !live_state_can_reach_wanted[component_index][start_local_state as usize] {
-            return None;
+            return Ok(None);
         }
     }
 
-    shortest_witness_word_int(
+    Ok(shortest_witness_word_int(
         start,
         alphabet_size,
         |product_state, global_sym, succ_state| {
@@ -284,7 +434,7 @@ pub fn shortest_witness_word_product(
             }
             true
         },
-    )
+    ))
 }
 
 /// `ProductBFS.projectedSymsByComponent(int[][], int)` (`ProductBFS.java:263-286`).
@@ -388,42 +538,93 @@ fn compute_live_state_can_reach_wanted(
     live_state_can_reach_wanted
 }
 
-/// New (not ported) integration-seam convenience for U25 -- see this module's docs,
-/// "Trivial (TRUE/FALSE) automaton inputs". Finds a shortest word accepted by `a`,
-/// searching from `a.fa.q0` and taking the first NFA destination per symbol at each
-/// state (matching `Test.java`'s own call shape, `destinations.getInt(0)`,
-/// `Test.java:86`). Returns `None` for the FALSE automaton (no word is accepted) and
-/// `Some(vec![])` for the TRUE automaton (the empty word is accepted, and the TRUE
-/// automaton has no further alphabet to search over -- handled up front rather than
-/// falling through into `Fa`'s empty/stale-`q` trivial shapes).
-pub fn shortest_accepted_word(a: &Automaton) -> Option<Vec<i32>> {
+/// New (not ported) integration-seam glue for U25 — see this module's docs, "The
+/// `Test.java` integration seam". Finds the shortlex-smallest **non-empty** encoded
+/// word accepted by `a`: exactly `Test.findNextAcceptedWord(M, previous)` specialized
+/// to `previous == null` (`Test.java:71-95`), which is the first iteration of
+/// `findAccepted`'s loop and therefore the only shape of that call this crate can
+/// supply without also porting the rest of the `test` command.
+///
+/// # Correspondence to `Test.java`'s product-state layout
+///
+/// Java searches over the `int[3]` tuple `[M-state, min(length read, |previous|+1),
+/// lexicographic comparison with previous]` (`Test.java:63-68`). With `previous ==
+/// null` the last two collapse: component `[1]` becomes `min(length, 1)` — i.e. a
+/// plain "has anything been read yet?" flag — and `updateComparison` returns the
+/// incoming comparison unchanged, so component `[2]` is constantly `0` and carries no
+/// information. This function therefore searches the 2-tuple `[fa-state,
+/// has_read_a_symbol]`, which is that layout with the two dead degrees of freedom
+/// folded out; the BFS, the visited-set dedup and the tie-breaking are otherwise
+/// identical.
+///
+/// # Two behaviors a naive "shortest accepted word" helper gets wrong
+///
+/// * **The empty word is never a result.** Java's accepting predicate is
+///   `state[1] != 0 && M.fa.isAccepting(state[0]) && ...` (`Test.java:94`) — the
+///   leading `state[1] != 0` rejects the start tuple outright, so an accepting `q0`
+///   does *not* make `epsilon` the first accepted input. `findAccepted`'s own doc says
+///   so in as many words ("the first (non-empty) n inputs"). Returning `Some(vec![])`
+///   here would hand U25 a result Java never produces.
+/// * **The TRUE automaton is an error, not `epsilon`.** `Test.java:73-75` throws
+///   `WalnutException("Cannot enumerate accepted inputs of an unmaterialized true
+///   automaton.")`, because a trivial `Fa` carries no materialized alphabet to
+///   enumerate over. That is [`SearchError::UnmaterializedTrueAutomaton`] here. The
+///   FALSE automaton is `Ok(None)` (`Test.java:76`'s `return null`).
+///
+/// # Errors
+///
+/// Besides the TRUE-automaton case: `a.fa` must be a valid **deterministic** `Fa`
+/// ([`SearchError::NotDeterministic`] / [`SearchError::MalformedComponent`], component
+/// `0`). Java's `getInt(0)` at `Test.java:86` is safe only because `findAccepted`'s
+/// automaton is the `AutomatonDFA` returned by `AutomatonLogicalOps.and`; nothing in
+/// `&Automaton` reproduces that guarantee, and following `dests[0]` through a genuine
+/// nondeterministic choice silently answers about the wrong language (an NFA whose
+/// only accepting state is reachable exclusively via a second destination would report
+/// "no accepted word at all").
+pub fn shortest_accepted_word(a: &Automaton) -> Result<Option<Vec<i32>>, SearchError> {
     if a.fa.is_true_false_automaton() {
         return if a.fa.is_true_automaton() {
-            Some(Vec::new())
+            Err(SearchError::UnmaterializedTrueAutomaton)
         } else {
-            None
+            Ok(None)
         };
     }
 
-    let start = [a.fa.q0 as i32];
+    check_component(&a.fa, 0)?;
+    if a.fa.q0 >= a.fa.q {
+        return Err(SearchError::MalformedComponent {
+            component: 0,
+            reason: "q0 >= q",
+        });
+    }
 
-    shortest_witness_word_int(
+    // Java's `{ M.fa.getQ0(), 0, 0 }`, minus the two components that are constant when
+    // `previous == null` (see the layout note above).
+    let start = [a.fa.q0 as i32, 0];
+
+    Ok(shortest_witness_word_int(
         &start,
         a.fa.alphabet_size,
         |state, sym, out| match a.fa.d[state[0] as usize].get(&sym) {
+            // `check_component` above guarantees `dests.len() <= 1` and `dests[0] < q`,
+            // so this really is "the" destination, as Java's `getInt(0)` on a DFA is.
             Some(dests) if !dests.is_empty() => {
                 out[0] = dests[0] as i32;
+                out[1] = 1; // Java's min(oldLength + 1, 1)
                 true
             }
             _ => false,
         },
-        |state| a.fa.is_accepting(state[0] as usize),
-    )
+        // Java's `state[1] != 0 && M.fa.isAccepting(state[0])` (the third conjunct,
+        // `isAfterPrevious`, is vacuously true when `previous == null`).
+        |state| state[1] != 0 && a.fa.is_accepting(state[0] as usize),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
 
     // --- shortest_witness_word_int -- mirrors ProductBFSTest.java's cases ---
@@ -574,9 +775,12 @@ mod tests {
 
         let result = shortest_witness_word_product(&[0, 0], 2, &dfas, &symbol_maps, &want_accept);
 
-        let result = result.expect("expected a witness");
-        assert_eq!(result.len(), 2);
-        assert_ne!(result[0], result[1]);
+        // Both length-2 witnesses ("01" and "10") satisfy the two components, but the
+        // BFS is deterministic (symbols tried 0,1 at every state, FIFO queue), so
+        // exactly one of them comes back: [0,0] -> sym0 -> [0,1] is enqueued before
+        // [1,0], and [0,1] -> sym1 -> [1,1] hits acceptance first. Pin it rather than
+        // leaving the tie-breaking unverified.
+        assert_eq!(result, Ok(Some(vec![0, 1])));
     }
 
     #[test]
@@ -598,7 +802,7 @@ mod tests {
         let want_accept = [true, false];
 
         let result = shortest_witness_word_product(&[-1, 0], 1, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, None);
+        assert_eq!(result, Ok(None));
     }
 
     #[test]
@@ -633,7 +837,7 @@ mod tests {
         let want_accept = [false, true];
 
         let result = shortest_witness_word_product(&[-1, 0], 1, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, Some(vec![0]));
+        assert_eq!(result, Ok(Some(vec![0])));
     }
 
     #[test]
@@ -655,7 +859,7 @@ mod tests {
         let want_accept = [true];
 
         let result = shortest_witness_word_product(&[0], 1, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, None);
+        assert_eq!(result, Ok(None));
     }
 
     #[test]
@@ -684,7 +888,7 @@ mod tests {
         let want_accept = [true];
 
         let result = shortest_witness_word_product(&[0], 2, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, Some(vec![1]));
+        assert_eq!(result, Ok(Some(vec![1])));
     }
 
     #[test]
@@ -697,7 +901,7 @@ mod tests {
         let want_accept = [true, true];
 
         let result = shortest_witness_word_product(&[0, 0], 3, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, Some(vec![1]));
+        assert_eq!(result, Ok(Some(vec![1])));
     }
 
     #[test]
@@ -720,21 +924,128 @@ mod tests {
         let want_accept = [false];
 
         let result = shortest_witness_word_product(&[0], 1, &dfas, &symbol_maps, &want_accept);
-        assert_eq!(result, Some(vec![0]));
+        assert_eq!(result, Ok(Some(vec![0])));
     }
 
-    // --- shortest_accepted_word -- trivial (TRUE/FALSE) automaton handling (U19) ---
+    // --- shortest_witness_word_product -- precondition hard errors (U19 review) ---
+
+    #[test]
+    fn product_nondeterministic_component_is_a_hard_error_not_a_silent_dests0_search() {
+        // Java's `CompactDFA<Integer>[]` parameter type makes this input impossible to
+        // even construct; `&[Fa]` does not. Following `dests[0]` here would let the
+        // reverse-reachability precomputation discard the real destination 2 and prune
+        // away a witness that genuinely exists.
+        let mut nfa = Fa {
+            q0: 0,
+            q: 3,
+            alphabet_size: 1,
+            o: vec![0, 0, 1],
+            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            true_false: None,
+        };
+        nfa.d[0].insert(0, vec![1, 2]); // nondeterministic
+        nfa.d[2].insert(0, vec![2]);
+
+        let dfas = [nfa];
+        let symbol_maps = vec![vec![0]];
+        let want_accept = [true];
+
+        assert_eq!(
+            shortest_witness_word_product(&[0], 1, &dfas, &symbol_maps, &want_accept),
+            Err(SearchError::NotDeterministic { component: 0 })
+        );
+    }
+
+    #[test]
+    fn product_out_of_range_destination_is_a_hard_error_not_an_index_panic() {
+        // `Fa` does not constrain destinations to `< q`; the predecessor-counting pass
+        // indexes an array sized by `q` with one, so this used to be a raw slice-index
+        // panic rather than a diagnosable error.
+        let mut malformed = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 1,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
+            true_false: None,
+        };
+        malformed.d[0].insert(0, vec![7]);
+
+        let dfas = [malformed];
+        let symbol_maps = vec![vec![0]];
+        let want_accept = [true];
+
+        assert_eq!(
+            shortest_witness_word_product(&[0], 1, &dfas, &symbol_maps, &want_accept),
+            Err(SearchError::MalformedComponent {
+                component: 0,
+                reason: "transition destination >= q",
+            })
+        );
+    }
+
+    #[test]
+    fn product_argument_shape_mismatches_are_hard_errors() {
+        let dfa = contains_symbol(1);
+        let dfas = [dfa.clone(), dfa];
+        let symbol_maps = vec![vec![0, 0], vec![1, 1]];
+
+        // start too short for the component count.
+        assert_eq!(
+            shortest_witness_word_product(&[0], 2, &dfas, &symbol_maps, &[true, true]),
+            Err(SearchError::MalformedInput(
+                "start length != number of components"
+            ))
+        );
+        // want_accept too short.
+        assert_eq!(
+            shortest_witness_word_product(&[0, 0], 2, &dfas, &symbol_maps, &[true]),
+            Err(SearchError::MalformedInput(
+                "want_accept length != number of components"
+            ))
+        );
+        // alphabet_size promises more global symbols than symbol_maps describes: the
+        // step closure indexes `symbol_maps[global_sym]` for every symbol below it.
+        assert_eq!(
+            shortest_witness_word_product(&[0, 0], 3, &dfas, &symbol_maps, &[true, true]),
+            Err(SearchError::MalformedInput(
+                "symbol_maps has fewer entries than alphabet_size"
+            ))
+        );
+        // A symbol_maps row that doesn't cover every component.
+        assert_eq!(
+            shortest_witness_word_product(&[0, 0], 2, &dfas, &[vec![0, 0], vec![1]], &[true, true]),
+            Err(SearchError::MalformedInput(
+                "a symbol_maps row is shorter than the number of components"
+            ))
+        );
+        // A live start local state outside its own component's state set.
+        assert_eq!(
+            shortest_witness_word_product(&[0, 9], 2, &dfas, &symbol_maps, &[true, true]),
+            Err(SearchError::MalformedInput(
+                "a start local state is >= its component's q"
+            ))
+        );
+    }
+
+    // --- shortest_accepted_word (U19) ---
 
     #[test]
     fn shortest_accepted_word_false_automaton_returns_none_without_panicking() {
+        // `Test.java:76`'s `return null` for the FALSE automaton.
         let a = Automaton::true_false(false);
-        assert_eq!(shortest_accepted_word(&a), None);
+        assert_eq!(shortest_accepted_word(&a), Ok(None));
     }
 
     #[test]
-    fn shortest_accepted_word_true_automaton_returns_epsilon_without_panicking() {
+    fn shortest_accepted_word_true_automaton_is_an_error_matching_test_java() {
+        // `Test.java:73-75` throws WalnutException here rather than answering epsilon
+        // -- an unmaterialized TRUE automaton has no alphabet to enumerate over.
         let a = Automaton::true_false(true);
-        assert_eq!(shortest_accepted_word(&a), Some(Vec::new()));
+        assert_eq!(
+            shortest_accepted_word(&a),
+            Err(SearchError::UnmaterializedTrueAutomaton)
+        );
     }
 
     #[test]
@@ -755,6 +1066,271 @@ mod tests {
             true_false: None,
         };
         let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
-        assert_eq!(shortest_accepted_word(&a), Some(vec![1]));
+        assert_eq!(shortest_accepted_word(&a), Ok(Some(vec![1])));
+    }
+
+    #[test]
+    fn shortest_accepted_word_never_returns_the_empty_word_even_when_q0_accepts() {
+        // `Test.java:94`'s accepting predicate leads with `state[1] != 0`, so an
+        // accepting start state is NOT the "first accepted input" -- `findAccepted`'s
+        // own doc says "the first (non-empty) n inputs". The answer here is the
+        // shortest NON-empty accepted word instead.
+        let mut d = vec![BTreeMap::new(), BTreeMap::new()];
+        d[0].insert(0, vec![1]); // 0 --0--> 1 (non-accepting)
+        d[0].insert(1, vec![0]); // 0 --1--> 0 (accepting, back to the start)
+        d[1].insert(0, vec![1]);
+        d[1].insert(1, vec![1]);
+        let fa = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 0], // q0 itself accepts
+            d,
+            true_false: None,
+        };
+        let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
+        assert!(a.fa.is_accepting(a.fa.q0));
+        assert_eq!(shortest_accepted_word(&a), Ok(Some(vec![1])));
+    }
+
+    #[test]
+    fn shortest_accepted_word_rejects_a_nondeterministic_automaton() {
+        // The reviewers' falsifier for the silent-`dests[0]` bug: state 2 (accepting)
+        // is reachable only via the SECOND destination of `d[0][0]`, so a `dests[0]`-
+        // only search reports "no accepted word" while [0] is genuinely accepted.
+        // Rejected loudly instead of answered wrongly.
+        let mut nfa = Fa {
+            q0: 0,
+            q: 3,
+            alphabet_size: 1,
+            o: vec![0, 0, 1],
+            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            true_false: None,
+        };
+        nfa.d[0].insert(0, vec![1, 2]);
+        nfa.d[2].insert(0, vec![2]);
+        assert!(
+            nfa.accepts_word(&[0]),
+            "the falsifier word really is accepted"
+        );
+
+        let a = Automaton::new(nfa, vec![vec![0]], vec!["x".to_string()], vec![None]);
+        assert_eq!(
+            shortest_accepted_word(&a),
+            Err(SearchError::NotDeterministic { component: 0 })
+        );
+    }
+
+    #[test]
+    fn shortest_accepted_word_rejects_a_malformed_automaton() {
+        let mut malformed = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 1,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
+            true_false: None,
+        };
+        malformed.d[0].insert(0, vec![7]);
+        let a = Automaton::new(malformed, vec![vec![0]], vec!["x".to_string()], vec![None]);
+        assert_eq!(
+            shortest_accepted_word(&a),
+            Err(SearchError::MalformedComponent {
+                component: 0,
+                reason: "transition destination >= q",
+            })
+        );
+
+        // A `q0` outside the state set would index `d[q0]` in the step closure.
+        let stale = Fa {
+            q0: 3,
+            q: 1,
+            alphabet_size: 1,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
+            true_false: None,
+        };
+        let a = Automaton::new(stale, vec![vec![0]], vec!["x".to_string()], vec![None]);
+        assert_eq!(
+            shortest_accepted_word(&a),
+            Err(SearchError::MalformedComponent {
+                component: 0,
+                reason: "q0 >= q",
+            })
+        );
+    }
+
+    #[test]
+    fn shortest_accepted_word_agrees_with_accepts_word_on_a_deterministic_automaton() {
+        // Ties the seam back to `Fa`'s own language oracle: whatever word comes back is
+        // accepted, is non-empty, and nothing shorter (nor anything of the same length
+        // that sorts earlier) is accepted.
+        let mut d = vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
+        d[0].insert(0, vec![1]);
+        d[0].insert(1, vec![0]);
+        d[1].insert(0, vec![1]);
+        d[1].insert(1, vec![2]);
+        d[2].insert(0, vec![2]);
+        d[2].insert(1, vec![2]);
+        let fa = Fa {
+            q0: 0,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 0, 1],
+            d,
+            true_false: None,
+        };
+        let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
+
+        let witness = shortest_accepted_word(&a).unwrap().expect("a witness");
+        assert!(!witness.is_empty());
+        assert!(a.fa.accepts_word(&witness));
+        for word in shortlex_words(2, witness.len()) {
+            if word == witness {
+                break;
+            }
+            assert!(
+                !a.fa.accepts_word(&word),
+                "{word:?} is accepted and precedes the reported witness {witness:?}"
+            );
+        }
+    }
+
+    /// Every word over `0..alphabet_size` up to and including length `max_len`, in
+    /// shortlex order (shorter first, then numerically by symbol).
+    fn shortlex_words(alphabet_size: i32, max_len: usize) -> Vec<Vec<i32>> {
+        let mut all = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for word in &frontier {
+                for sym in 0..alphabet_size {
+                    let mut extended = word.clone();
+                    extended.push(sym);
+                    next.push(extended);
+                }
+            }
+            all.extend(next.iter().cloned());
+            frontier = next;
+        }
+        all
+    }
+
+    // --- Tier-4 property: the reverse-reachability pruning is result-preserving ---
+
+    /// The same product search with Java's pruning precomputation removed entirely:
+    /// every successor is enqueued, dead components included. Used as the oracle for
+    /// [`shortest_witness_word_product`] below.
+    ///
+    /// Pruning *should* be invisible in the result: a product state matching
+    /// `want_accept` in every component trivially "can reach wanted" (it is its own
+    /// witness), and reachability is transitive, so every state on some path to an
+    /// accepting product state survives pruning. That argument is what this property
+    /// checks empirically.
+    fn unpruned_witness_word_product(
+        start: &[i32],
+        alphabet_size: usize,
+        dfas: &[Fa],
+        symbol_maps: &[Vec<i32>],
+        want_accept: &[bool],
+    ) -> Option<Vec<i32>> {
+        let component_count = dfas.len();
+        shortest_witness_word_int(
+            start,
+            alphabet_size,
+            |product_state, global_sym, succ_state| {
+                let projected = &symbol_maps[global_sym as usize];
+                for component_index in 0..component_count {
+                    let current = product_state[component_index];
+                    succ_state[component_index] = if current < 0 {
+                        -1
+                    } else {
+                        dfa_successor(
+                            &dfas[component_index],
+                            current as usize,
+                            projected[component_index],
+                        )
+                        .map_or(-1, |s| s as i32)
+                    };
+                }
+                true // no pruning at all
+            },
+            |product_state| {
+                (0..component_count).all(|component_index| {
+                    let accepting = product_state[component_index] >= 0
+                        && dfas[component_index]
+                            .is_accepting(product_state[component_index] as usize);
+                    accepting == want_accept[component_index]
+                })
+            },
+        )
+    }
+
+    /// A small partial DFA: `q` states over `0..alphabet_size`, each `(state, symbol)`
+    /// either unset ("dead", Java's `-1`) or a single destination.
+    fn arb_partial_dfa(q_max: usize, alphabet_size: usize) -> impl Strategy<Value = Fa> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let table = prop::collection::vec(
+                prop::collection::vec(prop::option::of(0..q), alphabet_size),
+                q,
+            );
+            let o = prop::collection::vec(0i32..=1, q);
+            (table, o).prop_map(move |(table, o)| Fa {
+                true_false: None,
+                q0: 0,
+                q,
+                alphabet_size,
+                o,
+                d: table
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .enumerate()
+                            .filter_map(|(sym, dest)| dest.map(|dest| (sym as i32, vec![dest])))
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect(),
+            })
+        })
+    }
+
+    /// A whole `shortest_witness_word_product` call: components, global alphabet size,
+    /// the per-global-symbol projection table, and the desired per-component
+    /// acceptance. Kept tiny per `CLAUDE.md`'s test-performance guardrails -- at most 3
+    /// components of at most 3 states each, so the unpruned oracle's product space is
+    /// at most `4^3` states.
+    #[allow(clippy::type_complexity)]
+    fn arb_product_case() -> impl Strategy<Value = (Vec<Fa>, usize, Vec<Vec<i32>>, Vec<bool>)> {
+        (1usize..=3, 1usize..=3).prop_flat_map(|(component_count, alphabet_size)| {
+            (
+                prop::collection::vec(arb_partial_dfa(3, 2), component_count),
+                prop::collection::vec(
+                    prop::collection::vec(0i32..2, component_count),
+                    alphabet_size,
+                ),
+                prop::collection::vec(any::<bool>(), component_count),
+            )
+                .prop_map(move |(dfas, symbol_maps, want_accept)| {
+                    (dfas, alphabet_size, symbol_maps, want_accept)
+                })
+        })
+    }
+
+    proptest! {
+        /// Tier-4 invariant: Java's reverse-reachability pruning is a pure
+        /// optimization. Removing it must not change the witness -- not merely its
+        /// existence, but the exact word, since both searches share
+        /// `shortest_witness_word_int`'s deterministic BFS order.
+        #[test]
+        fn pruning_never_changes_the_witness(
+            (dfas, alphabet_size, symbol_maps, want_accept) in arb_product_case(),
+        ) {
+            let start = vec![0i32; dfas.len()];
+            let pruned = shortest_witness_word_product(
+                &start, alphabet_size, &dfas, &symbol_maps, &want_accept);
+            let unpruned = unpruned_witness_word_product(
+                &start, alphabet_size, &dfas, &symbol_maps, &want_accept);
+            prop_assert_eq!(pruned, Ok(unpruned));
+        }
     }
 }
