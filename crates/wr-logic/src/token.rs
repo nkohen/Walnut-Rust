@@ -28,48 +28,45 @@
 //! plugin point, no third-party subclass. [`Token`] and [`OperatorKind`] below are that
 //! closed set as Rust `enum`s, restricted to the leaf kinds this unit actually ports.
 //!
-//! # Scope boundary: symbol tables, not `act()` semantics
+//! # Scope: symbol tables (U2) AND `act()` semantics (U9, U10)
 //!
-//! Per this unit's brief, `LogicalOperator`/`RelationalOperator`/`ArithmeticOperator`
-//! are ported ONLY as far as `Operator::set_priority`'s dispatch needs them — the
-//! `Ops` enum / symbol-table declarations, reused directly from
-//! [`wr_core::numsys::RelationalOp`]/[`wr_core::numsys::ArithmeticOp`] rather than
-//! duplicated (see [`relational_op_from_symbol`]/[`arithmetic_op_from_symbol`]'s docs
-//! for why reusing those types is correct here, not merely convenient). Each
-//! operator's real `act()` behavior — the automaton-building logic in
-//! `LogicalOperator.act`/`RelationalOperator.act`/`ArithmeticOperator.act` — is
-//! deliberately NOT ported here; it lands in U10 (`LogicalOperator`) and U9
-//! (`RelationalOperator`/`ArithmeticOperator`). [`Token::act`] therefore has no arm for
-//! [`Token::Operator`] beyond the inherited no-op default, exactly mirroring Java:
-//! `Token.act(Stack<Expression>)` is `{}` by default, and `Operator` itself never
-//! overrides it (only its `LogicalOperator`/`RelationalOperator`/`ArithmeticOperator`
-//! subclasses do, and none of those are ported yet). [`Operator`] is designed so U9/U10
-//! can add real behavior — most naturally as a `match &self.kind` inside a new
-//! `Operator::act` — without restructuring anything here: [`OperatorKind::Relational`]/
-//! [`OperatorKind::Arithmetic`] already carry the right operator enum, and
-//! [`Operator::ns`] already carries the `NumberSystem` handle both need.
+//! U2 ported `LogicalOperator`/`RelationalOperator`/`ArithmeticOperator` only as far as
+//! `Operator::set_priority`'s dispatch needed them — the `Ops` enum / symbol-table
+//! declarations, reused directly from [`wr_core::numsys::RelationalOp`]/
+//! [`wr_core::numsys::ArithmeticOp`] rather than duplicated (see
+//! [`relational_op_from_symbol`]/[`arithmetic_op_from_symbol`]'s docs for why reusing
+//! those types is correct here, not merely convenient). The automaton-building `act()`
+//! bodies followed later, exactly where U2's shape anticipated — a `match &self.kind`
+//! inside [`Operator::act`], with [`OperatorKind::Relational`]/
+//! [`OperatorKind::Arithmetic`] already carrying the right operator enum and
+//! `Operator::ns` already carrying the `NumberSystem` handle both need:
 //!
-//! Two small `Operator.java` pieces are ALSO deliberately deferred alongside those,
-//! for the same reason (they exist purely to support `act()`, and porting them here
-//! would be untestable dead code): `Operator.andThenQuantifyIfArithmetic` (needs
-//! `Logging::indent/dedent`, itself deferred per Ruling 4 — see [`crate::expr`]'s
-//! module docs) is documented there, not here, since it is a free function rather than
-//! a `Token`/`Operator` method. `Operator.validateArity(Stack<Expression>)` — the
-//! two-argument overload Java's `Operator` itself declares — IS ported below
-//! ([`Operator::validate_arity`]), since unlike the other two it needs nothing this
-//! unit doesn't already have.
+//! * **U9** — `RelationalOperator.act` (`Operator::act_relational`) and
+//!   `ArithmeticOperator.act` (`Operator::act_arithmetic`).
+//! * **U10** — `LogicalOperator.act`: the five binary connectives inline in
+//!   [`Operator::act`], plus `Operator::act_negation_or_reverse` (`~`/`` ` ``) and
+//!   `Operator::act_quantifier` (`E`/`A`/`I` — the quantifier-elimination driver).
 //!
-//! # Fresh identifiers: not needed by anything ported here
+//! So [`Token::act`]'s [`Token::Operator`] arm now really dispatches, and the inherited
+//! `Token.act(Stack<Expression>)` no-op survives only for `LeftParenthesis`/
+//! `RightParenthesis`, which genuinely never override it in Java either (and never reach
+//! an operand stack at all — the shunting yard consumes them, see
+//! [`Operator::push_onto`]).
 //!
-//! Unlike [`crate::expr`]'s `VariableExpression`/`NumberLiteralExpression::act`,
-//! nothing in this file calls `Token.getUniqueString()` in Java — that only happens
-//! inside the deferred `RelationalOperator`/`ArithmeticOperator::act` bodies (via
-//! `Operator.andThenQuantifyIfArithmetic` and `ArithmeticOperator`'s own unary-negate
-//! path) and `Expression`'s own `act()` methods (already ported using
-//! [`crate::predicate_env::FreshIdentifiers`]). So no [`crate::predicate_env`] type
-//! appears in this file's public API at all — U9/U10 will need to add it when they add
-//! `Operator::act`, and nothing here forecloses that (a `&mut FreshIdentifiers`
-//! parameter added to a new method costs nothing today).
+//! `Operator.andThenQuantifyIfArithmetic` — a free function rather than a
+//! `Token`/`Operator` method — is ported alongside U9's bodies as
+//! `and_then_quantify_if_arithmetic`; its `Logging::indent`/`dedent` bracketing is
+//! dropped per `predicate_env.rs`'s Ruling 4, as everywhere else in this crate.
+//! `Operator.validateArity(Stack<Expression>)` is [`Operator::validate_arity`].
+//!
+//! # Fresh identifiers
+//!
+//! `Token.getUniqueString()` is reached from exactly one place in this file:
+//! `ArithmeticOperator::act`'s temporaries (its own unary-negate path and
+//! `and_then_quantify_if_arithmetic`'s callers) — `LogicalOperator`'s bodies mint no
+//! names at all, and neither do the U2 leaf tokens. It is supplied as
+//! `&mut `[`crate::predicate_env::FreshIdentifiers`] threaded through [`Token::act`]/
+//! [`Operator::act`] rather than as a `Token` parameter, per Ruling 4.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -77,7 +74,10 @@ use std::rc::Rc;
 
 use num_bigint::BigInt;
 use wr_core::automaton::Automaton;
-use wr_core::logicalops::{and, imply};
+use wr_core::infinite::{infinite, InfiniteError};
+use wr_core::logicalops::{
+    and, iff, imply, not, or, remove_leading_zeros, reverse, xor, RemoveLeadingZerosError,
+};
 use wr_core::numsys::{ArithmeticOp, NumSysError, NumberSystem, RelationalOp};
 use wr_core::quantify::{quantify, QuantifyError};
 use wr_core::word_automaton::{
@@ -268,6 +268,17 @@ pub enum TokenError {
     /// [`NumberLiteralExpression::int_value_exact`]'s own docs on why the context string
     /// is the caller's to supply.
     NumberLiteralOverflow(String),
+    /// `LogicalOperator.actQuantifier` (`LogicalOperator.java:133-135`): `"operator " +
+    /// op + " requires a list of " + quantifiedVariableCount + " variables"` — one of
+    /// the first `arity - 1` operands of `E`/`A`/`I` was not a `VariableExpression`.
+    /// Phase 3a's U10.
+    QuantifierRequiresVariableList {
+        op: String,
+        quantified_variable_count: usize,
+    },
+    /// `LogicalOperator.actQuantifier` (`:139-140`): `"the last operand of " + op + " can
+    /// only be of type automaton"`. Phase 3a's U10.
+    QuantifierLastOperandNotAutomaton { op: String },
 }
 
 impl fmt::Display for TokenError {
@@ -313,6 +324,16 @@ impl fmt::Display for TokenError {
                  and {b_type} respectively"
             ),
             TokenError::NumberLiteralOverflow(msg) => write!(f, "{msg}"),
+            TokenError::QuantifierRequiresVariableList {
+                op,
+                quantified_variable_count,
+            } => write!(
+                f,
+                "operator {op} requires a list of {quantified_variable_count} variables"
+            ),
+            TokenError::QuantifierLastOperandNotAutomaton { op } => {
+                write!(f, "the last operand of {op} can only be of type automaton")
+            }
         }
     }
 }
@@ -347,6 +368,15 @@ pub enum ActError {
     /// `ExprError` would imply an expression-level failure that never happened.
     /// [`fmt::Display`] renders `NumSysError`'s verbatim Walnut text either way.
     NumberSystem(NumSysError),
+    /// The `I` quantifier's `AutomatonLogicalOps.removeLeadingZeros` pre-pass
+    /// (`LogicalOperator.java:151`) — added by U10. Both of its variants are
+    /// `WalnutException`s in Java; see [`RemoveLeadingZerosError`] for why neither is
+    /// reachable through a well-formed formula.
+    RemoveLeadingZeros(RemoveLeadingZerosError),
+    /// The `I` quantifier's `Infinite.infinite` call (`:152`) — added by U10. Its single
+    /// variant stands in for a real Java `NullPointerException` (WB-002), surfaced as an
+    /// `Err` rather than a panic; see [`wr_core::infinite::InfiniteError`].
+    Infinite(InfiniteError),
 }
 
 impl From<TokenError> for ActError {
@@ -373,6 +403,18 @@ impl From<NumSysError> for ActError {
     }
 }
 
+impl From<RemoveLeadingZerosError> for ActError {
+    fn from(e: RemoveLeadingZerosError) -> Self {
+        ActError::RemoveLeadingZeros(e)
+    }
+}
+
+impl From<InfiniteError> for ActError {
+    fn from(e: InfiniteError) -> Self {
+        ActError::Infinite(e)
+    }
+}
+
 impl fmt::Display for ActError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -392,6 +434,9 @@ impl fmt::Display for ActError {
             ),
             ActError::Quantify(other) => write!(f, "{other:?}"),
             ActError::NumberSystem(e) => write!(f, "{e}"),
+            // Both carry verbatim Walnut text of their own.
+            ActError::RemoveLeadingZeros(e) => write!(f, "{e}"),
+            ActError::Infinite(e) => write!(f, "{e}"),
         }
     }
 }
@@ -983,6 +1028,26 @@ fn label_set(labels: &[String]) -> BTreeSet<String> {
     labels.iter().cloned().collect()
 }
 
+/// `Token.reverseStack(Stack<Expression> S)` (`Token.java:65-71`), as a free function of
+/// the arity so both [`Token::reverse_stack`] (which reads it off a [`Token`]) and
+/// `Operator::act_quantifier` (which is `LogicalOperator`'s own inherited call site,
+/// `LogicalOperator.java:121`, and holds only an [`Operator`]) can share one
+/// implementation instead of duplicating the pop loop.
+///
+/// Panics — matching Java's unchecked `EmptyStackException` — if `stack` holds fewer than
+/// `arity` elements; every caller validates arity first.
+fn reverse_stack_n(arity: usize, stack: &mut Vec<Expression>) -> Vec<Expression> {
+    let mut temp = Vec::with_capacity(arity);
+    for _ in 0..arity {
+        temp.push(
+            stack
+                .pop()
+                .expect("caller must validate_arity before reverse_stack"),
+        );
+    }
+    temp
+}
+
 impl Operator {
     /// `RelationalOperator.ns` / `ArithmeticOperator.ns`. Panics for a kind that has
     /// none — unreachable by construction, since only [`Operator::relational`] and
@@ -996,24 +1061,273 @@ impl Operator {
 
     /// The `act(Stack<Expression>)` override each concrete `Operator` subclass supplies.
     ///
-    /// Two of the three are ported here (U9): [`OperatorKind::Relational`] ->
-    /// `RelationalOperator.act`, [`OperatorKind::Arithmetic`] -> `ArithmeticOperator.act`.
-    /// `LogicalOperator.act` (every remaining kind that has one: the connectives, negate,
-    /// reverse, and the three quantifiers) is **U10**, so those kinds still fall through
-    /// to the inherited `Token.act` no-op — exactly as they did before this unit, and
-    /// exactly as `LeftParenthesis`/`RightParenthesis` do permanently (neither ever
-    /// reaches an operand stack: the tokenizer consumes them during the shunting yard,
-    /// see [`Operator::push_onto`]).
+    /// All three are ported now: [`OperatorKind::Relational`] -> `RelationalOperator.act`
+    /// and [`OperatorKind::Arithmetic`] -> `ArithmeticOperator.act` (U9), and every
+    /// remaining kind that has one -> `LogicalOperator.act` (U10: the five binary
+    /// connectives below, plus `Operator::act_negation_or_reverse` and
+    /// `Operator::act_quantifier`). `LeftParen`/`RightParen` keep the inherited
+    /// `Token.act` no-op permanently — neither ever reaches an operand stack, since the
+    /// tokenizer consumes them during the shunting yard (see [`Operator::push_onto`]).
+    ///
+    /// # `LogicalOperator.act`'s structure (`LogicalOperator.java:62-100`)
+    ///
+    /// `super.validateArity(S)` runs FIRST, for every kind — including the unary and
+    /// quantifier paths, which is why the check below precedes the dispatch rather than
+    /// living in each branch. Then two early dispatches (negation/reverse; `E`/`A`/`I`),
+    /// and only what is left falls through to the binary-connective body.
+    ///
+    /// The binary body pops `b` then `a` and requires BOTH to be `AutomatonExpression`s.
+    /// Java's `switch (op)` has a `default -> throw new WalnutException("Unexpected
+    /// logical operator: " + op)` arm; it is unreachable here by construction (only these
+    /// five [`OperatorKind`]s can reach this point, and [`Operator::logical_connective`]
+    /// refuses to build any other), so it becomes an [`unreachable!`] rather than a
+    /// user-facing error — the same "prove-unreachable-then-simplify" call that
+    /// constructor's own docs make about `setPriority`'s `default:`.
+    ///
+    /// Note the argument order and mutability: `and(a.M, b.M)` never mutates either
+    /// operand, while `or`/`xor`/`imply`/`iff` totalize both in place (see
+    /// [`wr_core::logicalops`]). Both operands are owned local pops here, so the
+    /// in-place mutation is unobservable in either engine.
     pub fn act(
         &self,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
     ) -> Result<(), ActError> {
         match self.kind {
-            OperatorKind::Relational(opp) => self.act_relational(opp, stack),
-            OperatorKind::Arithmetic(opp) => self.act_arithmetic(opp, fresh, stack),
-            _ => Ok(()),
+            OperatorKind::Relational(opp) => return self.act_relational(opp, stack),
+            OperatorKind::Arithmetic(opp) => return self.act_arithmetic(opp, fresh, stack),
+            OperatorKind::LeftParen | OperatorKind::RightParen => return Ok(()),
+            _ => {}
         }
+
+        // `super.validateArity(S)` (`:63`).
+        self.validate_arity(stack.len())?;
+
+        // `if (this.isNegation(op) || op.equals(Operator.REVERSE))` (`:65-68`).
+        if matches!(self.kind, OperatorKind::Negate | OperatorKind::Reverse) {
+            return self.act_negation_or_reverse(stack);
+        }
+        // `if (op.equals(EXISTS) || op.equals(FORALL) || op.equals(INFINITE))` (`:69-72`).
+        if matches!(
+            self.kind,
+            OperatorKind::Exists { .. }
+                | OperatorKind::Forall { .. }
+                | OperatorKind::Infinite { .. }
+        ) {
+            return self.act_quantifier(stack);
+        }
+
+        let b = stack.pop().expect("validated arity above");
+        let a = stack.pop().expect("validated arity above");
+        let op = &self.op_text;
+
+        // Captured before the operands are destructured; `expressionInString` is not
+        // touched by anything below, so this reads exactly what Java's `:80` would.
+        let (a_display, b_display) = (a.to_string(), b.to_string());
+
+        // `if (a instanceof AutomatonExpression && b instanceof AutomatonExpression)`
+        // (`:77`) — everything else is `invalidDualOperators` (`:99`).
+        let (mut a, mut b) = match (a, b) {
+            (Expression::Automaton(a), Expression::Automaton(b)) => (a, b),
+            (a, b) => {
+                return Err(TokenError::InvalidDualOperators {
+                    op: op.clone(),
+                    a: a.to_string(),
+                    b: b.to_string(),
+                    a_type: a.java_class_name(),
+                    b_type: b.java_class_name(),
+                }
+                .into())
+            }
+        };
+
+        // `String opString = "(" + a + op + b + ")";` (`:80`) — built BEFORE the operands
+        // are consumed, and parenthesized, unlike `RelationalOperator`'s bare `a + op + b`.
+        let op_string = format!("({a_display}{op}{b_display})");
+        let m = match self.kind {
+            OperatorKind::And => and(&a.m, &b.m),
+            OperatorKind::Or => or(&mut a.m, &mut b.m),
+            OperatorKind::Xor => xor(&mut a.m, &mut b.m),
+            OperatorKind::Imply => imply(&mut a.m, &mut b.m),
+            OperatorKind::Iff => iff(&mut a.m, &mut b.m),
+            _ => unreachable!("`default -> throw` (`:91`): every other kind returned above"),
+        };
+        stack.push(Expression::Automaton(AutomatonExpression::new(
+            op_string,
+            m.into_automaton(),
+        )));
+        Ok(())
+    }
+
+    /// `LogicalOperator.actNegationOrReverse(Stack<Expression> S)` (`:102-117`) — the two
+    /// unary operators, `~` (any tilde spelling) and `` ` ``.
+    ///
+    /// Java's two `if`s are NOT an if/else: they are independent tests on the same `op`,
+    /// and exactly one can hold ([`is_negation`] and `op == REVERSE` are disjoint), so the
+    /// order between them is not load-bearing. Ported as the same two independent tests
+    /// via a `match` on the already-classified [`OperatorKind`].
+    ///
+    /// The pushed expression's string is `op + a` — `a`'s ORIGINAL text, since
+    /// `Expression.toString()` reads `expressionInString`, which neither branch touches.
+    /// Java reads it after mutating `a.M`; that ordering is therefore unobservable, and
+    /// this port captures the display string up front so the borrow checker does not have
+    /// to care either.
+    ///
+    /// Note `reverse(a.M, true)` — `reverseMsd = true`, so each track's numeration
+    /// direction really is flipped msd<->lsd (unlike `NumberSystem`'s internal `false`
+    /// calls). And note `not(a.M.asDFA())`: `asDFA()` *clones* (see
+    /// [`wr_core::automaton::Automaton::as_dfa`]), so Java's `a.M = not(...)` rebinds
+    /// rather than mutating in place — which is exactly the by-value ownership transfer
+    /// [`wr_core::logicalops::not`] models.
+    fn act_negation_or_reverse(&self, stack: &mut Vec<Expression>) -> Result<(), ActError> {
+        let a = stack.pop().expect("validated arity above");
+        let op = &self.op_text;
+        // `if (a instanceof AutomatonExpression)` (`:104`), else `invalidOperator` (`:116`).
+        if !matches!(a, Expression::Automaton(_)) {
+            return Err(TokenError::InvalidOperator {
+                op: op.clone(),
+                operand: a.to_string(),
+                operand_type: a.java_class_name(),
+            }
+            .into());
+        }
+        // `op + a` (`:111`), read off `a`'s untouched `expressionInString`.
+        let string_value = format!("{op}{a}");
+        let Expression::Automaton(ae) = a else {
+            unreachable!("checked immediately above")
+        };
+        let mut m = ae.m;
+        match self.kind {
+            // `AutomatonLogicalOps.reverse(a.M, true)` (`:107-108`) — mutates in place and
+            // returns void.
+            OperatorKind::Reverse => reverse(&mut m, true),
+            // `a.M = AutomatonLogicalOps.not(a.M.asDFA())` (`:109-110`).
+            OperatorKind::Negate => m = not(m.as_dfa()).into_automaton(),
+            _ => unreachable!("only the two unary kinds reach this method"),
+        }
+        stack.push(Expression::Automaton(AutomatonExpression::new(
+            string_value,
+            m,
+        )));
+        Ok(())
+    }
+
+    /// `LogicalOperator.actQuantifier(Stack<Expression> S)` (`:119-161`) — **the
+    /// quantifier-elimination driver**, and the point where the parsed formula finally
+    /// meets the already-ported automaton primitives.
+    ///
+    /// One loop over `arity` operands, taken in **left-to-right source order** (hence
+    /// [`Token::reverse_stack`]: the operand stack holds them LIFO). The first `arity - 1`
+    /// must be [`Expression::Variable`]s and only contribute their identifiers; the last
+    /// must be an [`Expression::Automaton`] and is where all three quantifiers do their
+    /// work:
+    ///
+    /// * **`E`** (`:142-143`) — `AutomatonQuantification.quantify(M, identifiers)`, i.e.
+    ///   [`wr_core::quantify::quantify`]: ∃-projection + determinize + minimize + the
+    ///   leading-zero fixup. Nothing else.
+    /// * **`A`** (`:144-148`) — Java's own comment is literally `// A == ~ E ~`:
+    ///   complement, ∃-quantify, complement. This port wires exactly that chain; it does
+    ///   not re-derive the duality (already a Tier-4 property, Phase 2's U9) or take any
+    ///   shortcut around it.
+    /// * **`I`** (`:149-153`) — [`wr_core::logicalops::remove_leading_zeros`] over the
+    ///   quantified identifiers, then [`wr_core::infinite::infinite`], then **discard the
+    ///   automaton entirely**: the result is `new Automaton(!infReg.isEmpty())`, a
+    ///   TRUE/FALSE automaton. So `I` does not eliminate its variables in the ∃ sense at
+    ///   all — it answers one global yes/no question ("are there infinitely many witnesses,
+    ///   counting each *value* once rather than each zero-padded encoding") and throws the
+    ///   witness structure away. That is why `I` is the one quantifier whose result has no
+    ///   free tracks, and why U0's TRUE/FALSE-automaton support is a hard prerequisite for
+    ///   this unit rather than a convenience.
+    ///
+    /// # Ported quirks
+    ///
+    /// * The validation of the variable operands happens **inside** the loop, interleaved
+    ///   with the string building — so a malformed operand at position `i` fails only
+    ///   after operands `0..i` have already been appended to the (discarded) string, and
+    ///   crucially only after the operand stack has already been drained by
+    ///   `reverseStack`. A failed `actQuantifier` therefore consumes its operands, unlike
+    ///   a failed `validateArity`. Faithful: Java's `reverseStack` pops too.
+    /// * `identifiersToQuantify` is a `List`, and `quantify` turns it into a `HashSet`
+    ///   (so `E x,x φ` quantifies `x` once) while `removeLeadingZeros` keeps the list (so
+    ///   the same duplicate builds and ORs in the same helper twice — idempotent). Both
+    ///   halves ported as-is.
+    /// * `I` runs `remove_leading_zeros` even when `identifiersToQuantify` is empty
+    ///   (`quantifiedVariableCount == 0`, i.e. a bare `(I φ)`), where it is a clone.
+    /// * Java's `Automaton M = null` (`:122`) can in principle survive to `:158` — but
+    ///   only if the loop body never runs, which needs `arity == 0`, and every quantifier
+    ///   constructor sets `arity = quantifiedVariableCount + 1 >= 1`. Modeled here as a
+    ///   value that is definitely assigned by the `i == arity - 1` iteration, with an
+    ///   [`expect`](Option::expect) standing in for Java's would-be NPE.
+    fn act_quantifier(&self, stack: &mut Vec<Expression>) -> Result<(), ActError> {
+        let op = &self.op_text;
+        let quantified_variable_count = self.arity - 1;
+        let mut string_value = format!("({op} ");
+        // `Stack<Expression> temp = reverseStack(S);` (`:121`).
+        let mut temp = reverse_stack_n(self.arity, stack);
+        let mut m: Option<Automaton> = None;
+        let mut identifiers_to_quantify: Vec<String> = Vec::new();
+
+        for i in 0..self.arity {
+            let operand = temp
+                .pop()
+                .expect("reverse_stack_n produced `arity` operands");
+            if i < self.arity - 1 {
+                // `:129-132`.
+                if i == 0 {
+                    string_value.push_str(&format!("{operand} "));
+                } else {
+                    string_value.push_str(&format!(", {operand} "));
+                }
+                // `:133-135`.
+                let Expression::Variable(ve) = &operand else {
+                    return Err(TokenError::QuantifierRequiresVariableList {
+                        op: op.clone(),
+                        quantified_variable_count,
+                    }
+                    .into());
+                };
+                identifiers_to_quantify.push(ve.identifier.clone());
+            } else {
+                // `:137-154`.
+                string_value.push_str(&operand.to_string());
+                let Expression::Automaton(ae) = operand else {
+                    return Err(
+                        TokenError::QuantifierLastOperandNotAutomaton { op: op.clone() }.into(),
+                    );
+                };
+                let mut automaton = ae.m;
+                match self.kind {
+                    OperatorKind::Exists { .. } => {
+                        quantify(&mut automaton, &label_set(&identifiers_to_quantify))?;
+                    }
+                    OperatorKind::Forall { .. } => {
+                        // `// A == ~ E ~` (`:145-148`).
+                        automaton = not(automaton.as_dfa()).into_automaton();
+                        quantify(&mut automaton, &label_set(&identifiers_to_quantify))?;
+                        automaton = not(automaton.as_dfa()).into_automaton();
+                    }
+                    OperatorKind::Infinite { .. } => {
+                        // `// op == I` (`:150-153`).
+                        automaton = remove_leading_zeros(&automaton, &identifiers_to_quantify)?;
+                        // Java: `String infReg = Infinite.infinite(...); M = new
+                        // Automaton(!infReg.isEmpty());` — the `""`-means-finite sentinel
+                        // this port already replaced with `Option` (see
+                        // `wr_core::infinite`'s module docs), so `!isEmpty()` is `is_some`.
+                        let inf_reg = infinite(&automaton)?;
+                        automaton = Automaton::true_false(inf_reg.is_some());
+                    }
+                    _ => unreachable!("only the three quantifier kinds reach this method"),
+                }
+                m = Some(automaton);
+            }
+        }
+
+        string_value.push(')');
+        stack.push(Expression::Automaton(AutomatonExpression::new(
+            string_value,
+            m.expect("arity >= 1, so the last iteration always assigned M"),
+        )));
+        Ok(())
     }
 
     /// `RelationalOperator.act(Stack<Expression> S)` (`RelationalOperator.java:87-177`).
@@ -2092,21 +2406,14 @@ impl Token {
     /// operations as `java.util.Stack`'s, so this is a direct 1:1 translation, not a
     /// reimplementation) — so that popping the RESULT (via [`Vec::pop`], mirroring
     /// Java's `temp.pop()`) yields elements in their original left-to-right push order
-    /// rather than LIFO order. Callers (U10's `LogicalOperator.actQuantifier`, once
-    /// ported) must call [`Token::validate_arity_stack`] or [`Operator::validate_arity`]
-    /// first — this panics, matching Java's unchecked `EmptyStackException`, if `stack`
-    /// holds fewer than `arity()` elements.
+    /// rather than LIFO order. Callers must call [`Token::validate_arity_stack`] or
+    /// [`Operator::validate_arity`] first — this panics, matching Java's unchecked
+    /// `EmptyStackException`, if `stack` holds fewer than `arity()` elements.
+    ///
+    /// Shares its body with `Operator::act_quantifier`'s own call site
+    /// (`LogicalOperator.java:121`) via the free `reverse_stack_n`.
     pub fn reverse_stack(&self, stack: &mut Vec<Expression>) -> Vec<Expression> {
-        let arity = self.arity();
-        let mut temp = Vec::with_capacity(arity);
-        for _ in 0..arity {
-            temp.push(
-                stack
-                    .pop()
-                    .expect("caller must validate_arity before reverse_stack"),
-            );
-        }
-        temp
+        reverse_stack_n(self.arity(), stack)
     }
 }
 
@@ -2126,6 +2433,10 @@ impl fmt::Display for Token {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // U10's end-to-end tests drive the real lexer/shunting-yard rather than hand-built
+    // token lists; nothing else in this module needs either type.
+    use crate::predicate::Predicate;
+    use crate::predicate_env::InMemoryPredicateEnv;
 
     fn ns(name: &str) -> Rc<NumberSystem> {
         Rc::new(NumberSystem::new(name).unwrap())
@@ -2854,14 +3165,27 @@ mod tests {
         }
     }
 
+    /// U10's flip of `operator_token_act_is_a_noop_pending_u9_u10`: `Token::act`'s
+    /// `Operator` arm now really dispatches into `LogicalOperator.act`, whose very first
+    /// statement is `super.validateArity(S)` — so `&` against an empty operand stack is an
+    /// error, not the silent no-op it was while the port was incomplete. The
+    /// parenthesis kinds keep the no-op permanently (see [`Operator::act`]).
     #[test]
-    fn operator_token_act_is_a_noop_pending_u9_u10() {
+    fn operator_token_act_dispatches_into_logical_operator_act() {
         let mut stack = Vec::new();
         let mut fresh = FreshIdentifiers::new();
-        Token::Operator(Operator::logical_connective(0, "&"))
+        let err = Token::Operator(Operator::logical_connective(0, "&"))
             .act(&mut fresh, &mut stack)
-            .unwrap();
-        assert!(stack.is_empty());
+            .unwrap_err();
+        assert_eq!(err.to_string(), "operator & requires 2 operands");
+
+        for paren in [Operator::left_paren(0), Operator::right_paren(0)] {
+            let mut stack = Vec::new();
+            Token::Operator(paren)
+                .act(&mut fresh, &mut stack)
+                .expect("parentheses never reach an operand stack");
+            assert!(stack.is_empty());
+        }
     }
 
     // ------------------------------------------------------------- Word / Function
@@ -4153,25 +4477,763 @@ mod tests {
         assert!(!accepts(&ae.m, 2, 5, &[("x", 4), (&c, 11)]));
     }
 
-    /// Every non-relational, non-arithmetic operator kind still falls through to the
-    /// inherited no-op (`LogicalOperator.act` is U10) — pinned so U10's author sees this
-    /// test flip rather than silently changing behavior.
+    /// U10's flip of `logical_operator_kinds_are_still_a_no_op_pending_u10`. Handed two
+    /// `VariableExpression`s — the wrong operand type for every `LogicalOperator` kind —
+    /// each connective/unary/quantifier kind now reports its own Walnut error instead of
+    /// silently doing nothing, while the two parenthesis kinds keep the inherited no-op
+    /// forever. Also pins that no path here mints a synthetic identifier (only
+    /// `ArithmeticOperator` does).
     #[test]
-    fn logical_operator_kinds_are_still_a_no_op_pending_u10() {
-        let operators = [
-            Operator::logical_connective(0, "&"),
-            Operator::logical_connective(0, "~"),
-            Operator::logical_connective(0, "`"),
-            Operator::quantifier(0, "E", 1),
-            Operator::left_paren(0),
-            Operator::right_paren(0),
+    fn logical_operator_kinds_dispatch_and_parens_stay_no_ops() {
+        let cases: [(Operator, &str); 4] = [
+            (
+                Operator::logical_connective(0, "&"),
+                "operator & cannot be applied to operands x and y of types \
+                 Main.EvalComputations.Expressions.VariableExpression and \
+                 Main.EvalComputations.Expressions.VariableExpression respectively",
+            ),
+            (
+                Operator::logical_connective(0, "~"),
+                "operator ~ cannot be applied to the operand y of type \
+                 Main.EvalComputations.Expressions.VariableExpression",
+            ),
+            (
+                Operator::logical_connective(0, "`"),
+                "operator ` cannot be applied to the operand y of type \
+                 Main.EvalComputations.Expressions.VariableExpression",
+            ),
+            (
+                Operator::quantifier(0, "E", 1),
+                "the last operand of E can only be of type automaton",
+            ),
         ];
-        for operator in operators {
+        for (operator, expected) in cases {
+            let mut fresh = FreshIdentifiers::new();
+            let mut stack = vec![variable("x"), variable("y")];
+            let err = operator.act(&mut fresh, &mut stack).unwrap_err();
+            assert_eq!(err.to_string(), expected, "for {operator}");
+            assert_eq!(fresh.issued(), 0);
+        }
+
+        for operator in [Operator::left_paren(0), Operator::right_paren(0)] {
             let mut fresh = FreshIdentifiers::new();
             let mut stack = vec![variable("x"), variable("y")];
             operator.act(&mut fresh, &mut stack).unwrap();
-            assert_eq!(stack.len(), 2, "{operator} must not touch the stack yet");
-            assert_eq!(fresh.issued(), 0);
+            assert_eq!(stack.len(), 2, "{operator} must never touch the stack");
+        }
+    }
+
+    // =====================================================================
+    // LogicalOperator (U10)
+    // =====================================================================
+
+    /// A predicate operand shaped the way every real `LogicalOperator` operand is: an
+    /// `AutomatonExpression` over labelled `msd_2` tracks, produced by the already-tested
+    /// `RelationalOperator::act` rather than hand-built, so these tests exercise the same
+    /// values the parser would hand them.
+    fn predicate_operand(op: &str, a: Expression, b: Expression) -> Expression {
+        let n = ns("msd_2");
+        let mut stack = vec![a, b];
+        Operator::relational(0, op, n)
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .expect("building the test operand must not fail");
+        stack.pop().unwrap()
+    }
+
+    /// `x < c` over `msd_2`.
+    fn lt_const(var: &str, c: i64) -> Expression {
+        let n = ns("msd_2");
+        predicate_operand("<", variable(var), number_literal(c, &n))
+    }
+
+    /// `x >= c` over `msd_2`.
+    fn ge_const(var: &str, c: i64) -> Expression {
+        let n = ns("msd_2");
+        predicate_operand(">=", variable(var), number_literal(c, &n))
+    }
+
+    fn act_logical(op: &Operator, operands: Vec<Expression>) -> Expression {
+        act_once(op, &mut FreshIdentifiers::new(), operands)
+    }
+
+    // ----------------------------------------------- the five binary connectives
+
+    /// Each connective computes the right SET on a shared pair of one-track operands
+    /// (`x < 5`, `x >= 3`), checked value-by-value against an independent truth table
+    /// rather than against a second automaton built the same way.
+    #[test]
+    fn logical_connectives_compute_the_right_language() {
+        for (symbol, truth) in [
+            ("&", (|p: bool, q: bool| p && q) as fn(bool, bool) -> bool),
+            ("|", |p, q| p || q),
+            ("^", |p, q| p != q),
+            ("=>", |p, q| !p || q),
+            ("<=>", |p, q| p == q),
+        ] {
+            let operator = Operator::logical_connective(0, symbol);
+            let m = as_automaton_expression(act_logical(
+                &operator,
+                vec![lt_const("x", 5), ge_const("x", 3)],
+            ))
+            .m;
+            for x in 0u32..12 {
+                assert_eq!(
+                    accepts(&m, 2, 5, &[("x", x)]),
+                    truth(x < 5, x >= 3),
+                    "{symbol}: wrong verdict at x = {x}"
+                );
+            }
+        }
+    }
+
+    /// `=>` is the one connective whose operand ORDER is observable, so it gets its own
+    /// check that the port did not swap `a` and `b` (the stack pops `b` first).
+    #[test]
+    fn imply_is_not_symmetric_and_uses_the_stack_order_java_does() {
+        let operator = Operator::logical_connective(0, "=>");
+        // `(x < 2) => (x < 5)` is vacuously true everywhere...
+        let m = as_automaton_expression(act_logical(
+            &operator,
+            vec![lt_const("x", 2), lt_const("x", 5)],
+        ))
+        .m;
+        for x in 0u32..12 {
+            assert!(accepts(&m, 2, 5, &[("x", x)]), "x = {x}");
+        }
+        // ... while the reverse fails on exactly 2, 3, 4.
+        let m = as_automaton_expression(act_logical(
+            &operator,
+            vec![lt_const("x", 5), lt_const("x", 2)],
+        ))
+        .m;
+        for x in 0u32..12 {
+            assert_eq!(accepts(&m, 2, 5, &[("x", x)]), !(2..5).contains(&x));
+        }
+    }
+
+    /// `"(" + a + op + b + ")"` (`LogicalOperator.java:80`) — parenthesized, unlike
+    /// `RelationalOperator`'s bare `a + op + b`. Note the operands keep THEIR own strings
+    /// (here `x<5` and `x>=3`, unparenthesized, exactly as `RelationalOperator::act` left
+    /// them), so only one pair of parentheses appears.
+    #[test]
+    fn binary_connective_expression_string_is_parenthesized() {
+        let operator = Operator::logical_connective(0, "<=>");
+        let result = act_logical(&operator, vec![lt_const("x", 5), ge_const("x", 3)]);
+        assert_eq!(result.to_string(), "(x<5<=>x>=3)");
+    }
+
+    /// The TRUE/FALSE short-circuits U0 exists for: a trivial operand must stay trivial
+    /// through every connective, never being expanded into a real automaton.
+    #[test]
+    fn binary_connectives_short_circuit_on_trivial_operands() {
+        let t = || {
+            Expression::Automaton(AutomatonExpression::new(
+                "true",
+                Automaton::true_false(true),
+            ))
+        };
+        let f = || {
+            Expression::Automaton(AutomatonExpression::new(
+                "false",
+                Automaton::true_false(false),
+            ))
+        };
+        for (symbol, tt, tf, ft, ff) in [
+            ("&", true, false, false, false),
+            ("|", true, true, true, false),
+            ("^", false, true, true, false),
+            ("=>", true, false, true, true),
+            ("<=>", true, false, false, true),
+        ] {
+            let operator = Operator::logical_connective(0, symbol);
+            for (a, b, expected) in [
+                (t(), t(), tt),
+                (t(), f(), tf),
+                (f(), t(), ft),
+                (f(), f(), ff),
+            ] {
+                let m = as_automaton_expression(act_logical(&operator, vec![a, b])).m;
+                assert!(
+                    m.is_true_false_automaton(),
+                    "{symbol} on two trivial operands must stay trivial"
+                );
+                assert_eq!(m.is_true_automaton(), expected, "{symbol}");
+            }
+        }
+        // ... and a trivial operand against a REAL one also short-circuits, without
+        // touching the real operand's language.
+        let and = Operator::logical_connective(0, "&");
+        let m = as_automaton_expression(act_logical(&and, vec![t(), lt_const("x", 5)])).m;
+        assert!(!m.is_true_false_automaton());
+        assert!(accepts(&m, 2, 5, &[("x", 4)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 5)]));
+        let m = as_automaton_expression(act_logical(&and, vec![f(), lt_const("x", 5)])).m;
+        assert!(m.is_true_false_automaton() && !m.is_true_automaton());
+    }
+
+    #[test]
+    fn binary_connective_validates_arity_before_popping() {
+        let operator = Operator::logical_connective(0, "&");
+        let mut stack = vec![lt_const("x", 5)];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "operator & requires 2 operands");
+        assert_eq!(stack.len(), 1, "a failed act must not consume the stack");
+    }
+
+    // ------------------------------------------------------- negation and reverse
+
+    #[test]
+    fn negation_complements_the_language_in_every_tilde_spelling() {
+        for spelling in ["~", "\u{02dc}", "\u{0303}"] {
+            let operator = Operator::logical_connective(0, spelling);
+            let result = act_logical(&operator, vec![lt_const("x", 5)]);
+            assert_eq!(result.to_string(), format!("{spelling}x<5"));
+            let m = as_automaton_expression(result).m;
+            for x in 0u32..12 {
+                assert_eq!(accepts(&m, 2, 5, &[("x", x)]), x >= 5, "x = {x}");
+            }
+        }
+    }
+
+    /// Double negation must return the original language (and must not, for instance,
+    /// leave a stray sink state that makes the second complement wrong).
+    #[test]
+    fn double_negation_is_the_identity_on_the_language() {
+        let not = Operator::logical_connective(0, "~");
+        let once = act_logical(&not, vec![lt_const("x", 5)]);
+        let twice = act_logical(&not, vec![once]);
+        assert_eq!(twice.to_string(), "~~x<5");
+        let m = as_automaton_expression(twice).m;
+        for x in 0u32..12 {
+            assert_eq!(accepts(&m, 2, 5, &[("x", x)]), x < 5, "x = {x}");
+        }
+    }
+
+    /// Negating a trivial operand stays trivial (U0's short-circuit inside
+    /// [`wr_core::logicalops::not`]).
+    #[test]
+    fn negation_of_a_trivial_automaton_stays_trivial() {
+        let not = Operator::logical_connective(0, "~");
+        for truth in [true, false] {
+            let operand =
+                Expression::Automaton(AutomatonExpression::new("t", Automaton::true_false(truth)));
+            let m = as_automaton_expression(act_logical(&not, vec![operand])).m;
+            assert!(m.is_true_false_automaton());
+            assert_eq!(m.is_true_automaton(), !truth);
+        }
+    }
+
+    /// `` ` `` reverses the LANGUAGE and flips each track's numeration direction
+    /// (`reverse(a.M, true)`, `LogicalOperator.java:108`). Read the result lsd-first and
+    /// the original predicate comes back.
+    #[test]
+    fn reverse_reverses_the_language_and_flips_the_numeration_direction() {
+        let operator = Operator::logical_connective(0, "`");
+        let result = act_logical(&operator, vec![lt_const("x", 5)]);
+        assert_eq!(result.to_string(), "`x<5");
+        let m = as_automaton_expression(result).m;
+        assert_eq!(
+            m.msd,
+            vec![Some(false)],
+            "reverse(_, true) must flip msd to lsd"
+        );
+        // A word is accepted iff its reversal was accepted before, i.e. iff the lsd-first
+        // reading of the digits denotes a value < 5.
+        for x in 0u32..12 {
+            let digits: Vec<i32> = msd_digits(x, 2, 5).into_iter().rev().collect();
+            let word: Vec<i32> = digits.iter().map(|&d| m.encode(&[d])).collect();
+            assert_eq!(m.fa.accepts_word(&word), x < 5, "lsd x = {x}");
+        }
+    }
+
+    #[test]
+    fn unary_operators_validate_arity_before_popping() {
+        for symbol in ["~", "`"] {
+            let operator = Operator::logical_connective(0, symbol);
+            let mut stack: Vec<Expression> = Vec::new();
+            let err = operator
+                .act(&mut FreshIdentifiers::new(), &mut stack)
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("operator {symbol} requires 1 operands")
+            );
+        }
+    }
+
+    // ----------------------------------------------------- the E/A/I quantifiers
+
+    /// `∃y (x < y)` over `msd_2` is "there is something above `x`", i.e. TRUE for every
+    /// `x` — but only as a LANGUAGE over the surviving `x` track, so the result is a real
+    /// one-track automaton, not a trivial one.
+    #[test]
+    fn exists_quantifier_projects_the_named_track_away() {
+        let operator = Operator::quantifier(0, "E", 1);
+        let phi = predicate_operand("<", variable("x"), variable("y"));
+        let result = act_logical(&operator, vec![variable("y"), phi]);
+        assert_eq!(result.to_string(), "(E y x<y)");
+        let m = as_automaton_expression(result).m;
+        assert_eq!(m.label, vec!["x".to_string()], "y must be gone");
+        for x in 0u32..8 {
+            assert!(accepts(&m, 2, 5, &[("x", x)]), "x = {x}");
+        }
+    }
+
+    /// The multi-variable string form, including Java's odd `" , "` spacing
+    /// (`:129-132`: operand 0 gets a trailing space, then each later one is prefixed by
+    /// `", "` — so the comma lands AFTER that trailing space).
+    #[test]
+    fn quantifier_expression_string_reproduces_javas_exact_spacing() {
+        let operator = Operator::quantifier(0, "E", 2);
+        let phi = predicate_operand("<", variable("x"), variable("y"));
+        let result = act_logical(&operator, vec![variable("x"), variable("y"), phi]);
+        assert_eq!(result.to_string(), "(E x , y x<y)");
+        assert!(
+            as_automaton_expression(result).m.is_true_automaton(),
+            "∃x∃y (x<y) is true"
+        );
+    }
+
+    /// `A` is implemented as `¬∃¬` and nothing else (`:145-148`). Checked here at the
+    /// operator level against an independent enumeration; the end-to-end parser version
+    /// is `forall_equals_not_exists_not_end_to_end_through_the_parser` below.
+    #[test]
+    fn forall_quantifier_is_not_exists_not() {
+        let forall = Operator::quantifier(0, "A", 1);
+        // ∀y (x < y) is false for every x (take y = 0... y = x).
+        let phi = predicate_operand("<", variable("x"), variable("y"));
+        let result = act_logical(&forall, vec![variable("y"), phi]);
+        assert_eq!(result.to_string(), "(A y x<y)");
+        let m = as_automaton_expression(result).m;
+        for x in 0u32..8 {
+            assert!(!accepts(&m, 2, 5, &[("x", x)]), "x = {x}");
+        }
+
+        // ∀y (y < 4 => y < x) holds exactly for x >= 4 — an asymmetric predicate, so a
+        // port that dropped one of the two complements would be caught.
+        let inner = {
+            let imply = Operator::logical_connective(0, "=>");
+            act_logical(
+                &imply,
+                vec![
+                    lt_const("y", 4),
+                    predicate_operand("<", variable("y"), variable("x")),
+                ],
+            )
+        };
+        let m = as_automaton_expression(act_logical(&forall, vec![variable("y"), inner])).m;
+        for x in 0u32..12 {
+            assert_eq!(accepts(&m, 2, 5, &[("x", x)]), x >= 4, "x = {x}");
+        }
+    }
+
+    /// The `I` quantifier discards its automaton entirely and answers a single global
+    /// yes/no — so its result is ALWAYS a TRUE/FALSE automaton (U0's representation).
+    ///
+    /// Every expected verdict here was confirmed against the real `walnut-java` CLI
+    /// (`eval t "?msd_2 Ix …"`).
+    #[test]
+    fn infinite_quantifier_returns_a_trivial_automaton_with_the_right_verdict() {
+        let inf = Operator::quantifier(0, "I", 1);
+        for (operand, expected, label) in [
+            (lt_const("x", 5), false, "Ix x<5"),
+            (ge_const("x", 5), true, "Ix x>=5"),
+        ] {
+            let result = act_logical(&inf, vec![variable("x"), operand]);
+            let m = as_automaton_expression(result).m;
+            assert!(
+                m.is_true_false_automaton(),
+                "{label}: I must collapse to a trivial automaton"
+            );
+            assert_eq!(m.is_true_automaton(), expected, "{label}");
+        }
+    }
+
+    /// **The `removeLeadingZeros` pre-pass is what makes this test's answer FALSE.**
+    /// `x = 3` accepts the infinite STRING set `0*11`, so an `I` that only asked
+    /// `Infinite.infinite` would answer TRUE. Counting each *value* once — which is what
+    /// stripping leading zeros achieves — there is exactly one witness, so the answer is
+    /// FALSE. Confirmed against the real `walnut-java` CLI (`eval t3 "?msd_2 Ix x = 3"`
+    /// prints `FALSE`).
+    #[test]
+    fn infinite_quantifier_strips_leading_zeros_before_asking() {
+        let n = ns("msd_2");
+        let inf = Operator::quantifier(0, "I", 1);
+        let eq3 = predicate_operand("=", variable("x"), number_literal(3, &n));
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), eq3])).m;
+        assert!(m.is_true_false_automaton());
+        assert!(
+            !m.is_true_automaton(),
+            "exactly one x satisfies x = 3, so `I x` must be FALSE"
+        );
+    }
+
+    /// Two quantified variables, both verdicts confirmed against the real `walnut-java`
+    /// CLI: `Ix,y x=y` is TRUE (infinitely many pairs), `Ix,y (x=y & x<5)` is FALSE
+    /// (five pairs).
+    #[test]
+    fn infinite_quantifier_over_two_variables() {
+        let inf = Operator::quantifier(0, "I", 2);
+        let eq = predicate_operand("=", variable("x"), variable("y"));
+        let m = as_automaton_expression(act_logical(
+            &inf,
+            vec![variable("x"), variable("y"), eq.clone()],
+        ))
+        .m;
+        assert!(m.is_true_automaton(), "Ix,y x=y must be TRUE");
+
+        let bounded = act_logical(
+            &Operator::logical_connective(0, "&"),
+            vec![eq, lt_const("x", 5)],
+        );
+        let m = as_automaton_expression(act_logical(
+            &inf,
+            vec![variable("x"), variable("y"), bounded],
+        ))
+        .m;
+        assert!(
+            m.is_true_false_automaton() && !m.is_true_automaton(),
+            "Ix,y (x=y & x<5) must be FALSE"
+        );
+    }
+
+    /// **WB-027**, pinned. `I` asks whether the WHOLE multi-track language is infinite and
+    /// then throws every track away — so a free variable in the body is silently folded
+    /// into the question and then silently dropped from the answer.
+    ///
+    /// `Ix (x < y)` therefore comes out TRUE (the set of PAIRS `{(x, y) : x < y}` is
+    /// infinite), where the correct answer is FALSE for every fixed `y` (at most `y`
+    /// witnesses). Confirmed live against the real `walnut-java` CLI, which prints `TRUE`
+    /// for `eval t "?msd_2 Ix x < y"` — this test asserts the faithful-but-wrong result,
+    /// per the mechanical-port rule.
+    #[test]
+    fn wb_027_infinite_quantifier_silently_drops_a_free_variable() {
+        let inf = Operator::quantifier(0, "I", 1);
+        let lt = predicate_operand("<", variable("x"), variable("y"));
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), lt])).m;
+        assert!(
+            m.is_true_automaton(),
+            "WB-027: Walnut answers TRUE here; the correct answer is FALSE for every y"
+        );
+        assert!(
+            m.label.is_empty(),
+            "WB-027: the free track `y` is gone from the result entirely"
+        );
+
+        // Same shape, one witness per `y`: still TRUE.
+        let eq = predicate_operand("=", variable("x"), variable("y"));
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), eq])).m;
+        assert!(m.is_true_automaton(), "WB-027, via `Ix x = y`");
+    }
+
+    /// An unsatisfiable body: `remove_leading_zeros` and `infinite` must both cope with
+    /// the empty language rather than erroring. Confirmed against the real CLI
+    /// (`eval t7 "?msd_2 Ix (x < 5 & x >= 5)"` prints `FALSE`).
+    #[test]
+    fn infinite_quantifier_on_an_empty_language_is_false() {
+        let inf = Operator::quantifier(0, "I", 1);
+        let empty = act_logical(
+            &Operator::logical_connective(0, "&"),
+            vec![lt_const("x", 5), ge_const("x", 5)],
+        );
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), empty])).m;
+        assert!(m.is_true_false_automaton() && !m.is_true_automaton());
+    }
+
+    /// A bare `I` with no variables at all (`quantifiedVariableCount == 0`, `arity == 1`)
+    /// — `remove_leading_zeros` gets an empty label list and clones, and the verdict is
+    /// just "is `L(φ)` infinite as a set of STRINGS". Also covers the same shape for
+    /// `E`/`A`, where an empty quantify list is a no-op on the tracks (but still runs the
+    /// leading-zero fixup — see `wr_core::quantify`'s ported quirk).
+    #[test]
+    fn quantifiers_with_no_variables_at_all() {
+        let m = as_automaton_expression(act_logical(
+            &Operator::quantifier(0, "I", 0),
+            vec![lt_const("x", 5)],
+        ))
+        .m;
+        assert!(
+            m.is_true_automaton(),
+            "x<5 accepts 0*{{0..4}}, an infinite STRING set"
+        );
+
+        for symbol in ["E", "A"] {
+            let m = as_automaton_expression(act_logical(
+                &Operator::quantifier(0, symbol, 0),
+                vec![lt_const("x", 5)],
+            ))
+            .m;
+            assert_eq!(m.label, vec!["x".to_string()]);
+            for x in 0u32..8 {
+                assert_eq!(accepts(&m, 2, 5, &[("x", x)]), x < 5, "{symbol}, x = {x}");
+            }
+        }
+    }
+
+    /// Quantifying EVERY track away yields a trivial automaton (`quantify`'s
+    /// all-tracks-quantified path, U0) — so `E`/`A` reach U0's representation too, not
+    /// just `I`.
+    #[test]
+    fn quantifying_every_track_away_yields_a_trivial_automaton() {
+        let phi = predicate_operand("<", variable("x"), variable("y"));
+        let m = as_automaton_expression(act_logical(
+            &Operator::quantifier(0, "E", 2),
+            vec![variable("x"), variable("y"), phi.clone()],
+        ))
+        .m;
+        assert!(m.is_true_automaton(), "∃x∃y (x<y)");
+
+        let m = as_automaton_expression(act_logical(
+            &Operator::quantifier(0, "A", 2),
+            vec![variable("x"), variable("y"), phi],
+        ))
+        .m;
+        assert!(
+            m.is_true_false_automaton() && !m.is_true_automaton(),
+            "∀x∀y (x<y) is false"
+        );
+    }
+
+    /// `:133-135` and `:139-140` — the two `WalnutException`s `actQuantifier` raises, with
+    /// their exact text. Note that BOTH leave the operand stack drained, because
+    /// `reverseStack` popped before the validation ran; pinned deliberately.
+    #[test]
+    fn quantifier_operand_type_errors_match_walnuts_exact_messages() {
+        let operator = Operator::quantifier(0, "A", 2);
+        let mut stack = vec![variable("x"), lt_const("y", 3), lt_const("y", 5)];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "operator A requires a list of 2 variables");
+        assert!(
+            stack.is_empty(),
+            "reverseStack drains the stack before the type check"
+        );
+
+        let operator = Operator::quantifier(0, "E", 1);
+        let mut stack = vec![variable("x"), variable("y")];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the last operand of E can only be of type automaton"
+        );
+    }
+
+    #[test]
+    fn quantifier_validates_arity_before_popping() {
+        let operator = Operator::quantifier(0, "E", 2);
+        let mut stack = vec![variable("x"), lt_const("x", 5)];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "operator E requires 3 operands");
+        assert_eq!(stack.len(), 2);
+    }
+
+    /// A name that is not a track of the body: `AutomatonQuantification.validateLabels`'s
+    /// `WalnutException.notFreeVariable`, reached through `E` (via `quantify`) and through
+    /// `I` (via `remove_leading_zeros`, which validates FIRST — before its own empty-list
+    /// short-circuit). `A` reaches it too, but only after the first complement.
+    #[test]
+    fn quantifying_a_name_that_is_not_a_free_variable_is_an_error() {
+        for symbol in ["E", "A", "I"] {
+            let operator = Operator::quantifier(0, symbol, 1);
+            let mut stack = vec![variable("nope"), lt_const("x", 5)];
+            let err = operator
+                .act(&mut FreshIdentifiers::new(), &mut stack)
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Variable nope in the list of quantified variables is not a free variable.",
+                "for {symbol}"
+            );
+        }
+    }
+
+    /// The one place `E`/`A` and `I` disagree about that same validation, because the two
+    /// helpers order it differently: `AutomatonQuantification.quantifyHelper` short-circuits
+    /// on a LABEL-LESS automaton *before* validating (`:50-52`), while
+    /// `AutomatonLogicalOps.removeLeadingZeros` validates *first* (`:344-345`). So
+    /// quantifying `x` out of a body with no tracks at all — e.g. the constant-folded
+    /// `1 = 1` — is silently fine for `E`/`A` and an error for `I`.
+    ///
+    /// Confirmed live against the real `walnut-java` CLI: `Ex 1 = 1` and `Ax 1 = 1` both
+    /// print `TRUE`, while `Ix 1 = 1` prints "Variable x in the list of quantified
+    /// variables is not a free variable."
+    #[test]
+    fn quantifying_out_of_a_track_less_body_is_fine_for_e_and_a_but_not_for_i() {
+        let trivially_true =
+            || Expression::Automaton(AutomatonExpression::new("1=1", Automaton::true_false(true)));
+        for symbol in ["E", "A"] {
+            let operator = Operator::quantifier(0, symbol, 1);
+            let m = as_automaton_expression(act_logical(
+                &operator,
+                vec![variable("x"), trivially_true()],
+            ))
+            .m;
+            assert!(m.is_true_automaton(), "{symbol}x (1=1)");
+        }
+
+        let operator = Operator::quantifier(0, "I", 1);
+        let mut stack = vec![variable("x"), trivially_true()];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Variable x in the list of quantified variables is not a free variable."
+        );
+    }
+
+    // ------------------------------------------- end-to-end, through the parser
+
+    /// Lexes `predicate`, then runs the postfix token stream against an operand stack —
+    /// a test-local stand-in for U11's shared executor (`EvalDef.compute`), deliberately
+    /// minimal: it exists so these tests can reach `LogicalOperator.act` the way the real
+    /// pipeline will, not to preempt that unit's design.
+    fn eval_predicate(predicate: &str) -> Automaton {
+        let env = InMemoryPredicateEnv::new();
+        let p = Predicate::new(&env, predicate)
+            .unwrap_or_else(|e| panic!("lexing {predicate:?} failed: {e}"));
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack: Vec<Expression> = Vec::new();
+        for token in p.post_order() {
+            token
+                .act(&mut fresh, &mut stack)
+                .unwrap_or_else(|e| panic!("evaluating {predicate:?} failed: {e}"));
+        }
+        assert_eq!(
+            stack.len(),
+            1,
+            "{predicate:?} did not reduce to a single expression"
+        );
+        match stack.pop().unwrap() {
+            Expression::Automaton(ae) => ae.m,
+            other => panic!("{predicate:?} evaluated to {other:?}, not an automaton"),
+        }
+    }
+
+    /// [`wr_core::equiv::automaton_language_equivalent`] over two possibly-PARTIAL DFAs:
+    /// its `complement` step demands a total one, and everything this crate builds comes
+    /// out of `minimize`, which drops non-co-reachable states. Totalizing a private clone
+    /// of each side first is language-preserving (the added sink is non-accepting) and is
+    /// what `wr-io`'s own round-trip tests already do.
+    fn same_language(a: &Automaton, b: &Automaton) -> bool {
+        let mut a = a.clone();
+        let mut b = b.clone();
+        if !a.fa.is_true_false_automaton() {
+            a.fa.totalize(0);
+        }
+        if !b.fa.is_true_false_automaton() {
+            b.fa.totalize(0);
+        }
+        wr_core::equiv::automaton_language_equivalent(&a, &b)
+            .expect("both sides are total DFAs over the same track structure")
+    }
+
+    /// **This unit's headline done-when.** `∀` really is driven by the `¬∃¬` chain, all
+    /// the way from a predicate STRING through the lexer, the shunting yard and
+    /// `LogicalOperator.act`.
+    ///
+    /// Three independent computations of the same first-order statement must agree:
+    /// the `A` form, the hand-written `~E~` form, and (as an oracle that shares no code
+    /// path with either) a direct enumeration of the intended predicate. The first two are
+    /// compared by semantic language equivalence, per `CLAUDE.md`'s prime directive.
+    #[test]
+    fn forall_equals_not_exists_not_end_to_end_through_the_parser() {
+        for (with_a, with_e, oracle) in [
+            (
+                "?msd_2 Ay (y < 4 => y < x)",
+                "?msd_2 ~(Ey ~(y < 4 => y < x))",
+                (|x: u32| x >= 4) as fn(u32) -> bool,
+            ),
+            (
+                "?msd_2 Ay (y < x | x <= y)",
+                "?msd_2 ~(Ey ~(y < x | x <= y))",
+                |_x| true,
+            ),
+            ("?msd_2 Ay (x < y)", "?msd_2 ~(Ey ~(x < y))", |_x: u32| {
+                false
+            }),
+        ] {
+            let a_form = eval_predicate(with_a);
+            let e_form = eval_predicate(with_e);
+            assert!(
+                same_language(&a_form, &e_form),
+                "{with_a} and {with_e} must be language-equivalent"
+            );
+            for x in 0u32..12 {
+                assert_eq!(
+                    accepts(&a_form, 2, 5, &[("x", x)]),
+                    oracle(x),
+                    "{with_a} at x = {x}"
+                );
+            }
+        }
+    }
+
+    /// Nested alternation through the parser: `∀x ∃y (x < y)` is true, `∃y ∀x (x < y)` is
+    /// false. Both collapse to a trivial automaton (every track quantified away), so this
+    /// also exercises `A` composing with U0's representation.
+    #[test]
+    fn quantifier_alternation_through_the_parser() {
+        let m = eval_predicate("?msd_2 Ax Ey (x < y)");
+        assert!(m.is_true_automaton(), "∀x∃y (x<y)");
+        let m = eval_predicate("?msd_2 Ey Ax (x < y)");
+        assert!(
+            m.is_true_false_automaton() && !m.is_true_automaton(),
+            "∃y∀x (x<y)"
+        );
+    }
+
+    /// **The `I` half of this unit's done-when**: an `I`-quantified formula evaluated from
+    /// its source string must come out as U0's TRUE/FALSE automaton with the verdict the
+    /// real `walnut-java` CLI gives (every expectation below was captured from
+    /// `eval … "?msd_2 Ix …"`).
+    #[test]
+    fn infinite_quantifier_round_trips_through_the_parser() {
+        for (predicate, expected) in [
+            ("?msd_2 Ix x < 5", false),
+            ("?msd_2 Ix x >= 5", true),
+            ("?msd_2 Ix x = 3", false),
+            ("?msd_2 Ix,y x = y", true),
+            ("?msd_2 Ix,y (x = y & x < 5)", false),
+            ("?msd_2 Ix (x < 5 & x >= 5)", false),
+        ] {
+            let m = eval_predicate(predicate);
+            assert!(
+                m.is_true_false_automaton(),
+                "{predicate}: I must yield a trivial automaton"
+            );
+            assert_eq!(m.is_true_automaton(), expected, "{predicate}");
+        }
+    }
+
+    /// The connectives and `~` through the parser too, so the precedence table U2 ported
+    /// and this unit's dispatch are exercised together rather than only in isolation.
+    #[test]
+    fn connectives_through_the_parser_respect_precedence() {
+        // `=>` binds looser than `&`, so this is `(x < 5 & x >= 3) => x < 4`.
+        let m = eval_predicate("?msd_2 x < 5 & x >= 3 => x < 4");
+        for x in 0u32..12 {
+            assert_eq!(
+                accepts(&m, 2, 5, &[("x", x)]),
+                !(3..5).contains(&x) || x < 4,
+                "x = {x}"
+            );
+        }
+        // `~` binds tighter than `&`.
+        let m = eval_predicate("?msd_2 ~x < 5 & x >= 3");
+        for x in 0u32..12 {
+            assert_eq!(
+                accepts(&m, 2, 5, &[("x", x)]),
+                !(x < 5) && x >= 3,
+                "x = {x}"
+            );
         }
     }
 }

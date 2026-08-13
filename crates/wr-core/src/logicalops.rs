@@ -145,17 +145,13 @@
 //!   (`:771-781`).** `combine` needs `Automaton.combineIndex`/`combineOutputs` plus
 //!   `Prover.COMBINE`'s `determineOutput` mode; the three morphism helpers exist solely
 //!   to serve `convertMsdBaseToExponent`.
-//! - **`removeLeadingZeros` (`:343-367`) + `removeLeadingZerosHelper` (`:375-405`).**
-//!   Not a CLI-display concern — its callers are `ProverHelper.java:52`,
-//!   `LogicalOperator.java:151` (the `I` quantifier) and `Test.java:43`, i.e. the
-//!   evaluation pipeline (`wr-logic` scope). Its ORIGINAL blocker — it builds
-//!   `new Automaton(false)` as the fold's identity (`:356`) and
-//!   `removeLeadingZerosHelper` returns `new AutomatonDFA(true)` for a non-arithmetic
-//!   track (`:381-383`), both TRUE/FALSE automata — **is removed by U0**; both are now
-//!   expressible ([`crate::automaton::Automaton::true_false`]). It stays unported here
-//!   only because it belongs to the `I`-quantifier unit that consumes it (see the
-//!   Phase-3 plan's U10), and it still needs
-//!   `AutomatonQuantification.validateLabels`.
+//!
+//! `removeLeadingZeros` (`:343-367`) + `removeLeadingZerosHelper` (`:375-405`) used to be
+//! listed here as deferred too; **Phase 3a's U10 ports them** ([`remove_leading_zeros`]),
+//! since that is the unit whose `I` quantifier consumes them
+//! (`LogicalOperator.java:151`). Their original blocker — the `new Automaton(false)` fold
+//! identity (`:356`) and the `new AutomatonDFA(true)` no-numeration-system case
+//! (`:381-383`), both TRUE/FALSE automata — was removed by U0.
 //!
 //! # `fa.setCanonized(false)`
 //!
@@ -176,6 +172,7 @@ use crate::fa::Fa;
 use crate::minimize::{minimize, MinimizeError};
 use crate::product::{cross_product, cross_product_and_minimize, BooleanOp};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fmt;
 use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
@@ -801,6 +798,194 @@ pub fn fix_trailing_zeros_problem(a: &mut Automaton) {
     if set_states_reachable_to_final_states_by_zeros(&mut a.fa, zero) {
         a.fa = just_minimize(&a.fa);
     }
+}
+
+/// Every failure [`remove_leading_zeros`] can report.
+///
+/// Both variants are `WalnutException`s Java throws from the same two methods; neither is
+/// reachable from a well-formed `Automaton` reached through the `I` quantifier's own call
+/// path (see each variant's docs), but both are surfaced as `Err` rather than `panic!` per
+/// `PORTING.md`'s error-mapping rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveLeadingZerosError {
+    /// `WalnutException.notFreeVariable(String)`, thrown by
+    /// `AutomatonQuantification.validateLabels` (`AutomatonQuantification.java:110-116`)
+    /// — the very first statement of `removeLeadingZeros` (`:344`). Same exception, same
+    /// trigger and same message as [`crate::quantify::QuantifyError::NotFreeVariable`].
+    NotFreeVariable(String),
+    /// `removeLeadingZerosHelper`'s own guard (`:376-379`): "Cannot remove leading zeros
+    /// for the `n+1`-th input when A only has `inputs` inputs."
+    ///
+    /// Unreachable through [`remove_leading_zeros`], which is `removeLeadingZerosHelper`'s
+    /// only caller in either engine: `n` comes from `A.getLabel().indexOf(l)` for a label
+    /// the validation above has already proven present, so `0 <= n < label.len()`, and
+    /// `label.len() == alphabet.len()` for any well-formed `Automaton`. Ported anyway
+    /// (Java's guard is likewise unreachable-but-present), and it does fire here for a
+    /// hand-built `Automaton` whose `label` is longer than its `alphabet`.
+    InputIndexOutOfRange { n: usize, inputs: usize },
+}
+
+impl fmt::Display for RemoveLeadingZerosError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RemoveLeadingZerosError::NotFreeVariable(s) => write!(
+                f,
+                "Variable {s} in the list of quantified variables is not a free variable."
+            ),
+            RemoveLeadingZerosError::InputIndexOutOfRange { n, inputs } => write!(
+                f,
+                "Cannot remove leading zeros for the {}-th input when A only has {inputs} inputs.",
+                n + 1
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoveLeadingZerosError {}
+
+/// `AutomatonLogicalOps.removeLeadingZeros(Automaton, List<String>)` (`:343-367`) — the
+/// `I` (infinite) quantifier's pre-pass, and its only production caller inside the ported
+/// subset (`LogicalOperator.java:151`).
+///
+/// For each named track: build an automaton that requires that track's **first** symbol to
+/// be non-zero (msd) or its **last** to be non-zero (lsd), OR all of those together, and
+/// intersect the result with `a`. Java's own doc comment states the intent; note the
+/// disjunction, not conjunction — "at least one of the quantified inputs is not
+/// zero-padded" — which is what makes `I` count *distinct values* rather than distinct
+/// zero-padded encodings of them.
+///
+/// Returns a clone of `a` untouched when `list_of_labels` is empty (`:345-347`), **after**
+/// the label validation, which is therefore vacuous in exactly that case.
+///
+/// `list_of_labels` is a slice, not a set: Java passes `LogicalOperator`'s raw
+/// `List<String>` here (unlike `AutomatonQuantification.quantify`, which converts to a
+/// `HashSet` first), so a repeated label really does build and OR in the same helper
+/// automaton twice. Harmless (`or` is idempotent) and ported as-is rather than
+/// deduplicated.
+pub fn remove_leading_zeros(
+    a: &Automaton,
+    list_of_labels: &[String],
+) -> Result<Automaton, RemoveLeadingZerosError> {
+    // `AutomatonQuantification.validateLabels(A, listOfLabels)` (`:344`). Four lines
+    // rather than a call into `crate::quantify`: that module inlines the identical check
+    // inside its private `quantify_helper`, where it sits *after* an early return this
+    // method does not have (Java's `quantify` short-circuits on an empty label list before
+    // validating; `removeLeadingZeros` validates first). Keeping the two copies separate
+    // preserves that ordering difference, which is observable — `remove_leading_zeros(a,
+    // &["nope"])` is an error while `quantify(a, &{})` is not.
+    for s in list_of_labels {
+        if !a.label.contains(s) {
+            return Err(RemoveLeadingZerosError::NotFreeVariable(s.clone()));
+        }
+    }
+    if list_of_labels.is_empty() {
+        return Ok(a.clone());
+    }
+
+    // `A.getLabel().indexOf(l)` (`:352-354`). `indexOf` takes the FIRST occurrence, so a
+    // label repeated across two tracks constrains only the earlier one — the same
+    // first-occurrence quirk `crate::quantify` documents.
+    let list_of_inputs: Vec<usize> = list_of_labels
+        .iter()
+        .map(|l| {
+            a.label
+                .iter()
+                .position(|x| x == l)
+                .expect("validated above")
+        })
+        .collect();
+
+    // `Automaton M = new Automaton(false);` (`:356`) — the FALSE automaton as the fold's
+    // identity, expressible only since U0. `or(FALSE, N)` short-circuits to `N`, so the
+    // first iteration costs nothing.
+    let mut m = Automaton::true_false(false);
+    for n in list_of_inputs {
+        let mut helper = remove_leading_zeros_helper(a, n)?;
+        m = or(&mut m, &mut helper).into_automaton();
+    }
+    // `M = and(A, M);` (`:361`) — note the argument order, and that `and` never mutates
+    // (see its docs), so the caller's `a` survives this call unchanged.
+    Ok(and(a, &m).into_automaton())
+}
+
+/// `AutomatonLogicalOps.removeLeadingZerosHelper(Automaton, int n)` (`:375-405`,
+/// `private`) — "the `n`-th input does not start (msd) / end (lsd) with a zero".
+///
+/// # The two-state automaton, and why BOTH states accept
+///
+/// `initBasicFA(IntList.of(1, 1))` (`:385`) builds `Q = 2`, `q0 = 0`, outputs `[1, 1]`.
+/// State 0 steps to state 1 on exactly the symbols whose `n`-th digit is non-zero; state 1
+/// self-loops on **every** symbol. So the accepted language is `{ε} ∪ {w : w[0][n] ≠ 0}`.
+///
+/// The `ε` looks like an oversight (state 0's own output is `1`, so the empty word is
+/// accepted even though it has no non-zero leading digit) but is best read as deliberate:
+/// `ε` is precisely the leading-zero-free representation of the value `0`, whose only other
+/// encodings (`0`, `00`, …) this automaton is built to reject. Java's other caller of
+/// `removeLeadingZeros`, `Main/Commands/Test.java`'s accepted-word enumerator (`:43`), is
+/// where that matters — it lists one representation per value, and dropping `ε` would drop
+/// `0` from the listing. Either way it is not observable through the `I` quantifier:
+/// `Infinite::infinite` asks whether the language is *infinite*, which one extra word cannot
+/// change. Ported verbatim.
+///
+/// For an lsd track the whole automaton is reversed at the end (`:402-404`, `reverse(M,
+/// false)` — language reversal only, no msd/lsd flip), which turns "first symbol non-zero"
+/// into "last symbol non-zero".
+///
+/// # `A.getNS().get(n) == null -> new AutomatonDFA(true)` (`:381-383`)
+///
+/// A track with no numeration system has no notion of a leading zero, so it imposes no
+/// constraint. In this crate that is `a.msd[n].is_none()`.
+fn remove_leading_zeros_helper(
+    a: &Automaton,
+    n: usize,
+) -> Result<Automaton, RemoveLeadingZerosError> {
+    // `if (n >= A.richAlphabet.getA().size() || n < 0)` (`:376`). The `n < 0` half is
+    // unrepresentable for a `usize`.
+    if n >= a.alphabet.len() {
+        return Err(RemoveLeadingZerosError::InputIndexOutOfRange {
+            n,
+            inputs: a.alphabet.len(),
+        });
+    }
+
+    let msd = match a.msd[n] {
+        Some(msd) => msd,
+        None => return Ok(Automaton::true_false(true)),
+    };
+
+    let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(), BTreeMap::new()];
+    for i in 0..a.fa.alphabet_size as i32 {
+        let digits = a.decode(i);
+        if digits[n] != 0 {
+            d[0].insert(i, vec![1]);
+        }
+        d[1].insert(i, vec![1]);
+    }
+
+    let mut m = Automaton::new(
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: a.fa.alphabet_size,
+            o: vec![1, 1],
+            d,
+        },
+        a.alphabet.clone(),
+        a.label.clone(),
+        a.msd.clone(),
+    );
+    // `M.setNS(A.getNS())` (`:387`) shares the whole `NumberSystem` list, i.e. both halves
+    // of this crate's NS stand-in — the msd flags handed to `Automaton::new` above AND the
+    // all-representations restriction, which `or`/`xor`/`imply`/`iff` re-apply after
+    // totalizing (`and` never totalizes, so it never needs to).
+    m.set_all_reps(a.all_reps.clone());
+
+    // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
+    if !msd {
+        reverse(&mut m, false);
+    }
+    Ok(m)
 }
 
 /// `AutomatonLogicalOps.reverse(Automaton, boolean reverseMsd)` (`:414-430`) — replace
@@ -1736,6 +1921,229 @@ mod tests {
             rhs_fa.totalize(0);
             prop_assert_eq!(equiv::language_equivalent(&lhs_fa, &rhs_fa), Ok(true));
         }
+    }
+
+    // ------------------------------------------------------- removeLeadingZeros
+
+    /// A 2-track automaton over `{0,1} x {0,1}` accepting `Σ*`, with the given per-track
+    /// numeration directions.
+    fn universal_two_track(msd: Vec<Option<bool>>) -> Automaton {
+        let mut d0 = BTreeMap::new();
+        for sym in 0..4 {
+            d0.insert(sym, vec![0]);
+        }
+        Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 4,
+                o: vec![1],
+                d: vec![d0],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            msd,
+        )
+    }
+
+    fn labels(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The msd case: `Σ*` restricted to "the `x` track does not START with a zero" —
+    /// plus, faithfully, the empty word (both states of the helper automaton accept; see
+    /// [`remove_leading_zeros_helper`]'s docs).
+    #[test]
+    fn remove_leading_zeros_msd_requires_a_nonzero_first_digit() {
+        let a = single_track(universal(), Some(true));
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        for word in [&[1][..], &[1, 0], &[1, 1], &[1, 0, 0]] {
+            assert!(m.fa.accepts_word(word), "must accept {word:?}");
+        }
+        for word in [&[0][..], &[0, 1], &[0, 0], &[0, 1, 1]] {
+            assert!(!m.fa.accepts_word(word), "must reject {word:?}");
+        }
+        assert!(
+            m.fa.accepts_word(&[]),
+            "the helper's start state is itself accepting -- epsilon is the \
+             leading-zero-free representation of 0"
+        );
+    }
+
+    /// The lsd case (`reverse(M, false)`, `:402-404`): the constraint moves to the LAST
+    /// symbol, and the numeration direction itself is NOT flipped.
+    #[test]
+    fn remove_leading_zeros_lsd_requires_a_nonzero_last_digit() {
+        let a = single_track(universal(), Some(false));
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        for word in [&[1][..], &[0, 1], &[1, 1], &[0, 0, 1]] {
+            assert!(m.fa.accepts_word(word), "must accept {word:?}");
+        }
+        for word in [&[0][..], &[1, 0], &[0, 0], &[1, 1, 0]] {
+            assert!(!m.fa.accepts_word(word), "must reject {word:?}");
+        }
+        assert_eq!(
+            m.msd,
+            vec![Some(false)],
+            "reverse(_, false) must not flip NS"
+        );
+    }
+
+    /// A track with no numeration system contributes `new AutomatonDFA(true)`
+    /// (`:381-383`), i.e. no constraint at all.
+    #[test]
+    fn remove_leading_zeros_ignores_a_track_with_no_number_system() {
+        let a = single_track(universal(), None);
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        for word in [&[][..], &[0], &[1], &[0, 0], &[0, 1]] {
+            assert!(m.fa.accepts_word(word), "must still accept {word:?}");
+        }
+    }
+
+    /// Multiple labels are OR'd, not AND'd (`:357-360`): the result requires **at least
+    /// one** named track to be free of leading zeros.
+    #[test]
+    fn remove_leading_zeros_ors_the_per_track_constraints() {
+        let a = universal_two_track(vec![Some(true), Some(true)]);
+        let m = remove_leading_zeros(&a, &labels(&["x", "y"])).unwrap();
+        // Symbol encoding is x + 2y (track 0 is least significant in `encode`).
+        let sym = |x: i32, y: i32| a.encode(&[x, y]);
+        assert!(m.fa.accepts_word(&[sym(1, 0), sym(0, 0)]), "x leads with 1");
+        assert!(m.fa.accepts_word(&[sym(0, 1), sym(0, 0)]), "y leads with 1");
+        assert!(m.fa.accepts_word(&[sym(1, 1), sym(0, 0)]), "both do");
+        assert!(
+            !m.fa.accepts_word(&[sym(0, 0), sym(1, 1)]),
+            "neither track leads with a nonzero digit"
+        );
+
+        // ... and naming only ONE of the two constrains only that one.
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        assert!(m.fa.accepts_word(&[sym(1, 0), sym(0, 0)]));
+        assert!(!m.fa.accepts_word(&[sym(0, 1), sym(0, 0)]));
+    }
+
+    /// `if (listOfLabels.isEmpty()) return A.clone();` (`:345-347`) — but only AFTER the
+    /// (vacuous) validation, and it really is a clone: the argument is untouched.
+    #[test]
+    fn remove_leading_zeros_with_no_labels_is_a_clone() {
+        let a = single_track(exactly_one(), Some(true));
+        let m = remove_leading_zeros(&a, &[]).unwrap();
+        for word in WORDS {
+            assert_eq!(m.fa.accepts_word(word), a.fa.accepts_word(word), "{word:?}");
+        }
+        assert_eq!(
+            m.fa.q, a.fa.q,
+            "an untouched clone, not a rebuilt automaton"
+        );
+    }
+
+    /// `validateLabels` runs FIRST (`:344`), before the empty-list short-circuit — so an
+    /// unknown name is an error even though an empty list is fine.
+    #[test]
+    fn remove_leading_zeros_rejects_a_name_that_is_not_a_track() {
+        let a = single_track(universal(), Some(true));
+        let err = remove_leading_zeros(&a, &labels(&["nope"])).unwrap_err();
+        assert_eq!(
+            err,
+            RemoveLeadingZerosError::NotFreeVariable("nope".to_string())
+        );
+        assert_eq!(
+            err.to_string(),
+            "Variable nope in the list of quantified variables is not a free variable."
+        );
+    }
+
+    /// `removeLeadingZerosHelper`'s own guard (`:376-379`), reachable only for a
+    /// malformed automaton whose `label` is longer than its `alphabet`.
+    #[test]
+    fn remove_leading_zeros_reports_an_out_of_range_input_index() {
+        let mut a = single_track(universal(), Some(true));
+        a.label.push("y".to_string());
+        a.msd.push(Some(true));
+        let err = remove_leading_zeros(&a, &labels(&["y"])).unwrap_err();
+        assert_eq!(
+            err,
+            RemoveLeadingZerosError::InputIndexOutOfRange { n: 1, inputs: 1 }
+        );
+        assert_eq!(
+            err.to_string(),
+            "Cannot remove leading zeros for the 2-th input when A only has 1 inputs."
+        );
+    }
+
+    /// A repeated label really does build and OR in the same helper twice (Java passes a
+    /// `List`, not a `Set`) — idempotent, so the language is unchanged.
+    #[test]
+    fn remove_leading_zeros_tolerates_a_repeated_label() {
+        let a = single_track(universal(), Some(true));
+        let once = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        let twice = remove_leading_zeros(&a, &labels(&["x", "x"])).unwrap();
+        for word in WORDS {
+            assert_eq!(
+                twice.fa.accepts_word(word),
+                once.fa.accepts_word(word),
+                "{word:?}"
+            );
+        }
+    }
+
+    /// The intersection really is with the ORIGINAL language, and the original is left
+    /// untouched (Java's `and(A, M)` never mutates its operands).
+    #[test]
+    fn remove_leading_zeros_intersects_with_the_original_and_does_not_mutate_it() {
+        // "the word contains a 1" — accepts `01`, which the fixup must then reject.
+        let a = single_track(ends_with_one(), Some(true));
+        let before = format!("{:?}", a.fa);
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        assert_eq!(
+            format!("{:?}", a.fa),
+            before,
+            "the operand must survive unchanged"
+        );
+        for word in WORDS {
+            let expected = a.fa.accepts_word(word) && word.first().is_none_or(|&d| d != 0);
+            assert_eq!(m.fa.accepts_word(word), expected, "{word:?}");
+        }
+    }
+
+    /// `remove_leading_zeros` on a custom-base-shaped track (an `all_reps` restriction
+    /// attached, mirroring [`right_quotient_copies_both_halves_of_the_track_metadata_onto_the_second_operand`]
+    /// for this function). Like `and` (which `remove_leading_zeros`'s final step calls,
+    /// `:908`), this function correctly has no `apply_all_representations()` call of its
+    /// own -- intersection cannot re-admit an invalid representation, so nothing needs
+    /// re-applying. What DOES need checking is that the restriction's metadata (the
+    /// `all_reps`/`msd` parallel-array pair) survives onto the result rather than being
+    /// dropped or desynchronized.
+    #[test]
+    fn remove_leading_zeros_preserves_the_valid_representation_restriction_metadata() {
+        let a = restricted(universal());
+        let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
+        assert_eq!(m.msd, vec![Some(true)]);
+        assert!(
+            m.all_reps.iter().all(|r| r.is_some()),
+            "the no_adjacent_ones restriction must still be attached to the x track"
+        );
+
+        // The restriction is not yet re-applied to `m.fa` itself (correctly -- see the
+        // doc comment above), so `11` is still literally accepted here...
+        assert!(m.fa.accepts_word(&[1, 1]));
+
+        // ...but re-applying it now (as any real caller eventually does, since every
+        // custom-base-backed automaton's `fa` is expected to already respect its own
+        // `all_reps` by the time other code reads it) correctly intersects BOTH
+        // constraints: leading-zero-free (from `remove_leading_zeros`) AND no-adjacent-
+        // ones (from the restriction) -- `11` is now rejected, but `10`/`101` etc. still
+        // accepted the same way `remove_leading_zeros_msd_requires_a_nonzero_first_digit`
+        // already pins for the unrestricted case.
+        let mut applied = m;
+        applied.apply_all_representations();
+        assert!(
+            !applied.fa.accepts_word(&[1, 1]),
+            "11 violates no_adjacent_ones and must now be rejected"
+        );
+        assert!(applied.fa.accepts_word(&[1, 0, 1]));
+        assert!(!applied.fa.accepts_word(&[0, 1]), "still leading-zero-free");
     }
 
     // ----------------------------------------------------------------- reverse

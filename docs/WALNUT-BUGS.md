@@ -1235,6 +1235,49 @@ bug costs a silent wrong answer somewhere downstream.
   precisely to run against a home tree that is not the working directory). No golden fixture
   exercises it (the corpus harness runs command files from the repo root, where the working
   directory *is* the home directory), which is why Phase 0's coverage work did not surface it.
+## WB-027 — the `I` quantifier silently discards the body's FREE variables, answering one global TRUE/FALSE instead of a predicate over them
+
+- **Where:** `Main/EvalComputations/Token/LogicalOperator.actQuantifier`'s `I` branch
+  (`LogicalOperator.java:149-153`), specifically `M = new Automaton(!infReg.isEmpty())` at `:153`.
+- **What:** `E` and `A` both *project away only the named variables* and leave a real automaton over
+  the body's remaining (free) tracks. `I` does not: it runs `removeLeadingZeros` over the named
+  variables, asks `Infinite.infinite` whether the **whole multi-track language** is infinite, and
+  then replaces the automaton with a TRUE/FALSE automaton carrying no tracks at all. So when the
+  body has a free variable, the verdict is computed over the free variable's values too — "are
+  there infinitely many *(x, y)* pairs" rather than "for this *y*, are there infinitely many *x*" —
+  and the free variable then vanishes from the result rather than the answer being a predicate over
+  it. There is no guard, no warning, and no error: the wrong answer is indistinguishable from a
+  right one.
+  - Concretely, `Ix x < y` over `msd_2` evaluates to `TRUE`. For every fixed `y` there are only
+    finitely many `x < y` (at most `y` of them), so the correct answer is `FALSE` for every `y`;
+    Walnut answers `TRUE` because the *set of pairs* `{(x, y) : x < y}` is infinite. `Ix x = y`
+    likewise answers `TRUE` where the correct answer is `FALSE` for every `y` (exactly one witness
+    each).
+  - Even under the most charitable reading — that `I` is only *meant* for closed formulas, so a free
+    variable is user error — the defect stands: the correct behavior for unsupported input is an
+    error, not a confidently-printed `TRUE`. Note also that `E`/`A` accept free variables perfectly
+    well, so nothing in the surface syntax signals that `I` is different.
+- **Trigger:** any `I`-quantified formula whose body mentions a variable the `I` does not quantify,
+  e.g. `eval t "?msd_2 Ix x < y";`.
+- **Found:** Phase 3a, U10 (`LogicalOperator.act`), 2026-08-12. Confirmed live against the real
+  `walnut-java` CLI (`Walnut-all.jar`): both `Ix x < y` and `Ix x = y` print `TRUE`. The
+  free-variable-less cases in the same probe are all correct (`Ix x < 5` → `FALSE`, `Ix x >= 5` →
+  `TRUE`, `Ix x = 3` → `FALSE`, `Ix,y x = y` → `TRUE`, `Ix,y (x = y & x < 5)` → `FALSE`), so this is
+  specifically about free variables, not about `I` generally.
+- **Rust port:** `ported verbatim (bug)`. `Operator::act_quantifier`'s `Infinite` arm in
+  `crates/wr-logic/src/token.rs` reproduces `:150-153` exactly, including replacing the automaton
+  with `Automaton::true_false(...)`. Pinned by
+  `wb_027_infinite_quantifier_silently_drops_a_free_variable` in the same file, which asserts the
+  wrong-but-faithful `TRUE` and states the correct answer in its own comment.
+- **Upstream:** not filed. Two candidate fixes, neither obviously the intended one, which is exactly
+  why this is logged rather than resolved here: (a) reject an `I` whose body has free tracks left
+  after the quantified ones are removed, or (b) give `I` a genuinely per-free-variable semantics
+  (for each valuation of the free tracks, is the fibre infinite?) — a real construction, not a
+  one-line change.
+- **Severity:** moderate-to-high where it applies — a silently wrong TRUE/FALSE from the decision
+  procedure itself, which is the worst failure shape for a theorem prover — but narrow: `I` is a
+  niche quantifier and the overwhelmingly common use is on a closed formula, where the answer is
+  correct.
 
 ---
 
