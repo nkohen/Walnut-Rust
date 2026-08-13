@@ -46,6 +46,7 @@ pub mod numsys;
 pub mod product;
 pub mod quantify;
 pub mod regex;
+pub mod search;
 pub mod trim;
 pub mod util;
 pub mod word_automaton;
