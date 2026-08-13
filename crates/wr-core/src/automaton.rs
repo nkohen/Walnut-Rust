@@ -475,6 +475,19 @@ impl Automaton {
         self.encoder = Self::compute_encoder(&self.alphabet);
     }
 
+    /// Read-only accessor for the per-track encoder (`RichAlphabet.encoder`), added in
+    /// U16 so a caller assembling `Automaton.setAlphabet` (see
+    /// [`Automaton::rebuild_transitions_for_new_alphabet`]'s doc comment: "a future unit
+    /// can call this once it has real `NumberSystem` objects") can obtain the freshly
+    /// recomputed encoder after [`Automaton::setup_encoder`] to pass into that function's
+    /// explicit `new_encoder` parameter, without `wr-cli` needing its own duplicate
+    /// encoder-computation logic. `encoder` itself stays private (mutating it directly
+    /// from outside this module would bypass [`Automaton::compute_encoder`]'s overflow
+    /// check), so this is a read-only escape hatch, not a new mutation path.
+    pub fn encoder(&self) -> &[usize] {
+        &self.encoder
+    }
+
     /// `Automaton.randomLabel` (`Automaton.java:299-305`).
     pub fn random_label(&mut self) {
         self.label = (0..self.alphabet.len()).map(|i| i.to_string()).collect();
@@ -590,10 +603,9 @@ impl Automaton {
     ///    documented-in-source behavior rather than a defect, and because no shipped custom
     ///    base has more than one arithmetic track in a *word* automaton for it to bite.
     ///
-    /// No caller in this crate yet: Java's two are `Automaton.setAlphabet` (Phase 3a U16)
-    /// and `AutomatonLogicalOps.combine` (out of scope, needs `Prover.COMBINE`'s product
-    /// mode). Ported now anyway, alongside its sibling, so U16 inherits it rather than
-    /// re-deriving the `IF_OTHER_OP` truth table under pressure.
+    /// Java's two callers are `Automaton.setAlphabet` and `AutomatonLogicalOps.combine`.
+    /// `wr-cli`'s `alphabet::set_alphabet` (Phase 3a U16) is now this crate's first real
+    /// caller; `combine`'s is still out of scope (needs `Prover.COMBINE`'s product mode).
     pub fn apply_all_representations_with_output(&mut self) {
         self.debug_assert_track_invariant();
         let flag = self.determine_random_label();

@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dev-dependencies]
+wr-cli = { path = "../../crates/wr-cli" }
 wr-core = { path = "../../crates/wr-core" }
 wr-io = { path = "../../crates/wr-io" }
 wr-logic = { path = "../../crates/wr-logic" }

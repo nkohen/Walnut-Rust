@@ -541,7 +541,18 @@ impl FileLibraries {
     /// reader failure (a genuine parse error) is [`PredicateEnvError::MalformedAutomaton`].
     /// That split is exactly Java's: it is the `IOException` boundary, not a message-text
     /// classification.
-    fn read_library_automaton(&self, address: &str) -> Result<Automaton, PredicateEnvError> {
+    ///
+    /// `pub(crate)` (rather than private) as of U16: `crate::alphabet::alphabet_command`
+    /// needs exactly this "read a `.txt` at an already-resolved address, mapping
+    /// `IOException`/parse failures the same way `new Automaton(address)` does" behavior
+    /// for `Automaton M = new Automaton(ProverHelper.determineInLibrary(...))`
+    /// (`Alphabet.java:20`) — widening this existing method's visibility avoids a second,
+    /// independent copy of the same IO/error-mapping logic drifting out of sync with this
+    /// one.
+    pub(crate) fn read_library_automaton(
+        &self,
+        address: &str,
+    ) -> Result<Automaton, PredicateEnvError> {
         // A custom base named in this file's own header resolves through the SESSION (session
         // copy shadowing the global one, per file), which is what Java's
         // `ParseMethods.parseAlphabetDeclaration` → `NumberSystem.getComputeIfAbsent` →

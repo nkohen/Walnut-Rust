@@ -14,5 +14,8 @@
 //! workspace (e.g. a future differential/golden-corpus harness), the same
 //! shape `wr-core`/`wr-io`/`wr-logic` already use.
 
+pub mod alphabet;
+pub mod automaton_output;
+pub mod reg;
 pub mod session;
 pub mod test_case;

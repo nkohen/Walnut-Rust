@@ -405,6 +405,7 @@ dependencies = [
 name = "wr-differential"
 version = "0.0.0"
 dependencies = [
+ "wr-cli",
  "wr-core",
  "wr-io",
  "wr-logic",

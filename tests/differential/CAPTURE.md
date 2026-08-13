@@ -111,3 +111,82 @@ where `U8Probe.main` calls `new AutomatonDFA(regex, alphabet, null)` and prints
 explicit languages in `crates/wr-core/src/regex/tests.rs`'s
 `from_regex_over_alphabet_*` tests (the driver itself is not committed — it is 30 lines
 and fully described by that recipe).
+
+---
+
+# Ground-truth capture: U16's `reg` (named number systems) and `alphabet` fixtures
+
+Phase 3a U16 (`wr_cli::reg`/`wr_cli::alphabet`, the CLI-layer wiring around U8's regex
+engine and `Automaton.setAlphabet`) is checked by
+`tests/reg_and_alphabet_commands.rs`. Most of its `reg` coverage reuses U8's own 60-case
+corpus (`fixtures/reg/r*.txt`) unchanged, re-driven through the STRING alphabet-
+declaration layer U16 adds — no new capture needed for that part (see that test file's
+own module docs for why). Two things are genuinely new:
+
+## `reg` with named number systems (`fixtures/reg/u16_*.txt`)
+
+None of U8's 60 fixtures declare a `reg` alphabet by number-system name (`msd_3`, …) —
+every one uses a literal `{…}` set. Captured with:
+
+```bash
+cd ~/dev/walnut-java
+cat > "Command Files/u16capture.txt" <<'EOF'
+reg u16r01 msd_3 "0*1";
+reg u16r02 msd_2 lsd_2 "[0,0][1,1]*";
+reg u16r03 {0,1,2} "1*";
+EOF
+java -jar target/Walnut-all.jar u16capture.txt < /dev/null
+cp "Session/<timestamp>/Automata Library/u16r01.txt" ~/dev/walnut-rs/tests/differential/fixtures/reg/u16_msd3.txt
+cp "Session/<timestamp>/Automata Library/u16r02.txt" ~/dev/walnut-rs/tests/differential/fixtures/reg/u16_mixed_ns.txt
+cp "Session/<timestamp>/Automata Library/u16r03.txt" ~/dev/walnut-rs/tests/differential/fixtures/reg/u16_set.txt
+```
+
+(`u16r03`'s `{0,1,2}` case is redundant with U8's own corpus in spirit — kept anyway as a
+belt-and-suspenders sanity check alongside the two number-system cases captured in the
+same run.)
+
+## `alphabet` (`fixtures/alphabet/*.txt`)
+
+No prior unit captured the `alphabet` command at all. Two source/result pairs, each
+`reg`'d fresh and then run through `alphabet` in the same command file so the source
+automaton is also pinned as ground truth (`baseB.txt`/`baseC.txt`):
+
+```bash
+cd ~/dev/walnut-java
+cat > "Command Files/u16capture2.txt" <<'EOF'
+reg baseB msd_2 msd_2 "[0,0][1,1]*";
+alphabet baseB_asSet {0,1} {0,1} $baseB;
+EOF
+cat > "Command Files/u16capture3.txt" <<'EOF'
+reg baseC {0,1,2,3} "[0-3]";
+alphabet baseC_restricted msd_2 $baseC;
+EOF
+java -jar target/Walnut-all.jar u16capture2.txt < /dev/null
+java -jar target/Walnut-all.jar u16capture3.txt < /dev/null
+cp "Session/<ts2>/Automata Library/baseB.txt"            ~/dev/walnut-rs/tests/differential/fixtures/alphabet/
+cp "Session/<ts2>/Automata Library/baseB_asSet.txt"      ~/dev/walnut-rs/tests/differential/fixtures/alphabet/
+cp "Session/<ts3>/Automata Library/baseC.txt"            ~/dev/walnut-rs/tests/differential/fixtures/alphabet/
+cp "Session/<ts3>/Automata Library/baseC_restricted.txt" ~/dev/walnut-rs/tests/differential/fixtures/alphabet/
+```
+
+`baseC`'s regex (`"[0-3]"`, i.e. "any single symbol 0-3" via the same char-range-over-
+encoded-digits idiom U8's `r08`/`r15`/`r31` already established) was chosen specifically
+so every one of the four declared digits has a real outgoing transition from the start
+state — `alphabet baseC_restricted msd_2 $baseC` then genuinely PRUNES the digit-2/3
+transitions (confirmed by inspecting both captured files), rather than only rewriting
+the header, which a less deliberately-chosen source automaton could have masked. `baseB`
+exercises the opposite direction: a named-number-system automaton converted to an
+equivalent literal-set alphabet (same digits, `NS` cleared), the `None`-NS/`all_reps`-
+clearing path `set_alphabet` shares with `reg`.
+
+Only `isDFAO = false` (`$`-prefixed old-name syntax, per `Alphabet.java`'s inverted-
+looking `!"$".equals(...)` flag — see `RESUME-HERE.md`/`crate::alphabet`'s module docs)
+was captured; the `isDFAO = true` (word-automaton) path is covered by
+`wr_core::word_automaton`'s own existing unit tests
+(`minimize_self_with_output_mutates_in_place`, etc.) rather than a fresh empirical
+capture — flagged here as a real, deliberate scope cut for whoever reviews this unit,
+not an oversight: setting up a genuine word (DFAO) automaton via the command-line surface
+needs `morphism`/`image`/`combine`, none of which are ported yet.
+
+Command files and session directories were deleted from the `walnut-java` checkout
+afterward, per this file's established practice.
