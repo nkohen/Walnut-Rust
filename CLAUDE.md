@@ -240,9 +240,41 @@ Four new genuine Walnut (Java) bugs found and logged during the port (WB-008–W
 `docs/WALNUT-BUGS.md`, all ported verbatim per the mechanical-port rule, not fixed). `cargo test
 --workspace` is green throughout; `cargo fmt`/`clippy` clean.
 
-Not yet started: Phase 3 (`wr-logic`'s parser/quantifier-elimination/boolean-op formula layer, `wr-io`,
-`wr-cli`; the full FOL decider) — needs the user's explicit go-ahead per
-`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating. Deferred into Phase 3 by Phase 2's own scope calls:
-`Morphism`, `WordAutomaton`, `AutomatonDFA`'s regex constructors, `BricsConverter`, `Transducer`,
-`Infinite`, `Search/ProductBFS`, `convertNS`, and `NumberSystem`'s file-backed custom-base loading.
-per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating.
+**Phase 3a complete** (all 22 units landed on `master`, plan at
+`.claude/plans/synthetic-prancing-aurora.md`, adversarially reviewed before execution per this
+project's now-standard practice; execution history and process notes in `RESUME-HERE.md`). Built
+the full FOL decider: `wr-logic`'s parser/precedence/lexer (`Token`/`Operator`/`Expressions`,
+macro/word/function token construction), the quantifier-elimination driving logic
+(`LogicalOperator`'s `E`/`A`/`I` dispatch — **the decision-procedure crux of the whole port**),
+relational/arithmetic operand semantics, the shared postfix-token executor (the Phase 3a
+*integration* checkpoint — the first proof the parser+quantifier-elimination+operand-semantics
+stack genuinely composes, not just that each piece passes its own isolated tests); `wr-core`'s
+regex engine (a hand-rolled Brics-dialect parser + Thompson construction, transliterated from the
+real `dk.brics:automaton` sources, the largest single unit this phase), `WordAutomaton`,
+`Infinite`, custom-base `NumberSystem` file loading, and the `TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON`
+retrofit (closed a blocking Phase-2 gap — 13% of golden fixtures are literally `true`/`false`);
+`wr-io`'s writer (`.txt`/`.gv`/`.ba`) and reader extensions (custom-base headers, transducers,
+comments); and `wr-cli`'s `Session` (the first real file-backed `PredicateEnv` impl), `eval`/`def`
+(`EvalDef`), `reg`/`alphabet`. **16 new genuine Walnut (Java) bugs found and logged this phase**
+(WB-011 through WB-021 and WB-023 through WB-027; WB-022 is a Rust-port scope gap, not a Java
+bug — see `docs/WALNUT-BUGS.md`), all ported verbatim per the mechanical-port rule. **Exit criterion
+met**: a consolidated differential suite (`tests/differential/tests/phase3a_checkpoint.rs`)
+exercises `eval`/`def`/`reg`/`alphabet` together through `wr-cli`'s real public library API —
+boolean connectives + quantifiers in combination, a custom base, word/function tokens with
+quantifiers, TRUE/FALSE results, the CAS-validation success path, a `reg`-then-`alphabet`
+pipeline — compared against real `walnut-java` CLI output via `wr_core::equiv`, zero genuine
+divergences found. `cargo test --workspace` green throughout (920+ tests); `cargo fmt`/`clippy`
+clean.
+
+**Known limitation, flagged not silently accepted**: `eval`/`def`/`reg` over `lsd_*` numeration
+combined with any quantifier (`E`/`A`/`I`) currently fails
+(`QuantifyError::UnsupportedLsdFixup`) — a pre-existing Phase-2 `wr-core::quantify` scope cut
+(the leading/trailing-zero fixup exists as a function but was never wired in), first surfaced as
+a real functional gap by Phase 3a's exit checkpoint. Not yet scheduled; a real decision (fix now
+vs. explicitly schedule) is still open.
+
+Not yet started: **Phase 3b** (the remaining `wr-core` primitives — `Morphism`, `convertNS`,
+`Search/ProductBFS`, `Transducer` — the real `Prover.java` dispatch/REPL/`MetaCommands` wiring
+real values into Phase 3a's U0c no-op hook, all remaining `Commands/*`, and the Tier-1
+golden-corpus harness) — needs the user's explicit go-ahead per
+`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating, same as Phase 3 itself needed before Phase 3a began.
