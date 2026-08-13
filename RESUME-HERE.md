@@ -1,11 +1,11 @@
-# RESUME-HERE — Phase 3a, unit-by-unit
+# RESUME-HERE — Phase 3a: all 22 units merged, exit checkpoint in flight
 
 The plan being executed is `/Users/nkohen/.claude/plans/synthetic-prancing-aurora.md` (Phase 3,
 full unit breakdown — read it before doing anything else if this is a cold start). This file is
 updated at each unit-merge checkpoint so a fresh session (after a pause, e.g. a usage-limit reset)
 can resume immediately without re-deriving state.
 
-## Done and merged (master is green at these units) — 21 of 22 Phase 3a units
+## ALL 22 Phase 3a units done and merged — master is green
 
 - **U0** — `TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON` retrofit (`4758462`)
 - **U0a** — `Logging.java` port (`5d9f714`)
@@ -27,77 +27,77 @@ can resume immediately without re-deriving state.
 - **U10** — `LogicalOperator`'s connective dispatch + the quantifier-elimination driving logic
   (`19c2c28`) — the decision-procedure crux of the whole port
 - **U16** — `Reg.java` + the full `alphabet` command body (`991e8f4`)
-- **U11** — the shared postfix executor + final `Predicate` assembly, **the Phase 3a integration
-  checkpoint** (`f2aa6ce`, current `master` HEAD). Two Opus-tier reviewers found the core
-  postfix-evaluation math correct (confirmed via a 40+-predicate differential sweep against the
-  real CLI, including cross-feature compositions no single earlier unit's tests exercised), but
-  found and a fixer resolved: a FALSE documentation claim that Java's operand-token `act()` calls
-  have no `Logging` side effects worth porting (they do — verified live, 6 of 10 expected log
-  lines were missing; now honestly documented as a deferred gap needed before Phase 3b's golden-
-  corpus unit, not before this unit, and pinned by a test asserting current behavior), plus a
-  differential-test methodology bug that could have silently produced a wrong verdict on the first
-  multi-track fixture (the port's raw track order vs. Walnut's always-`canonize()`'d fixture
-  output — fixed and verified load-bearing), plus several weaker/tautological tests strengthened.
+- **U11** — the shared postfix executor + final `Predicate` assembly, the Phase 3a integration
+  checkpoint (`f2aa6ce`)
+- **U15** — `EvalDef.java`, the actual `eval`/`def` command (`fa9488e`, current `master` HEAD).
+  Reviewer #2 found and a fixer resolved a real correctness-risk: the CAS-matrix-export drop
+  (a plan-approved DROP-scope decision) had been implemented as a silent no-op, but real Walnut
+  actually ABORTS `eval`/`def` (throws, after already writing the automaton output and printing
+  the TRUE/FALSE verdict) when a TRUE/FALSE result is asked for free variables, or when a named
+  free variable doesn't exist — the port was silently reporting success for the same input. Fixed
+  by porting the two cheap input-validation checks (not the CAS-file-writing itself), preserving
+  the sign-off's actual intent while closing the wrong-success divergence.
 
-`cargo test --workspace` was green on `master` as of `f2aa6ce` (wr-cli 58, wr-core 444, wr-io 99,
+`cargo test --workspace` was green on `master` as of `fa9488e` (wr-cli 71, wr-core 444, wr-io 99,
 wr-logic 270, wr-cts 22, differential 8, wr-core-integration-tests 2 — all passing). `cargo fmt
 --all -- --check` clean, `cargo clippy --workspace --all-targets` clean. **27**
-genuine Walnut (Java) bugs found and logged so far (WB-001 through WB-027 — see
-`docs/WALNUT-BUGS.md`; U11/U16 found no new genuine Java bugs, only pre-existing/deferred gaps,
-correctly documented honestly rather than logged as Java bugs since they aren't Java defects).
+genuine Walnut (Java) bugs found and logged across Phase 3 so far (WB-001 through WB-027 — see
+`docs/WALNUT-BUGS.md`). U11/U15/U16 found no NEW genuine Java bugs, only pre-existing/deferred
+gaps or port-side defects, all correctly handled per CLAUDE.md's protocol.
 
 **Process notes for whoever resumes:**
-- **WB-number collisions remain routine when a unit adds new entries** — none this round (neither
-  U16 nor U11 added any). Always grep `^## WB-` for duplicate/gapped numbers after ANY rebase
-  touching `docs/WALNUT-BUGS.md`, conflict-reported or not.
-- **U11's rebase had a real (non-WB) conflict** in `tests/differential/CAPTURE.md` — both U16 and
-  U11 appended a new capture-recipe section to the same file, at the same insertion point. Trivial
-  to resolve (both sections are independent prose, no actual content conflict) — just remove the
-  three-way markers and keep both sections in sequence. Same "grep for markers, don't assume a
-  reported conflict means real content conflict" discipline as the WB-number collisions.
-- **A real coordinator process-hygiene lesson from the U16 round is worth restating**: after any
-  sequence of commands that `cd`s into a worktree for inspection, explicitly `cd` back to the
-  intended target directory before the next stateful command (`git add`/`commit`/`merge`) — a
-  stale shell cwd from several tool calls back caused one misdirected (but non-destructive) commit
-  attempt that round.
+- **WB-number collisions are routine when a unit adds new entries; always grep `^## WB-` for
+  duplicate/gapped numbers after ANY rebase touching `docs/WALNUT-BUGS.md`, conflict-reported or
+  not** — this has now been the single most recurring process wrinkle across the whole phase.
+- **"No reviewer flagged correctness-fatal" is not the same as "nothing to fix."** Nearly every
+  unit in the back half of this phase (U8, U14, U16, U11, U15) had at least one reviewer surface a
+  real, fixable issue despite the other reviewer (or even both, on first pass) finding nothing —
+  always read BOTH full reports, not just the summary line, before deciding a unit is clean.
 - Several agent runs stalled on a 600s stream-watchdog timeout (infra hiccup, not a task problem)
-  — relaunching the same unit fresh has resolved it every time so far.
+  — relaunching the same unit fresh has resolved it every time this phase.
+- **A coordinator process-hygiene lesson from mid-phase**: after any sequence of commands that
+  `cd`s into a worktree for inspection, explicitly `cd` back to the intended target directory
+  before the next stateful command (`git add`/`commit`/`merge`) — don't rely on remembering the
+  last `cd` several tool calls back.
 
-## In flight right now — the LAST Phase 3a unit
+## In flight right now — the Phase 3a EXIT CHECKPOINT itself
 
-- **U15** — `EvalDef.java` (~185 LOC) as a `wr-cli` library function, the actual `eval`/`def`
-  command implementation, wired to the real `Session` (U14) and calling `wr-logic`'s
-  `evaluate`/`evaluate_with_logging` (U11). Needs to get right: Java's headless/non-headless split,
-  the `TRUE`/`FALSE` print branch (now real via U0's trivial-automaton support), and the CAS
-  matrix-export path per the plan's ALREADY-USER-DECIDED sign-off item #1 (write the automaton
-  output normally, never produce matrix side-files, don't reach the DROP-scope CAS machinery at
-  all). Sonnet tier, isolated subagent, worktree not yet known at this checkpoint (dispatched just
-  before this file was last written — check `git worktree list` if resuming cold). Depends on U11
-  (**done**) and U14 (**done**) — the last blocker just cleared, so this is the final unit standing
-  between here and the **Phase 3a exit checkpoint**.
+Per the plan: extend `tests/differential` with `eval`/`def`/`reg` cases (literal strings, called
+via **`wr-cli`'s real library API** — not the individual units' own lower-layer tests, and not yet
+the full `Prover` dispatch loop — using U0c's no-op strategy/export context), compared against
+real `walnut-java` CLI output through `wr_core::equiv`. This is the first time the ENTIRE Phase 3a
+stack (parser → quantifier-elimination → operand semantics → `wr-cli` command wiring) gets
+exercised together through the actual public API, not each unit's own isolated tests.
 
-## After U15 lands: the Phase 3a exit checkpoint
+Dispatched to worktree `/Users/nkohen/dev/walnut-rs/.claude/worktrees/agent-a9437470573d60839`
+(branch `worktree-agent-a9437470573d60839`, based on `fa9488e`). Not yet returned as of this
+checkpoint. Briefed to: survey what differential coverage already exists (several units, e.g. U16,
+already built real `wr-cli`-layer differential tests; U11/U8's tests stop at `wr-logic`/`wr-core`
+and don't fully satisfy this checkpoint's "through `wr-cli`" bar on their own), build a new
+consolidated checkpoint suite covering boolean connectives + quantifiers in combination, a
+custom-base query, word/function tokens with quantifiers, `reg`/`alphabet` cases, a TRUE/FALSE
+`eval` result, and a `def` free-variable case exercising U15's just-fixed CAS-validation path —
+and to log, not silently resolve, any genuine divergence found.
 
-Per the plan: extend `tests/differential` with `eval`/`def`/`reg` cases (literal strings via
-`wr-cli`'s library API, using U0c's no-op strategy/export context) compared against real
-`walnut-java` CLI output through `wr_core::equiv`. `cargo test --workspace` green throughout; every
-genuine divergence logged to `docs/WALNUT-BUGS.md`, not silently resolved either way. This is
-**the actual completion of Phase 3a** — a real, meaningful milestone (the full FOL decider's
-engine + parser + CLI wiring, working end-to-end) worth flagging clearly to the user when reached,
-distinct from Phase 3b (the remaining `wr-core` primitives, the real `Prover` dispatch/REPL, the
-Tier-1 golden-corpus harness) which per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating doctrine
-still needs the user's explicit go-ahead before starting, same as Phase 3 itself did.
+**This is a real, significant milestone once it lands** — the completion of Phase 3a (the full FOL
+decider's engine + parser + CLI wiring, working end-to-end). **Flag this clearly to the user when
+reached.** Phase 3b (the remaining `wr-core` primitives — `Morphism`/`convertNS`/`ProductBFS`/
+`Transducer`, the real `Prover` dispatch/REPL/`MetaCommands`, all remaining `Commands/*`, and the
+Tier-1 golden-corpus harness) still needs the user's **explicit go-ahead** before starting, per
+`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating doctrine — same as Phase 3 itself needed at the start
+of this whole stretch. Do not begin Phase 3b work without that explicit signal, even if "continue"
+is said in a context that doesn't obviously address the phase boundary — the phase-gating rule is
+about the PHASE transition specifically, not ordinary unit-to-unit continuation within a phase.
 
 ## Process notes for whoever resumes
 
-- Follow the same loop used for every unit so far: author (worktree-isolated background agent) →
-  two split-context adversarial reviewers (diff-only, model ≠ author — U11's author ran on the
-  session's default/Sonnet tier per the plan's own tiering, so its reviewers used an explicit Opus
-  override; check what tier U15's author actually runs on before picking reviewer models) → fixer
-  if either review finds `correctness-fatal`/`correctness-risk` → verify (`cargo test
+- Same loop as every unit this phase: author (worktree-isolated background agent) → two
+  split-context adversarial reviewers (diff-only, model ≠ author for trust-critical crates) →
+  fixer if either review finds `correctness-fatal`/`correctness-risk` → verify (`cargo test
   --workspace`/`fmt`/`clippy`) → commit in the worktree → rebase onto current `master` → grep for
-  WB-number duplicates/gaps AND check for non-WB content conflicts (e.g. `CAPTURE.md`) regardless
-  of whether the rebase reported conflicts → fast-forward merge → `git worktree remove` +
-  `git branch -d` to clean up.
-- This is the home stretch of Phase 3a — U8/U14/U16/U11 all found real, fixable issues even in
-  units that looked clean on first read. Don't relax review rigor for U15 just because it's last.
+  WB-number duplicates/gaps AND check for non-WB content conflicts regardless of whether the
+  rebase reported conflicts → fast-forward merge → `git worktree remove` + `git branch -d`.
+- The exit-checkpoint task itself may or may not need a two-reviewer loop depending on what it
+  actually touches (a NEW differential test file only touches `tests/differential`, not
+  `wr-core`/`wr-logic` — check CLAUDE.md's trust-critical-crate scoping before deciding whether the
+  full loop is mandatory here, vs. a single careful read given it's test-only, no production code).
