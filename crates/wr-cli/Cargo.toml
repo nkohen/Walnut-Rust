@@ -18,3 +18,9 @@ wr-core = { path = "../wr-core" }
 wr-logic = { path = "../wr-logic" }
 wr-io = { path = "../wr-io" }
 wr-cts = { path = "../wr-cts" }
+# `Prover.java`'s ~30 `java.util.regex.Pattern` statics — the command-argument grammar. Same
+# workspace dependency (and same justifying comment) `wr-logic`'s lexer already uses; see the
+# `[workspace.dependencies]` entry. `meta::Regex` keeps `regex`'s own syntax and capture-group
+# numbering, which is what lets `Prover.java`'s `static int GROUP_… = 20` constants be ported
+# as literal group indices.
+regex-automata.workspace = true

@@ -1228,15 +1228,20 @@ bug costs a silent wrong answer somewhere downstream.
   while reading `parseArgs` to establish who is responsible for appending the trailing `/` to
   `--home-dir=`/`--session-dir=` values (`Prover.java:304-313`) that `Session`'s string
   concatenation assumes.
-- **Rust port:** `not yet reached` — the defect is in `Prover.parseArgs`, which is **U21**, not in
-  `Session.java`. U14 ports only `Session`'s path builders, and the builder involved
-  (`SessionPaths::read_address_for_command_files`) is faithful; nothing in `wr-cli` calls it yet.
-  Recorded here so U21's author makes an explicit replicate-vs-diverge call instead of "naturally"
-  writing the correct order (parse all args → build the `SessionPaths` → validate), which is what a
-  from-scratch Rust arg parser would do by default and would silently diverge. Per
-  `CLAUDE.md`'s mechanical-port rule the default is to replicate — but note that replicating means
-  deliberately constructing a throwaway `SessionPaths` with no home directory just to run a check
-  whose result is discarded, which is unusual enough to deserve the user's sign-off either way.
+- **Rust port:** `ported verbatim (bug)` **as of Phase 3b's U21** (was `not yet reached` while the
+  defect's owning file, `Prover.parseArgs`, was unported; U14 ports only `Session`'s path builders,
+  and the builder involved, `SessionPaths::read_address_for_command_files`, is faithful).
+  `crates/wr-cli/src/prover.rs`'s `parse_args` replicates the ordering exactly, including the odd
+  part this entry predicted: it constructs a **throwaway** `SessionPaths::new(Some(""), Some(""),
+  false)` — an explicitly empty home directory, matching Java's still-uninitialized
+  `Session.mainWalnutDir` static — purely to run a validation whose result is then discarded by
+  `run`'s correct re-validation. The explicit `Some("")` (rather than `None`) matters: `None` would
+  apply `setPathsAndNames`' "working directory ends in `bin` → `../`" rule, which has *not* run at
+  this point in Java. Pinned by `run_command_file_validation_ignores_home_dir_wb_026`, which
+  asserts the reported path has no home-directory prefix. **The user's sign-off this entry asked
+  for was not obtained**; U21 applied `CLAUDE.md`'s stated default (replicate) rather than deciding
+  the divergence on its own authority. Flipping to the one-line fix later is a two-line change here
+  plus that test.
 - **Upstream:** not filed. Fix is a one-line deletion: drop `:318` entirely and let `run`'s `:326`
   do the validation (it already does, correctly). If an early "unknown file" diagnostic is wanted,
   it has to move below `:321`.
@@ -1364,6 +1369,84 @@ bug costs a silent wrong answer somewhere downstream.
   single token (e.g. `Morphisms`) also works but changes documented output.
 - **Severity:** low — a discoverability defect, not a wrong answer; the affected help text is
   still reachable via `help <command>;`.
+
+---
+
+## WB-028 — the `earlyExistTermination` metacommand is accepted, documented in-code, and does nothing: its only reader was deleted
+
+- **Where:** `Main/Prover.java:254` (`public static boolean earlyExistTermination = false;
+  // earlyExistTermination metacommand`) and `Main/MetaCommands.java:115-117`, the switch arm that
+  sets it. `MetaCommands`' constructor resets it (`:24`).
+- **What:** the flag is **written twice and read nowhere**. Grepping the whole of `src/` for
+  `earlyExistTermination` returns exactly four sites: the constant `EARLY_EXIST_TERMINATION`
+  (`Prover.java:234`), the field declaration (`:254`), the constructor reset
+  (`MetaCommands.java:24`), and the metacommand arm that sets it to `true` (`:116`) — plus the
+  arity check at `:98` that lets a one-token metacommand block through *only* for this name. So
+  `[earlyExistTermination] eval …::` parses successfully, takes a dedicated code path, and has
+  precisely zero effect on the evaluation. There is no warning, no log line, and no error: the
+  user gets the ordinary answer and no indication the metacommand was ignored.
+  - This is not a feature that was never wired up. `git log -S earlyExistTermination` shows the
+    reader existed and was removed: commit `e013dd7` ("Test of earlyExistTermination.",
+    2025-04-08) added both the flag and its consumers in `Main/EvalComputer` /
+    `EvalComputations/Token/LogicalOperator` — `Prover.earlyExistTermination &&
+    postOrder.getLast().toString().equals(Operator.EXISTS)`, a short-circuit for a trailing `E`
+    quantifier — and commit `b1aa9ab` ("Remove all remaining prefixes.", 2026-05-23) deleted those
+    consumer lines while leaving the flag, the constant, the parser arm and the special-case arity
+    check in place. The metacommand is the orphaned half of a reverted experiment.
+- **Trigger:** `[earlyExistTermination] eval x "?msd_2 Ey y > x"::` — accepted, no effect.
+- **Found:** Phase 3b, U21 (`Main/MetaCommands.java` port), 2026-08-13, by tracing the field to its
+  (nonexistent) readers while deciding how to port it.
+- **Rust port:** `ported verbatim (quirk)`. `crates/wr-cli/src/meta_commands.rs`'s `MetaCommands`
+  keeps the field, parses the token, and exposes it through
+  `MetaCommands::early_exist_termination()` — stored, observable, and consulted by nothing, exactly
+  as in Java. Dropping it would have made a currently-accepted command string an error, which is a
+  behavior change; that is why it is inert rather than deleted. Pinned by
+  `wb_028_early_exist_termination_parses_and_sets_an_inert_flag`.
+- **Upstream:** not filed. Two clean fixes, and the choice is a product decision, not a mechanical
+  one: (a) delete the flag, the constant, the switch arm and the `:98` arity special-case, so the
+  metacommand is rejected like any other unknown one; or (b) restore the consumer `b1aa9ab`
+  removed. Note that (b) needs care — the deleted short-circuit was itself only ever described as a
+  "test".
+- **Severity:** low. No wrong answers; the cost is a silently-ignored user request and four pieces
+  of misleading dead code (including a `// earlyExistTermination metacommand` comment that reads as
+  if the flag were live).
+
+---
+
+## WB-029 — `Strategy.fromString` strips dashes from its input but not from its alias table, so a strategy's own printed name never parses
+
+- **Where:** `Automata/FA/DeterminizationStrategies.java`, `Strategy.fromString` (`:52-63`),
+  interacting with the enum constructor's `this.aliases.add(name)` (`:48`).
+- **What:** `fromString` normalizes its argument with `name.replace("_","-").replace("-","")` —
+  i.e. **delete every underscore and dash** — and then compares the normalized string, case
+  -insensitively, against each strategy's alias list. But the alias list is built from the declared
+  aliases *plus the strategy's own `name`*, and two of those names contain dashes
+  (`"Brzozowski-CCLS"`, `"Brzozowski-CCL"`). Since the alias side is never normalized, those two
+  entries are unreachable: the input `Brzozowski-CCL` normalizes to `BrzozowskiCCL`, which equals
+  neither `BRZCCL` nor `Brzozowski-CCL`. So `[strategy 1 Brzozowski-CCL]` throws
+  `IllegalArgumentException: No strategy found for: Brzozowski-CCL` even though
+  `Brzozowski-CCL` is exactly the string Walnut itself prints for that strategy (via
+  `Strategy.outputName`, `:69-71`, in every `Determinizing …` details line).
+- **Trigger:** `[strategy 1 Brzozowski-CCL] eval x "?msd_2 x = 1"::`, or the same with
+  `Brzozowski-CCLS`. The undashed aliases (`BRZCCL`, `BRZ_CCL`, `BRZ-CCL`, `brzccl`, …) all work.
+- **Found:** Phase 3b, U21 (`Main/MetaCommands.java` port), 2026-08-13, while porting the alias
+  table.
+- **Rust port:** `ported verbatim (quirk)`. `crates/wr-cli/src/meta_commands.rs`'s
+  `strategy_from_string` reproduces the normalize-input-only comparison and the same alias table,
+  so the two dashed names likewise fail to resolve; pinned by
+  `wb_029_dashed_strategy_names_are_unreachable_aliases`. Note the practical impact **in this
+  port is nil**: both affected names are OTF strategies, which `docs/DESIGN.md` §9/§10 defer and
+  which `strategy_from_string` rejects with `MetaCommandError::OtfStrategyDeferred` on the
+  reachable spellings anyway. The two in-scope strategies (`SC`, `Brzozowski`) have no dash in
+  their names and round-trip correctly — pinned by
+  `the_two_in_scope_strategy_names_round_trip_including_aliases`.
+- **Upstream:** not filed. One-line fix: normalize the alias the same way as the input inside the
+  comparison loop (`alias.replace("_","-").replace("-","")`), which also makes the redundant
+  `List.of("BRZCCLS")`-style aliases unnecessary.
+- **Severity:** low, and low *here* — it only bites the OTF family, which this project does not
+  implement. Logged because the shape of the defect ("the printed name is not a parseable name")
+  is exactly the kind that survives a port unnoticed, and because it would become user-visible the
+  day the OTF deferral is revisited.
 
 ---
 

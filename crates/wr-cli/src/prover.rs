@@ -1,0 +1,1971 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.).
+
+//! `Main/Prover.java` (814 LOC) — the command **dispatch core**: the regex table, the
+//! `[...]`-metacommand strip + `;`/`:`/`::` suffix handling (`parseSetup`), the
+//! command-name lookup (`dispatch`), the 35-arm switch (`processCommand`), and the shared
+//! file/REPL reader loop (`readBuffer`/`run`).
+//!
+//! # What this unit ports and what it deliberately leaves as stubs
+//!
+//! U21's job is the *plumbing*, so that U22–U26 can fill in command bodies without
+//! touching dispatch. Fully wired here (calling code that already exists):
+//!
+//! | command | goes to |
+//! |---|---|
+//! | `eval`, `def` | [`crate::eval_def::eval_def_command_with_stdout`] (U15) |
+//! | `reg` | [`crate::reg::reg`] (U16) |
+//! | `alphabet` | [`crate::alphabet::alphabet_command`] (U16) |
+//! | `load` | [`Prover::load_command`], which re-enters [`Prover::read_buffer`] |
+//! | `exit`, `quit` | no body — `dispatch` returns `false` |
+//! | `cls`, `clear` | [`crate::prover_helper::clear_screen_to`] |
+//!
+//! Every OTHER command name in Java's `RE_FOR_THE_LIST_OF_CMDS` has a real arm here that
+//! **matches its argument regex first** (so a malformed invocation still produces Walnut's
+//! own `Invalid use of the X command.`) and then returns
+//! [`ProverError::NotYetImplemented`] naming the unit that owns it, or
+//! [`ProverError::UnsupportedCommand`] for `ost` (Ostrowski numeration — DROP scope,
+//! `docs/BOUNDARY-MAP.md` §4.1). Each arm cites its `Prover.java` line so its owning unit
+//! can find its slot.
+//!
+//! # Java statics → fields
+//!
+//! `PORTING.md`'s standing ruling, already applied by `crate::session` and
+//! `wr_core::logging`. [`Prover`] owns the [`Session`], the [`Logging`], the
+//! [`MetaCommands`], `printFlag`/`printDetails`, `currentEvalName`, and the process stdout
+//! sink (injectable, so the whole REPL is testable without capturing real streams).
+//! `Prover.mainProver` — the singleton — simply does not exist; callers construct a
+//! `Prover`.
+//!
+//! # The parsed `MetaCommands` is not threaded into determinization yet
+//!
+//! `[strategy …]`/`[export …]` are fully **parsed** here and
+//! [`crate::meta_commands::MetaCommands`] implements
+//! [`wr_core::determinize::DeterminizeContext`], but nothing hands that context down to
+//! `wr_core::determinize::determinize` yet: the whole `eval` call chain
+//! (`eval_def_command` → `wr_logic::eval` → `wr_core::quantify`) still passes `None`, i.e.
+//! U0c's documented no-op default (`SC`, no export, no counter movement). Wiring the real
+//! context through that chain means threading an `Option<&mut dyn DeterminizeContext>`
+//! parameter through `wr-logic`, which is a separate unit's decision — and note
+//! `determinize.rs`'s standing requirement that the caller pass `None` whenever
+//! `should_print_details()` is false, or the automaton indices shift. Until then a
+//! metacommand parses, validates, and has no effect on the computation;
+//! [`Prover::meta_commands`]/[`Prover::meta_commands_mut`] expose the parsed state so that
+//! unit has something to pass.
+//!
+//! # `FreshIdentifiers` is per-evaluation, not per-session
+//!
+//! `PORTING.md`'s `Token.getUniqueString()` entry: one [`FreshIdentifiers`] per
+//! evaluation. The `eval`/`def` arm therefore builds a fresh one per command, which is
+//! what every existing call site in this workspace already does.
+//!
+//! # Java regex dialect
+//!
+//! Patterns are ported verbatim except for the three ASCII/Unicode class fixes
+//! `PORTING.md`'s "Phase 3 rulings" already settled for `wr-logic`'s lexer: every `\w`,
+//! `\s` and `\d` is written `(?-u:\w)`/`(?-u:\s)`/`(?-u:\d)`, because Java's `Pattern` is
+//! ASCII-only for these classes unless `UNICODE_CHARACTER_CLASS` is set (it is not). Two
+//! further dialect notes:
+//!
+//! * `]` must be escaped in Rust even where Java allows it bare (`[^]]` → `[^\]]`, and a
+//!   literal `]` outside a class → `\]`). Same language, different spelling.
+//! * **`\>` is not a literal `>` in Rust — it is an end-of-word boundary** (`\<`/`\>`,
+//!   added to the `regex` crate in 1.10). Java has no such escape, so `\-\>` in
+//!   `RE_FOR_morphism_CMD` (`:120`) means the two literals `->`. The trap is that
+//!   `\-\>` **compiles clean** here and then never matches; it is written `\->` in this
+//!   port and pinned by
+//!   [`tests::an_escaped_gt_is_a_word_boundary_in_rust_not_a_literal`]. (Escaping `-`
+//!   outside a class *is* a plain literal in both dialects, so `\-` stays.)
+//! * Java's `$` also matches *before* a final line terminator; Rust's matches only at the
+//!   very end. The only `$`-anchored patterns here (`PAT_META_CMD`, `PAT_FOR_ost_CMD`) are
+//!   fed strings that `readBuffer` has already stripped, so no trailing terminator can
+//!   survive to expose the difference.
+//!
+//! Group NUMBERS are preserved exactly as Java's `static int` constants declare them
+//! (`R_REGEXP = 20`, `GROUP_alphabet_OLD_NAME = 21`, …) — capture groups number by opening
+//! parenthesis in both engines — and [`tests`] pins each one against a real command string
+//! rather than trusting the count.
+
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
+use std::sync::OnceLock;
+
+use regex_automata::meta::Regex;
+use regex_automata::util::captures::Captures;
+use regex_automata::Input;
+
+use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
+use wr_core::util::validate_file;
+use wr_logic::predicate_env::FreshIdentifiers;
+
+use crate::alphabet::{alphabet_command, AlphabetError};
+use crate::eval_def::{eval_def_command_with_stdout, EvalDefError};
+use crate::meta_commands::{MetaCommandError, MetaCommands};
+use crate::prover_helper::{clear_screen_to, ProverHelperError};
+use crate::reg::{reg, RegError};
+use crate::session::{Session, SessionPaths, PROMPT, WALNUT_VERSION};
+use crate::test_case::TestCase;
+use crate::walnut_exception as msg;
+
+// ---------------------------------------------------------------------------
+// Command names and small constants (`Prover.java:36-244`)
+// ---------------------------------------------------------------------------
+
+/// `Prover.RE_FOR_THE_LIST_OF_CMDS` (`:36`) — the 35 command names, verbatim and in
+/// Walnut's own order.
+pub const RE_FOR_THE_LIST_OF_CMDS: &str = "(eval|def|macro|reg|load|ost|exit|quit|cls|clear|combine|morphism|promote|image|inf|split|rsplit|join|test|transduce|reverse|minimize|convert|fixleadzero|fixtrailzero|alphabet|union|intersect|star|concat|rightquo|leftquo|describe|export|help)";
+
+/// `Prover.RE_START` (`:37`).
+const RE_START: &str = "^";
+
+/// `Prover.RE_IDENTIFIER` (`:39`), with `(?-u:\w)` for Java's ASCII-only `\w`.
+pub const RE_IDENTIFIER: &str = r"[a-zA-Z](?-u:\w)*";
+
+/// `Prover.RE_WORD_OF_CMD_NO_SPC` (`:40`).
+pub const RE_WORD_OF_CMD_NO_SPC: &str = r"([a-zA-Z](?-u:\w)*)";
+
+/// `Prover.RE_WORD_OF_CMD` (`:41`).
+const RE_WORD_OF_CMD: &str = r"(?-u:\s)+([a-zA-Z](?-u:\w)*)";
+
+/// `Prover.RE_EQ_INT_OPTIONAL` (`:43`).
+pub const RE_EQ_INT_OPTIONAL: &str = r"(=-?(?-u:\d)+)?";
+
+/// `Prover.DOLLAR` (`:162`) — the optional `$` marker distinguishing a predicate automaton
+/// from a word automaton (DFAO) argument.
+const DOLLAR: &str = r"(?-u:\s)+(\$|(?-u:\s)*)";
+
+pub const FIXTRAILZERO: &str = "fixtrailzero";
+pub const CONVERT: &str = "convert";
+/// `Prover.REVERSE_SPLIT` (`:53`) — used only as the *error-message* name for `rsplit`.
+pub const REVERSE_SPLIT: &str = "reverse split";
+pub const REG: &str = "reg";
+pub const LOAD: &str = "load";
+pub const ALPHABET: &str = "alphabet";
+pub const HELP: &str = "help";
+pub const CLEAR: &str = "clear";
+pub const CLS: &str = "cls";
+pub const DEF: &str = "def";
+pub const EVAL: &str = "eval";
+pub const EXIT: &str = "exit";
+pub const QUIT: &str = "quit";
+pub const LEFT_BRACKET: &str = "[";
+pub const DOT: &str = ".";
+pub const TXT_STRING: &str = "txt";
+/// `Prover.TXT_EXTENSION` (`:67`) — aliased to `wr-core`'s existing constant rather than
+/// spelled a second time (one literal, not two that can drift).
+pub const TXT_EXTENSION: &str = wr_core::numsys::TXT_EXTENSION;
+pub const GV_STRING: &str = "gv";
+/// `Prover.GV_EXTENSION` (`:69`) — aliased to `crate::automaton_output`'s existing copy.
+pub const GV_EXTENSION: &str = crate::automaton_output::GV_EXTENSION;
+pub const BA_STRING: &str = "ba";
+pub const BA_EXTENSION: &str = ".ba";
+pub const FIRST_OP: &str = "first";
+pub const IF_OTHER_OP: &str = "if_other";
+
+pub const MACRO: &str = "macro";
+pub const OST: &str = "ost";
+pub const COMBINE: &str = "combine";
+pub const MORPHISM: &str = "morphism";
+pub const PROMOTE: &str = "promote";
+pub const IMAGE: &str = "image";
+pub const INF: &str = "inf";
+pub const SPLIT: &str = "split";
+pub const RSPLIT: &str = "rsplit";
+pub const JOIN: &str = "join";
+pub const TEST: &str = "test";
+pub const TRANSDUCE: &str = "transduce";
+pub const REVERSE: &str = "reverse";
+pub const MINIMIZE: &str = "minimize";
+pub const FIXLEADZERO: &str = "fixleadzero";
+pub const UNION: &str = "union";
+pub const INTERSECT: &str = "intersect";
+pub const STAR: &str = "star";
+pub const CONCAT: &str = "concat";
+pub const RIGHTQUO: &str = "rightquo";
+pub const LEFTQUO: &str = "leftquo";
+pub const EXPORT: &str = "export";
+pub const DESCRIBE: &str = "describe";
+
+// -- capture-group indices, verbatim from Java's `static int` constants ------
+
+/// `Prover.L_FILENAME` (`:78`).
+pub const L_FILENAME: usize = 1;
+/// `Prover.ED_NAME`/`ED_FREE_VARIABLES`/`ED_PREDICATE` (`:88`).
+pub const ED_NAME: usize = 2;
+pub const ED_FREE_VARIABLES: usize = 3;
+pub const ED_PREDICATE: usize = 4;
+/// `Prover.M_NAME`/`M_DEFINITION` (`:93`).
+pub const M_NAME: usize = 1;
+pub const M_DEFINITION: usize = 2;
+/// `Prover.R_NAME`/`R_LIST_OF_ALPHABETS`/`R_REGEXP` (`:101`). `R_LIST_OF_ALPHABETS` is
+/// reused verbatim by the `alphabet` arm (`:767`) — the two patterns share that group's
+/// position.
+pub const R_NAME: usize = 2;
+pub const R_LIST_OF_ALPHABETS: usize = 3;
+pub const R_REGEXP: usize = 20;
+/// `Prover.R_NUMBER_SYSTEM`/`R_SET` (`:106`) — consumed by
+/// `Alphabet.determineAlphabetsAndNS`, i.e. `crate::alphabet`, not by dispatch.
+pub const R_NUMBER_SYSTEM: usize = 2;
+pub const R_SET: usize = 11;
+/// `Prover.GROUP_OST_*` (`:111`).
+pub const GROUP_OST_NAME: usize = 1;
+pub const GROUP_OST_PREPERIOD: usize = 2;
+pub const GROUP_OST_PERIOD: usize = 4;
+/// `Prover.GROUP_COMBINE_*` (`:117`).
+pub const GROUP_COMBINE_NAME: usize = 1;
+pub const GROUP_COMBINE_AUTOMATA: usize = 2;
+/// `Prover.GROUP_MORPHISM_NAME` (`:122`).
+///
+/// **Quirk, ported verbatim:** Java declares `static int GROUP_MORPHISM_NAME = 1,
+/// GROUP_MORPHISM_DEFINITION;` — the second field is never assigned, so it keeps `int`'s
+/// default `0`, and `morphismCommand` passes `m.group(0)` (the WHOLE match) as the
+/// morphism definition. That is not a typo in this port.
+pub const GROUP_MORPHISM_NAME: usize = 1;
+pub const GROUP_MORPHISM_DEFINITION: usize = 0;
+/// `Prover.GROUP_PROMOTE_*` (`:127`).
+pub const GROUP_PROMOTE_NAME: usize = 1;
+pub const GROUP_PROMOTE_MORPHISM: usize = 2;
+/// `Prover.GROUP_IMAGE_*` (`:132`).
+pub const GROUP_IMAGE_NEW_NAME: usize = 1;
+pub const GROUP_IMAGE_MORPHISM: usize = 2;
+pub const GROUP_IMAGE_OLD_NAME: usize = 3;
+/// `Prover.GROUP_INF_NAME` (`:137`).
+pub const GROUP_INF_NAME: usize = 1;
+/// `Prover.GROUP_SPLIT_*` (`:142`).
+pub const GROUP_SPLIT_NAME: usize = 1;
+pub const GROUP_SPLIT_AUTOMATA: usize = 2;
+pub const GROUP_SPLIT_INPUT: usize = 3;
+/// `Prover.GROUP_RSPLIT_*` (`:149`) — note the unusual order.
+pub const GROUP_RSPLIT_NAME: usize = 1;
+pub const GROUP_RSPLIT_AUTOMATA: usize = 4;
+pub const GROUP_RSPLIT_INPUT: usize = 2;
+/// `Prover.GROUP_JOIN_*` (`:154`).
+pub const GROUP_JOIN_NAME: usize = 1;
+pub const GROUP_JOIN_AUTOMATA: usize = 2;
+/// `Prover.GROUP_TEST_*` (`:159`).
+pub const GROUP_TEST_NAME: usize = 1;
+pub const GROUP_TEST_NUM: usize = 2;
+/// `Prover.GROUP_TRANSDUCE_*` (`:165-166`).
+pub const GROUP_TRANSDUCE_NEW_NAME: usize = 1;
+pub const GROUP_TRANSDUCE_TRANSDUCER: usize = 2;
+pub const GROUP_TRANSDUCE_DOLLAR_SIGN: usize = 3;
+pub const GROUP_TRANSDUCE_OLD_NAME: usize = 4;
+/// `Prover.GROUP_REVERSE_*` (`:171`).
+pub const GROUP_REVERSE_NEW_NAME: usize = 1;
+pub const GROUP_REVERSE_DOLLAR_SIGN: usize = 2;
+pub const GROUP_REVERSE_OLD_NAME: usize = 3;
+/// `Prover.GROUP_MINIMIZE_*` (`:176`).
+pub const GROUP_MINIMIZE_NEW_NAME: usize = 1;
+pub const GROUP_MINIMIZE_OLD_NAME: usize = 2;
+/// `Prover.GROUP_CONVERT_*` (`:180-183`).
+pub const GROUP_CONVERT_NEW_NAME: usize = 2;
+pub const GROUP_CONVERT_OLD_NAME: usize = 7;
+pub const GROUP_CONVERT_NEW_DOLLAR_SIGN: usize = 1;
+pub const GROUP_CONVERT_OLD_DOLLAR_SIGN: usize = 6;
+pub const GROUP_CONVERT_MSD_OR_LSD: usize = 4;
+pub const GROUP_CONVERT_BASE: usize = 5;
+/// `Prover.GROUP_FIXLEADZERO_*`/`GROUP_FIXTRAILZERO_*` (`:188`, `:192`).
+pub const GROUP_FIXLEADZERO_NEW_NAME: usize = 1;
+pub const GROUP_FIXLEADZERO_OLD_NAME: usize = 3;
+pub const GROUP_FIXTRAILZERO_NEW_NAME: usize = 1;
+pub const GROUP_FIXTRAILZERO_OLD_NAME: usize = 3;
+/// `Prover.GROUP_alphabet_*` (`:197`).
+pub const GROUP_ALPHABET_NEW_NAME: usize = 2;
+pub const GROUP_ALPHABET_DOLLAR_SIGN: usize = 20;
+pub const GROUP_ALPHABET_OLD_NAME: usize = 21;
+/// `Prover.GROUP_UNION_*`/`GROUP_INTERSECT_*`/`GROUP_CONCAT_*` (`:202`, `:207`, `:217`).
+pub const GROUP_UNION_NAME: usize = 1;
+pub const GROUP_UNION_AUTOMATA: usize = 2;
+pub const GROUP_INTERSECT_NAME: usize = 1;
+pub const GROUP_INTERSECT_AUTOMATA: usize = 2;
+pub const GROUP_CONCAT_NAME: usize = 1;
+pub const GROUP_CONCAT_AUTOMATA: usize = 2;
+/// `Prover.GROUP_STAR_*` (`:212`).
+pub const GROUP_STAR_NEW_NAME: usize = 1;
+pub const GROUP_STAR_OLD_NAME: usize = 2;
+/// `Prover.GROUP_quo_*` (`:222`), shared by `rightquo` and `leftquo`.
+pub const GROUP_QUO_NEW_NAME: usize = 1;
+pub const GROUP_QUO_OLD_NAME1: usize = 2;
+pub const GROUP_QUO_OLD_NAME2: usize = 3;
+/// `Prover.GROUP_META_CMD`/`GROUP_FINAL_CMD` (`:230`).
+pub const GROUP_META_CMD: usize = 1;
+pub const GROUP_FINAL_CMD: usize = 2;
+/// `Prover.GROUP_export_*` (`:239`).
+pub const GROUP_EXPORT_DOLLAR_SIGN: usize = 1;
+pub const GROUP_EXPORT_NAME: usize = 2;
+pub const GROUP_EXPORT_TYPE: usize = 3;
+/// `Prover.GROUP_describe_*` (`:244`).
+pub const GROUP_DESCRIBE_DOLLAR_SIGN: usize = 1;
+pub const GROUP_DESCRIBE_NAME: usize = 2;
+
+/// `Prover.usageMessage` (`:256-270`).
+pub const USAGE_MESSAGE: &str = r#"Usage: walnut [OPTIONS] [<filename>]
+
+Walnut command-line interface.
+
+Positional arguments:
+  <filename>          File of commands to execute (same effect as the `load`
+                      command). If omitted, starts an interactive session.
+
+Options:
+  --global-session    Use the old (Walnut 6 and earlier) global session behavior.
+  --session-dir PATH  Use PATH instead of an auto-generated Session directory.
+  --home-dir PATH     Use PATH instead of the current working directory.
+  --help              Show this help message and exit.
+"#;
+
+/// `Prover.OTF_MESSAGE` (`:272-276`) — printed after any command that used an OTF
+/// strategy. **Unreachable in this port** (see [`crate::meta_commands`]); ported because
+/// the mechanical-port rule says dead code stays.
+pub const OTF_MESSAGE: &str = r#"---------------------------
+If the CCL(S) or BRZ-CCL(S) algorithms are used, please cite the paper:
+Nicol, John, and Markus Frohme. "Deconstructing Subset Construction: Reducing While Determinizing." International Conference on Tools and Algorithms for the Construction and Analysis of Systems. Cham: Springer Nature Switzerland, 2026.
+---------------------------"#;
+
+/// `Prover.homeDirArg`/`sessionDirArg`/`globalSessionArg` (`:278-280`).
+pub const HOME_DIR_ARG: &str = "--home-dir=";
+pub const SESSION_DIR_ARG: &str = "--session-dir=";
+pub const GLOBAL_SESSION_ARG: &str = "--global-session";
+
+// ---------------------------------------------------------------------------
+// The compiled pattern table
+// ---------------------------------------------------------------------------
+
+/// Every `Pattern` static in `Prover.java`. Java also holds a `Matcher` per use site;
+/// a `regex_automata::meta::Regex` binds to no haystack, so there is no `Matcher` half
+/// here (same shape as `wr-logic`'s lexer, whose docs argue the point at length).
+pub struct Patterns {
+    pub cmd: Regex,
+    pub list_of_cmds: Regex,
+    pub load: Regex,
+    pub eval_def: Regex,
+    pub macro_cmd: Regex,
+    pub reg: Regex,
+    pub single_element_of_a_set: Regex,
+    pub ost: Regex,
+    pub combine: Regex,
+    pub morphism: Regex,
+    pub promote: Regex,
+    pub image: Regex,
+    pub inf: Regex,
+    pub split: Regex,
+    pub input_in_split: Regex,
+    pub rsplit: Regex,
+    pub join: Regex,
+    pub test: Regex,
+    pub transduce: Regex,
+    pub reverse: Regex,
+    pub minimize: Regex,
+    pub convert: Regex,
+    pub fixleadzero: Regex,
+    pub fixtrailzero: Regex,
+    pub alphabet: Regex,
+    pub union: Regex,
+    pub intersect: Regex,
+    pub star: Regex,
+    pub concat: Regex,
+    pub rightquo: Regex,
+    pub leftquo: Regex,
+    pub export: Regex,
+    pub describe: Regex,
+    pub meta_cmd: Regex,
+}
+
+/// The alphabet/number-system token list shared by `RE_FOR_reg_CMD` (`:96`) and
+/// `RE_FOR_alphabet_CMD` (`:194-195`) — identical text in both, which is why their group
+/// numbering agrees and `R_LIST_OF_ALPHABETS` is reused across them.
+const RE_LIST_OF_ALPHABETS: &str = r"((((((msd|lsd)_((?-u:\d)+|(?-u:\w)+))|((msd|lsd)((?-u:\d)+|(?-u:\w)+))|(msd|lsd)|((?-u:\d)+|(?-u:\w)+))|(\{((?-u:\s)*(\+|\-)?(?-u:\s)*(?-u:\d)+)((?-u:\s)*,(?-u:\s)*(\+|\-)?(?-u:\s)*(?-u:\d)+)*(?-u:\s)*\}))(?-u:\s)+)+)";
+
+fn compile(pattern: &str) -> Regex {
+    Regex::new(pattern)
+        .unwrap_or_else(|e| panic!("Prover pattern failed to compile: {pattern}: {e}"))
+}
+
+impl Patterns {
+    fn compile_all() -> Patterns {
+        let id = RE_IDENTIFIER;
+        let w = RE_WORD_OF_CMD;
+        let wn = RE_WORD_OF_CMD_NO_SPC;
+        Patterns {
+            // `RE_FOR_CMD` (`:48`).
+            cmd: compile(&format!(r"{RE_START}((?-u:\w)+)((?-u:\s)+.*)?")),
+            // `commandName.matches(RE_FOR_THE_LIST_OF_CMDS)` (`:415`) -- `String.matches`
+            // anchors both ends, hence the added `^`/`$`.
+            list_of_cmds: compile(&format!("^{RE_FOR_THE_LIST_OF_CMDS}$")),
+            // `RE_FOR_load_CMD` (`:79`).
+            load: compile(&format!(r"{RE_START}{LOAD}(?-u:\s)+((?-u:\w)+\.txt)")),
+            // `RE_FOR_eval_def_CMDS` (`:83-84`).
+            eval_def: compile(&format!(
+                r#"{RE_START}(eval|def)(?:(?-u:\s)+({id})((?:(?-u:\s)+{id})*))?(?-u:\s)+"(.*)""#
+            )),
+            // `RE_FOR_macro_CMD` (`:92`).
+            macro_cmd: compile(&format!(r#"{RE_START}{MACRO}{w}(?-u:\s)+"(.*)""#)),
+            // `RE_FOR_reg_CMD` (`:96`).
+            reg: compile(&format!(
+                r#"{RE_START}(reg){w}(?-u:\s)+{RE_LIST_OF_ALPHABETS}"(.*)""#
+            )),
+            // `RE_FOR_A_SINGLE_ELEMENT_OF_A_SET` (`:103`).
+            single_element_of_a_set: compile(r"(\+|\-)?(?-u:\s)*(?-u:\d)+"),
+            // `RE_FOR_ost_CMD` (`:109`).
+            ost: compile(&format!(
+                r"{RE_START}{OST}{w}(?-u:\s)*\[(?-u:\s)*(((?-u:\d)+(?-u:\s)*)*)\](?-u:\s)*\[(?-u:\s)*(((?-u:\d)+(?-u:\s)*)*)\]$"
+            )),
+            // `RE_FOR_combine_CMD` (`:114-115`).
+            combine: compile(&format!(
+                r"{RE_START}{COMBINE}{w}(((?-u:\s)+({id}{RE_EQ_INT_OPTIONAL}))*)"
+            )),
+            // `RE_FOR_morphism_CMD` (`:120`).
+            morphism: compile(&format!(
+                r#"{RE_START}{MORPHISM}{w}(?-u:\s)+"((?-u:\d)+(?-u:\s)*\->(?-u:\s)*(.)*(,(?-u:\d)+(?-u:\s)*\->(?-u:\s)*(.)*)*)""#
+            )),
+            // `RE_FOR_promote_CMD` (`:125`).
+            promote: compile(&format!(r"{RE_START}{PROMOTE}{w}{w}")),
+            // `RE_FOR_image_CMD` (`:130`).
+            image: compile(&format!(r"{RE_START}{IMAGE}{w}{w}{w}")),
+            // `RE_FOR_inf_CMD` (`:135`).
+            inf: compile(&format!(r"{RE_START}{INF}{w}")),
+            // `RE_FOR_split_CMD` (`:140`).
+            split: compile(&format!(
+                r"{RE_START}{SPLIT}{w}{w}(((?-u:\s)*\[(?-u:\s)*[+-]?(?-u:\s)*\])+)"
+            )),
+            // `RE_FOR_INPUT_IN_split_CMD` (`:143`).
+            input_in_split: compile(r"\[(?-u:\s)*([+-]?)(?-u:\s)*\]"),
+            // `RE_FOR_rsplit_CMD` (`:147`).
+            rsplit: compile(&format!(
+                r"{RE_START}{RSPLIT}{w}(((?-u:\s)*\[(?-u:\s)*[+-]?(?-u:\s)*\])+){w}"
+            )),
+            // `RE_FOR_join_CMD` (`:152`).
+            join: compile(&format!(
+                r"{RE_START}{JOIN}{w}(({w}(((?-u:\s)*\[(?-u:\s)*[a-zA-Z&&[^AE]](?-u:\w)*(?-u:\s)*\])+))*)"
+            )),
+            // `RE_FOR_test_CMD` (`:157`).
+            test: compile(&format!(r"{RE_START}{TEST}{w}(?-u:\s)*((?-u:\d)+)")),
+            // `RE_FOR_transduce_CMD` (`:163`).
+            transduce: compile(&format!(r"{RE_START}{TRANSDUCE}{w}{w}{DOLLAR}{wn}")),
+            // `RE_FOR_reverse_CMD` (`:169`).
+            reverse: compile(&format!(r"{RE_START}{REVERSE}{w}{DOLLAR}{wn}")),
+            // `RE_FOR_minimize_CMD` (`:174`).
+            minimize: compile(&format!(r"{RE_START}{MINIMIZE}{w}{w}")),
+            // `RE_FOR_convert_CMD` (`:178`).
+            convert: compile(&format!(
+                r"{RE_START}convert{DOLLAR}{wn}(?-u:\s)+((msd|lsd)_((?-u:\d)+)){DOLLAR}{wn}"
+            )),
+            // `RE_FOR_fixleadzero_CMD` (`:186`).
+            fixleadzero: compile(&format!(r"{RE_START}{FIXLEADZERO}{w}{DOLLAR}{wn}")),
+            // `RE_FOR_fixtrailzero_CMD` (`:190`).
+            fixtrailzero: compile(&format!(r"{RE_START}{FIXTRAILZERO}{w}{DOLLAR}{wn}")),
+            // `RE_FOR_alphabet_CMD` (`:194-195`).
+            alphabet: compile(&format!(
+                r"{RE_START}({ALPHABET}){w}(?-u:\s)+{RE_LIST_OF_ALPHABETS}(\$|(?-u:\s)*){wn}"
+            )),
+            // `RE_FOR_union_CMD` (`:200`).
+            union: compile(&format!(r"{RE_START}{UNION}{w}(({w})*)")),
+            // `RE_FOR_intersect_CMD` (`:205`).
+            intersect: compile(&format!(r"{RE_START}{INTERSECT}{w}(({w})*)")),
+            // `RE_FOR_star_CMD` (`:210`).
+            star: compile(&format!(r"{RE_START}{STAR}{w}{w}")),
+            // `RE_FOR_concat_CMD` (`:215`).
+            concat: compile(&format!(r"{RE_START}{CONCAT}{w}(({w})*)")),
+            // `RE_FOR_rightquo_CMD` (`:220`).
+            rightquo: compile(&format!(r"{RE_START}{RIGHTQUO}{w}{w}{w}")),
+            // `RE_FOR_leftquo_CMD` (`:225`).
+            leftquo: compile(&format!(r"{RE_START}{LEFTQUO}{w}{w}{w}")),
+            // `RE_FOR_export_CMD` (`:237`).
+            export: compile(&format!(r"{RE_START}{EXPORT}{DOLLAR}{wn}{w}")),
+            // `RE_FOR_describe_CMD` (`:242`).
+            describe: compile(&format!(r"{RE_START}{DESCRIBE}{DOLLAR}{wn}")),
+            // `PAT_META_CMD` (`:229`) -- Java's bare `]`s must be escaped in Rust.
+            meta_cmd: compile(r"^\[([^\]]*)\](.*)$"),
+        }
+    }
+}
+
+/// The process-wide compiled pattern table. [`OnceLock`] rather than `LazyLock` for the
+/// same reason `wr-logic`'s lexer uses one: this workspace's `rust-version` is 1.75.
+pub fn patterns() -> &'static Patterns {
+    static PATTERNS: OnceLock<Patterns> = OnceLock::new();
+    PATTERNS.get_or_init(Patterns::compile_all)
+}
+
+/// `Matcher.find()` — an UNANCHORED search (every pattern here starts with `^`, so the
+/// distinction only matters for the ones that do not).
+pub fn find(re: &Regex, hay: &str) -> Option<Captures> {
+    let mut caps = re.create_captures();
+    re.search_captures(&Input::new(hay), &mut caps);
+    if caps.is_match() {
+        Some(caps)
+    } else {
+        None
+    }
+}
+
+/// `Matcher.group(int)` — `None` for a group that did not participate (Java's `null`).
+pub fn group<'h>(caps: &Captures, hay: &'h str, index: usize) -> Option<&'h str> {
+    caps.get_group(index).map(|span| &hay[span])
+}
+
+/// `ProverHelper.matchOrFail(Pattern, String, String)` (`ProverHelper.java:35-41`) — see
+/// `crate::prover_helper`'s docs for why it lives here rather than there.
+pub fn match_or_fail(re: &Regex, input: &str, command_name: &str) -> Result<Captures, ProverError> {
+    find(re, input).ok_or_else(|| ProverError::InvalidCommandUse(command_name.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Every failure `Prover`'s dispatch layer can report.
+#[derive(Debug)]
+pub enum ProverError {
+    /// `WalnutException.invalidCommand` (`:411`, `:437`, `:574`).
+    InvalidCommand(String),
+    /// `WalnutException.noSuchCommand` (`:416`).
+    NoSuchCommand,
+    /// `WalnutException.invalidCommandUse`, via `ProverHelper.matchOrFail`.
+    InvalidCommandUse(String),
+    /// `UtilityMethods.validateFile`'s `IllegalArgumentException`
+    /// (`UtilityMethods.java:153-158`).
+    InvalidFile(String),
+    Meta(MetaCommandError),
+    EvalDef(EvalDefError),
+    Reg(RegError),
+    Alphabet(AlphabetError),
+    Helper(ProverHelperError),
+    Io(io::Error),
+    /// **Port-specific.** A command this project deliberately does not implement.
+    UnsupportedCommand {
+        command: &'static str,
+        reason: &'static str,
+    },
+    /// **Port-specific.** A command whose dispatch arm exists but whose body belongs to a
+    /// later unit.
+    NotYetImplemented {
+        command: &'static str,
+        unit: &'static str,
+    },
+}
+
+impl std::fmt::Display for ProverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProverError::InvalidCommand(c) => write!(f, "{}", msg::invalid_command(c)),
+            ProverError::NoSuchCommand => write!(f, "{}", msg::no_such_command()),
+            ProverError::InvalidCommandUse(c) => write!(f, "{}", msg::invalid_command_use(c)),
+            ProverError::InvalidFile(m) => write!(f, "{m}"),
+            ProverError::Meta(e) => write!(f, "{e}"),
+            ProverError::EvalDef(e) => write!(f, "{e}"),
+            ProverError::Reg(e) => write!(f, "{e}"),
+            ProverError::Alphabet(e) => write!(f, "{e}"),
+            ProverError::Helper(e) => write!(f, "{e}"),
+            ProverError::Io(e) => write!(f, "{e}"),
+            ProverError::UnsupportedCommand { command, reason } => write!(
+                f,
+                "The {command} command is out of scope for walnut-rs ({reason})."
+            ),
+            ProverError::NotYetImplemented { command, unit } => write!(
+                f,
+                "The {command} command is not implemented yet (planned for {unit})."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProverError {}
+
+impl LoggableError for ProverError {
+    /// Exhaustive on purpose, same discipline as `wr_logic::eval`'s `ActError` impl.
+    fn is_handled(&self) -> bool {
+        match self {
+            ProverError::InvalidCommand(_)
+            | ProverError::NoSuchCommand
+            | ProverError::InvalidCommandUse(_) => true,
+            // `IllegalArgumentException`, not a `WalnutException`.
+            ProverError::InvalidFile(_) => false,
+            ProverError::Meta(e) => e.is_handled(),
+            // Wrapped command errors: every variant of these is a deliberately-thrown
+            // `WalnutException` (or, for the I/O ones, this port's own Result-propagating
+            // idiom — see `crate::automaton_output`'s docs), so they render message-only.
+            ProverError::EvalDef(_)
+            | ProverError::Reg(_)
+            | ProverError::Alphabet(_)
+            | ProverError::Helper(_)
+            | ProverError::Io(_) => true,
+            // This port's own scope errors; no Java analogue.
+            ProverError::UnsupportedCommand { .. } | ProverError::NotYetImplemented { .. } => true,
+        }
+    }
+
+    fn message(&self) -> Option<String> {
+        Some(self.to_string())
+    }
+
+    fn kind(&self) -> String {
+        match self {
+            ProverError::InvalidFile(_) => "java.lang.IllegalArgumentException".to_string(),
+            ProverError::Meta(e) => e.kind(),
+            _ => "Main.WalnutException".to_string(),
+        }
+    }
+
+    fn stack_trace_lines(&self) -> Vec<String> {
+        match self {
+            ProverError::Meta(e) => e.stack_trace_lines(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+macro_rules! prover_error_from {
+    ($($from:ty => $variant:ident),+ $(,)?) => {
+        $(impl From<$from> for ProverError {
+            fn from(e: $from) -> Self {
+                ProverError::$variant(e)
+            }
+        })+
+    };
+}
+
+prover_error_from! {
+    MetaCommandError => Meta,
+    EvalDefError => EvalDef,
+    RegError => Reg,
+    AlphabetError => Alphabet,
+    ProverHelperError => Helper,
+    io::Error => Io,
+}
+
+// ---------------------------------------------------------------------------
+// Prover
+// ---------------------------------------------------------------------------
+
+/// `Main/Prover.java`'s instance state, plus the statics it read (see the module docs).
+pub struct Prover {
+    session: Session,
+    logging: Logging,
+    /// `Prover.metaCommands` (`:246`) — rebuilt by every `parseSetup`.
+    meta_commands: MetaCommands,
+    /// `Prover.printDetails` (`:249`).
+    print_details: bool,
+    /// `Prover.printFlag` (`:250`).
+    print_flag: bool,
+    /// `Prover.currentEvalName` (`:252`).
+    current_eval_name: Option<String>,
+    /// `System.out`, injectable. Everything Java writes with a bare `System.out.print`
+    /// (the prompt, the file echo, the welcome banner, `TRUE`/`FALSE`, `clearScreen`)
+    /// goes here; `Logging`'s own console sink is separate, exactly as in Java.
+    out: Box<dyn Write>,
+}
+
+impl Prover {
+    /// A prover over `session`, writing to the real process stdout, with the global log
+    /// initialized under the session's `Result/` directory.
+    ///
+    /// Java runs `Logging.initializeGlobalLog(getAddressForResult() +
+    /// GLOBAL_LOG_FILENAME)` as the last statement of `Session.setPathsAndNames`
+    /// (`Session.java:84`); this port has no static `Logging`, so the call moves to the
+    /// point where a `Logging` first exists. Nothing can be logged in between.
+    pub fn new(session: Session) -> Self {
+        Prover::with_output(session, Logging::new(), Box::new(io::stdout()))
+    }
+
+    /// As [`Prover::new`], with both sinks injected — the seam the tests below and any
+    /// future harness use.
+    pub fn with_output(session: Session, mut logging: Logging, out: Box<dyn Write>) -> Self {
+        logging.initialize_global_log(&format!(
+            "{}{GLOBAL_LOG_FILENAME}",
+            session.paths().address_for_result()
+        ));
+        Prover {
+            meta_commands: MetaCommands::with_paths(session.paths_rc()),
+            session,
+            logging,
+            print_details: false,
+            print_flag: false,
+            current_eval_name: None,
+            out,
+        }
+    }
+
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub fn logging(&self) -> &Logging {
+        &self.logging
+    }
+
+    pub fn logging_mut(&mut self) -> &mut Logging {
+        &mut self.logging
+    }
+
+    /// `Prover.metaCommands` (`:246`) — the parsed metacommand state of the command most
+    /// recently dispatched.
+    pub fn meta_commands(&self) -> &MetaCommands {
+        &self.meta_commands
+    }
+
+    /// As [`Prover::meta_commands`], mutably — this is the handle a later unit passes as
+    /// the `&mut dyn DeterminizeContext` the determinizer takes (see the module docs on
+    /// why nothing does that yet).
+    pub fn meta_commands_mut(&mut self) -> &mut MetaCommands {
+        &mut self.meta_commands
+    }
+
+    /// `Prover.printFlag`/`printDetails` (`:249-250`).
+    pub fn print_flag(&self) -> bool {
+        self.print_flag
+    }
+
+    pub fn print_details(&self) -> bool {
+        self.print_details
+    }
+
+    /// `Prover.currentEvalName` (`:252`).
+    pub fn current_eval_name(&self) -> Option<&str> {
+        self.current_eval_name.as_deref()
+    }
+
+    // -- parseSetup / dispatch ------------------------------------------------
+
+    /// `Prover.parseSetup(String)` (`:432-454`): reset per-command state, decode the
+    /// `;`/`:`/`::` suffix into `printFlag`/`printDetails`, strip metacommands, and
+    /// configure logging.
+    fn parse_setup(&mut self, s: &str) -> Result<String, ProverError> {
+        self.meta_commands = MetaCommands::with_paths(self.session.paths_rc());
+        self.print_details = false;
+        self.print_flag = false;
+
+        if !s.ends_with(';') && !s.ends_with(':') {
+            return Err(ProverError::InvalidCommand(s.to_string()));
+        }
+        let mut ending_to_remove = 1;
+        if s.ends_with(':') {
+            self.print_flag = true;
+            if s.ends_with("::") {
+                ending_to_remove += 1;
+                self.print_details = true;
+            }
+        }
+        // `s.substring(0, s.length() - endingToRemove)` -- the removed characters are `;`
+        // and `:`, both ASCII, so byte and char arithmetic agree here.
+        let s = &s[..s.len() - ending_to_remove];
+        // `s.strip()` (Unicode-aware) -- `str::trim` is the same idea; see
+        // `crate::eval_def`'s note on the `isBlank`/`trim` correspondence.
+        let s = s.trim();
+
+        let s = self
+            .meta_commands
+            .parse_meta_commands(s, self.print_details)?;
+        self.logging
+            .configure_for_command(self.print_flag, self.print_details);
+        Ok(s)
+    }
+
+    /// `Prover.dispatch(String)` (`:401-430`) — returns `false` iff the command was
+    /// `exit`/`quit` (or a `load` whose file contained one).
+    pub fn dispatch(&mut self, s: &str) -> Result<bool, ProverError> {
+        let original_command = s.to_string();
+        let s = self.parse_setup(s)?;
+        if s.is_empty() {
+            return Ok(true);
+        }
+        self.logging.log_command(Some(&original_command));
+
+        let caps =
+            find(&patterns().cmd, &s).ok_or_else(|| ProverError::InvalidCommand(s.clone()))?;
+        let command_name = group(&caps, &s, 1).unwrap_or("").to_string();
+        if !patterns().list_of_cmds.is_match(command_name.as_str()) {
+            return Err(ProverError::NoSuchCommand);
+        }
+
+        let mut exit_val = !(command_name == EXIT || command_name == QUIT);
+        if command_name == LOAD {
+            // Special-cased BEFORE the switch, "since load is a batch command" (`:420`).
+            exit_val = self.load_command(&s)?;
+        } else {
+            self.process_command(&s, &command_name)?;
+        }
+
+        if self.meta_commands.using_otf() {
+            // Unreachable while the OTF family is deferred -- see `crate::meta_commands`.
+            self.logging.log_and_print(OTF_MESSAGE);
+        }
+        Ok(exit_val)
+    }
+
+    /// `Prover.dispatchForIntegrationTest(String s, String msg)` (`:456-475`).
+    ///
+    /// Java's `msg` parameter is never used in the method body; ported as `_msg` rather
+    /// than dropped, so a Java call site translates one-for-one.
+    pub fn dispatch_for_integration_test(
+        &mut self,
+        s: &str,
+        _msg: &str,
+    ) -> Result<Option<TestCase>, ProverError> {
+        let s = s.trim();
+        let original_command = s.to_string();
+        let s = self.parse_setup(s)?;
+
+        if s.is_empty() || s.starts_with('#') {
+            return Ok(None);
+        }
+        self.logging.log_command(Some(&original_command));
+
+        let caps =
+            find(&patterns().cmd, &s).ok_or_else(|| ProverError::InvalidCommand(s.clone()))?;
+        let command_name = group(&caps, &s, 1).unwrap_or("").to_string();
+        if !patterns().list_of_cmds.is_match(command_name.as_str()) {
+            return Err(ProverError::NoSuchCommand);
+        }
+
+        self.process_command(&s, &command_name)
+    }
+
+    /// `Prover.processCommand(String, String)` (`:477-577`) — the 35-arm switch, in Java's
+    /// own (alphabetical) arm order.
+    fn process_command(
+        &mut self,
+        s: &str,
+        command_name: &str,
+    ) -> Result<Option<TestCase>, ProverError> {
+        match command_name {
+            // `:479-481`
+            ALPHABET => Ok(Some(self.alphabet_command(s)?)),
+            // `:482-485`
+            CLEAR | CLS => {
+                clear_screen_to(&mut self.out);
+                Ok(None)
+            }
+            // `:486-488` -> `Combine.combineCommand`
+            COMBINE => {
+                match_or_fail(&patterns().combine, s, COMBINE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: COMBINE,
+                    unit: "U23",
+                })
+            }
+            // `:489-491` -> `Concat.concat`
+            CONCAT => {
+                match_or_fail(&patterns().concat, s, CONCAT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: CONCAT,
+                    unit: "U23",
+                })
+            }
+            // `:492-494` -> `AutomatonLogicalOps.convertNS`
+            CONVERT => {
+                match_or_fail(&patterns().convert, s, CONVERT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: CONVERT,
+                    unit: "U24",
+                })
+            }
+            // `:495-497`
+            DEF | EVAL => Ok(Some(self.eval_def_commands(s)?)),
+            // `:498-500` -> `Describe.describe`
+            DESCRIBE => {
+                match_or_fail(&patterns().describe, s, DESCRIBE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: DESCRIBE,
+                    unit: "U23",
+                })
+            }
+            // `:501-503` -- no body; `dispatch` already computed `exitVal`.
+            EXIT | QUIT => Ok(None),
+            // `:504-506` -> `ProverHelper.exportAutomata`
+            EXPORT => {
+                match_or_fail(&patterns().export, s, EXPORT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: EXPORT,
+                    unit: "U24",
+                })
+            }
+            // `:507-509` -> `AutomatonLogicalOps.fixLeadingZerosProblem`
+            FIXLEADZERO => {
+                match_or_fail(&patterns().fixleadzero, s, FIXLEADZERO)?;
+                Err(ProverError::NotYetImplemented {
+                    command: FIXLEADZERO,
+                    unit: "U23",
+                })
+            }
+            // `:510-512` -> `AutomatonLogicalOps.fixTrailingZerosProblem`
+            FIXTRAILZERO => {
+                match_or_fail(&patterns().fixtrailzero, s, FIXTRAILZERO)?;
+                Err(ProverError::NotYetImplemented {
+                    command: FIXTRAILZERO,
+                    unit: "U23",
+                })
+            }
+            // `:513` -> `HelpMessages.helpCommand`. Note Java does NOT return here: the
+            // arm falls through to the method's trailing `return null`.
+            HELP => Err(ProverError::NotYetImplemented {
+                command: HELP,
+                unit: "U22",
+            }),
+            // `:514-516` -> `Image.image`
+            IMAGE => {
+                match_or_fail(&patterns().image, s, IMAGE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: IMAGE,
+                    unit: "U24",
+                })
+            }
+            // `:517-519` -> `ProverHelper.infFromAddress` (already ported; the arm still
+            // needs U24's decision about the command's console output contract).
+            INF => {
+                match_or_fail(&patterns().inf, s, INF)?;
+                Err(ProverError::NotYetImplemented {
+                    command: INF,
+                    unit: "U24",
+                })
+            }
+            // `:520-522` -> `Intersect.intersect`
+            INTERSECT => {
+                match_or_fail(&patterns().intersect, s, INTERSECT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: INTERSECT,
+                    unit: "U23",
+                })
+            }
+            // `:523-525` -> `Join.joinCommand`
+            JOIN => {
+                match_or_fail(&patterns().join, s, JOIN)?;
+                Err(ProverError::NotYetImplemented {
+                    command: JOIN,
+                    unit: "U24",
+                })
+            }
+            // `:526-528` -> `Quotient.leftQuotient`
+            LEFTQUO => {
+                match_or_fail(&patterns().leftquo, s, LEFTQUO)?;
+                Err(ProverError::NotYetImplemented {
+                    command: LEFTQUO,
+                    unit: "U23",
+                })
+            }
+            // `:529-531` -- reachable only through `dispatchForIntegrationTest`;
+            // `dispatch` special-cases `load` before the switch. Java discards the
+            // `false` return the same way (`if (!loadCommand(s)) return null;` and the
+            // method returns `null` regardless).
+            LOAD => {
+                self.load_command(s)?;
+                Ok(None)
+            }
+            // `:532-534`
+            MACRO => {
+                match_or_fail(&patterns().macro_cmd, s, MACRO)?;
+                Err(ProverError::NotYetImplemented {
+                    command: MACRO,
+                    unit: "U23",
+                })
+            }
+            // `:535-537` -> `WordAutomaton.minimizeSelfWithOutput`
+            MINIMIZE => {
+                match_or_fail(&patterns().minimize, s, MINIMIZE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: MINIMIZE,
+                    unit: "U23",
+                })
+            }
+            // `:538-540` -> `Main.Commands.Morphism.morphismCommand`
+            MORPHISM => {
+                match_or_fail(&patterns().morphism, s, MORPHISM)?;
+                Err(ProverError::NotYetImplemented {
+                    command: MORPHISM,
+                    unit: "U24",
+                })
+            }
+            // `:541-543` -> `Ost.ostCommand`. Ostrowski numeration is DROP scope.
+            OST => {
+                match_or_fail(&patterns().ost, s, OST)?;
+                Err(ProverError::UnsupportedCommand {
+                    command: OST,
+                    reason: "Ostrowski numeration is out of scope; see docs/BOUNDARY-MAP.md",
+                })
+            }
+            // `:544-546` -> `Morphism.toWordAutomaton`
+            PROMOTE => {
+                match_or_fail(&patterns().promote, s, PROMOTE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: PROMOTE,
+                    unit: "U24",
+                })
+            }
+            // `:547-549`
+            REG => Ok(Some(self.reg_command(s)?)),
+            // `:550-552` -> `Reverse.reverseCommand`
+            REVERSE => {
+                match_or_fail(&patterns().reverse, s, REVERSE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: REVERSE,
+                    unit: "U23",
+                })
+            }
+            // `:553-555` -> `Quotient.rightQuotient`
+            RIGHTQUO => {
+                match_or_fail(&patterns().rightquo, s, RIGHTQUO)?;
+                Err(ProverError::NotYetImplemented {
+                    command: RIGHTQUO,
+                    unit: "U23",
+                })
+            }
+            // `:556-558` -> `Split.processSplitCommand(…, true, …)`. Note the error name
+            // Java uses here is `REVERSE_SPLIT` ("reverse split"), not "rsplit".
+            RSPLIT => {
+                match_or_fail(&patterns().rsplit, s, REVERSE_SPLIT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: RSPLIT,
+                    unit: "U24",
+                })
+            }
+            // `:559-561` -> `Split.processSplitCommand(…, false, …)`
+            SPLIT => {
+                match_or_fail(&patterns().split, s, SPLIT)?;
+                Err(ProverError::NotYetImplemented {
+                    command: SPLIT,
+                    unit: "U24",
+                })
+            }
+            // `:562-564` -> `Star.star`
+            STAR => {
+                match_or_fail(&patterns().star, s, STAR)?;
+                Err(ProverError::NotYetImplemented {
+                    command: STAR,
+                    unit: "U23",
+                })
+            }
+            // `:565-567` -> `Test.testCommand`
+            TEST => {
+                match_or_fail(&patterns().test, s, TEST)?;
+                Err(ProverError::NotYetImplemented {
+                    command: TEST,
+                    unit: "U25",
+                })
+            }
+            // `:568-570` -> `Transducer.transduceNonDeterministic`
+            TRANSDUCE => {
+                match_or_fail(&patterns().transduce, s, TRANSDUCE)?;
+                Err(ProverError::NotYetImplemented {
+                    command: TRANSDUCE,
+                    unit: "U26",
+                })
+            }
+            // `:571-573` -> `Union.union`
+            UNION => {
+                match_or_fail(&patterns().union, s, UNION)?;
+                Err(ProverError::NotYetImplemented {
+                    command: UNION,
+                    unit: "U23",
+                })
+            }
+            // `:574` -- unreachable from `dispatch` (the name was already checked against
+            // `RE_FOR_THE_LIST_OF_CMDS`), but ported verbatim.
+            _ => Err(ProverError::InvalidCommand(command_name.to_string())),
+        }
+    }
+
+    // -- individual commands ---------------------------------------------------
+
+    /// `Prover.loadCommand(String)` (`:584-595`) — "load x.p; loads commands from the
+    /// file x.p. […] The user don't get a warning if the x.p contains load x.p but the
+    /// program might end up in an infinite loop."
+    pub fn load_command(&mut self, s: &str) -> Result<bool, ProverError> {
+        let caps = match_or_fail(&patterns().load, s, LOAD)?;
+        let filename = group(&caps, s, L_FILENAME).unwrap_or("");
+        let address = self
+            .session
+            .paths()
+            .read_address_for_command_files(filename);
+        validate_file(&address).map_err(ProverError::InvalidFile)?;
+        match File::open(&address) {
+            Ok(f) => {
+                let mut reader = BufReader::new(f);
+                if !self.read_buffer(&mut reader, false) {
+                    return Ok(false);
+                }
+            }
+            // Java's `catch (IOException e) { Logging.printTruncatedStackTrace(e); }`
+            // (`:591-593`) -- logged, not propagated, and `loadCommand` still returns
+            // `true`.
+            Err(e) => {
+                let io_err = IoLoggable(e);
+                self.logging.print_truncated_stack_trace(&io_err);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `Prover.evalDefCommands(String)` (`:597-602`).
+    fn eval_def_commands(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().eval_def, s, "eval/def")?;
+        // `currentEvalName = m.group(ED_NAME);` -- null in headless mode; used for the
+        // export metacommand, hence the second assignment into `MetaCommands`.
+        let eval_name = group(&caps, s, ED_NAME).map(|n| n.to_string());
+        self.current_eval_name = eval_name.clone();
+        self.meta_commands
+            .set_current_eval_name(eval_name.as_deref());
+
+        let predicate = group(&caps, s, ED_PREDICATE).unwrap_or("").to_string();
+        let free_vars = group(&caps, s, ED_FREE_VARIABLES).map(|v| v.to_string());
+
+        // One `FreshIdentifiers` per evaluation -- `PORTING.md`'s
+        // `Token.getUniqueString()` ruling.
+        let mut fresh = FreshIdentifiers::new();
+        let tc = eval_def_command_with_stdout(
+            &self.session,
+            &mut self.logging,
+            &mut fresh,
+            self.print_flag,
+            self.print_details,
+            &predicate,
+            eval_name.as_deref(),
+            free_vars.as_deref(),
+            &mut self.out,
+        )?;
+        Ok(tc)
+    }
+
+    /// `Prover.regCommand(String)` (`:615-618`).
+    fn reg_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().reg, s, REG)?;
+        let list_of_alphabets = group(&caps, s, R_LIST_OF_ALPHABETS)
+            .unwrap_or("")
+            .to_string();
+        let regexp = group(&caps, s, R_REGEXP).unwrap_or("").to_string();
+        let name = group(&caps, s, R_NAME).unwrap_or("").to_string();
+        Ok(reg(&self.session, &list_of_alphabets, &regexp, &name)?)
+    }
+
+    /// `Prover.alphabetCommand(String)` (`:764-771`). Note it reads
+    /// `R_LIST_OF_ALPHABETS` — `reg`'s group constant — off the `alphabet` pattern.
+    fn alphabet_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().alphabet, s, ALPHABET)?;
+        let list_of_alphabets = group(&caps, s, R_LIST_OF_ALPHABETS).map(|v| v.to_string());
+        let is_dfao = group(&caps, s, GROUP_ALPHABET_DOLLAR_SIGN) != Some("$");
+        let in_file_name = format!(
+            "{}{TXT_EXTENSION}",
+            group(&caps, s, GROUP_ALPHABET_OLD_NAME).unwrap_or("")
+        );
+        let new_name = group(&caps, s, GROUP_ALPHABET_NEW_NAME)
+            .unwrap_or("")
+            .to_string();
+        Ok(alphabet_command(
+            &self.session,
+            s,
+            list_of_alphabets.as_deref(),
+            is_dfao,
+            &in_file_name,
+            &new_name,
+        )?)
+    }
+
+    // -- the reader loop --------------------------------------------------------
+
+    /// `Prover.readBuffer(BufferedReader, boolean console)` (`:354-399`) — the ONE loop
+    /// behind both the REPL and `load`/command-file execution. Returns `false` iff a
+    /// command asked to exit.
+    ///
+    /// Quirks preserved: lines are concatenated into the buffer with **no separator**
+    /// (`:372`), a `#` line is echoed and skipped *before* buffering, and a
+    /// `RuntimeException` out of `dispatch` is logged and the loop continues (`:390-392`).
+    pub fn read_buffer(&mut self, input: &mut dyn BufRead, console: bool) -> bool {
+        let mut buffer = String::new();
+        loop {
+            if console {
+                let _ = write!(self.out, "{PROMPT}");
+                let _ = self.out.flush();
+            }
+
+            let mut line = String::new();
+            let read = match input.read_line(&mut line) {
+                Ok(n) => n,
+                // `catch (IOException e)` around the whole loop (`:394-396`).
+                Err(e) => {
+                    let io_err = IoLoggable(e);
+                    self.logging.print_truncated_stack_trace(&io_err);
+                    return true;
+                }
+            };
+            if read == 0 {
+                // `if (s == null) return true;` -- end of input.
+                return true;
+            }
+            // `BufferedReader.readLine` strips the terminator; `read_line` keeps it, and
+            // the following `strip()` removes it either way.
+            let s = line.trim();
+            if s.starts_with('#') {
+                let _ = writeln!(self.out, "{s}");
+                continue;
+            }
+
+            buffer.push_str(s);
+
+            if !(s.ends_with(';') || s.ends_with(':')) {
+                continue;
+            }
+
+            let command = std::mem::take(&mut buffer);
+
+            if !console {
+                let _ = writeln!(self.out, "{command}");
+            }
+
+            match self.dispatch(&command) {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => self.logging.print_truncated_stack_trace(&e),
+            }
+        }
+    }
+
+    /// `Prover.run(String filename)` (`:324-348`) — run a command file (if given), then
+    /// print the banner and hand control to the console REPL.
+    ///
+    /// The `validateFile` failure is an `IllegalArgumentException` in Java, uncaught, so
+    /// it aborts the process; here it is a returned `Err` for `main` to report.
+    pub fn run(&mut self, filename: Option<&str>) -> Result<(), ProverError> {
+        self.run_with_input(filename, &mut BufReader::new(io::stdin()))
+    }
+
+    /// As [`Prover::run`], with the console stream injected.
+    pub fn run_with_input(
+        &mut self,
+        filename: Option<&str>,
+        console_input: &mut dyn BufRead,
+    ) -> Result<(), ProverError> {
+        if let Some(filename) = filename {
+            let address = self
+                .session
+                .paths()
+                .read_address_for_command_files(filename);
+            validate_file(&address).map_err(ProverError::InvalidFile)?;
+            match File::open(&address) {
+                Ok(f) => {
+                    let mut reader = BufReader::new(f);
+                    if !self.read_buffer(&mut reader, false) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    let io_err = IoLoggable(e);
+                    self.logging.print_truncated_stack_trace(&io_err);
+                }
+            }
+        }
+
+        // `:336-342`.
+        let _ = writeln!(
+            self.out,
+            "Welcome to Walnut v{WALNUT_VERSION}! Type \"help;\" to see all available commands."
+        );
+        if self.session.paths().is_global_session() {
+            let _ = writeln!(self.out, "Using global Walnut session.");
+        } else {
+            let _ = writeln!(
+                self.out,
+                "Starting Walnut session: {}",
+                self.session.paths().name().unwrap_or("")
+            );
+        }
+
+        self.read_buffer(console_input, true);
+        Ok(())
+    }
+}
+
+/// `std::io::Error` as something [`Logging::print_truncated_stack_trace`] accepts. Java
+/// passes the raw `IOException`, which is not a `WalnutException`, hence `is_handled() ==
+/// false`.
+struct IoLoggable(io::Error);
+
+impl LoggableError for IoLoggable {
+    fn is_handled(&self) -> bool {
+        false
+    }
+
+    fn message(&self) -> Option<String> {
+        Some(self.0.to_string())
+    }
+
+    fn kind(&self) -> String {
+        "java.io.IOException".to_string()
+    }
+
+    fn stack_trace_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command-line entry point (`Prover.main`/`parseArgs`)
+// ---------------------------------------------------------------------------
+
+/// What [`parse_args`] decided.
+#[derive(Debug)]
+pub enum ArgsOutcome {
+    /// `--help`/`-h`: print [`USAGE_MESSAGE`] and exit 0 (`Prover.java:300-303`).
+    Help,
+    /// Everything else: the session to run in, and the optional command file.
+    Run {
+        filename: Option<String>,
+        session: Session,
+    },
+}
+
+/// `Prover.parseArgs(String[])` (`:293-323`), **including WB-026 verbatim**.
+///
+/// The command-file validation at `:318` runs *inside* the argument loop, i.e. before
+/// `Session.setPathsAndNames` at `:321`, so it resolves the file against Java's
+/// still-uninitialized `Session.mainWalnutDir` (`""`) and ignores `--home-dir=`
+/// entirely. That is a genuine Walnut bug (`docs/WALNUT-BUGS.md` WB-026); per
+/// `CLAUDE.md`'s mechanical-port rule it is replicated, not fixed — which is why this
+/// function builds a throwaway `SessionPaths` with an explicitly empty home directory
+/// purely to run a check whose result is then thrown away (`run` re-validates
+/// correctly at `:326`). `run_command_file_validation_ignores_home_dir_wb_026` pins it.
+pub fn parse_args(args: &[String]) -> Result<ArgsOutcome, ProverError> {
+    let mut filename: Option<String> = None;
+    let mut session_dir: Option<String> = None;
+    let mut home_dir: Option<String> = None;
+    let mut global_session = false;
+
+    for arg in args {
+        if arg.starts_with("--help") || arg == "-h" {
+            return Ok(ArgsOutcome::Help);
+        }
+        if let Some(rest) = arg.strip_prefix(SESSION_DIR_ARG) {
+            let mut dir = rest.to_string();
+            if !dir.ends_with('/') {
+                dir.push('/');
+            }
+            session_dir = Some(dir);
+        } else if let Some(rest) = arg.strip_prefix(HOME_DIR_ARG) {
+            let mut dir = rest.to_string();
+            if !dir.ends_with('/') {
+                dir.push('/');
+            }
+            home_dir = Some(dir);
+        } else if arg == GLOBAL_SESSION_ARG {
+            global_session = true;
+        } else if filename.is_none() {
+            // WB-026, verbatim: resolved against an EMPTY home directory, because Java's
+            // `Session.mainWalnutDir` static initializer has not been overwritten yet.
+            let premature = SessionPaths::new(Some(""), Some(""), false);
+            validate_file(&premature.read_address_for_command_files(arg))
+                .map_err(ProverError::InvalidFile)?;
+            filename = Some(arg.clone());
+        }
+    }
+
+    // `Session.setPathsAndNames(sessionDir, homeDir, globalSession);` (`:321`).
+    let paths = SessionPaths::new(session_dir.as_deref(), home_dir.as_deref(), global_session);
+    paths
+        .create_subdirectories()
+        .map_err(ProverError::InvalidFile)?;
+    Ok(ArgsOutcome::Run {
+        filename,
+        session: Session::from_paths(paths),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    // ------------------------------------------------------------ scaffolding
+
+    /// A shared, inspectable stdout sink (the `Prover` needs to own its writer).
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn temp_tree(tag: &str) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "wr-cli-prover-{tag}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        for sub in [
+            "Result",
+            "Automata Library",
+            "Word Automata Library",
+            "Custom Bases",
+            "Macro Library",
+            "Morphism Library",
+            "Command Files",
+        ] {
+            fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir_str = format!("{}/", dir.to_str().unwrap());
+        (dir, dir_str)
+    }
+
+    fn prover(tag: &str) -> (Prover, PathBuf, Capture) {
+        let (dir, dir_str) = temp_tree(tag);
+        let capture = Capture::default();
+        let session = Session::new(Some(&dir_str), Some(&dir_str), false);
+        let logging = Logging::with_writers(Box::new(io::sink()), Box::new(io::sink()));
+        let p = Prover::with_output(session, logging, Box::new(capture.clone()));
+        (p, dir, capture)
+    }
+
+    // ------------------------------------------------------- pattern sanity
+
+    /// The dialect trap that cost this unit a debugging round, pinned so nobody
+    /// re-introduces it: Java's `\>` is a literal `>`, Rust's is an END-OF-WORD BOUNDARY.
+    /// It COMPILES either way, and simply never matches what Java's did.
+    #[test]
+    fn an_escaped_gt_is_a_word_boundary_in_rust_not_a_literal() {
+        let javaish = Regex::new(r"a\-\>b").expect("compiles fine -- that is the trap");
+        assert!(!javaish.is_match("a->b"));
+        let ported = Regex::new(r"a\->b").unwrap();
+        assert!(ported.is_match("a->b"));
+        // The escaped `-` half IS a plain literal in both dialects.
+        assert!(Regex::new(r"x\-y").unwrap().is_match("x-y"));
+    }
+
+    #[test]
+    fn every_pattern_compiles() {
+        // Touching the table forces `Patterns::compile_all`, whose `compile` panics with
+        // the offending pattern text on a syntax error.
+        let p = patterns();
+        assert!(p.cmd.is_match("eval x \"x=1\""));
+    }
+
+    #[test]
+    fn the_command_list_holds_exactly_javas_thirty_five_names() {
+        let names: Vec<&str> = RE_FOR_THE_LIST_OF_CMDS
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split('|')
+            .collect();
+        assert_eq!(names.len(), 35, "{names:?}");
+        for name in &names {
+            assert!(
+                patterns().list_of_cmds.is_match(name),
+                "{name} must match the list pattern"
+            );
+        }
+        // ...and nothing else does.
+        for name in ["evaluate", "ev", "", "Eval", "loadx"] {
+            assert!(!patterns().list_of_cmds.is_match(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn eval_def_group_numbers_match_javas_constants() {
+        let s = r#"def phi x y "?msd_2 x < y""#;
+        let caps = find(&patterns().eval_def, s).unwrap();
+        assert_eq!(group(&caps, s, 1), Some("def"));
+        assert_eq!(group(&caps, s, ED_NAME), Some("phi"));
+        assert_eq!(group(&caps, s, ED_FREE_VARIABLES), Some(" x y"));
+        assert_eq!(group(&caps, s, ED_PREDICATE), Some("?msd_2 x < y"));
+    }
+
+    #[test]
+    fn a_headless_eval_has_no_name_group() {
+        let s = r#"eval "?msd_2 x < y""#;
+        let caps = find(&patterns().eval_def, s).unwrap();
+        assert_eq!(group(&caps, s, ED_NAME), None);
+        assert_eq!(group(&caps, s, ED_PREDICATE), Some("?msd_2 x < y"));
+    }
+
+    #[test]
+    fn reg_group_numbers_match_javas_constants() {
+        let s = r#"reg r msd_2 "0*1""#;
+        let caps = find(&patterns().reg, s).unwrap();
+        assert_eq!(group(&caps, s, R_NAME), Some("r"));
+        assert_eq!(group(&caps, s, R_LIST_OF_ALPHABETS), Some("msd_2 "));
+        assert_eq!(group(&caps, s, R_REGEXP), Some("0*1"));
+    }
+
+    #[test]
+    fn alphabet_group_numbers_match_javas_constants() {
+        let s = "alphabet newname msd_3 oldname";
+        let caps = find(&patterns().alphabet, s).unwrap();
+        assert_eq!(group(&caps, s, GROUP_ALPHABET_NEW_NAME), Some("newname"));
+        assert_eq!(group(&caps, s, R_LIST_OF_ALPHABETS), Some("msd_3 "));
+        assert_eq!(group(&caps, s, GROUP_ALPHABET_DOLLAR_SIGN), Some(""));
+        assert_eq!(group(&caps, s, GROUP_ALPHABET_OLD_NAME), Some("oldname"));
+
+        let s = "alphabet newname msd_3 $oldname";
+        let caps = find(&patterns().alphabet, s).unwrap();
+        assert_eq!(group(&caps, s, GROUP_ALPHABET_DOLLAR_SIGN), Some("$"));
+        assert_eq!(group(&caps, s, GROUP_ALPHABET_OLD_NAME), Some("oldname"));
+    }
+
+    #[test]
+    fn convert_group_numbers_match_javas_constants() {
+        let s = "convert new lsd_3 $old";
+        let caps = find(&patterns().convert, s).unwrap();
+        assert_eq!(group(&caps, s, GROUP_CONVERT_NEW_NAME), Some("new"));
+        assert_eq!(group(&caps, s, GROUP_CONVERT_MSD_OR_LSD), Some("lsd"));
+        assert_eq!(group(&caps, s, GROUP_CONVERT_BASE), Some("3"));
+        assert_eq!(group(&caps, s, GROUP_CONVERT_OLD_DOLLAR_SIGN), Some("$"));
+        assert_eq!(group(&caps, s, GROUP_CONVERT_OLD_NAME), Some("old"));
+    }
+
+    #[test]
+    fn the_remaining_command_patterns_match_a_well_formed_invocation() {
+        let cases: Vec<(&Regex, &str)> = vec![
+            (&patterns().load, "load cmds.txt"),
+            (&patterns().macro_cmd, r#"macro m "x = 1""#),
+            (&patterns().ost, "ost o [1 2] [3]"),
+            (&patterns().combine, "combine c a=1 b=2"),
+            (&patterns().morphism, r#"morphism h "0->01,1->10""#),
+            (&patterns().promote, "promote P h"),
+            (&patterns().image, "image I h T"),
+            (&patterns().inf, "inf T"),
+            (&patterns().split, "split S T [+][-]"),
+            (&patterns().rsplit, "rsplit S [+][-] T"),
+            (&patterns().join, "join J A [x] B [y]"),
+            (&patterns().test, "test T 5"),
+            (&patterns().transduce, "transduce N T $M"),
+            (&patterns().reverse, "reverse R $M"),
+            (&patterns().minimize, "minimize N M"),
+            (&patterns().fixleadzero, "fixleadzero N $M"),
+            (&patterns().fixtrailzero, "fixtrailzero N $M"),
+            (&patterns().union, "union U A B"),
+            (&patterns().intersect, "intersect I A B"),
+            (&patterns().star, "star S A"),
+            (&patterns().concat, "concat C A B"),
+            (&patterns().rightquo, "rightquo Q A B"),
+            (&patterns().leftquo, "leftquo Q A B"),
+            (&patterns().export, "export $M gv"),
+            (&patterns().describe, "describe $M"),
+        ];
+        for (re, s) in cases {
+            assert!(find(re, s).is_some(), "pattern should match {s:?}");
+        }
+    }
+
+    #[test]
+    fn the_split_input_and_set_element_patterns_work() {
+        assert!(find(&patterns().input_in_split, "[ + ]").is_some());
+        assert!(find(&patterns().single_element_of_a_set, "- 3").is_some());
+    }
+
+    // ------------------------------------------------------------- parseSetup
+
+    #[test]
+    fn the_suffix_decides_print_flag_and_print_details() {
+        let (mut p, dir, _) = prover("suffix");
+        assert_eq!(p.parse_setup("eval x \"x=1\";").unwrap(), "eval x \"x=1\"");
+        assert!(!p.print_flag() && !p.print_details());
+        assert_eq!(p.parse_setup("eval x \"x=1\":").unwrap(), "eval x \"x=1\"");
+        assert!(p.print_flag() && !p.print_details());
+        assert_eq!(p.parse_setup("eval x \"x=1\"::").unwrap(), "eval x \"x=1\"");
+        assert!(p.print_flag() && p.print_details());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_command_with_no_terminator_is_an_invalid_command() {
+        let (mut p, dir, _) = prover("noterm");
+        let err = p.dispatch("eval x \"x=1\"").unwrap_err();
+        assert_eq!(err.to_string(), "Invalid command: eval x \"x=1\"");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn metacommands_are_stripped_before_the_command_name_is_read() {
+        let (mut p, dir, _) = prover("metastrip");
+        let rest = p.parse_setup("[strategy 1 BRZ] eval x \"x=1\"::").unwrap();
+        assert_eq!(rest, "eval x \"x=1\"");
+        assert_eq!(
+            p.meta_commands().get_strategy(1),
+            wr_core::determinize::Strategy::Brz
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_otf_strategy_metacommand_is_rejected_through_dispatch() {
+        let (mut p, dir, _) = prover("metaotf");
+        let err = p
+            .dispatch("[strategy 1 CCLS] eval x \"?msd_2 x=1\"::")
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProverError::Meta(MetaCommandError::OtfStrategyDeferred(_))
+        ));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---------------------------------------------------------------- dispatch
+
+    #[test]
+    fn an_unknown_command_name_is_no_such_command() {
+        let (mut p, dir, _) = prover("nosuch");
+        let err = p.dispatch("frobnicate x;").unwrap_err();
+        assert!(matches!(err, ProverError::NoSuchCommand));
+        assert_eq!(err.to_string(), "No such command exists.");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exit_and_quit_stop_the_loop() {
+        let (mut p, dir, _) = prover("exit");
+        assert!(!p.dispatch("exit;").unwrap());
+        assert!(!p.dispatch("quit;").unwrap());
+        assert!(p.dispatch("cls;").unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_and_cls_emit_the_ansi_escape() {
+        let (mut p, dir, out) = prover("cls");
+        p.dispatch("clear;").unwrap();
+        assert_eq!(out.text(), "\u{1b}[H\u{1b}[2J");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, out) = prover("eval");
+        assert!(p.dispatch("eval whatever \"?msd_2 Ei i < x\";").unwrap());
+        // `EvalDef` prints nothing for a non-trivial result, but it must have written the
+        // result files.
+        assert!(dir.join("Result").join("whatever.txt").is_file());
+        assert!(dir.join("Automata Library").join("whatever.txt").is_file());
+        let _ = out.text();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_trivially_true_eval_prints_true() {
+        let (mut p, dir, out) = prover("evaltrue");
+        assert!(p.dispatch("eval t \"?msd_2 Ex x = 1\";").unwrap());
+        assert!(out.text().contains("TRUE"), "{:?}", out.text());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn def_runs_end_to_end_and_is_the_same_arm_as_eval() {
+        let (mut p, dir, _) = prover("def");
+        assert!(p.dispatch("def lt x y \"?msd_2 x < y\";").unwrap());
+        assert!(dir.join("Automata Library").join("lt.txt").is_file());
+        assert_eq!(p.current_eval_name(), Some("lt"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reg_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, _) = prover("reg");
+        assert!(p.dispatch("reg rr msd_2 \"0*1\";").unwrap());
+        assert!(dir.join("Automata Library").join("rr.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alphabet_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, _) = prover("alphabet");
+        // Build something to re-alphabetize first. `$src` marks it as a predicate
+        // automaton (no `$` would send `determineInLibrary` to the WORD library).
+        p.dispatch("reg src msd_2 \"0*1\";").unwrap();
+        assert!(p.dispatch("alphabet dst msd_3 $src;").unwrap());
+        assert!(dir.join("Automata Library").join("dst.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Exercises the `{…}`-set branch of the shared alphabet-list sub-pattern, including
+    /// its escaped `\-`/`\+` signs, through real dispatch.
+    #[test]
+    fn a_literal_set_alphabet_dispatches() {
+        let (mut p, dir, _) = prover("setalpha");
+        assert!(p.dispatch("reg s1 {0,1} \"0*1\";").unwrap());
+        assert!(p.dispatch("reg s2 {-1,+1} \"(-1)*\";").unwrap());
+        assert!(dir.join("Automata Library").join("s1.txt").is_file());
+        assert!(dir.join("Automata Library").join("s2.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_invocation_of_an_unimplemented_command_still_reports_walnuts_error() {
+        let (mut p, dir, _) = prover("malformed");
+        // `union` needs at least a name; the regex fails before the stub is reached.
+        let err = p.dispatch("union;").unwrap_err();
+        assert_eq!(err.to_string(), "Invalid use of the union command.");
+        // `rsplit` reports itself as "reverse split" (Java's `REVERSE_SPLIT`).
+        let err = p.dispatch("rsplit;").unwrap_err();
+        assert_eq!(err.to_string(), "Invalid use of the reverse split command.");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_unimplemented_command_has_an_arm_that_reports_its_owning_unit() {
+        let (mut p, dir, _) = prover("stubs");
+        let cases = [
+            ("combine c a b;", "U23"),
+            ("concat C A B;", "U23"),
+            ("convert new lsd_3 $old;", "U24"),
+            ("describe $M;", "U23"),
+            ("export $M gv;", "U24"),
+            ("fixleadzero N $M;", "U23"),
+            ("fixtrailzero N $M;", "U23"),
+            ("help;", "U22"),
+            ("image I h T;", "U24"),
+            ("inf T;", "U24"),
+            ("intersect I A B;", "U23"),
+            ("join J A [x];", "U24"),
+            ("leftquo Q A B;", "U23"),
+            (r#"macro m "x = 1";"#, "U23"),
+            ("minimize N M;", "U23"),
+            (r#"morphism h "0->01,1->10";"#, "U24"),
+            ("promote P h;", "U24"),
+            ("reverse R $M;", "U23"),
+            ("rightquo Q A B;", "U23"),
+            ("rsplit S [+] T;", "U24"),
+            ("split S T [+];", "U24"),
+            ("star S A;", "U23"),
+            ("test T 5;", "U25"),
+            ("transduce N T $M;", "U26"),
+            ("union U A B;", "U23"),
+        ];
+        for (command, unit) in cases {
+            let err = p.dispatch(command).unwrap_err();
+            match err {
+                ProverError::NotYetImplemented { unit: u, .. } => {
+                    assert_eq!(u, unit, "{command}")
+                }
+                other => panic!("{command}: expected NotYetImplemented, got {other}"),
+            }
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ost_is_reported_as_out_of_scope_not_unimplemented() {
+        let (mut p, dir, _) = prover("ost");
+        let err = p.dispatch("ost o [1 2] [3];").unwrap_err();
+        assert!(matches!(
+            err,
+            ProverError::UnsupportedCommand { command: "ost", .. }
+        ));
+        assert!(err.to_string().contains("out of scope"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------------------------------------------------------------------- load
+
+    #[test]
+    fn load_is_special_cased_before_the_switch_and_runs_the_file() {
+        let (mut p, dir, _) = prover("load");
+        fs::write(
+            dir.join("Command Files").join("script.txt"),
+            "reg fromfile msd_2 \"0*1\";\n",
+        )
+        .unwrap();
+
+        assert!(p.dispatch("load script.txt;").unwrap());
+        assert!(dir.join("Automata Library").join("fromfile.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_loaded_file_containing_exit_stops_the_outer_loop() {
+        let (mut p, dir, _) = prover("loadexit");
+        fs::write(dir.join("Command Files").join("bye.txt"), "exit;\n").unwrap();
+        // `dispatch` returns `loadCommand`'s value verbatim -- the `load` special case.
+        assert!(!p.dispatch("load bye.txt;").unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loading_a_missing_file_is_an_invalid_file_error() {
+        let (mut p, dir, _) = prover("loadmissing");
+        let err = p.dispatch("load nope.txt;").unwrap_err();
+        assert!(matches!(err, ProverError::InvalidFile(_)));
+        assert!(err
+            .to_string()
+            .contains("File does not exist or is not a valid file"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_with_a_bad_argument_reports_invalid_use() {
+        let (mut p, dir, _) = prover("loadbad");
+        // `.p` is not `.txt`, so the pattern fails.
+        let err = p.dispatch("load script.p;").unwrap_err();
+        assert_eq!(err.to_string(), "Invalid use of the load command.");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -------------------------------------------------------------- readBuffer
+
+    #[test]
+    fn read_buffer_echoes_comments_and_concatenates_continuation_lines() {
+        let (mut p, dir, out) = prover("buffer");
+        let script = "# a comment\nreg spread msd_2\n \"0*1\";\n";
+        let mut input = io::Cursor::new(script.as_bytes().to_vec());
+        assert!(p.read_buffer(&mut input, false));
+
+        let text = out.text();
+        assert!(text.contains("# a comment"), "{text}");
+        // Lines are concatenated with NO separator (Java's `buffer.append(s)`), so the
+        // command that actually ran is `reg spread msd_2"0*1";` -- which does NOT parse.
+        // The failure is logged, not returned; what matters here is the echo.
+        assert!(text.contains("reg spread msd_2"), "{text}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_buffer_returns_false_on_exit_and_stops_reading() {
+        let (mut p, dir, _) = prover("bufferexit");
+        let mut input = io::Cursor::new(b"exit;\nreg after msd_2 \"0*1\";\n".to_vec());
+        assert!(!p.read_buffer(&mut input, false));
+        assert!(!dir.join("Automata Library").join("after.txt").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_buffer_logs_a_failing_command_and_keeps_going() {
+        let (mut p, dir, _) = prover("bufferfail");
+        let mut input = io::Cursor::new(b"frobnicate;\nreg survived msd_2 \"0*1\";\n".to_vec());
+        assert!(p.read_buffer(&mut input, true));
+        assert!(dir.join("Automata Library").join("survived.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_console_prompt_is_printed_only_in_console_mode() {
+        let (mut p, dir, out) = prover("prompt");
+        let mut input = io::Cursor::new(b"exit;\n".to_vec());
+        p.read_buffer(&mut input, true);
+        assert!(out.text().contains(PROMPT), "{:?}", out.text());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_prints_the_welcome_banner_after_the_command_file() {
+        let (mut p, dir, out) = prover("run");
+        fs::write(
+            dir.join("Command Files").join("s.txt"),
+            "reg banner msd_2 \"0*1\";\n",
+        )
+        .unwrap();
+        let mut console = io::Cursor::new(Vec::new());
+        p.run_with_input(Some("s.txt"), &mut console).unwrap();
+
+        let text = out.text();
+        assert!(text.contains("Welcome to Walnut v"), "{text}");
+        assert!(text.contains("Starting Walnut session: "), "{text}");
+        assert!(dir.join("Automata Library").join("banner.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_skips_the_banner_when_the_command_file_exits() {
+        let (mut p, dir, out) = prover("runexit");
+        fs::write(dir.join("Command Files").join("s.txt"), "exit;\n").unwrap();
+        let mut console = io::Cursor::new(Vec::new());
+        p.run_with_input(Some("s.txt"), &mut console).unwrap();
+        assert!(!out.text().contains("Welcome to Walnut"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------- dispatchForIntegrationTest
+
+    #[test]
+    fn dispatch_for_integration_test_returns_the_test_case() {
+        let (mut p, dir, _) = prover("integration");
+        let tc = p
+            .dispatch_for_integration_test("reg it msd_2 \"0*1\";", "ignored")
+            .unwrap()
+            .expect("reg returns a TestCase");
+        assert_eq!(tc.automaton_pairs().len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dispatch_for_integration_test_skips_comments() {
+        let (mut p, dir, _) = prover("integrationcomment");
+        assert!(p
+            .dispatch_for_integration_test("#nothing;", "ignored")
+            .unwrap()
+            .is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------- parse_args
+
+    #[test]
+    fn parse_args_prints_usage_for_help() {
+        assert!(matches!(
+            parse_args(&["--help".to_string()]).unwrap(),
+            ArgsOutcome::Help
+        ));
+        assert!(matches!(
+            parse_args(&["-h".to_string()]).unwrap(),
+            ArgsOutcome::Help
+        ));
+        assert!(USAGE_MESSAGE.starts_with("Usage: walnut"));
+    }
+
+    #[test]
+    fn parse_args_builds_a_session_and_creates_its_subdirectories() {
+        let dir = std::env::temp_dir().join(format!(
+            "wr-cli-prover-args-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let dir_str = format!("{}/", dir.to_str().unwrap());
+
+        let outcome = parse_args(&[
+            format!("--home-dir={dir_str}"),
+            GLOBAL_SESSION_ARG.to_string(),
+        ])
+        .unwrap();
+        match outcome {
+            ArgsOutcome::Run { filename, session } => {
+                assert!(filename.is_none());
+                assert!(session.paths().is_global_session());
+            }
+            ArgsOutcome::Help => panic!("expected Run"),
+        }
+        assert!(dir.join("Result").is_dir());
+        assert!(dir.join("Automata Library").is_dir());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// WB-026, pinned: the command file is validated against `""` + `Command Files/`,
+    /// i.e. the CURRENT WORKING DIRECTORY, before `--home-dir=` is applied — so a file
+    /// that genuinely exists under the home tree is rejected.
+    #[test]
+    fn run_command_file_validation_ignores_home_dir_wb_026() {
+        let (dir, dir_str) = temp_tree("wb026");
+        fs::write(dir.join("Command Files").join("probe.txt"), "exit;\n").unwrap();
+
+        let err =
+            parse_args(&[format!("--home-dir={dir_str}"), "probe.txt".to_string()]).unwrap_err();
+        match &err {
+            ProverError::InvalidFile(m) => assert_eq!(
+                m, "File does not exist or is not a valid file: Command Files/probe.txt",
+                "the reported path must have NO home-dir prefix -- that is the bug"
+            ),
+            other => panic!("expected InvalidFile, got {other}"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+}

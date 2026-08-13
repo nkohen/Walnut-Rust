@@ -95,6 +95,30 @@ and add a property test that the result is order-independent.
   `Predicate.java`'s regex table, don't re-derive these from scratch. (This is a
   *different* `regex-automata` use than the still-open `dk.brics` question below — see
   that entry, don't conflate the two.)
+- **A Java `Pattern` ported to `regex`/`regex-automata`: `\>` and `\<` are NOT literals in
+  Rust, and two other spellings must change.** Added in Phase 3b's U21, which ported
+  `Prover.java`'s ~30 command-argument patterns and lost a debugging round to the first
+  entry below. These are *in addition to* Ruling 2's four divergences (which are about the
+  lexer's `\G` anchoring and ASCII classes); they apply to any Java pattern ported anywhere
+  in this workspace:
+  1. **`\>` is an end-of-word boundary in Rust** (`\<`/`\>` were added to the `regex` crate
+     in 1.10), while Java has no such escape and reads `\>` as the literal `>`. The trap is
+     that the Java spelling **compiles clean** and then silently never matches:
+     `RE_FOR_morphism_CMD`'s `\d+\s*\-\>\s*` matched nothing at all until the `>` was
+     unescaped. Port `\>` as `>` (and `\<` as `<`). Escaping `-` outside a character class
+     *is* a plain literal in both dialects, so `\-` can stay as-is.
+  2. **`]` must be escaped in Rust** even where Java allows it bare — Java's `[^]]`
+     ("anything but `]`") becomes `[^\]]`, and a literal `]` outside a class becomes `\]`.
+     This one fails loudly (a compile error), so it costs nothing but a spelling change.
+  3. **`$` is not the same anchor.** Java's `$` also matches immediately *before* a final
+     line terminator; Rust's matches only at the very end of the haystack. Check that the
+     strings reaching a `$`-anchored ported pattern are already stripped (`Prover.java`'s
+     are, via `readBuffer`), or the divergence is real.
+  Capture-group NUMBERING, by contrast, does agree: both engines number by opening
+  parenthesis and skip `(?:…)`, so Java's `static int GROUP_… = 20` constants port as
+  literal group indices — but pin each one with a test against a real input rather than
+  re-counting parens by eye (`crates/wr-cli/src/prover.rs`'s
+  `*_group_numbers_match_javas_constants` tests).
 - **A lexer never borrows the string it's lexing; it owns a `String` buffer.** Java's
   `Predicate.putMacro` rewrites the predicate string mid-lex and rebuilds all its
   matchers over the new string. The Rust lexer instead owns `src: String` (not `&'a str`),

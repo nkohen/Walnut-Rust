@@ -409,6 +409,39 @@ impl SessionPaths {
     pub fn write_address_for_words_library(&self) -> String {
         format!("{}{WORD_AUTOMATA_LIB}", self.session_walnut_dir)
     }
+
+    /// `Session.createSubdirectories()` (`:122-135`), the `setPathsAndNames` step U14
+    /// left out of scope (see this module's docs) and U21's `crate::prover::parse_args`
+    /// needs, since a real CLI run has to create the tree it writes into.
+    ///
+    /// Java's `File.mkdir()` is **not** recursive and its failure is a
+    /// `WalnutException("Couldn't create directory:" + s)` — both reproduced: this uses
+    /// `fs::create_dir` (single level), and the directory list, its order, and the
+    /// `s.isEmpty()` skip are verbatim. The `Err` is the message string, which
+    /// `crate::prover` wraps.
+    pub fn create_subdirectories(&self) -> Result<(), String> {
+        for s in [
+            format!("{}{SESSION_NAME}", self.main_walnut_dir),
+            self.session_walnut_dir.clone(),
+            self.address_for_result(),
+            self.write_address_for_automata_library(),
+            self.write_address_for_custom_bases(),
+            self.write_address_for_macro_library(),
+            self.write_address_for_morphism_library(),
+            self.write_address_for_words_library(),
+        ] {
+            if s.is_empty() {
+                continue;
+            }
+            let path = Path::new(&s);
+            // `if (!f.isDirectory() && !f.mkdir())` -- an already-existing directory is
+            // fine, anything else that fails to be created is fatal.
+            if !path.is_dir() && std::fs::create_dir(path).is_err() {
+                return Err(crate::walnut_exception::could_not_create_directory(&s));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Lets `wr-io` resolve a custom-base file named in a library `.txt`'s **header** through this
@@ -725,6 +758,15 @@ impl Session {
     /// The path builders.
     pub fn paths(&self) -> &SessionPaths {
         &self.paths
+    }
+
+    /// The path builders as a shared handle. Needed by `crate::meta_commands::MetaCommands`,
+    /// which must be able to write `[export …]` files from inside
+    /// `DeterminizeContext::export_pre_determinization` — a `&mut self` method that holds no
+    /// borrow of the `Session`. [`SessionPaths`] is immutable after construction, so sharing
+    /// it is free of the usual aliasing caveats (same argument as the field's own docs).
+    pub fn paths_rc(&self) -> Rc<SessionPaths> {
+        Rc::clone(&self.paths)
     }
 
     /// The file libraries, as their concrete type.

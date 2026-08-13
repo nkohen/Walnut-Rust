@@ -86,7 +86,8 @@ use wr_core::word_automaton::minimize_self_with_output;
 use wr_logic::predicate_env::{PredicateEnv, PredicateEnvError};
 
 use crate::automaton_output::write_automata;
-use crate::session::{Session, SessionPaths};
+use crate::prover_helper::{determine_in_library, determine_out_library};
+use crate::session::Session;
 use crate::test_case::TestCase;
 
 // ---------------------------------------------------------------------------
@@ -412,23 +413,11 @@ pub fn set_alphabet(
 // `Alphabet.alphabetCommand`
 // ---------------------------------------------------------------------------
 
-/// `ProverHelper.determineInLibrary(boolean, String)` (`ProverHelper.java:64-67`).
-fn determine_in_library(paths: &SessionPaths, is_dfao: bool, in_file_name: &str) -> String {
-    if is_dfao {
-        paths.read_file_for_words_library(in_file_name)
-    } else {
-        paths.read_file_for_automata_library(in_file_name)
-    }
-}
-
-/// `ProverHelper.determineOutLibrary(boolean)` (`ProverHelper.java:69-72`).
-fn determine_out_library(paths: &SessionPaths, is_dfao: bool) -> String {
-    if is_dfao {
-        paths.write_address_for_words_library()
-    } else {
-        paths.write_address_for_automata_library()
-    }
-}
+// `ProverHelper.determineInLibrary`/`determineOutLibrary` (`ProverHelper.java:64-72`) used
+// to be ported privately here, because U16 needed them before `ProverHelper` had a module.
+// U21 gave them their real home; this file now calls that single copy rather than keeping a
+// second one that could drift (the same call this crate already made for
+// `Session::read_library_automaton`).
 
 /// `Alphabet.alphabetCommand(String s, String listOfAlphabets, boolean isDFAO, String
 /// inFileName, String newName)` (`Alphabet.java:17-30`).
