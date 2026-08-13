@@ -17,6 +17,7 @@
 pub mod alphabet;
 pub mod automaton_output;
 pub mod eval_def;
+pub mod help_messages;
 pub mod reg;
 pub mod session;
 pub mod test_case;

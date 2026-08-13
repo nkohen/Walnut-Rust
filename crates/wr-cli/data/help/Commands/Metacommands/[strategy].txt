@@ -1,0 +1,26 @@
+The "strategy" metacommand allows different strategies for determinization of intermediate automata, rather than the default SC (Subset Construction).
+
+The strategy syntax is as follows:
+[strategy 0 BRZ]   ##  Use the BRZ strategy for intermediate automaton 0
+[strategy * CCLS]  ##  Use the CCLS strategy for all intermediate automata
+
+Example usage:
+
+[strategy 5 BRZ-CCLS]eval triboddpal "?msd_trib Ei ((i>=n) & Aj ((1<=j)&(j<=n)) => TR[i+j] = TR[i-j])"::
+
+This uses the BRZ-CCLS strategy for intermediate automaton 5. In this case, BRZ-CCLS is roughly 16x faster than SC and uses much less memory.
+
+Supported strategies:
+
+BRZ - Brzozowski's algorithm: https://en.wikipedia.org/wiki/DFA_minimization#Brzozowski's_algorithm
+CCL - Convexity Closure Lattice
+CCLS - Convexity Closure Lattice with Simulation
+BRZ-CCL - Brzozowski + CCL
+BRZ-CCLS - Brzozowski + CCLS
+SC - Subset Construction (default)
+
+CCL(S) and BRZ-CCL(S) are new algorithms written by John Nicol and Markus Frohme.
+Please cite the OTF paper if you use those algorithms: the latest citation information is available at https://github.com/jn1z/OTF/blob/main/README.md
+
+For a given automaton, it's not clear which algorithm is best; you may need to try them all.
+Rules of thumb: usually CCLS outperforms CCL, and BRZ-CCLS outperforms BRZ-CCL. However, if the NFA size is very large (over 50,000 say), you will need a lot of memory and time to compute simulation in CCLS and BRZ-CCLS, and they may crash.
