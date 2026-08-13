@@ -482,12 +482,16 @@ bug costs a silent wrong answer somewhere downstream.
 - **Upstream:** not filed. Fix in Java would be an explicit `a == 0 || b == 0` early return (mirroring
   the Rust guard), placed before the `a > b` swap so both the negative-`a` hang and the
   positive-`a`/zero-`b` `ArithmeticException` are replaced with a clean, documented `NO_COMMON_ROOT`.
-- **Severity:** low in Java today — `commonRoot`'s only caller is
-  `AutomatonLogicalOps.java:482` inside `convertNS`, which is out of scope for this port
-  (`docs/BOUNDARY-MAP.md`), so this isn't reachable from any code path this port currently exposes.
-  Logged now (rather than deferred) because the Rust port's own `common_root` was being touched in
-  this same review pass and the divergence needed to be a deliberate, documented choice per
-  `CLAUDE.md`, not a silent one.
+- **Severity:** low in Java — `commonRoot`'s only caller is `AutomatonLogicalOps.java:482` inside
+  `convertNS`, and its two arguments there are `fromBase` (from `NumberSystem.parseBase()`, which
+  itself rejects anything `<= 1`) and the `toBase` the `convert` command's regex captured as
+  `\d+`, so neither can be `0` or negative in practice. Logged (rather than deferred) because the
+  Rust port's own `common_root` was being touched in this same review pass and the divergence needed
+  to be a deliberate, documented choice per `CLAUDE.md`, not a silent one.
+  **Updated Phase 3b, U18:** `convertNS` is no longer out of scope — it is ported as
+  `wr_core::logicalops::convert_ns`, so `common_root` now has a live caller in this port too. The
+  reachability argument above is unchanged (`convert_ns`'s callers supply an already-validated
+  `from_base`), and the guarded divergence continues to apply.
 
 ---
 
@@ -1589,6 +1593,101 @@ bug costs a silent wrong answer somewhere downstream.
   survives it; but it fires on valid, ordinary input (an explicit-alphabet word automaton is a
   normal thing to have in `Word Automata Library/`) with no adversarial shape at all, and the
   message names an internal class rather than telling the user what is wrong with their file.
+
+---
+
+<!-- Numbering note (Phase 3b, U18): WB-028..WB-031 were already claimed by three other
+     in-flight Phase 3b worktrees (Transducer, MetaCommands, HelpMessages) when this unit
+     filed its findings, so it took 032/033 rather than adding a fourth claim on 028. If any
+     of those units is dropped, close the gap when merging — see RESUME-HERE.md's
+     "WB-number collisions across parallel worktrees" process note. -->
+
+## WB-032 — `convertNS`'s exponent is a truncated floating-point log ratio, so `convert msd_1000` silently produces an `msd_100` automaton
+
+- **Where:** `Automata/AutomatonLogicalOps.java`, `convertNS`, both exponent computations:
+  `int exponent = (int) (Math.log(fromBase) / Math.log(commonRoot));` (`:504`) and the same
+  expression on `toBase` (`:519`).
+- **What:** the exponent `j` in `base == root^j` is computed in IEEE-754 double and then **truncated**
+  by the `(int)` cast. `Math.log` is correctly rounded but the *quotient* of two correctly-rounded
+  logarithms is not exact: for several `(root, exponent)` pairs it lands a fraction of an ulp below
+  the integer it should be, and the truncating cast then rounds it DOWN by a whole unit. The
+  smallest case is `ln(1000) / ln(10) == 2.9999999999999996`, yielding `2` instead of `3`.
+  Consequences depend on which of the two call sites hits it:
+  - `:519` (`toBase != commonRoot`, the `k -> k^j` regrouping): **silently wrong output**.
+    `convertMsdBaseToExponent` groups two digits instead of three, sets the number system to
+    `msd_{root^2}`, and writes a perfectly well-formed automaton in the WRONG base. The user asked
+    for `msd_1000` and gets `msd_100`, with no warning of any kind.
+  - `:504` (`fromBase != commonRoot`, the `k^i -> k` ungrouping): a **crash**, since
+    `convertLsdBaseToRoot`'s own `base != root^exponent` guard (`:570-572`) then fires with
+    `Base mismatch: expected 100, found 1000`.
+
+  The full affected set for bases up to `10^9`, as `(root, exponent)` pairs:
+  `(10,3) (3,5) (10,6) (11,7) (12,7) (3,10) (9,5) (10,9)` — i.e. bases `1000, 243, 10^6, 11^7,
+  12^7, 3^10, 9^5, 10^9`. Everything else (including every power of 2, the overwhelmingly common
+  case) is unaffected, which is why this has gone unnoticed.
+- **Trigger:** `convert $y msd_1000 $x;` where `x.txt` is any `msd_10` automaton.
+- **Found:** Phase 3b, U18 (porting `convertNS`), 2026-08-13. **Confirmed live** against
+  `walnut-java`'s `Walnut-all.jar`: `def base10 "?msd_10 x < 15"; convert $b10msd1000 msd_1000
+  $base10;` writes a file whose first line is `msd_100`. (The `:504` crash direction is confirmed
+  by arithmetic and by `convertLsdBaseToRoot`'s guard, but is hard to reach end-to-end today for an
+  unrelated reason: `def`-ing anything over `msd_1000` first blows up in
+  `ProductStrategies.computeAllInputsOfAxB` with `NegativeArraySizeException` on the `1000^2`
+  cross-product alphabet — a separate, already-known scaling limit, not this bug.)
+- **Rust port:** `ported verbatim (quirk)`. `wr_core::logicalops::truncated_log_ratio` reproduces
+  the exact expression, and two tests pin it: `truncated_log_ratio_reproduces_wb032` (which also
+  asserts the raw quotient is `< 3.0`, so it fails loudly rather than silently diverging on a
+  platform whose `ln` is not correctly rounded) and the end-to-end
+  `wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines` in
+  `tests/differential/tests/convert_ns.rs`, which compares the port's wrong answer against the real
+  engine's wrong answer. Verified portable: the double nearest `ln(1000)` divided by the double
+  nearest `ln(10)` **is** `2.9999999999999996`, so any correctly-rounded libm (macOS, glibc) and
+  Java's `Math.log` all agree.
+- **Upstream:** not filed. The fix in Java is to compute the exponent with integer arithmetic
+  (repeated division by `commonRoot` until the quotient is 1, verifying exactness on the way) rather
+  than `Math.log`; `UtilityMethods.commonRoot` already walks exactly that recursion and could return
+  the exponent alongside the root.
+- **Severity:** moderate — a silently wrong answer (not a crash) from a supported command on valid
+  input, but confined to a small, unusual set of bases; every power of 2 and every base below 243 is
+  correct.
+
+---
+
+## WB-033 — `convertNS` NPEs on an automaton whose track was declared with an explicit alphabet instead of a number system
+
+- **Where:** `Automata/AutomatonLogicalOps.java`, `convertNS` (`:460-462`) —
+  `NumberSystem ns = A.getNS().get(0); int fromBase = ns.parseBase();`, with no null check between.
+- **What:** `Automaton.NS` is populated one entry per track by
+  `ParseMethods.parseAlphabetDeclaration` (`Automata/ParseMethods.java:84-109`): an `msd_k`/`lsd_k`
+  token adds a real `NumberSystem` (`:98-103`), but an explicit-alphabet token like `{0,1}` adds a
+  literal `null` (`:91-96`, `bases.add(null)`) — Walnut deliberately supports tracks with no attached
+  number system, and a single-track `{0,1}` automaton file is perfectly valid input everywhere else.
+  `convertNS`'s arity guard (`:456`) passes for such a file (the list has exactly one entry, it just
+  happens to be `null`), and the very next statement dereferences it. Same defect CLASS as WB-013 (a
+  `null` `NumberSystem` from a `{...}`-declared track reaching an unguarded dereference), in a
+  different method.
+- **Trigger:** any `convert` on an automaton `.txt` whose alphabet line is `{...}` rather than
+  `msd_k`/`lsd_k`.
+- **Found:** Phase 3b, U18 (porting `convertNS`), 2026-08-13. **Confirmed live** against
+  `Walnut-all.jar`: a one-track `{0,1}` automaton in `Automata Library/` plus
+  `convert $out msd_4 $in;` prints
+  `java.lang.NullPointerException: Cannot invoke "Automata.NumberSystem.parseBase()" because "ns" is
+  null / at Automata.AutomatonLogicalOps.convertNS(AutomatonLogicalOps.java:462)`.
+- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than a
+  `panic!` — `wr_core::logicalops::ConvertNsError::NoNumberSystem`, whose `Display` reproduces Java's
+  NPE message verbatim so CLI output still matches. The reasoning is WB-013's, unchanged: Java's NPE
+  is an unchecked `RuntimeException` that `Prover.dispatch`'s top-level `catch (RuntimeException e)`
+  (`Prover.java:390`) recovers from — the message is printed and the session continues — so an
+  uncaught Rust `panic!` would be *less* faithful, not more (absent a `catch_unwind` boundary this
+  port doesn't have, it would kill the process). This crate's stand-in for a `null` `NumberSystem` is
+  `Automaton::msd[i] == None`, so the guard is a `let Some(from_msd) = a.msd[0] else { ... }`. Pinned
+  by `convert_ns_rejects_a_track_with_no_number_system_wb033`.
+- **Upstream:** not filed. A two-line guard in `convertNS` (throw a real `WalnutException` naming the
+  automaton/track when `A.getNS().get(0) == null`, e.g. "cannot convert the number system of an
+  automaton whose input has no number system") would fix it in Java.
+- **Severity:** low-to-moderate — a real crash rather than a silently wrong answer, on valid input
+  reachable straight from the CLI, but the combination (an explicit-alphabet automaton being handed
+  to `convert`, a command that exists precisely to change a *number system*) is an unlikely thing to
+  ask for, and the failure is loud.
 
 ---
 

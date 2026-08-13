@@ -123,28 +123,34 @@
 //! `wr-logic` copy surfaced `minimize`'s (unreachable) errors as a `Result` where this
 //! one lets [`crate::automaton::Automaton::determinize_and_minimize_from`] panic.
 //!
-//! # Not ported (investigated, with the exact blocker)
+//! # Formerly not ported — this file is complete as of U18
 //!
-//! - **`convertNS` (`:455-529`) + `convertMsdBaseToExponent` (`:535-560`) +
-//!   `convertLsdBaseToRoot` (`:566-657`) + `setAutomatonAlphabet` (`:662-665`) +
-//!   `computeStringValue` (`:671-677`).** The `WordAutomaton` dependency is
-//!   **unconditional**, not confined to a DFAO-only branch: `convertNS`'s same-base
-//!   msd<->lsd branch ends in `WordAutomaton.reverseWithOutput` (`:475`), and on the
-//!   general path `fromBase != toBase` forces at least one of `fromBase != commonRoot`
-//!   / `toBase != commonRoot` to hold, each of which calls
-//!   `WordAutomaton.minimizeSelfWithOutput` (`:509` / `:521`). `minimizeSelfWithOutput`
-//!   (`WordAutomaton.java:231-234`) delegates to `minimizeWithOutput`
-//!   (`WordAutomaton.java:215-228`), which is built out of `WordAutomaton.uncombine` +
-//!   `AutomatonLogicalOps.combine` — and `combine` is itself out of scope (needs
-//!   `Prover.COMBINE` product-mode state). `convertNS` additionally needs a real
-//!   `NumberSystem` object for `parseBase()`/`new NumberSystem(name)`, which
-//!   `crate::numsys` does not yet provide (it currently exposes only `less_than_msd`).
-//!   No stub is invented here.
-//! - **`combine` (`:679-722`), `buildTransitionsFromMorphism` (`:727-740`),
-//!   `updateTransitionsFromMorphism` (`:745-765`), `buildInitialMorphism`
-//!   (`:771-781`).** `combine` needs `Automaton.combineIndex`/`combineOutputs` plus
-//!   `Prover.COMBINE`'s `determineOutput` mode; the three morphism helpers exist solely
-//!   to serve `convertMsdBaseToExponent`.
+//! Through Phase 2 this section listed `convertNS` (`:455-529`), its four private helpers
+//! (`convertMsdBaseToExponent` `:535-560`, `convertLsdBaseToRoot` `:566-657`,
+//! `setAutomatonAlphabet` `:662-665`, `computeStringValue` `:671-677`), `combine`
+//! (`:679-722`), and the three morphism helpers (`buildTransitionsFromMorphism` `:727-740`,
+//! `updateTransitionsFromMorphism` `:745-765`, `buildInitialMorphism` `:771-781`) as
+//! deferred, on the grounds that `convertNS` has an **unconditional** `WordAutomaton`
+//! dependency (`reverseWithOutput` `:475`/`:496`/`:505`/`:516`/`:526` and
+//! `minimizeSelfWithOutput` `:509`/`:521`) and needs a real `NumberSystem` for
+//! `parseBase()`/`new NumberSystem(name)`. Both blockers are gone: Phase 3a's U6 landed
+//! [`crate::word_automaton`] (and, as its own hard dependency, [`combine`] below), and the
+//! `NumberSystem`-shaped inputs are handled by this crate's established per-track stand-in
+//! — see [`convert_ns`]'s `from_base` parameter for the exact substitution and its one
+//! declared limitation. Phase 3b's U18 ports the rest, so nothing in
+//! `AutomatonLogicalOps.java` is unported now.
+//!
+//! **The three `*Morphism` helpers have nothing to do with [`crate::morphism::Morphism`]**
+//! despite the shared word, and U18 confirmed that by tracing the call graph rather than
+//! assuming. `Morphism.java` maps *letters to integer words*;
+//! `buildInitialMorphism`/`updateTransitionsFromMorphism` build the `Q x alphabetSize`
+//! **state-transition matrix** `morphism[q][d] = δ(q, d)` and iterate it to obtain
+//! `δ*(q, w)` for every length-`exponent` digit word `w` — the digit-grouping step behind
+//! `msd_k -> msd_{k^j}`. `Morphism::to_word_automaton` (still deferred in `morphism.rs`)
+//! is NOT on this file's call graph, so U18 did not need it, and therefore did not need
+//! the `Fa::canonized` flag that `morphism.rs`'s docs name as its prerequisite. The only
+//! `setCanonized` call U18 touches at all is `convertLsdBaseToRoot`'s `setCanonized(false)`
+//! — see [`convert_lsd_base_to_root`], where it is a no-op for the opposite reason.
 //!
 //! `removeLeadingZeros` (`:343-367`) + `removeLeadingZerosHelper` (`:375-405`) used to be
 //! listed here as deferred too; **Phase 3a's U10 ports them** ([`remove_leading_zeros`]),
@@ -155,23 +161,39 @@
 //!
 //! # `fa.setCanonized(false)`
 //!
-//! `fixLeadingZerosProblem` (`:273`) and `fixTrailingZerosProblem` (`:326`) each clear
-//! `FA`'s private `canonized` memo flag. `Fa` carries no such flag (it always
-//! recomputes — see `fa.rs`'s doc comment on `Fa::canonicalize`), so there is nothing
-//! to clear here.
+//! `fixLeadingZerosProblem` (`:273`), `fixTrailingZerosProblem` (`:326`) and
+//! `convertLsdBaseToRoot` (`:647`) each clear `FA`'s private `canonized` memo flag. `Fa`
+//! carries no such flag (it always recomputes — see `fa.rs`'s doc comment on
+//! `Fa::canonicalize`), so there is nothing to clear here.
+//!
+//! Note the DIRECTION, because it is what makes the missing flag harmless at all three of
+//! these sites and *not* harmless at `Morphism.java:88`: clearing the flag means "canonicalize
+//! next time you're asked", which is exactly what a flagless `Fa::canonicalize` already does.
+//! `setCanonized(**true**)` is the dangerous one — it SUPPRESSES a canonicalization that
+//! would otherwise drop `q0`-unreachable states — and no call site in this file sets it.
 //!
 //! # Logging / timing
 //!
 //! Every method in the Java file brackets its work in `logMessage`/`Logging.indent()`
-//! and `System.currentTimeMillis()` timing. This crate has no `Logging` module
-//! (diagnostic output, not behavior — same call this file's siblings already made), so
-//! none of it is ported.
+//! and `System.currentTimeMillis()` timing. None of it is ported (diagnostic output, not
+//! behavior — the same call this file's siblings already made), and that includes
+//! `convertNS`'s own `Logging.indent()`/`dedent()` pairs (`:474-476`, `:492`/`:528`) and
+//! the four `CONVERTING`/`CONVERTED` lines in its two helpers.
+//!
+//! **This paragraph used to say "this crate has no `Logging` module", which went stale in
+//! Phase 3a** — [`crate::logging::Logging`] exists now. The decision is unchanged, for the
+//! reason `determinize.rs` states in its own identical note: no `wr-core` *algorithm*
+//! threads a `Logging` handle yet, so adding one here alone would be an inconsistent
+//! partial wiring. Whichever unit threads logging through `wr-core` should do it for all of
+//! them at once.
 
 use crate::automaton::{Automaton, AutomatonDFA};
 use crate::fa::Fa;
 use crate::minimize::{minimize, MinimizeError};
 use crate::product::{cross_product, cross_product_and_minimize, BooleanOp};
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use crate::util;
+use crate::word_automaton;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::rc::Rc;
 
@@ -1113,6 +1135,605 @@ pub fn combine(a: &Automaton, subautomata: Vec<Automaton>, outputs: &[i32]) -> A
     first.force_canonize();
     first.apply_all_representations_with_output();
     first
+}
+
+// ---------------------------------------------------------------------------
+// Number-system conversion: `convertNS` and its five private helpers (U18).
+// ---------------------------------------------------------------------------
+
+/// Every failure [`convert_ns`] can report. All but [`ConvertNsError::NoNumberSystem`] are
+/// `WalnutException`s Java throws from `convertNS`/`convertMsdBaseToExponent`/
+/// `convertLsdBaseToRoot`, with their messages preserved verbatim in the [`fmt::Display`]
+/// impl (each one checked against the real `walnut-java` CLI, not transcribed from source);
+/// `NoNumberSystem` stands in for a genuine Java `NullPointerException` — see its own docs
+/// and `docs/WALNUT-BUGS.md` WB-033.
+///
+/// `Result` rather than `panic!`, per `PORTING.md`'s exception-mapping rule and for the
+/// same reason WB-013's entry spells out: every one of these is reachable from raw
+/// user-typed CLI input (`convert` reads its operand from a `.txt` file and its target
+/// number system from the command line), and Java recovers from all of them —
+/// `Prover.dispatch`'s top-level `catch` prints the message and the session continues. An
+/// uncaught Rust `panic!` would kill the process instead, which is *less* faithful, not
+/// more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvertNsError {
+    /// `convertNS`'s `A.getNS().size() != 1` guard (`:456-458`). Also fires for a
+    /// TRUE/FALSE automaton, which has no tracks at all — matching Java, whose trivial
+    /// automata carry an empty `NS` list.
+    NotSingleInput,
+    /// The track exists but has **no numeration system** — Java's `A.getNS().get(0)` is
+    /// `null`, and `ns.parseBase()` (`:462`) dereferences it unguarded.
+    ///
+    /// Reachable from the plain CLI on a perfectly valid input: an automaton `.txt` whose
+    /// alphabet is declared explicitly (`{0,1}`) rather than as `msd_k`/`lsd_k` gets a
+    /// literal `null` NS entry from `ParseMethods.parseAlphabetDeclaration`
+    /// (`Automata/ParseMethods.java:91-96`, `bases.add(null)`), and `convert`ing it throws
+    /// `NullPointerException: Cannot invoke "Automata.NumberSystem.parseBase()" because
+    /// "ns" is null` — confirmed live against `Walnut-all.jar`, see `docs/WALNUT-BUGS.md`
+    /// WB-033. Ported as this `Err` variant rather than replicated as a `panic!`, matching
+    /// how WB-013 (the same "null NS reaches an unguarded dereference" shape) is already
+    /// handled in `wr-logic`.
+    NoNumberSystem,
+    /// `"New and old number systems are identical: <name>"` (`:467`). Carries the
+    /// reconstructed `msd_k`/`lsd_k` name Java prints via `ns.getName()`.
+    IdenticalNumberSystems {
+        /// e.g. `"msd_2"`.
+        name: String,
+    },
+    /// `"New and old number systems must have bases k^i and k^j for some integer k."`
+    /// (`:484`) — [`util::common_root`] returned [`util::NO_COMMON_ROOT`].
+    NoCommonRoot,
+    /// `"Automaton must be deterministic for msd_k^j conversion"`
+    /// (`convertMsdBaseToExponent`, `:536-538`).
+    ///
+    /// Unreachable through [`convert_ns`] itself (its own totalization at `:488-490`, plus
+    /// the `minimizeSelfWithOutput` that precedes every path into that helper, leave the
+    /// automaton deterministic and total) — Java's own characterization test reaches it
+    /// only by reflection, and the test below reaches it by calling the private helper
+    /// directly. Ported anyway, exactly as Java keeps the defensive guard.
+    NotDeterministicAndTotal,
+    /// `"Base mismatch: expected <expected>, found <found>"` (`convertLsdBaseToRoot`,
+    /// `:570-572`).
+    BaseMismatch {
+        /// `root^exponent`.
+        expected: i32,
+        /// The automaton's declared base.
+        found: i32,
+    },
+}
+
+impl fmt::Display for ConvertNsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConvertNsError::NotSingleInput => {
+                write!(f, "Automaton must have exactly one input to be converted.")
+            }
+            ConvertNsError::NoNumberSystem => write!(
+                f,
+                "Cannot invoke \"Automata.NumberSystem.parseBase()\" because \"ns\" is null"
+            ),
+            ConvertNsError::IdenticalNumberSystems { name } => {
+                write!(f, "New and old number systems are identical: {name}")
+            }
+            ConvertNsError::NoCommonRoot => write!(
+                f,
+                "New and old number systems must have bases k^i and k^j for some integer k."
+            ),
+            ConvertNsError::NotDeterministicAndTotal => {
+                write!(f, "Automaton must be deterministic for msd_k^j conversion")
+            }
+            ConvertNsError::BaseMismatch { expected, found } => {
+                write!(f, "Base mismatch: expected {expected}, found {found}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConvertNsError {}
+
+/// `FA.isDeterministicAndTotal()` (`FA.java:521-528`) — **not** the same predicate as
+/// [`Fa::is_deterministic_and_total`], which is why this exists.
+///
+/// Java asks only "does every state's transition map have exactly `alphabetSize` KEYS".
+/// It never looks at how many destinations a key holds, and it never checks *which* keys
+/// they are. [`Fa::is_deterministic_and_total`] is strictly stronger on both counts
+/// (`matches!(m.get(&sym), Some(dests) if dests.len() == 1)` for every `sym` in range), so
+/// an NFA-shaped table with every symbol present is "total" to Java and "not total" to it.
+///
+/// That difference is unobservable at [`convert_ns`]'s two `if (!isDeterministicAndTotal())
+/// totalize()` sites — [`totalize`] only fills MISSING keys, so on such a table it is a
+/// no-op either way — but it is **observable** at
+/// [`convert_msd_base_to_exponent`]'s guard, where Java proceeds (silently taking
+/// destination `0`) and the stronger predicate would return an error instead. Java's exact
+/// predicate is used at all three sites so no branch diverges.
+fn is_deterministic_and_total_java(fa: &Fa) -> bool {
+    (0..fa.q).all(|q| fa.d[q].len() == fa.alphabet_size)
+}
+
+/// Java's `(int) Math.pow(a, b)`. `f64::powf` matches `Math.pow` exactly on the
+/// small integral arguments this file uses, and Rust's saturating `f64 as i32` matches
+/// Java's saturating `(int)` cast of a `double` at the extremes.
+fn int_pow(base: i32, exponent: i32) -> i32 {
+    f64::from(base).powf(f64::from(exponent)) as i32
+}
+
+/// Java's `(int) (Math.log(x) / Math.log(root))` (`:504`, `:519`) — "the `j` such that
+/// `x == root^j`", computed in floating point and **truncated**.
+///
+/// # This is `docs/WALNUT-BUGS.md` WB-032, ported verbatim
+///
+/// The truncation is not safe: `ln(x)/ln(root)` can land a fraction of an ulp *below* the
+/// integer it should be, and `as i32` then rounds it DOWN by a whole unit. The smallest
+/// affected pair is `(x, root) = (1000, 10)`, where the quotient is `2.9999999999999996`
+/// and this returns `2` instead of `3` — so `convert $y msd_1000 $x` on an `msd_10`
+/// automaton silently produces an `msd_100` one (confirmed live against
+/// `Walnut-all.jar`). The full affected set for bases up to `10^9` is
+/// `(10,3) (3,5) (10,6) (11,7) (12,7) (3,10) (9,5) (10,9)` as `(root, exponent)` pairs.
+///
+/// Kept bug-for-bug rather than replaced with an exact integer logarithm, per `CLAUDE.md`'s
+/// mechanical-port rule; `truncated_log_ratio_reproduces_wb032` below pins it, and would
+/// fail loudly if a platform's `ln` were less accurate than the correctly-rounded one Java,
+/// macOS libm and glibc all provide here (verified: the double nearest `ln(1000)` divided by
+/// the double nearest `ln(10)` IS `2.9999999999999996`, so the value is libm-independent as
+/// long as `ln` is correctly rounded).
+fn truncated_log_ratio(x: i32, root: i32) -> i32 {
+    (f64::from(x).ln() / f64::from(root).ln()) as i32
+}
+
+/// The `msd_k`/`lsd_k` name Java would have built for a track, used only to fill in
+/// [`ConvertNsError::IdenticalNumberSystems`]'s `ns.getName()` (`:467`). Exact for every
+/// base-*k* system, which is the only kind [`convert_ns`] accepts (a custom base's name
+/// would not survive `parseBase()` in the first place).
+fn ns_name(is_msd: bool, base: i32) -> String {
+    let prefix = if is_msd {
+        crate::numsys::MSD_UNDERSCORE
+    } else {
+        crate::numsys::LSD_UNDERSCORE
+    };
+    format!("{prefix}{base}")
+}
+
+/// `AutomatonLogicalOps.setAutomatonAlphabet` (`:662-665`) **together with** the
+/// `A.getNS().set(0, new NumberSystem(<prefix> + newBase))` statement that immediately
+/// precedes each of its two call sites (`:554`/`:650`).
+///
+/// The two Java statements are fused into one function here on purpose, because this
+/// crate splits a `NumberSystem` into the parallel vectors `msd`/`all_reps`
+/// (`automaton.rs`'s field docs) and `PORTING.md`'s parallel-vector ruling requires every
+/// mutation site to move them **together**, in the same statement as the original.
+///
+/// * `msd` <- `Some(is_msd)`, the direction encoded in the new system's name.
+/// * `all_reps` <- `None`. `new NumberSystem(name)` sets `allRepresentations` from
+///   `loadAutomatonOrNull` (`NumberSystem.java:147-150`), i.e. from a
+///   `Custom Bases/<name>.txt` file. `wr-core` performs no file I/O (U5's design premise),
+///   and no such file exists for a plain integer base in a stock install, so `None` is the
+///   faithful outcome. Same declared limitation as [`flip_ns`]'s: a user who drops a
+///   hand-written `Custom Bases/msd_4.txt` into the session would get a restriction in Java
+///   and none here.
+/// * `alphabet` <- `[0..new_base-1]` and `fa.alphabet_size` <- `new_base`
+///   (`richAlphabet.setA(List.of(intRangeList(newBase)))` + `setAlphabetSize(newBase)`).
+///
+/// [`Automaton::setup_encoder`] is called afterwards, which Java does NOT do
+/// (`RichAlphabet.setA` leaves the cached `encoder` stale). Not a divergence: `convertNS`
+/// works only on arity-1 automata, and `encoder == [1]` for every arity-1 alphabet
+/// whatever its size — so the recompute is a no-op that keeps this crate's eagerly-cached
+/// encoder honest instead of relying on Java's stale one happening to be right.
+///
+/// `label` is deliberately untouched (Java touches neither), so the track keeps its name.
+fn set_number_system_and_alphabet(a: &mut Automaton, is_msd: bool, new_base: i32) {
+    a.msd = vec![Some(is_msd)];
+    a.all_reps = vec![None];
+    a.alphabet = vec![util::int_range_list(new_base)];
+    a.fa.alphabet_size = new_base as usize;
+    a.setup_encoder();
+    a.debug_assert_track_invariant();
+}
+
+/// `AutomatonLogicalOps.computeStringValue(List<Integer>, int root)` (`:671-677`) — the
+/// value of a digit list read **least-significant-first**, `Σ digits[i] * root^i`.
+///
+/// Java's `Math.addExact`/`Math.multiplyExact` throw `ArithmeticException` on `int`
+/// overflow; the `expect`s below are the faithful analog (an unchecked throw, in a place a
+/// caller cannot meaningfully recover from). Unreachable through [`convert_ns`]: the list
+/// is at most `exponent` digits long and its value is bounded by the automaton's own base,
+/// which already fit in an `i32` when it was parsed.
+fn compute_string_value(digits: &[i32], root: i32) -> i32 {
+    let mut value: i32 = 0;
+    for (i, &digit) in digits.iter().enumerate() {
+        let place = digit
+            .checked_mul(int_pow(root, i as i32))
+            .expect("computeStringValue: integer overflow (Java: ArithmeticException)");
+        value = value
+            .checked_add(place)
+            .expect("computeStringValue: integer overflow (Java: ArithmeticException)");
+    }
+    value
+}
+
+/// `AutomatonLogicalOps.buildInitialMorphism(FA)` (`:771-781`) — the `Q x alphabetSize`
+/// state-transition matrix `morphism[q][d] = δ(q, d)`, taking the FIRST destination of
+/// each entry (`getInt(0)`).
+///
+/// See this module's docs: "morphism" here is Walnut's word for this matrix and has
+/// nothing to do with [`crate::morphism::Morphism`].
+///
+/// # Panics
+///
+/// If any `(state, symbol)` pair in `0..q x 0..alphabet_size` is missing — Java's
+/// `getNfaStateDests(q, di).getInt(0)` NPEs on exactly the same input. Its only caller
+/// runs behind [`convert_msd_base_to_exponent`]'s deterministic-and-total guard, so this is
+/// a precondition violation, not a reachable user error.
+fn build_initial_morphism(fa: &Fa) -> Vec<Vec<usize>> {
+    (0..fa.q)
+        .map(|q| {
+            (0..fa.alphabet_size as i32)
+                .map(|di| {
+                    fa.d[q]
+                        .get(&di)
+                        .expect("buildInitialMorphism: automaton must be total")[0]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `AutomatonLogicalOps.buildTransitionsFromMorphism(FA, List<List<Integer>>)`
+/// (`:727-740`) — reinterpret a morphism matrix as a transition table, `row[di]` becoming
+/// the (single) destination on symbol `di`.
+///
+/// The row length is what re-bases the automaton: after `exponent - 1` extensions each row
+/// holds `alphabetSize^exponent` entries, one per length-`exponent` digit word, so the
+/// resulting table is over the alphabet `0..k^exponent - 1`.
+fn build_transitions_from_morphism(
+    fa: &Fa,
+    morphism: &[Vec<usize>],
+) -> Vec<BTreeMap<i32, Vec<usize>>> {
+    (0..fa.q)
+        .map(|q| {
+            morphism[q]
+                .iter()
+                .enumerate()
+                .map(|(di, &dest)| (di as i32, vec![dest]))
+                .collect()
+        })
+        .collect()
+}
+
+/// `AutomatonLogicalOps.updateTransitionsFromMorphism(FA, int exponent)` (`:745-765`) —
+/// extend the one-digit transition matrix into the `exponent`-digit one and install it.
+///
+/// Each extension step replaces `prev[j][k]` (the state reached from `j` by the `k`-th
+/// word of the current length) with one entry per outgoing symbol of `j`, in that symbol's
+/// sorted order:
+///
+/// ```text
+/// extended[j][k * k_alphabet + di] = δ(prev[j][k], di)
+/// ```
+///
+/// so the index of a word in the row equals the word's own value read
+/// **most-significant-first** — which is exactly what makes this the `msd_k -> msd_{k^j}`
+/// grouping and NOT the lsd one (that direction is [`convert_lsd_base_to_root`]'s separate
+/// BFS, which reads its digit strings least-significant-first).
+///
+/// Two Java details preserved exactly, both easy to "clean up" into a different algorithm:
+///
+/// * The inner loop iterates the key set of state **`j`** (`getNfaStateKeySet(j)`), not of
+///   `prev[j][k]`, and looks the transition up on the *other* state. Equivalent only
+///   because the caller guarantees the table is total; ported as written. `BTreeMap`'s
+///   sorted key order matches Java's `Int2ObjectRBTreeMap`, so the index arithmetic above
+///   holds in both engines.
+/// * The loop runs for `i in 2..=exponent`, so `exponent <= 1` performs no extension at
+///   all and the matrix is installed as-is.
+///
+/// # Panics
+///
+/// Same precondition as [`build_initial_morphism`] (Java: NPE).
+fn update_transitions_from_morphism(fa: &mut Fa, exponent: i32) {
+    let mut prev_morphism = build_initial_morphism(fa);
+    for _i in 2..=exponent {
+        let mut new_morphism: Vec<Vec<usize>> = Vec::with_capacity(fa.q);
+        // Java's bound is `fa.getQ()`; iterating the rows is equivalent because
+        // `build_initial_morphism` emits exactly `fa.q` rows and every extension below
+        // emits one row per row it consumed, so `prev_morphism.len() == fa.q` throughout.
+        for (j, prev_row) in prev_morphism.iter().enumerate() {
+            // Hoisted out of the inner loop; Java re-reads the same key set each iteration.
+            let symbols: Vec<i32> = fa.d[j].keys().copied().collect();
+            let mut extended_row: Vec<usize> = Vec::new();
+            for &src in prev_row {
+                for &di in &symbols {
+                    let next_state = fa.d[src]
+                        .get(&di)
+                        .expect("updateTransitionsFromMorphism: automaton must be total")[0];
+                    extended_row.push(next_state);
+                }
+            }
+            new_morphism.push(extended_row);
+        }
+        prev_morphism = new_morphism;
+    }
+    fa.d = build_transitions_from_morphism(fa, &prev_morphism);
+}
+
+/// `AutomatonLogicalOps.convertMsdBaseToExponent(Automaton, int exponent)` (`:535-560`,
+/// `private`) — `msd_base` to `msd_{base^exponent}`, by grouping `exponent` consecutive
+/// digits into one.
+///
+/// `base` is this crate's stand-in for Java's `A.getNS().get(0).parseBase()` (`:540`); see
+/// [`convert_ns`]'s own doc comment for why the base is threaded as a parameter rather than
+/// read back off the automaton. Its sole caller passes the common root, which is what the
+/// automaton's declared base is by then on both paths into here.
+///
+/// The state SET is untouched — only the transition table is re-keyed — so unlike
+/// [`convert_lsd_base_to_root`] this cannot invalidate `q0`.
+fn convert_msd_base_to_exponent(
+    a: &mut Automaton,
+    base: i32,
+    exponent: i32,
+) -> Result<(), ConvertNsError> {
+    if !is_deterministic_and_total_java(&a.fa) {
+        return Err(ConvertNsError::NotDeterministicAndTotal);
+    }
+
+    let new_base = int_pow(base, exponent);
+
+    update_transitions_from_morphism(&mut a.fa, exponent);
+
+    // `A.getNS().set(0, new NumberSystem(MSD_UNDERSCORE + newBase))` (`:554`) +
+    // `setAutomatonAlphabet(A, newBase)` (`:555`).
+    set_number_system_and_alphabet(a, true, new_base);
+    Ok(())
+}
+
+/// `AutomatonLogicalOps.convertLsdBaseToRoot(Automaton, int root, int exponent)`
+/// (`:566-657`, `private`) — `lsd_{root^exponent}` to `lsd_root`, by splitting each
+/// big-base digit into `exponent` small ones.
+///
+/// A BFS over pairs `(old state, digits read so far)`: while fewer than `exponent` digits
+/// have accumulated the old state stands still and the partial string grows; on the
+/// `exponent`-th digit the pair jumps to `δ(old state, value(string))` with an empty
+/// string again. Digit strings are valued **least-significant-first**
+/// ([`compute_string_value`]), which is what makes this the lsd direction. A partial
+/// state's OUTPUT is the output of the state the *completed* prefix would reach — correct
+/// under lsd, where the unread digits are the high-order ones and are all zero.
+///
+/// `base` is this crate's stand-in for `A.getNS().get(0).parseBase()` (`:568`); it is only
+/// read by the `base != root^exponent` guard (`:569-572`).
+///
+/// # `A.fa.setCanonized(false)` (`:647`) is a no-op here
+///
+/// See this module's docs: `Fa` has no `canonized` memo, so it always canonicalizes when
+/// asked — which is precisely what clearing the flag requests.
+///
+/// # `q0` is left stale after `setFields`, exactly as in Java — and it is masked
+///
+/// `newStates[0]` is the BFS root `(A.fa.getQ0(), [])`, so `0` is always the correct new
+/// initial state, but neither `FA.setFields` nor this method assigns `q0` (the same
+/// omission as `docs/WALNUT-BUGS.md` WB-016, in a different method). Not filed as its own
+/// bug because it is unreachable: this method's ONLY caller invokes it immediately after
+/// `WordAutomaton.reverseWithOutput` (`:505`), whose closing `minimizeSelfWithOutput` ->
+/// `combine` -> `forceCanonize` always leaves `q0 == 0` (`FA.canonizeInternal` assigns
+/// `q0 = permutationMap.get(q0)`, and the map sends `q0` to `0`). Ported verbatim anyway.
+///
+/// # Panics
+///
+/// If the old transition table is missing an entry the BFS needs (Java: NPE on
+/// `oldD.get(...).get(...).getInt(0)`). The caller totalizes first, so this is a
+/// precondition violation rather than a reachable user error.
+fn convert_lsd_base_to_root(
+    a: &mut Automaton,
+    base: i32,
+    root: i32,
+    exponent: i32,
+) -> Result<(), ConvertNsError> {
+    let expected = int_pow(root, exponent);
+    if base != expected {
+        return Err(ConvertNsError::BaseMismatch {
+            expected,
+            found: base,
+        });
+    }
+
+    let old_o = a.fa.o.clone();
+    let old_d = a.fa.d.clone();
+    let jump = |state: usize, value: i32| -> usize {
+        old_d[state]
+            .get(&value)
+            .expect("convertLsdBaseToRoot: automaton must be total")[0]
+    };
+
+    // BFS structures. `HashMap` (not `BTreeMap`) matches Java's `HashMap` and is safe
+    // under `PORTING.md`'s iteration-order rule: `state_map` is only ever looked up by
+    // key, never iterated, and the numbering it hands out is fixed by the queue order.
+    let mut new_states: Vec<(usize, Vec<i32>)> = Vec::new();
+    let mut queue: VecDeque<(usize, Vec<i32>)> = VecDeque::new();
+    let mut state_map: HashMap<(usize, Vec<i32>), usize> = HashMap::new();
+    let mut new_d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
+    let mut new_o: Vec<i32> = Vec::new();
+
+    let init = (a.fa.q0, Vec::new());
+    new_states.push(init.clone());
+    queue.push_back(init.clone());
+    state_map.insert(init, 0);
+
+    while let Some(curr) = queue.pop_front() {
+        new_d.push(BTreeMap::new());
+        let curr_idx = state_map[&curr];
+
+        // Output logic.
+        if curr.1.is_empty() {
+            new_o.push(old_o[curr.0]);
+        } else {
+            let string_val = compute_string_value(&curr.1, root);
+            new_o.push(old_o[jump(curr.0, string_val)]);
+        }
+
+        // Build transitions for each possible digit `di` in `0..root-1`.
+        for di in 0..root {
+            let mut next_string = curr.1.clone();
+            next_string.push(di);
+
+            let next = if (curr.1.len() as i32) < exponent - 1 {
+                // Haven't reached exponent length yet.
+                (curr.0, next_string)
+            } else {
+                // A full 'digit string', so jump to an actual next state.
+                let next_string_val = compute_string_value(&next_string, root);
+                (jump(curr.0, next_string_val), Vec::new())
+            };
+
+            let next_idx = match state_map.get(&next) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = new_states.len();
+                    new_states.push(next.clone());
+                    queue.push_back(next.clone());
+                    state_map.insert(next, idx);
+                    idx
+                }
+            };
+
+            new_d[curr_idx].insert(di, vec![next_idx]);
+        }
+    }
+
+    a.fa.set_fields(new_states.len(), new_o, new_d);
+    // `A.fa.setCanonized(false)` (`:647`) — nothing to clear, see this function's docs.
+
+    // `A.getNS().set(0, new NumberSystem(LSD_UNDERSCORE + root))` (`:650`) +
+    // `setAutomatonAlphabet(A, root)` (`:651`).
+    set_number_system_and_alphabet(a, false, root);
+    Ok(())
+}
+
+/// `AutomatonLogicalOps.convertNS(Automaton, boolean toMsd, int toBase)` (`:455-529`) —
+/// convert a single-track automaton's number system from `[msd|lsd]_{k^i}` to
+/// `[msd|lsd]_{k^j}`, in place. The `convert` command's whole implementation
+/// (`Prover.java:739`).
+///
+/// Java's own doc comment notes "this assumes that A is a word automaton when it may not
+/// be"; it works on both, since a plain DFA is just a DFAO whose outputs are `0`/`1`, and
+/// the `convert` command accepts either.
+///
+/// # Legal conversions
+///
+/// Only `msd`/`lsd` **and/or** a base change between two powers of a common root:
+/// `fromBase = k^i`, `toBase = k^j` for some integer `k`
+/// ([`util::common_root`] decides this — note it is a genuine common-root test, so e.g.
+/// `4 -> 8` is legal with `k = 2`, while `2 -> 6` is not). The four steps:
+///
+/// 1. equal bases -> a pure direction flip, one `reverseWithOutput` (`:465-479`);
+/// 2. otherwise, put the automaton in msd form (`:495-497`), then
+/// 3. ungroup `k^i -> k` if needed ([`convert_lsd_base_to_root`], run on the reversed
+///    automaton — hence the extra `reverseWithOutput` at `:505`), then
+/// 4. regroup `k -> k^j` if needed ([`convert_msd_base_to_exponent`]), then
+/// 5. `if (toMsd == currentlyReversed) reverseWithOutput` (`:525-527`) — one final
+///    reversal that simultaneously undoes step 3's and delivers the requested direction.
+///
+/// # `from_base`: this crate's stand-in for `A.getNS().get(0).parseBase()`
+///
+/// Java reads the source base off the track's `NumberSystem` object. `wr-core`'s
+/// `Automaton` deliberately carries no `NumberSystem` (`automaton.rs`'s field docs: that
+/// would be circular, since a `NumberSystem` owns three `Automaton`s), only the two facts
+/// ported code reads off one — and the *base* is not among them. It is therefore threaded
+/// in as a parameter, supplied by the `wr-io`/`wr-cli` caller that read the `msd_k`/`lsd_k`
+/// header in the first place (`crate::numsys::parse_base_of` is the exact port of Java's
+/// `parseBase`, including its `> 1 && is-an-integer` validation, so the caller reports
+/// that error rather than this function).
+///
+/// The msd/lsd half of the same `NumberSystem` IS carried, as `a.msd[0]`, and is read from
+/// there — so the two facts cannot drift apart mid-conversion the way two parameters
+/// could. The base is re-threaded explicitly through the helpers for the same reason
+/// (each is passed the base the automaton actually has at that point, which Java re-reads
+/// from the `NumberSystem` it just replaced).
+///
+/// A caller that hands in a `from_base` disagreeing with the automaton's actual alphabet
+/// gets the same garbage Java would from a mislabelled `.txt` header; the invariant
+/// `alphabet[0] == [0..from_base-1]` is the caller's to maintain, exactly as in Java.
+///
+/// # `docs/WALNUT-BUGS.md` WB-032 lives on this path
+///
+/// See [`truncated_log_ratio`]: for a handful of base pairs (`msd_10 -> msd_1000` being the
+/// smallest) the exponent is computed one too low, and the automaton is silently converted
+/// to the wrong base. Ported verbatim.
+pub fn convert_ns(
+    a: &mut Automaton,
+    from_base: i32,
+    to_msd: bool,
+    to_base: i32,
+) -> Result<(), ConvertNsError> {
+    if a.msd.len() != 1 {
+        return Err(ConvertNsError::NotSingleInput);
+    }
+    // `NumberSystem ns = A.getNS().get(0); int fromBase = ns.parseBase();` (`:460-462`) —
+    // the `null` case is WB-033, see `ConvertNsError::NoNumberSystem`.
+    let Some(from_msd) = a.msd[0] else {
+        return Err(ConvertNsError::NoNumberSystem);
+    };
+
+    // If the old and new bases are the same, check if only MSD/LSD is changing.
+    if from_base == to_base {
+        if from_msd == to_msd {
+            return Err(ConvertNsError::IdenticalNumberSystems {
+                name: ns_name(from_msd, from_base),
+            });
+        }
+        // The conversion routines assume a complete transition function; totalize before
+        // reversal.
+        if !is_deterministic_and_total_java(&a.fa) {
+            totalize(&mut a.fa);
+        }
+        // If only msd <-> lsd differs, just reverse A.
+        word_automaton::reverse_with_output(a, true);
+        return Ok(());
+    }
+
+    // Check if fromBase and toBase are powers of the same root.
+    let common_root = util::common_root(from_base, to_base);
+    if common_root == util::NO_COMMON_ROOT {
+        return Err(ConvertNsError::NoCommonRoot);
+    }
+
+    // Base conversion groups or ungroups digits and assumes every grouped digit has a
+    // transition, so totalize.
+    if !is_deterministic_and_total_java(&a.fa) {
+        totalize(&mut a.fa);
+    }
+
+    // If originally LSD, we need to reverse to treat it as MSD for the conversions.
+    if !from_msd {
+        word_automaton::reverse_with_output(a, true);
+    }
+
+    // We'll track if A is reversed relative to original.
+    let mut currently_reversed = false;
+
+    // Convert from k^i -> k if needed.
+    if from_base != common_root {
+        let exponent = truncated_log_ratio(from_base, common_root);
+        word_automaton::reverse_with_output(a, true);
+        currently_reversed = true;
+
+        convert_lsd_base_to_root(a, from_base, common_root, exponent)?;
+        word_automaton::minimize_self_with_output(a);
+    }
+
+    // Convert from k -> k^j if needed.
+    if to_base != common_root {
+        if currently_reversed {
+            // Undo reversal from the previous step.
+            word_automaton::reverse_with_output(a, true);
+            currently_reversed = false;
+        }
+        let exponent = truncated_log_ratio(to_base, common_root);
+        convert_msd_base_to_exponent(a, common_root, exponent)?;
+        word_automaton::minimize_self_with_output(a);
+    }
+
+    // If final desired base is LSD but we are still in MSD form, reverse again.
+    if to_msd == currently_reversed {
+        word_automaton::reverse_with_output(a, true);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3154,5 +3775,340 @@ mod tests {
         let mut a = Automaton::true_false(true);
         fix_leading_zeros_problem(&mut a);
         assert!(a.is_true_automaton());
+    }
+
+    // ------------------------------------------------------- convertNS (U18)
+
+    /// `AutomatonLogicalOpsTest.simulate(FA, int...)` (`:58-68`) — run from `q0`, taking
+    /// the first destination each step, returning `0` the moment the table runs out.
+    fn simulate(fa: &Fa, symbols: &[i32]) -> i32 {
+        let mut state = fa.q0;
+        for &sym in symbols {
+            match fa.d[state].get(&sym) {
+                Some(dests) if !dests.is_empty() => state = dests[0],
+                _ => return 0,
+            }
+        }
+        fa.o[state]
+    }
+
+    /// A one-state, no-transition, accepting automaton over `[0..base-1]` — Java's
+    /// `A.fa.initBasicFA(IntList.of(1))` plus an explicit alphabet. Accepts exactly the
+    /// empty word, and is deliberately NOT total.
+    fn epsilon_only(base: i32, msd: bool) -> Automaton {
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: base as usize,
+            o: vec![1],
+            d: vec![BTreeMap::new()],
+        };
+        Automaton::new(
+            fa,
+            vec![util::int_range_list(base)],
+            vec!["x".to_string()],
+            vec![Some(msd)],
+        )
+    }
+
+    /// Tier 2: `AutomatonLogicalOpsTest.testConvertNSSameBaseFlipsMsdLsd` (`:236-255`).
+    /// Same base, only the direction differs — so the `identical` error must NOT fire, the
+    /// non-total table must be totalized (`:470-471`), and `reverseWithOutput` must run.
+    #[test]
+    fn convert_ns_same_base_flips_msd_lsd() {
+        let mut a = epsilon_only(2, true);
+        assert_eq!(simulate(&a.fa, &[]), 1, "language before: {{epsilon}} only");
+
+        convert_ns(&mut a, 2, false, 2).expect("the flip must succeed");
+
+        assert_eq!(a.msd, vec![Some(false)], "number system must now be lsd_2");
+        assert_eq!(
+            simulate(&a.fa, &[]),
+            1,
+            "empty string still accepted after msd<->lsd flip"
+        );
+        assert_eq!(simulate(&a.fa, &[0]), 0, "\"0\" still rejected");
+        assert_eq!(simulate(&a.fa, &[1]), 0, "\"1\" still rejected");
+    }
+
+    /// Tier 2: `AutomatonLogicalOpsTest.testConvertNSBaseConversionFromLsd` (`:261-286`).
+    /// `lsd_4 -> msd_2`: `commonRoot(4, 2) == 2 == toBase`, so only the `k^i -> k`
+    /// ungrouping runs, behind the `!ns.isMsd()` pre-reversal at `:495-496`.
+    #[test]
+    fn convert_ns_base_conversion_from_lsd() {
+        let mut a = epsilon_only(4, false);
+
+        convert_ns(&mut a, 4, true, 2).expect("the conversion must succeed");
+
+        assert_eq!(a.msd, vec![Some(true)], "number system must now be msd_2");
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.fa.alphabet_size, 2);
+        assert_eq!(
+            simulate(&a.fa, &[]),
+            1,
+            "empty string still accepted after base conversion"
+        );
+        assert_eq!(simulate(&a.fa, &[0]), 0);
+        assert_eq!(simulate(&a.fa, &[1]), 0);
+        assert_eq!(simulate(&a.fa, &[0, 1]), 0);
+        assert_eq!(simulate(&a.fa, &[1, 0]), 0);
+    }
+
+    /// Tier 2: `AutomatonLogicalOpsTest.testConvertMsdBaseToExponentThrowsWhenNotDeterministicAndTotal`
+    /// (`:297-311`). Java reaches the private guard by reflection; this test module can
+    /// call it directly.
+    #[test]
+    fn convert_msd_base_to_exponent_rejects_a_non_total_automaton() {
+        let mut a = epsilon_only(2, true); // one state, no transitions -> not total
+        assert_eq!(
+            convert_msd_base_to_exponent(&mut a, 2, 2),
+            Err(ConvertNsError::NotDeterministicAndTotal)
+        );
+        assert_eq!(
+            ConvertNsError::NotDeterministicAndTotal.to_string(),
+            "Automaton must be deterministic for msd_k^j conversion"
+        );
+    }
+
+    /// Tier 2: `AutomatonLogicalOpsTest.testConvertLsdBaseToRootThrowsOnBaseMismatch`
+    /// (`:313-...`). `root = 2, exponent = 2` expects base 4; the automaton says 3.
+    #[test]
+    fn convert_lsd_base_to_root_rejects_a_base_mismatch() {
+        let mut a = epsilon_only(3, true);
+        assert_eq!(
+            convert_lsd_base_to_root(&mut a, 3, 2, 2),
+            Err(ConvertNsError::BaseMismatch {
+                expected: 4,
+                found: 3
+            })
+        );
+        assert_eq!(
+            ConvertNsError::BaseMismatch {
+                expected: 4,
+                found: 3
+            }
+            .to_string(),
+            "Base mismatch: expected 4, found 3"
+        );
+    }
+
+    /// `docs/WALNUT-BUGS.md` WB-033: a track declared `{0,1}` rather than `msd_k`/`lsd_k`
+    /// has a `null` `NumberSystem` in Java, and `convertNS`'s `ns.parseBase()` NPEs on it.
+    /// Surfaced here as an `Err`, per WB-013's established convention for a *recoverable*
+    /// Java NPE — the Java message is reproduced verbatim so the CLI text still matches.
+    #[test]
+    fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
+        let mut a = epsilon_only(2, true);
+        a.msd = vec![None];
+        let err = convert_ns(&mut a, 2, true, 4).expect_err("Java NPEs here");
+        assert_eq!(err, ConvertNsError::NoNumberSystem);
+        assert_eq!(
+            err.to_string(),
+            "Cannot invoke \"Automata.NumberSystem.parseBase()\" because \"ns\" is null"
+        );
+    }
+
+    /// A TRUE/FALSE automaton has no tracks at all, so it takes the arity guard — the same
+    /// branch Java takes, since its trivial automata carry an empty `NS` list.
+    #[test]
+    fn convert_ns_rejects_a_trivial_automaton_on_the_arity_guard() {
+        for t in [true, false] {
+            let mut a = Automaton::true_false(t);
+            assert_eq!(
+                convert_ns(&mut a, 2, true, 4),
+                Err(ConvertNsError::NotSingleInput)
+            );
+        }
+    }
+
+    /// `docs/WALNUT-BUGS.md` WB-032, pinned at the arithmetic level (the differential suite
+    /// pins it end-to-end). `ln(1000)/ln(10)` is `2.9999999999999996` in IEEE-754 double,
+    /// so Java's `(int)` cast — and therefore this port — yields `2`.
+    ///
+    /// The `assert!` on the raw quotient is what makes this test a genuine platform check
+    /// rather than a tautology: it would fail loudly on a libm whose `ln` is not correctly
+    /// rounded, which is exactly the condition under which the port would silently stop
+    /// matching Java.
+    #[test]
+    fn truncated_log_ratio_reproduces_wb032() {
+        assert!(
+            f64::from(1000).ln() / f64::from(10).ln() < 3.0,
+            "this platform's ln() is not the correctly-rounded one Java uses; WB-032 \
+             would not reproduce and the port would diverge from walnut-java"
+        );
+        assert_eq!(truncated_log_ratio(1000, 10), 2, "WB-032: should be 3");
+
+        // The unaffected neighbours, so the test also proves the truncation is not
+        // uniformly wrong (an exponent that were always one low would break these).
+        assert_eq!(truncated_log_ratio(4, 2), 2);
+        assert_eq!(truncated_log_ratio(8, 2), 3);
+        assert_eq!(truncated_log_ratio(100, 10), 2);
+        assert_eq!(truncated_log_ratio(9, 3), 2);
+    }
+
+    /// `computeStringValue` (`:671-677`) reads its digit list **least**-significant-first,
+    /// which is what makes `convertLsdBaseToRoot` the lsd direction.
+    #[test]
+    fn compute_string_value_reads_least_significant_first() {
+        assert_eq!(compute_string_value(&[], 2), 0);
+        assert_eq!(compute_string_value(&[1], 2), 1);
+        assert_eq!(compute_string_value(&[0, 1], 2), 2); // NOT 1
+        assert_eq!(compute_string_value(&[1, 1, 0], 2), 3);
+        assert_eq!(compute_string_value(&[2, 1], 3), 5);
+    }
+
+    /// `updateTransitionsFromMorphism` (`:745-765`) groups digits **most**-significant-first
+    /// — the opposite convention from [`compute_string_value`], and the reason the two
+    /// halves of `convertNS` are not each other's mirror image.
+    ///
+    /// Checked against a hand-derived table: a 3-state base-2 counter `δ(q, d) = (2q + d)
+    /// mod 3`, whose 2-digit grouping must satisfy `δ₂(q, 2a + b) = δ(δ(q, a), b)`.
+    #[test]
+    fn update_transitions_from_morphism_groups_digits_most_significant_first() {
+        let delta = |q: usize, d: i32| (2 * q + d as usize) % 3;
+        let d: Vec<BTreeMap<i32, Vec<usize>>> = (0..3)
+            .map(|q| (0..2).map(|dig| (dig, vec![delta(q, dig)])).collect())
+            .collect();
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 1, 2],
+            d,
+        };
+
+        update_transitions_from_morphism(&mut fa, 2);
+
+        for q in 0..3 {
+            assert_eq!(fa.d[q].len(), 4, "the grouped alphabet must be 0..3");
+            for a in 0..2 {
+                for b in 0..2 {
+                    assert_eq!(
+                        fa.d[q][&(2 * a + b)],
+                        vec![delta(delta(q, a), b)],
+                        "symbol {} of state {q} must be the two-step transition on ({a}, {b})",
+                        2 * a + b
+                    );
+                }
+            }
+        }
+        // `exponent <= 1` performs no extension at all (`for i in 2..=exponent`).
+        let mut untouched = Fa {
+            true_false: None,
+            q0: 0,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 1, 2],
+            d: (0..3)
+                .map(|q| (0..2).map(|dig| (dig, vec![delta(q, dig)])).collect())
+                .collect(),
+        };
+        let before = untouched.d.clone();
+        update_transitions_from_morphism(&mut untouched, 1);
+        assert_eq!(untouched.d, before);
+    }
+
+    /// The Java `isDeterministicAndTotal` this file uses is genuinely weaker than
+    /// [`Fa::is_deterministic_and_total`], and the difference is load-bearing at
+    /// [`convert_msd_base_to_exponent`]'s guard — pinned so a later "simplification" to the
+    /// `Fa` method is caught.
+    #[test]
+    fn is_deterministic_and_total_java_is_weaker_than_the_fa_predicate() {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![0, 0]); // present, but TWO destinations
+        d0.insert(1, vec![0]);
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![1],
+            d: vec![d0],
+        };
+        assert!(
+            is_deterministic_and_total_java(&fa),
+            "Java only counts keys, so this is 'total' to it"
+        );
+        assert!(
+            !fa.is_deterministic_and_total(),
+            "this crate's own predicate additionally requires exactly one destination"
+        );
+    }
+
+    /// `setAutomatonAlphabet` + the `NS.set(0, ...)` it always accompanies: both halves of
+    /// this crate's per-track number-system stand-in must move together
+    /// (`PORTING.md`'s parallel-vector ruling), and the encoder must follow the alphabet.
+    #[test]
+    fn set_number_system_and_alphabet_moves_every_parallel_track_field() {
+        let mut a = epsilon_only(2, true);
+        a.label = vec!["x".to_string()];
+
+        set_number_system_and_alphabet(&mut a, false, 5);
+
+        assert_eq!(a.alphabet, vec![vec![0, 1, 2, 3, 4]]);
+        assert_eq!(a.fa.alphabet_size, 5);
+        assert_eq!(a.msd, vec![Some(false)]);
+        assert_eq!(a.all_reps.len(), 1);
+        assert!(a.all_reps[0].is_none());
+        assert_eq!(
+            a.encoder(),
+            &[1],
+            "arity 1 ⇒ the encoder is [1] at any base"
+        );
+        assert_eq!(a.label, vec!["x".to_string()], "the track keeps its name");
+    }
+
+    /// Tier 4 (Walnut-independent): converting away and back is the identity on the
+    /// LANGUAGE, for every combination of direction and base-power step this method
+    /// supports. Uses a non-trivial, non-reversal-symmetric language (`x < 5` over base 2)
+    /// so a dropped or doubled reversal cannot pass.
+    #[test]
+    fn convert_ns_round_trips_through_every_direction_and_base_step() {
+        // `x < 5` over msd_2, total: states 0..4 count digits, 5 is a dead sink.
+        let d: Vec<BTreeMap<i32, Vec<usize>>> = vec![
+            BTreeMap::from([(0, vec![0]), (1, vec![1])]),
+            BTreeMap::from([(0, vec![2]), (1, vec![3])]),
+            BTreeMap::from([(0, vec![3]), (1, vec![4])]),
+            BTreeMap::from([(0, vec![4]), (1, vec![4])]),
+            BTreeMap::from([(0, vec![4]), (1, vec![4])]),
+        ];
+        let original = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 5,
+                alphabet_size: 2,
+                o: vec![1, 1, 1, 1, 0],
+                d,
+            },
+            vec![vec![0, 1]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
+
+        for (msd_mid, base_mid) in [(false, 2), (true, 4), (false, 4), (true, 8), (false, 8)] {
+            let mut there = original.clone();
+            convert_ns(&mut there, 2, msd_mid, base_mid).expect("forward conversion");
+            assert_eq!(there.msd, vec![Some(msd_mid)]);
+            assert_eq!(there.alphabet, vec![util::int_range_list(base_mid)]);
+
+            let mut back = there.clone();
+            convert_ns(&mut back, base_mid, true, 2).expect("reverse conversion");
+            assert_eq!(back.msd, vec![Some(true)]);
+            assert_eq!(back.alphabet, vec![vec![0, 1]]);
+
+            let mut lhs = back.clone();
+            let mut rhs = original.clone();
+            lhs.fa.totalize(0);
+            rhs.fa.totalize(0);
+            assert_eq!(
+                equiv::automaton_language_equivalent(&lhs, &rhs),
+                Ok(true),
+                "msd_2 -> {}_{base_mid} -> msd_2 must be the identity on the language",
+                if msd_mid { "msd" } else { "lsd" }
+            );
+        }
     }
 }
