@@ -77,13 +77,16 @@ use std::rc::Rc;
 
 use num_bigint::BigInt;
 use wr_core::automaton::Automaton;
-use wr_core::logicalops::and;
-use wr_core::numsys::{ArithmeticOp, NumberSystem, RelationalOp};
-use wr_core::quantify::QuantifyError;
+use wr_core::logicalops::{and, imply};
+use wr_core::numsys::{ArithmeticOp, NumSysError, NumberSystem, RelationalOp};
+use wr_core::quantify::{quantify, QuantifyError};
+use wr_core::word_automaton::{
+    apply_word_arith_operator, apply_word_operator, compare_word_automata, compare_word_automaton,
+};
 
 use crate::expr::{
-    AlphabetLetterExpression, AutomatonExpression, ExprError, Expression, NumberLiteralExpression,
-    VariableExpression, WordExpression,
+    AlphabetLetterExpression, ArithmeticExpression, AutomatonExpression, ExprError, Expression,
+    NumberLiteralExpression, VariableExpression, WordExpression,
 };
 use crate::predicate_env::FreshIdentifiers;
 
@@ -233,6 +236,38 @@ pub enum TokenError {
     /// `Operator.validateArity(Stack<Expression>)` (`Operator.java:146-148`):
     /// `"operator " + op + " requires " + arity + " operands"`.
     InsufficientOperands { op: String, arity: usize },
+    /// `WalnutException.invalidOperator(String, Expression)` (`WalnutException.java:76-78`):
+    /// `"operator " + op + " cannot be applied to the operand " + a + " of type " +
+    /// a.getClass().getName()`. Thrown by `ArithmeticOperator.act`/`processBinaryOperator`
+    /// when an operand is not one of the five kinds `isValidArithmeticOperator` accepts
+    /// (i.e. it is an [`Expression::Automaton`]) — Phase 3a's U9.
+    InvalidOperator {
+        op: String,
+        operand: String,
+        operand_type: &'static str,
+    },
+    /// `WalnutException.invalidDualOperators(String, Expression, Expression)`
+    /// (`:80-82`): `"operator " + op + " cannot be applied to operands " + a + " and " +
+    /// b + " of types " + a.getClass().getName() + " and " + b.getClass().getName() +
+    /// " respectively"`. `RelationalOperator.act`'s final `else`
+    /// (`RelationalOperator.java:172-174`) — Phase 3a's U9.
+    InvalidDualOperators {
+        op: String,
+        a: String,
+        b: String,
+        a_type: &'static str,
+        b_type: &'static str,
+    },
+    /// Propagated out of [`NumberLiteralExpression::int_value_exact`] — the
+    /// `WalnutException` `RelationalOperator.getIntConstantForWord` /
+    /// `ArithmeticOperator.getIntConstantForWord` let escape when a number literal used
+    /// against a word automaton's per-state OUTPUT doesn't fit a Java `int`
+    /// (`RelationalOperator.java:195-200`, `ArithmeticOperator.java:260-265`). Carries the
+    /// already-formatted message (that helper builds the whole string, including the
+    /// caller's context prefix) rather than its components — see
+    /// [`NumberLiteralExpression::int_value_exact`]'s own docs on why the context string
+    /// is the caller's to supply.
+    NumberLiteralOverflow(String),
 }
 
 impl fmt::Display for TokenError {
@@ -258,6 +293,26 @@ impl fmt::Display for TokenError {
             TokenError::InsufficientOperands { op, arity } => {
                 write!(f, "operator {op} requires {arity} operands")
             }
+            TokenError::InvalidOperator {
+                op,
+                operand,
+                operand_type,
+            } => write!(
+                f,
+                "operator {op} cannot be applied to the operand {operand} of type {operand_type}"
+            ),
+            TokenError::InvalidDualOperators {
+                op,
+                a,
+                b,
+                a_type,
+                b_type,
+            } => write!(
+                f,
+                "operator {op} cannot be applied to operands {a} and {b} of types {a_type} \
+                 and {b_type} respectively"
+            ),
+            TokenError::NumberLiteralOverflow(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -283,6 +338,15 @@ pub enum ActError {
     Token(TokenError),
     Expr(ExprError),
     Quantify(QuantifyError),
+    /// Every `WalnutException` `NumberSystem`'s automaton builders raise, surfaced
+    /// directly rather than through [`ExprError::NumberSystem`]. Added by U9: unlike
+    /// [`crate::expr`]'s `act(...)` methods (which only ever call `getConstant`, so
+    /// wrapping through `ExprError` cost nothing there), `RelationalOperator::act`/
+    /// `ArithmeticOperator::act` call `comparison`/`arithmetic`/`getConstant` from a
+    /// dozen sites and never build an [`ExprError`] of their own — routing those through
+    /// `ExprError` would imply an expression-level failure that never happened.
+    /// [`fmt::Display`] renders `NumSysError`'s verbatim Walnut text either way.
+    NumberSystem(NumSysError),
 }
 
 impl From<TokenError> for ActError {
@@ -300,6 +364,12 @@ impl From<ExprError> for ActError {
 impl From<QuantifyError> for ActError {
     fn from(e: QuantifyError) -> Self {
         ActError::Quantify(e)
+    }
+}
+
+impl From<NumSysError> for ActError {
+    fn from(e: NumSysError) -> Self {
+        ActError::NumberSystem(e)
     }
 }
 
@@ -321,6 +391,7 @@ impl fmt::Display for ActError {
                 "Variable {s} in the list of quantified variables is not a free variable."
             ),
             ActError::Quantify(other) => write!(f, "{other:?}"),
+            ActError::NumberSystem(e) => write!(f, "{e}"),
         }
     }
 }
@@ -744,6 +815,722 @@ impl Operator {
         Err(TokenError::UnbalancedParenthesis {
             position: self.position_in_predicate,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// U9 — `RelationalOperator.act` / `ArithmeticOperator.act` semantics
+// ---------------------------------------------------------------------------
+//
+// U2 ported these two classes only as far as `Operator.setPriority` needed (the `Ops`
+// symbol tables and the constructors above). This section is the rest: the
+// automaton-BUILDING half, i.e. `RelationalOperator.java:87-222` and
+// `ArithmeticOperator.java:88-280`, plus `Operator.andThenQuantifyIfArithmetic`
+// (`Operator.java:150-158`) which exists solely to support them and which U2 therefore
+// deferred to here by name.
+//
+// Two cross-cutting decisions, both continuations of rulings already made in this crate
+// rather than new calls:
+//
+// * **No `Logging` calls.** Java sprinkles `Logging.logAndPrint(COMPUTING/COMPUTED …)`
+//   and `Logging.indent()`/`dedent()` through both `act()` bodies (and through
+//   `andThenQuantifyIfArithmetic` itself). Per `predicate_env.rs`'s Ruling 4, the logging
+//   context is threaded by U11's postfix-token executor, not grown piecemeal into each
+//   `act()` signature — the same reason `Word::act`/`Function::act`/every
+//   `Expression::act` above omits them. Nothing else in these bodies depends on the log
+//   state, so omitting the calls changes no automaton.
+// * **`Token.getUniqueString()` becomes `&mut FreshIdentifiers`** (Ruling 4 again).
+//   `ArithmeticOperator` is the source of two of that ruling's four Java call sites
+//   (`:116` in `processUnaryOperator`, `:155` in `processBinaryOperator`); both are minted
+//   at exactly the point Java mints them, because the *order* of minting is observable in
+//   the synthetic names and one of the two (`:155`) is minted on paths that then discard
+//   it (see [`Operator::process_binary_operator`]'s zero-multiplication note).
+//
+// Java reaches all of this through `Operator`'s abstract-class polymorphism
+// (`RelationalOperator extends Operator`, `ArithmeticOperator extends Operator`, each
+// overriding `act(Stack<Expression>)`); here it is a `match` on [`OperatorKind`] inside
+// [`Operator::act`], exactly as U2's module docs predicted this unit would do it.
+
+/// `Operator.andThenQuantifyIfArithmetic(Expression a, Automaton M)`
+/// (`Operator.java:150-158`) — if (and only if) the operand was an
+/// [`Expression::Arithmetic`], fold in its own defining automaton and existentially
+/// eliminate the synthetic identifier that stands for its value.
+///
+/// This is what makes an [`ArithmeticExpression`] "an automaton plus a fresh variable
+/// `x` that must later be quantified away" (see [`Expression`]'s own docs) actually
+/// collapse to a plain predicate. Every other operand kind is returned untouched —
+/// including [`Expression::Word`], whose analogous cleanup its callers do inline instead
+/// (`and` with `word.M`, then `quantify` over `word.identifiersToQuantify`).
+///
+/// `Logging.indent()`/`dedent()` around the body are not ported (see this section's
+/// header). Java's `quantify(M, a.identifier)` is the single-`String` overload
+/// (`AutomatonQuantification.java:16-19`), which is just `quantify(A, Set.of(label))`.
+///
+/// `pub(crate)`, matching Java's package-private `static` — its only callers are the two
+/// `act()` bodies below, and U10's `LogicalOperator.act` does not use it either.
+pub(crate) fn and_then_quantify_if_arithmetic(
+    a: &Expression,
+    m: Automaton,
+) -> Result<Automaton, ActError> {
+    if let Expression::Arithmetic(ae) = a {
+        let mut m = and(&m, &ae.m).into_automaton();
+        quantify(&mut m, &BTreeSet::from([ae.identifier.clone()]))?;
+        return Ok(m);
+    }
+    Ok(m)
+}
+
+/// `RelationalOperator.isConstantExpression` (`:202-204`) / `ArithmeticOperator.
+/// isConstantExpression` (`:267-269`) — byte-identical private helpers in both classes.
+fn is_constant_expression(e: &Expression) -> bool {
+    matches!(
+        e,
+        Expression::NumberLiteral(_) | Expression::AlphabetLetter(_)
+    )
+}
+
+/// `RelationalOperator.getConstantValue` (`:206-211`) / `ArithmeticOperator.
+/// getConstantValue` (`:271-276`) — again identical in both classes.
+///
+/// The `unwrap_or(0)` reproduces Java's *field default* rather than adding a check Java
+/// doesn't have: `e.constant` is a plain `int` field on the shared `Expression` base
+/// class, `0` for every subclass whose constructor never assigns it. Both call sites are
+/// guarded by [`is_constant_expression`], so only the two variants that DO assign it can
+/// reach here — the fallback is unreachable, not a silent default (see
+/// [`Expression::constant`]'s own docs on the narrowing this mirrors).
+fn get_constant_value(e: &Expression) -> BigInt {
+    match e {
+        Expression::NumberLiteral(ne) => ne.value().clone(),
+        _ => BigInt::from(e.constant().unwrap_or(0)),
+    }
+}
+
+/// `a instanceof ArithmeticExpression || a instanceof VariableExpression` — the
+/// two-variant narrowing both `act()` bodies test over and over (six times in
+/// `RelationalOperator.act` alone). Exactly the set [`Expression::identifier`] answers
+/// `Some` for.
+fn is_arithmetic_or_variable(e: &Expression) -> bool {
+    matches!(e, Expression::Arithmetic(_) | Expression::Variable(_))
+}
+
+/// `ArithmeticOperator.isValidArithmeticOperator(Expression)` (`:278-280`) — everything
+/// except [`Expression::Automaton`]. Java spells out the five accepted subclasses rather
+/// than excluding the one rejected one; kept as an explicit five-way `matches!` for the
+/// same reason (if a seventh `Expression` kind ever appears, this must fail closed).
+fn is_valid_arithmetic_operand(e: &Expression) -> bool {
+    matches!(
+        e,
+        Expression::AlphabetLetter(_)
+            | Expression::Word(_)
+            | Expression::Arithmetic(_)
+            | Expression::Variable(_)
+            | Expression::NumberLiteral(_)
+    )
+}
+
+/// `RelationalOperator.getIntConstantForWord` (`:195-200`) /
+/// `ArithmeticOperator.getIntConstantForWord` (`:260-265`) — the same helper in both
+/// classes except for ONE word of the error message, which is why `usage` is a parameter
+/// here instead of the string being inlined: `RelationalOperator` says "used in word
+/// automaton output **comparison**", `ArithmeticOperator` says "… output
+/// **arithmetic**". Both are user-visible `WalnutException` text.
+///
+/// A word automaton's per-state output is a Java `int`, so a number literal compared or
+/// combined against one must fit in an `int` — unlike every other constant path in these
+/// two files, which keeps the unbounded `BigInteger`.
+fn get_int_constant_for_word(e: &Expression, usage: &str) -> Result<i32, TokenError> {
+    match e {
+        Expression::NumberLiteral(ne) => ne
+            .int_value_exact(&format!(
+                "number literal {e} used in word automaton output {usage}"
+            ))
+            .map_err(TokenError::NumberLiteralOverflow),
+        // `return e.constant;` — reachable only for `AlphabetLetterExpression` (both call
+        // sites narrow to `is_constant_expression` first); see [`get_constant_value`]'s
+        // note on the `0` fallback.
+        _ => Ok(e.constant().unwrap_or(0)),
+    }
+}
+
+/// `((WordExpression) e)` — the unchecked cast both `act()` bodies perform after an
+/// `instanceof WordExpression` test. Panics rather than returning an `Option` for the
+/// same reason Java's cast would `ClassCastException`: every call site below has already
+/// tested the variant on the immediately preceding line, so a failure here is an internal
+/// invariant violation, not user input (`PORTING.md`'s panic-for-precondition rule).
+fn as_word(e: &Expression) -> &WordExpression {
+    match e {
+        Expression::Word(w) => w,
+        other => panic!("as_word: expected a WordExpression, got {other:?}"),
+    }
+}
+
+/// `a.identifier` read off an `Expression`-typed local the surrounding `if` has already
+/// narrowed to `ArithmeticExpression | VariableExpression` — see
+/// [`Expression::identifier`]'s docs, which were added by U2's fixer specifically for
+/// these call sites. Panics for the same reason [`as_word`] does.
+fn identifier_of(e: &Expression) -> &str {
+    e.identifier().unwrap_or_else(|| {
+        panic!("identifier_of: expected an arithmetic/variable expression, got {e:?}")
+    })
+}
+
+/// `new HashSet<>(list)` — `AutomatonQuantification.quantify(Automaton, List<String>)`'s
+/// own first line (`AutomatonQuantification.java:21-23`). A `BTreeSet` rather than a
+/// `HashSet` per `PORTING.md`'s iteration-order rule; `quantify` itself is
+/// order-insensitive (it maps each label to a track index independently), so this is a
+/// determinism win with no behavior change.
+fn label_set(labels: &[String]) -> BTreeSet<String> {
+    labels.iter().cloned().collect()
+}
+
+impl Operator {
+    /// `RelationalOperator.ns` / `ArithmeticOperator.ns`. Panics for a kind that has
+    /// none — unreachable by construction, since only [`Operator::relational`] and
+    /// [`Operator::arithmetic`] produce those two kinds and both demand an `Rc`.
+    fn number_system(&self) -> &Rc<NumberSystem> {
+        self.ns.as_ref().expect(
+            "Operator::number_system: only Relational/Arithmetic kinds have one, and both \
+             constructors require it",
+        )
+    }
+
+    /// The `act(Stack<Expression>)` override each concrete `Operator` subclass supplies.
+    ///
+    /// Two of the three are ported here (U9): [`OperatorKind::Relational`] ->
+    /// `RelationalOperator.act`, [`OperatorKind::Arithmetic`] -> `ArithmeticOperator.act`.
+    /// `LogicalOperator.act` (every remaining kind that has one: the connectives, negate,
+    /// reverse, and the three quantifiers) is **U10**, so those kinds still fall through
+    /// to the inherited `Token.act` no-op — exactly as they did before this unit, and
+    /// exactly as `LeftParenthesis`/`RightParenthesis` do permanently (neither ever
+    /// reaches an operand stack: the tokenizer consumes them during the shunting yard,
+    /// see [`Operator::push_onto`]).
+    pub fn act(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        match self.kind {
+            OperatorKind::Relational(opp) => self.act_relational(opp, stack),
+            OperatorKind::Arithmetic(opp) => self.act_arithmetic(opp, fresh, stack),
+            _ => Ok(()),
+        }
+    }
+
+    /// `RelationalOperator.act(Stack<Expression> S)` (`RelationalOperator.java:87-177`).
+    ///
+    /// The operand-type dispatch, in Java's exact order (the order matters: several
+    /// later arms would also match an earlier arm's operands):
+    ///
+    /// | # | `a` | `b` | Result |
+    /// |---|---|---|---|
+    /// | 0 | const | const | **constant-fold** to a TRUE/FALSE automaton, no `NumberSystem` touched |
+    /// | 1 | word | arith\|var | word-output rewrite `⋀ᵢ (T[…] = @i ⇒ i op b)`, both operand orders |
+    /// | 1 | arith\|var | word | (same arm, `reverse = true`) |
+    /// | 2 | arith\|var | arith\|var | `ns.comparison(a.identifier, b.identifier, op)` |
+    /// | 3 | const | arith\|var | `ns.comparison(constant, b.identifier, op)` |
+    /// | 4 | arith\|var | const | `ns.comparison(a.identifier, constant, op)` |
+    /// | 5 | word | word | `WordAutomaton.compareWordAutomata` |
+    /// | 6 | word | const | `WordAutomaton.compareWordAutomaton(a.wordAutomaton, k, op)` |
+    /// | 7 | const | word | same, with the relation **reversed** |
+    /// | — | anything else | | `WalnutException.invalidDualOperators` |
+    ///
+    /// "const" is [`is_constant_expression`] (number literal or `@`-letter); "arith\|var"
+    /// is [`is_arithmetic_or_variable`]. The only combinations that fall through to the
+    /// final `else` are the ones involving an [`Expression::Automaton`] operand, e.g.
+    /// `(x=1) < y`.
+    fn act_relational(
+        &self,
+        opp: RelationalOp,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        // `super.validateArity(S)` (`:88`).
+        self.validate_arity(stack.len())?;
+        let ns = self.number_system();
+        let mut b = stack.pop().expect("validated arity above");
+        let mut a = stack.pop().expect("validated arity above");
+        let op = &self.op_text;
+
+        // ---- 0: constant folding (`:92-95`) --------------------------------
+        // No automaton and no `NumberSystem` involved: `new Automaton(boolean)` is Java's
+        // TRUE/FALSE automaton constructor. Note the comparison runs at FULL BigInteger
+        // width (`getConstantValue` never narrows), so a literal far outside `int` still
+        // folds exactly.
+        if is_constant_expression(&a) && is_constant_expression(&b) {
+            let truth = opp.compare_big_int(&get_constant_value(&a), &get_constant_value(&b));
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                format!("{a}{op}{b}"),
+                Automaton::true_false(truth),
+            )));
+            return Ok(());
+        }
+
+        // ---- 1: word vs arithmetic/variable (`:99-134`) ---------------------
+        if (matches!(a, Expression::Word(_)) && is_arithmetic_or_variable(&b))
+            || (is_arithmetic_or_variable(&a) && matches!(b, Expression::Word(_)))
+        {
+            // Java's comment, kept: "We rewrite T[a] < b as
+            // (T[a] = @0 => 0 < b) & (T[a] = @1 => 1 < b)", with one conjunct per output.
+            let (word_expr, arith_expr, reverse) = if matches!(a, Expression::Word(_)) {
+                (&a, &b, false)
+            } else {
+                (&b, &a, true)
+            };
+            let word = as_word(word_expr);
+            let identifier = identifier_of(arith_expr);
+
+            let mut m = Automaton::true_false(true);
+            // `for (int o : word.wordAutomaton.fa.getO())` — Java iterates the raw
+            // per-STATE output list, so a value shared by k states contributes k
+            // identical conjuncts. Redundant, not wrong (`and` is idempotent); ported
+            // verbatim rather than deduplicated, since deduplicating would change the
+            // intermediate state counts the `details*` golden fixtures compare exactly.
+            // Cloned up front only because the loop body clones `word.word_automaton`;
+            // the list itself is never mutated here, in either language.
+            for o in word.word_automaton.fa.o.clone() {
+                let mut n = word.word_automaton.clone();
+                compare_word_automaton(&mut n, o, RelationalOp::Equal);
+                let mut c = if reverse {
+                    ns.comparison_const_b(identifier, &BigInt::from(o), opp)?
+                } else {
+                    ns.comparison_const_a(&BigInt::from(o), identifier, opp)?
+                };
+                let n = imply(&mut n, &mut c).into_automaton();
+                m = and(&m, &n).into_automaton();
+            }
+            m = and(&m, &word.m).into_automaton();
+            quantify(&mut m, &label_set(&word.identifiers_to_quantify))?;
+            m = and_then_quantify_if_arithmetic(arith_expr, m)?;
+            // WB-023: `word.toString()`, NOT `a + op + b` like every sibling arm.
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                word_expr.to_string(),
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 2: arithmetic/variable vs arithmetic/variable (`:135-140`) -----
+        if is_arithmetic_or_variable(&a) && is_arithmetic_or_variable(&b) {
+            let mut m = ns.comparison(identifier_of(&a), identifier_of(&b), opp);
+            m = and_then_quantify_if_arithmetic(&a, m)?;
+            m = and_then_quantify_if_arithmetic(&b, m)?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                format!("{a}{op}{b}"),
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 3: constant vs arithmetic/variable (`:141-146`) ----------------
+        if is_constant_expression(&a) && is_arithmetic_or_variable(&b) {
+            let identifier = identifier_of(&b);
+            let m = match &a {
+                Expression::NumberLiteral(ne) => {
+                    ns.comparison_const_a(ne.value(), identifier, opp)?
+                }
+                _ => ns.comparison_const_a(&get_constant_value(&a), identifier, opp)?,
+            };
+            let m = and_then_quantify_if_arithmetic(&b, m)?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                format!("{a}{op}{b}"),
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 4: arithmetic/variable vs constant (`:147-152`) ----------------
+        if is_arithmetic_or_variable(&a) && is_constant_expression(&b) {
+            let identifier = identifier_of(&a);
+            let m = match &b {
+                Expression::NumberLiteral(ne) => {
+                    ns.comparison_const_b(identifier, ne.value(), opp)?
+                }
+                _ => ns.comparison_const_b(identifier, &get_constant_value(&b), opp)?,
+            };
+            let m = and_then_quantify_if_arithmetic(&a, m)?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                format!("{a}{op}{b}"),
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 5: word vs word (`:153-159`) -----------------------------------
+        if matches!(a, Expression::Word(_)) && matches!(b, Expression::Word(_)) {
+            let string_value = format!("{a}{op}{b}");
+            let aw = as_word(&a);
+            let bw = as_word(&b);
+            // Java passes the raw symbol string here (`compareWordAutomata(…, op)`), which
+            // `ProductStrategies` immediately maps back through `RELATIONAL_OPERATORS` —
+            // i.e. to exactly `opp`. Passing `opp` skips a lossless round trip.
+            let mut m = compare_word_automata(&aw.word_automaton, &bw.word_automaton, opp);
+            m = and(&m, &aw.m).into_automaton();
+            m = and(&m, &bw.m).into_automaton();
+            // Two separate `quantify` calls, not one merged set — each one re-runs the
+            // leading-zero fixup. Ported as-is (`:157-158`).
+            quantify(&mut m, &label_set(&aw.identifiers_to_quantify))?;
+            quantify(&mut m, &label_set(&bw.identifiers_to_quantify))?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                string_value,
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 6: word vs constant (`:160-165`) -------------------------------
+        if matches!(a, Expression::Word(_)) && is_constant_expression(&b) {
+            // Evaluated before the mutation below, matching Java's argument-evaluation
+            // order: an out-of-`int` literal must fail with `a.wordAutomaton` untouched.
+            let k = get_int_constant_for_word(&b, "comparison")?;
+            let string_value = format!("{a}{op}{b}");
+            let aw = match &mut a {
+                Expression::Word(w) => w,
+                _ => unreachable!("matched above"),
+            };
+            // Mutates `a.wordAutomaton` IN PLACE (`compareWordAutomaton` returns void);
+            // `a` is discarded right after, so the aliasing Java's `Automaton M =
+            // a.wordAutomaton` sets up is unobservable.
+            compare_word_automaton(&mut aw.word_automaton, k, opp);
+            let mut m = and(&aw.word_automaton, &aw.m).into_automaton();
+            quantify(&mut m, &label_set(&aw.identifiers_to_quantify))?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                string_value,
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- 7: constant vs word (`:166-171`) -------------------------------
+        if is_constant_expression(&a) && matches!(b, Expression::Word(_)) {
+            let k = get_int_constant_for_word(&a, "comparison")?;
+            let string_value = format!("{a}{op}{b}");
+            let bw = match &mut b {
+                Expression::Word(w) => w,
+                _ => unreachable!("matched above"),
+            };
+            // `k op T[…]` is `T[…] reverse(op) k` — hence `reverseOperator(opp)`.
+            compare_word_automaton(&mut bw.word_automaton, k, opp.reverse_operator());
+            let mut m = and(&bw.word_automaton, &bw.m).into_automaton();
+            quantify(&mut m, &label_set(&bw.identifiers_to_quantify))?;
+            stack.push(Expression::Automaton(AutomatonExpression::new(
+                string_value,
+                m,
+            )));
+            return Ok(());
+        }
+
+        // ---- else (`:172-174`) ----------------------------------------------
+        Err(TokenError::InvalidDualOperators {
+            op: op.clone(),
+            a: a.to_string(),
+            b: b.to_string(),
+            a_type: a.java_class_name(),
+            b_type: b.java_class_name(),
+        }
+        .into())
+    }
+
+    /// `ArithmeticOperator.act(Stack<Expression> S)` (`ArithmeticOperator.java:88-98`) —
+    /// validate, pop `b`, reject an [`Expression::Automaton`] operand, then split on
+    /// unary-vs-binary.
+    fn act_arithmetic(
+        &self,
+        opp: ArithmeticOp,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        self.validate_arity(stack.len())?;
+        let b = stack.pop().expect("validated arity above");
+        if !is_valid_arithmetic_operand(&b) {
+            return Err(TokenError::InvalidOperator {
+                op: self.op_text.clone(),
+                operand: b.to_string(),
+                operand_type: b.java_class_name(),
+            }
+            .into());
+        }
+        if opp == ArithmeticOp::UnaryNegative {
+            self.process_unary_operator(b, fresh, stack)
+        } else {
+            self.process_binary_operator(opp, b, fresh, stack)
+        }
+    }
+
+    /// `ArithmeticOperator.processUnaryOperator(Expression b, Stack<Expression> S)`
+    /// (`:100-123`) — the `_` (unary minus) operator.
+    ///
+    /// Four cases, in Java's order: a number literal negates its `BigInteger` outright; an
+    /// `@`-letter negates its `int`; a word automaton has its per-state OUTPUTS negated in
+    /// place (as `0 - output`) and is pushed back unchanged otherwise; anything else
+    /// (arithmetic/variable) gets an automaton for `b + c = 0` under a fresh `c`.
+    fn process_unary_operator(
+        &self,
+        mut b: Expression,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        let ns = self.number_system();
+        let op = &self.op_text;
+
+        if let Expression::NumberLiteral(ne) = &b {
+            // `ne.value().negate()` — note the new literal takes THIS OPERATOR's number
+            // system (`ns`), not the literal's own `base`, exactly as Java does.
+            let value = -ne.value();
+            stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                value.to_string(),
+                value,
+                Rc::clone(ns),
+            )));
+            return Ok(());
+        }
+        if let Expression::AlphabetLetter(ae) = &b {
+            let value = -ae.constant;
+            stack.push(Expression::AlphabetLetter(AlphabetLetterExpression::new(
+                format!("@{value}"),
+                value,
+            )));
+            return Ok(());
+        }
+        if matches!(b, Expression::Word(_)) {
+            {
+                let bw = match &mut b {
+                    Expression::Word(w) => w,
+                    _ => unreachable!("matched above"),
+                };
+                // `applyWordArithOperator(b.wordAutomaton, 0, Ops.MINUS, false)`: with
+                // `reverse == false` the per-state computation is `arith(MINUS, o=0,
+                // thisP)`, i.e. `0 - output`. Note MINUS, not the `_` this operator IS —
+                // `ArithmeticOp::UnaryNegative` is precisely the value
+                // `ArithmeticOp::arith` rejects, so the rewrite is load-bearing.
+                apply_word_arith_operator(&mut bw.word_automaton, 0, ArithmeticOp::Minus, false)?;
+            }
+            // The expression string is NOT updated, so `_T[i]` still displays as `T[i]`.
+            stack.push(b);
+            return Ok(());
+        }
+
+        // Arithmetic / variable: `b + c = 0` with a fresh `c` standing for `-b`.
+        let c = fresh.next_identifier();
+        let m =
+            ns.arithmetic_const_c(identifier_of(&b), &c, &BigInt::from(0), ArithmeticOp::Plus)?;
+        let m = and_then_quantify_if_arithmetic(&b, m)?;
+        stack.push(Expression::Arithmetic(ArithmeticExpression::new(
+            format!("({op}{b})"),
+            m,
+            c,
+        )));
+        Ok(())
+    }
+
+    /// `ArithmeticOperator.processBinaryOperator(Expression b, Stack<Expression> S)`
+    /// (`:125-234`) — `+`, `-`, `*`, `/`.
+    ///
+    /// Dispatch order, again exactly Java's (and again order-sensitive):
+    ///
+    /// | # | `a` | `b` | Result |
+    /// |---|---|---|---|
+    /// | 0 | word | word | outputs combined pointwise; `a` mutated and re-pushed as a word |
+    /// | 1 | word | const | `applyWordArithOperator(a.wordAutomaton, k, op, reverse=true)` |
+    /// | 2 | const | word | same with `reverse=false` |
+    /// | 3 | const | const | **constant-fold** to a new number literal (full `BigInteger`) |
+    /// | 4 | word involved | | word-output rewrite `⋀ᵢ (T[…] = @i ⇒ i op b = c)` |
+    /// | 5 | otherwise | | `ns.arithmetic(…, c, op)`, constant on either side or neither |
+    ///
+    /// Arms 0–3 return a non-[`Expression::Arithmetic`] value and never mint a synthetic
+    /// name; arms 4–5 both produce `ArithmeticExpression("(a op b)", M, c)`.
+    fn process_binary_operator(
+        &self,
+        opp: ArithmeticOp,
+        mut b: Expression,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+    ) -> Result<(), ActError> {
+        let ns = self.number_system();
+        let op = &self.op_text;
+        let mut a = stack.pop().expect("validated arity in act_arithmetic");
+        if !is_valid_arithmetic_operand(&a) {
+            return Err(TokenError::InvalidOperator {
+                op: op.clone(),
+                operand: a.to_string(),
+                operand_type: a.java_class_name(),
+            }
+            .into());
+        }
+
+        // ---- 0: word ⊕ word (`:130-138`) ------------------------------------
+        if matches!(a, Expression::Word(_)) && matches!(b, Expression::Word(_)) {
+            {
+                let bw = as_word(&b);
+                let aw = match &mut a {
+                    Expression::Word(w) => w,
+                    _ => unreachable!("matched above"),
+                };
+                aw.word_automaton =
+                    apply_word_operator(&aw.word_automaton, &bw.word_automaton, opp);
+                aw.m = and(&aw.m, &bw.m).into_automaton();
+                aw.identifiers_to_quantify
+                    .extend(bw.identifiers_to_quantify.iter().cloned());
+            }
+            // `a` is pushed back with its ORIGINAL `expressionInString`, so `T[i]+U[i]`
+            // still displays as `T[i]` — ported verbatim (cosmetic, same family as the
+            // unary word case above).
+            stack.push(a);
+            return Ok(());
+        }
+
+        // ---- 1: word ⊕ constant (`:139-143`) --------------------------------
+        if matches!(a, Expression::Word(_)) && is_constant_expression(&b) {
+            let k = get_int_constant_for_word(&b, "arithmetic")?;
+            {
+                let aw = match &mut a {
+                    Expression::Word(w) => w,
+                    _ => unreachable!("matched above"),
+                };
+                // `reverse = true` -> per-state `arith(op, output, k)`, i.e. `T[…] op k`.
+                apply_word_arith_operator(&mut aw.word_automaton, k, opp, true)?;
+            }
+            stack.push(a);
+            return Ok(());
+        }
+
+        // ---- 2: constant ⊕ word (`:144-148`) --------------------------------
+        if is_constant_expression(&a) && matches!(b, Expression::Word(_)) {
+            let k = get_int_constant_for_word(&a, "arithmetic")?;
+            {
+                let bw = match &mut b {
+                    Expression::Word(w) => w,
+                    _ => unreachable!("matched above"),
+                };
+                // `reverse = false` -> per-state `arith(op, k, output)`, i.e. `k op T[…]`.
+                apply_word_arith_operator(&mut bw.word_automaton, k, opp, false)?;
+            }
+            stack.push(b);
+            return Ok(());
+        }
+
+        // ---- 3: constant ⊕ constant (`:150-154`) ----------------------------
+        if is_constant_expression(&a) && is_constant_expression(&b) {
+            // Full-width `BigInteger` arithmetic with no narrowing step — the result goes
+            // straight into a new literal, so `DIV`'s floor-toward-negative-infinity
+            // rounding is whatever `ArithmeticOp::arith_big_int` computes. Division by
+            // zero surfaces here as `NumSysError::DivisionByZero`.
+            let value = opp.arith_big_int(&get_constant_value(&a), &get_constant_value(&b))?;
+            stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                value.to_string(),
+                value,
+                Rc::clone(ns),
+            )));
+            return Ok(());
+        }
+
+        // `String c = getUniqueString();` (`:155`) — minted HERE, before the branch
+        // split, which means the zero-multiplication short-circuits below discard it
+        // after it has already advanced the counter. Ported at Java's exact position
+        // because the counter's value is observable in later synthetic names.
+        let c = fresh.next_identifier();
+        let m: Automaton;
+
+        // ---- 4: a word is still involved (`:158-198`) ------------------------
+        // `a instanceof WordExpression || ((a is arith|var) && b instanceof
+        // WordExpression)` — Java's `&&`-binds-tighter grouping. Reachable for
+        // (word, arith|var) and (arith|var, word) only; every other word combination was
+        // consumed by arms 0-2 above.
+        if matches!(a, Expression::Word(_))
+            || (is_arithmetic_or_variable(&a) && matches!(b, Expression::Word(_)))
+        {
+            // Java's comment, kept: "We rewrite T[a] * 5 = z as
+            // (T[a] = @0 => 0 * 5 = z) & (T[a] = @1 => 1 * 5 = z)".
+            let (word_expr, arith_expr, reverse) = if matches!(a, Expression::Word(_)) {
+                (&a, &b, false)
+            } else {
+                (&b, &a, true)
+            };
+            let word = as_word(word_expr);
+            let identifier = identifier_of(arith_expr);
+
+            let mut acc = Automaton::true_false(true);
+            for o in word.word_automaton.fa.o.clone() {
+                let mut n = word.word_automaton.clone();
+                compare_word_automaton(&mut n, o, RelationalOp::Equal);
+                let mut cc = if o == 0 && opp == ArithmeticOp::Mult {
+                    // `0 * anything = 0`, asserted directly on `c` — this is the ONLY
+                    // conjunct that never mentions `arithmetic.identifier`, i.e. WB-003's
+                    // "the other operand is never bound or validated" short-circuit, in
+                    // its per-word-output form.
+                    let mut k = ns.get_constant(&BigInt::from(0))?;
+                    k.bind(vec![c.clone()]);
+                    k
+                } else if reverse {
+                    ns.arithmetic_const_b(identifier, &BigInt::from(o), &c, opp)?
+                } else {
+                    ns.arithmetic_const_a(&BigInt::from(o), identifier, &c, opp)?
+                };
+                let n = imply(&mut n, &mut cc).into_automaton();
+                acc = and(&acc, &n).into_automaton();
+            }
+            acc = and(&acc, &word.m).into_automaton();
+            quantify(&mut acc, &label_set(&word.identifiers_to_quantify))?;
+            m = and_then_quantify_if_arithmetic(arith_expr, acc)?;
+        } else {
+            // ---- 5: no word operand (`:200-231`) -----------------------------
+            // Exactly one of `a`/`b` may be a constant here (arm 3 consumed the
+            // both-constant case), so the four constant arms are mutually exclusive and
+            // the final `else` sees two arithmetic/variable operands.
+            let built = if let Expression::NumberLiteral(ne) = &a {
+                // WB-003: `0 * x` folds to the literal `0` without ever building an
+                // automaton for `x` — so an undeclared/misspelled `x` passes silently.
+                // Ported verbatim, incl. the wasted `c` minted just above.
+                if ne.is_zero() && opp == ArithmeticOp::Mult {
+                    stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                        "0",
+                        BigInt::from(0),
+                        Rc::clone(ns),
+                    )));
+                    return Ok(());
+                }
+                ns.arithmetic_const_a(ne.value(), identifier_of(&b), &c, opp)?
+            } else if let Expression::AlphabetLetter(ae) = &a {
+                if ae.constant == 0 && opp == ArithmeticOp::Mult {
+                    stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                        "0",
+                        BigInt::from(0),
+                        Rc::clone(ns),
+                    )));
+                    return Ok(());
+                }
+                ns.arithmetic_const_a(&BigInt::from(ae.constant), identifier_of(&b), &c, opp)?
+            } else if let Expression::NumberLiteral(ne) = &b {
+                if ne.is_zero() && opp == ArithmeticOp::Mult {
+                    stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                        "0",
+                        BigInt::from(0),
+                        Rc::clone(ns),
+                    )));
+                    return Ok(());
+                }
+                ns.arithmetic_const_b(identifier_of(&a), ne.value(), &c, opp)?
+            } else if let Expression::AlphabetLetter(ae) = &b {
+                if ae.constant == 0 && opp == ArithmeticOp::Mult {
+                    stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
+                        "0",
+                        BigInt::from(0),
+                        Rc::clone(ns),
+                    )));
+                    return Ok(());
+                }
+                ns.arithmetic_const_b(identifier_of(&a), &BigInt::from(ae.constant), &c, opp)?
+            } else {
+                ns.arithmetic(identifier_of(&a), identifier_of(&b), &c, opp)?
+            };
+            let built = and_then_quantify_if_arithmetic(&a, built)?;
+            m = and_then_quantify_if_arithmetic(&b, built)?;
+        }
+
+        stack.push(Expression::Arithmetic(ArithmeticExpression::new(
+            format!("({a}{op}{b})"),
+            m,
+            c,
+        )));
+        Ok(())
     }
 }
 
@@ -1220,11 +2007,12 @@ impl Token {
     }
 
     /// `Token.act(Stack<Expression> S)` (`:46`, no-op default) — overridden by
-    /// `Variable`/`NumberLiteral`/`AlphabetLetter` (U2) and, as of U4, by `Word`/
-    /// `Function` (`Word.java:50-79`, `Function.java`'s own `act`). `Operator` itself
-    /// never overrides the inherited no-op directly — only its `LogicalOperator`/
-    /// `RelationalOperator`/`ArithmeticOperator` subclasses do (deferred to U9/U10), so
-    /// [`Token::Operator`] still falls through to `Ok(())` here.
+    /// `Variable`/`NumberLiteral`/`AlphabetLetter` (U2), by `Word`/`Function` (U4,
+    /// `Word.java:50-79`, `Function.java`'s own `act`), and — as of U9 — by
+    /// `RelationalOperator`/`ArithmeticOperator` via [`Operator::act`]. `Operator` itself
+    /// still never overrides the inherited no-op directly; `LogicalOperator.act` remains
+    /// deferred to U10, so those operator kinds fall through [`Operator::act`]'s own
+    /// catch-all to `Ok(())`.
     ///
     /// `fresh` is [`FreshIdentifiers`] (`predicate_env.rs`'s Ruling 4) — needed
     /// transitively by `Word`/`Function::act` via the `Expression::act` overloads they
@@ -1240,7 +2028,7 @@ impl Token {
             Token::Variable(t) => t.act(stack),
             Token::NumberLiteral(t) => t.act(stack),
             Token::AlphabetLetter(t) => t.act(stack),
-            Token::Operator(_) => {}
+            Token::Operator(op) => return op.act(fresh, stack),
             Token::Word(w) => return w.act(fresh, stack),
             Token::Function(f) => return f.act(fresh, stack),
         }
@@ -2274,5 +3062,1116 @@ mod tests {
         let third = temp.pop().unwrap();
         assert!(matches!(third, Expression::Automaton(_)));
         assert!(temp.is_empty());
+    }
+
+    // =====================================================================
+    // U9 — `RelationalOperator.act` / `ArithmeticOperator.act`
+    // =====================================================================
+
+    use std::collections::BTreeMap as Map;
+    use wr_core::fa::Fa;
+
+    // ------------------------------------------------------- fixtures
+
+    fn number_literal(value: i64, base: &Rc<NumberSystem>) -> Expression {
+        big_literal(BigInt::from(value), base)
+    }
+
+    fn big_literal(value: BigInt, base: &Rc<NumberSystem>) -> Expression {
+        Expression::NumberLiteral(NumberLiteralExpression::new(
+            value.to_string(),
+            value,
+            Rc::clone(base),
+        ))
+    }
+
+    fn alphabet_letter(value: i32) -> Expression {
+        Expression::AlphabetLetter(AlphabetLetterExpression::new(format!("@{value}"), value))
+    }
+
+    fn variable(name: &str) -> Expression {
+        Expression::Variable(VariableExpression::new(name))
+    }
+
+    /// A deterministic, total, single-track msd-base-2 DFAO with the given per-state
+    /// outputs and transition table (`d[state][digit] = destination`), bound to `label`.
+    fn dfao(label: &str, outputs: &[i32], d: &[[usize; 2]]) -> Automaton {
+        let q = outputs.len();
+        assert_eq!(q, d.len());
+        let mut table: Vec<Map<i32, Vec<usize>>> = Vec::with_capacity(q);
+        for row in d {
+            let mut m = Map::new();
+            m.insert(0, vec![row[0]]);
+            m.insert(1, vec![row[1]]);
+            table.push(m);
+        }
+        Automaton::new(
+            Fa {
+                q0: 0,
+                q,
+                alphabet_size: 2,
+                o: outputs.to_vec(),
+                d: table,
+                true_false: None,
+            },
+            vec![vec![0, 1]],
+            vec![label.to_string()],
+            vec![Some(true)],
+        )
+    }
+
+    /// Thue–Morse: the output is the parity of the number of `1` digits, so
+    /// `T[i] == 1` exactly for odd-popcount `i` (leading zeros don't change it).
+    fn thue_morse(label: &str) -> Automaton {
+        dfao(label, &[0, 1], &[[0, 1], [1, 0]])
+    }
+
+    /// The constant-`1` DFAO — its single state outputs `1`.
+    fn always_one(label: &str) -> Automaton {
+        dfao(label, &[1], &[[0, 0]])
+    }
+
+    /// A [`WordExpression`] shaped the way `Word::act` leaves one for a plain,
+    /// first-occurrence variable index: the bound word automaton, a TRUE accumulator,
+    /// and nothing pending quantification.
+    fn word_expression(display: &str, word_automaton: Automaton) -> Expression {
+        Expression::Word(Box::new(WordExpression::new(
+            display,
+            word_automaton,
+            Automaton::true_false(true),
+            vec![],
+        )))
+    }
+
+    // ------------------------------------------------- semantic oracle
+
+    /// msd base-`base` digits of `value`, zero-padded on the left to `width`.
+    fn msd_digits(value: u32, base: u32, width: usize) -> Vec<i32> {
+        let mut digits = Vec::new();
+        let mut v = value;
+        while v > 0 {
+            digits.push((v % base) as i32);
+            v /= base;
+        }
+        assert!(
+            digits.len() <= width,
+            "{value} needs more than {width} base-{base} digits"
+        );
+        while digits.len() < width {
+            digits.push(0);
+        }
+        digits.reverse();
+        digits
+    }
+
+    /// Does `a` accept the given per-track values, each written msd base-`base` and
+    /// zero-padded to a common `width`?
+    ///
+    /// A deliberately INDEPENDENT oracle: it walks `a.fa`'s transitions directly over
+    /// symbols built with `a`'s own `RichAlphabet` encoding, rather than comparing `a`
+    /// against a second automaton built from the same `NumberSystem` primitives the code
+    /// under test used (where both sides could share one mistake). Tracks are looked up
+    /// BY NAME, so it is also immune to the track-permutation gap
+    /// `wr_core::equiv::automaton_language_equivalent` documents.
+    fn accepts(a: &Automaton, base: u32, width: usize, values: &[(&str, u32)]) -> bool {
+        assert_eq!(
+            a.label.len(),
+            values.len(),
+            "expected one value per track; automaton tracks are {:?}",
+            a.label
+        );
+        let mut per_track: Vec<Vec<i32>> = vec![Vec::new(); a.label.len()];
+        for (name, value) in values {
+            let idx = a
+                .label
+                .iter()
+                .position(|l| l == name)
+                .unwrap_or_else(|| panic!("no track named {name:?} in {:?}", a.label));
+            per_track[idx] = msd_digits(*value, base, width);
+        }
+        let word: Vec<i32> = (0..width)
+            .map(|pos| {
+                let digits: Vec<i32> = per_track.iter().map(|d| d[pos]).collect();
+                a.encode(&digits)
+            })
+            .collect();
+        a.fa.accepts_word(&word)
+    }
+
+    /// Runs one operator against a prepared operand stack and returns the single
+    /// [`Expression`] it leaves behind.
+    fn act_once(
+        op: &Operator,
+        fresh: &mut FreshIdentifiers,
+        mut stack: Vec<Expression>,
+    ) -> Expression {
+        op.act(fresh, &mut stack)
+            .unwrap_or_else(|e| panic!("act failed: {e}"));
+        assert_eq!(stack.len(), 1, "act must leave exactly one operand");
+        stack.pop().unwrap()
+    }
+
+    fn as_automaton_expression(e: Expression) -> AutomatonExpression {
+        match e {
+            Expression::Automaton(ae) => ae,
+            other => panic!("expected an AutomatonExpression, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
+    // RelationalOperator: constant folding (`RelationalOperator.java:92-95`)
+    // =====================================================================
+
+    #[test]
+    fn relational_constant_folding_of_two_number_literals() {
+        let n = ns("msd_2");
+        for (a, b, op, expected) in [
+            (5i64, 7i64, "<", true),
+            (7, 5, "<", false),
+            (5, 5, "<", false),
+            (5, 5, "<=", true),
+            (5, 5, "=", true),
+            (5, 7, "!=", true),
+            (7, 5, ">", true),
+            (5, 5, ">=", true),
+        ] {
+            let operator = Operator::relational(0, op, Rc::clone(&n));
+            let mut fresh = FreshIdentifiers::new();
+            let result = act_once(
+                &operator,
+                &mut fresh,
+                vec![number_literal(a, &n), number_literal(b, &n)],
+            );
+            let ae = as_automaton_expression(result);
+            assert!(
+                ae.m.is_true_false_automaton(),
+                "constant folding must produce a trivial automaton, never a real one"
+            );
+            assert_eq!(
+                ae.m.is_true_automaton(),
+                expected,
+                "{a} {op} {b} should fold to {expected}"
+            );
+            assert_eq!(
+                fresh.issued(),
+                0,
+                "constant folding mints no synthetic names"
+            );
+        }
+    }
+
+    /// `a + op + b`, using the operator's RAW symbol (`Operator.op`), not its
+    /// `toString()` (which would append `_msd_2`).
+    #[test]
+    fn relational_constant_folding_expression_string_is_a_op_b() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, ">=", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![number_literal(7, &n), number_literal(5, &n)],
+        );
+        assert_eq!(result.to_string(), "7>=5");
+    }
+
+    /// `@`-letters fold too — and, unlike every path that goes through `NumberSystem`,
+    /// NEGATIVE ones are fine here, because constant folding never touches the number
+    /// system and so never reaches `validateNeg`.
+    #[test]
+    fn relational_constant_folding_accepts_negative_alphabet_letters() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![alphabet_letter(-1), alphabet_letter(0)],
+        );
+        assert!(as_automaton_expression(result).m.is_true_automaton());
+    }
+
+    /// Why `RelationalOp::compare_big_int` exists: `getConstantValue` keeps the
+    /// literal's unbounded `BigInteger`, so a value far outside `i32` must still fold
+    /// exactly rather than overflow or truncate.
+    #[test]
+    fn relational_constant_folding_is_exact_far_outside_i32() {
+        let n = ns("msd_2");
+        let huge: BigInt = BigInt::from(10).pow(30);
+        let operator = Operator::relational(0, ">", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![big_literal(huge.clone(), &n), number_literal(5, &n)],
+        );
+        assert!(as_automaton_expression(result).m.is_true_automaton());
+
+        let operator = Operator::relational(0, "=", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![big_literal(huge.clone(), &n), big_literal(&huge + 1, &n)],
+        );
+        assert!(
+            !as_automaton_expression(result).m.is_true_automaton(),
+            "two distinct 31-digit literals must not compare equal"
+        );
+    }
+
+    // =====================================================================
+    // RelationalOperator: the general (automaton-building) arms
+    // =====================================================================
+
+    #[test]
+    fn relational_variable_vs_variable_builds_the_real_relation() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![variable("x"), variable("y")],
+        );
+        assert_eq!(result.to_string(), "x<y");
+        let m = as_automaton_expression(result).m;
+        assert_eq!(m.label.len(), 2);
+        for (x, y) in [(0u32, 1u32), (1, 2), (2, 5)] {
+            assert!(
+                accepts(&m, 2, 5, &[("x", x), ("y", y)]),
+                "{x} < {y} must be accepted"
+            );
+        }
+        for (x, y) in [(1u32, 1u32), (2, 1), (5, 0)] {
+            assert!(
+                !accepts(&m, 2, 5, &[("x", x), ("y", y)]),
+                "{x} < {y} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn relational_variable_vs_number_literal_and_the_mirror_image() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "=", Rc::clone(&n));
+
+        // x = 5
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![variable("x"), number_literal(5, &n)],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("x", 5)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 4)]));
+
+        // 5 = x — the constant now on the LEFT, which Java routes through
+        // `comparison(BigInteger, String, op)` by REVERSING the relation.
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![number_literal(5, &n), variable("x")],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("x", 5)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 4)]));
+    }
+
+    /// Reversal is only observable for an ASYMMETRIC relation: `3 < x` must not be
+    /// `x < 3`. This is the arm that would silently pass if `comparison_const_a` were
+    /// wired straight to `comparison_const_b` without the `reverse_operator()` step.
+    #[test]
+    fn relational_constant_on_the_left_reverses_the_relation() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![number_literal(3, &n), variable("x")],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("x", 4)]), "3 < 4");
+        assert!(!accepts(&m, 2, 5, &[("x", 3)]), "3 < 3 is false");
+        assert!(!accepts(&m, 2, 5, &[("x", 2)]), "3 < 2 is false");
+
+        // ... and the alphabet-letter form of the same arm.
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![alphabet_letter(3), variable("x")],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("x", 4)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 2)]));
+    }
+
+    #[test]
+    fn relational_variable_vs_alphabet_letter_constant() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![variable("x"), alphabet_letter(3)],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("x", 2)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 3)]));
+    }
+
+    /// `RelationalOperator.act`'s final `else` (`:172-174`). The message text is
+    /// `error*`-fixture material, so it is pinned verbatim.
+    #[test]
+    fn relational_rejects_automaton_operands_with_walnuts_exact_message() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let mut stack = vec![
+            Expression::Automaton(AutomatonExpression::new("x=1", Automaton::true_false(true))),
+            Expression::Automaton(AutomatonExpression::new("y=2", Automaton::true_false(true))),
+        ];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "operator < cannot be applied to operands x=1 and y=2 of types \
+             Main.EvalComputations.Expressions.AutomatonExpression and \
+             Main.EvalComputations.Expressions.AutomatonExpression respectively"
+        );
+    }
+
+    #[test]
+    fn relational_validates_arity_before_popping() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let mut stack = vec![variable("x")];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "operator < requires 2 operands");
+        assert_eq!(stack.len(), 1, "a failed act must not consume the stack");
+    }
+
+    // =====================================================================
+    // ArithmeticOperator: constant folding + DIV's floor semantics
+    // =====================================================================
+
+    fn fold_arithmetic(op: &str, a: Expression, b: Expression, n: &Rc<NumberSystem>) -> BigInt {
+        let operator = Operator::arithmetic(0, op, Rc::clone(n));
+        let result = act_once(&operator, &mut FreshIdentifiers::new(), vec![a, b]);
+        match result {
+            Expression::NumberLiteral(ne) => {
+                assert!(
+                    Rc::ptr_eq(ne.base(), n),
+                    "the folded literal takes the OPERATOR's number system"
+                );
+                ne.value().clone()
+            }
+            other => panic!("expected a folded NumberLiteralExpression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arithmetic_constant_folding_of_two_literals() {
+        let n = ns("msd_2");
+        assert_eq!(
+            fold_arithmetic("+", number_literal(3, &n), number_literal(4, &n), &n),
+            BigInt::from(7)
+        );
+        assert_eq!(
+            fold_arithmetic("-", number_literal(9, &n), number_literal(4, &n), &n),
+            BigInt::from(5)
+        );
+        assert_eq!(
+            fold_arithmetic("*", number_literal(6, &n), number_literal(7, &n), &n),
+            BigInt::from(42)
+        );
+    }
+
+    /// **This layer's** use of `ArithmeticOp::arith_big_int` must round toward NEGATIVE
+    /// INFINITY, not toward zero — checked end-to-end through `act()` on `@`-letter
+    /// operands (the only constants that can be negative without first going through
+    /// unary minus). `-7 / 2` is `-4` in Walnut, not the `-3` that Java's and Rust's
+    /// native `/` would give.
+    #[test]
+    fn arithmetic_div_floors_toward_negative_infinity_through_act() {
+        let n = ns("msd_2");
+        for (a, b, expected) in [
+            (7i32, 2i32, 3i64),
+            (-7, 2, -4),
+            (7, -2, -4),
+            (-7, -2, 3),
+            // Exact division: no floor correction even though the signs differ.
+            (-8, 2, -4),
+            (8, -2, -4),
+            (0, 5, 0),
+            (-1, 5, -1),
+        ] {
+            assert_eq!(
+                fold_arithmetic("/", alphabet_letter(a), alphabet_letter(b), &n),
+                BigInt::from(expected),
+                "floor({a} / {b})"
+            );
+        }
+    }
+
+    /// The same floor rounding reached from a genuinely negative NUMBER LITERAL (via the
+    /// unary-minus path) rather than an `@`-letter: `(_7) / 2 == -4`.
+    #[test]
+    fn arithmetic_div_floors_a_negated_number_literal() {
+        let n = ns("msd_2");
+        let negate = Operator::arithmetic(0, "_", Rc::clone(&n));
+        let negated = act_once(
+            &negate,
+            &mut FreshIdentifiers::new(),
+            vec![number_literal(7, &n)],
+        );
+        assert_eq!(negated.to_string(), "-7");
+        assert_eq!(
+            fold_arithmetic("/", negated, number_literal(2, &n), &n),
+            BigInt::from(-4)
+        );
+    }
+
+    #[test]
+    fn arithmetic_constant_folding_division_by_zero_is_walnuts_error() {
+        let n = ns("msd_2");
+        let operator = Operator::arithmetic(0, "/", Rc::clone(&n));
+        let mut stack = vec![number_literal(5, &n), number_literal(0, &n)];
+        let err = operator
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ActError::NumberSystem(NumSysError::DivisionByZero)
+        ));
+        assert_eq!(err.to_string(), "division by zero");
+    }
+
+    /// Constant folding pushes the raw `BigInteger` into a new literal with no
+    /// `intValueExact` step, so a product far outside `i32` must survive intact — the
+    /// `ArithmeticIntOverflow` that `ArithmeticOp::arith`'s `int` form raises must NOT be
+    /// reachable from here.
+    #[test]
+    fn arithmetic_constant_folding_never_narrows_to_i32() {
+        let n = ns("msd_2");
+        let big = BigInt::from(2).pow(40);
+        assert_eq!(
+            fold_arithmetic(
+                "*",
+                big_literal(big.clone(), &n),
+                big_literal(big.clone(), &n),
+                &n
+            ),
+            BigInt::from(2).pow(80)
+        );
+    }
+
+    // =====================================================================
+    // ArithmeticOperator: unary minus (`processUnaryOperator`, `:100-123`)
+    // =====================================================================
+
+    #[test]
+    fn unary_minus_negates_an_alphabet_letter() {
+        let n = ns("msd_2");
+        let operator = Operator::arithmetic(0, "_", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![alphabet_letter(1)],
+        );
+        match &result {
+            Expression::AlphabetLetter(ae) => assert_eq!(ae.constant, -1),
+            other => panic!("expected an AlphabetLetterExpression, got {other:?}"),
+        }
+        assert_eq!(result.to_string(), "@-1");
+    }
+
+    /// A word automaton's per-state OUTPUTS are negated in place (`0 - output`, via
+    /// `Ops.MINUS` — `ArithmeticOp::UnaryNegative` is exactly the value
+    /// `ArithmeticOp::arith` refuses, so the rewrite is load-bearing), and the same
+    /// `WordExpression` is pushed back.
+    #[test]
+    fn unary_minus_negates_a_word_automatons_outputs_in_place() {
+        let n = ns("msd_2");
+        let operator = Operator::arithmetic(0, "_", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i"))],
+        );
+        match &result {
+            Expression::Word(we) => {
+                let mut outputs = we.word_automaton.fa.o.clone();
+                outputs.sort_unstable();
+                assert_eq!(outputs, vec![-1, 0], "outputs {{0,1}} negate to {{0,-1}}");
+            }
+            other => panic!("expected a WordExpression, got {other:?}"),
+        }
+        // Ported quirk: the displayed expression is NOT updated.
+        assert_eq!(result.to_string(), "T[i]");
+    }
+
+    /// The general arm: `_x` becomes an [`ArithmeticExpression`] over a fresh `c` with
+    /// `x + c = 0`. Over a positive base that pins `x == c == 0`, which is exactly what
+    /// unary minus of a variable means in Walnut there.
+    #[test]
+    fn unary_minus_of_a_variable_builds_x_plus_c_equals_zero() {
+        let n = ns("msd_2");
+        let operator = Operator::arithmetic(0, "_", Rc::clone(&n));
+        let mut fresh = FreshIdentifiers::new();
+        let result = act_once(&operator, &mut fresh, vec![variable("x")]);
+        assert_eq!(fresh.issued(), 1, "exactly one synthetic name is minted");
+        assert_eq!(result.to_string(), "(_x)");
+        let ae = match result {
+            Expression::Arithmetic(ae) => ae,
+            other => panic!("expected an ArithmeticExpression, got {other:?}"),
+        };
+        let c = ae.identifier.clone();
+        assert!(c.starts_with(FreshIdentifiers::PREFIX));
+        assert!(accepts(&ae.m, 2, 4, &[("x", 0), (&c, 0)]));
+        assert!(!accepts(&ae.m, 2, 4, &[("x", 1), (&c, 1)]));
+        assert!(!accepts(&ae.m, 2, 4, &[("x", 1), (&c, 0)]));
+    }
+
+    // =====================================================================
+    // Fresh-variable generation + quantification
+    // =====================================================================
+
+    /// The headline behavior for this unit: a nested arithmetic sub-expression mints a
+    /// synthetic temporary, and the ENCLOSING relational operator must quantify it away
+    /// in the same `act()` — via `Operator.andThenQuantifyIfArithmetic`.
+    ///
+    /// `x + y = z` must therefore end up as a three-track relation over exactly
+    /// `{x, y, z}` (no `WALNUT_…` track surviving), denoting real addition.
+    #[test]
+    fn nested_arithmetic_subexpression_is_quantified_away_by_the_enclosing_relation() {
+        let n = ns("msd_2");
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![variable("x"), variable("y")];
+
+        Operator::arithmetic(0, "+", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        assert_eq!(fresh.issued(), 1, "`x+y` mints exactly one temporary");
+        let temporary = match &stack[0] {
+            Expression::Arithmetic(ae) => ae.identifier.clone(),
+            other => panic!("expected an ArithmeticExpression, got {other:?}"),
+        };
+        assert_eq!(stack[0].to_string(), "(x+y)");
+        assert!(temporary.starts_with(FreshIdentifiers::PREFIX));
+
+        stack.push(variable("z"));
+        Operator::relational(0, "=", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        assert_eq!(stack.len(), 1);
+        let m = as_automaton_expression(stack.pop().unwrap()).m;
+
+        let mut labels = m.label.clone();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec!["x".to_string(), "y".to_string(), "z".to_string()],
+            "the synthetic temporary {temporary} must have been quantified away"
+        );
+
+        for (x, y, z) in [(0u32, 0u32, 0u32), (1, 2, 3), (3, 4, 7), (5, 2, 7)] {
+            assert!(
+                accepts(&m, 2, 5, &[("x", x), ("y", y), ("z", z)]),
+                "{x} + {y} == {z} must be accepted"
+            );
+        }
+        for (x, y, z) in [(1u32, 2u32, 4u32), (3, 4, 6), (0, 0, 1)] {
+            assert!(
+                !accepts(&m, 2, 5, &[("x", x), ("y", y), ("z", z)]),
+                "{x} + {y} != {z} must be rejected"
+            );
+        }
+
+        // Padding-independent, because `quantify` applies the msd leading-zero fixup
+        // after eliminating the temporary. If that fixup had been skipped, the same
+        // tuple would be accepted at one width and rejected at another.
+        for width in [2usize, 3, 8, 12] {
+            assert!(
+                accepts(&m, 2, width, &[("x", 1), ("y", 2), ("z", 3)]),
+                "1 + 2 == 3 must be accepted at padding width {width}"
+            );
+        }
+    }
+
+    /// Two nested levels: `(x + y) + w = z`. Both temporaries must vanish, and the
+    /// counter must have advanced exactly twice.
+    #[test]
+    fn two_nested_arithmetic_temporaries_are_both_quantified_away() {
+        let n = ns("msd_2");
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![variable("x"), variable("y")];
+        Operator::arithmetic(0, "+", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        stack.push(variable("w"));
+        Operator::arithmetic(0, "+", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        assert_eq!(fresh.issued(), 2);
+        assert_eq!(stack[0].to_string(), "((x+y)+w)");
+
+        stack.push(variable("z"));
+        Operator::relational(0, "=", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        let m = as_automaton_expression(stack.pop().unwrap()).m;
+        let mut labels = m.label.clone();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec![
+                "w".to_string(),
+                "x".to_string(),
+                "y".to_string(),
+                "z".to_string()
+            ]
+        );
+        assert!(accepts(&m, 2, 5, &[("x", 1), ("y", 2), ("w", 4), ("z", 7)]));
+        assert!(!accepts(
+            &m,
+            2,
+            5,
+            &[("x", 1), ("y", 2), ("w", 4), ("z", 6)]
+        ));
+    }
+
+    /// The constant-operand arm of the same story: `x + 1 = z`.
+    #[test]
+    fn arithmetic_with_a_constant_operand_then_quantified_away() {
+        let n = ns("msd_2");
+        let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![variable("x"), number_literal(1, &n)];
+        Operator::arithmetic(0, "+", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        assert_eq!(stack[0].to_string(), "(x+1)");
+        stack.push(variable("z"));
+        Operator::relational(0, "=", Rc::clone(&n))
+            .act(&mut fresh, &mut stack)
+            .unwrap();
+        let m = as_automaton_expression(stack.pop().unwrap()).m;
+        let mut labels = m.label.clone();
+        labels.sort();
+        assert_eq!(labels, vec!["x".to_string(), "z".to_string()]);
+        assert!(accepts(&m, 2, 5, &[("x", 2), ("z", 3)]));
+        assert!(!accepts(&m, 2, 5, &[("x", 2), ("z", 4)]));
+    }
+
+    /// `and_then_quantify_if_arithmetic` must be a strict no-op for every operand kind
+    /// that is not an [`Expression::Arithmetic`] — otherwise it would quantify tracks out
+    /// of an unrelated automaton.
+    #[test]
+    fn and_then_quantify_if_arithmetic_is_a_no_op_for_non_arithmetic_operands() {
+        let m = thue_morse("i");
+        for operand in [
+            variable("x"),
+            alphabet_letter(1),
+            number_literal(3, &ns("msd_2")),
+            word_expression("T[i]", thue_morse("i")),
+        ] {
+            let out = and_then_quantify_if_arithmetic(&operand, m.clone()).unwrap();
+            assert_eq!(out.label, m.label);
+            assert_eq!(out.fa.q, m.fa.q);
+            assert_eq!(out.fa.o, m.fa.o);
+        }
+    }
+
+    // =====================================================================
+    // Word-automaton comparisons (`RelationalOperator.act` arms 1, 5, 6, 7)
+    // =====================================================================
+
+    /// Arm 6: `T[i] = @1` over Thue–Morse accepts exactly the odd-popcount indices.
+    #[test]
+    fn word_vs_constant_comparison_selects_the_matching_outputs() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "=", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i")), alphabet_letter(1)],
+        ))
+        .m;
+        assert_eq!(m.label, vec!["i".to_string()]);
+        for i in [1u32, 2, 4, 7, 8] {
+            assert!(
+                accepts(&m, 2, 5, &[("i", i)]),
+                "T[{i}] should be 1 (popcount {} is odd)",
+                i.count_ones()
+            );
+        }
+        for i in [0u32, 3, 5, 6, 9] {
+            assert!(
+                !accepts(&m, 2, 5, &[("i", i)]),
+                "T[{i}] should be 0 (popcount {} is even)",
+                i.count_ones()
+            );
+        }
+    }
+
+    /// Arm 7: the constant on the LEFT reverses the relation, so `@0 < T[i]` must be
+    /// `T[i] > 0`, i.e. again the odd-popcount indices. Without `reverse_operator()` this
+    /// would compute `T[i] < 0` and accept nothing, so both outcomes are checked.
+    #[test]
+    fn constant_vs_word_comparison_reverses_the_relation() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![alphabet_letter(0), word_expression("T[i]", thue_morse("i"))],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("i", 1)]), "0 < T[1] == 1");
+        assert!(!accepts(&m, 2, 5, &[("i", 3)]), "0 < T[3] == 0 is false");
+        assert!(!accepts(&m, 2, 5, &[("i", 0)]), "0 < T[0] == 0 is false");
+    }
+
+    /// Arm 5: `T[i] = U[i]` where `U` is the constant-`1` DFAO — again the odd-popcount
+    /// indices, but reached through `compareWordAutomata`'s cross product rather than the
+    /// per-state `compareWordAutomaton` loop.
+    #[test]
+    fn word_vs_word_comparison_compares_outputs_pointwise() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "=", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![
+                word_expression("T[i]", thue_morse("i")),
+                word_expression("U[i]", always_one("i")),
+            ],
+        ))
+        .m;
+        assert_eq!(m.label, vec!["i".to_string()]);
+        assert!(accepts(&m, 2, 5, &[("i", 1)]));
+        assert!(accepts(&m, 2, 5, &[("i", 2)]));
+        assert!(!accepts(&m, 2, 5, &[("i", 0)]));
+        assert!(!accepts(&m, 2, 5, &[("i", 3)]));
+    }
+
+    /// Arm 1, the word-vs-arithmetic rewrite: `T[i] < x` becomes
+    /// `(T[i] = @0 => 0 < x) & (T[i] = @1 => 1 < x)`, a two-track relation over `{i, x}`.
+    #[test]
+    fn word_vs_variable_comparison_rewrites_over_every_output() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i")), variable("x")],
+        ))
+        .m;
+        let mut labels = m.label.clone();
+        labels.sort();
+        assert_eq!(labels, vec!["i".to_string(), "x".to_string()]);
+        // T[0] == 0, T[1] == 1.
+        assert!(accepts(&m, 2, 5, &[("i", 0), ("x", 1)]), "T[0]=0 < 1");
+        assert!(!accepts(&m, 2, 5, &[("i", 0), ("x", 0)]), "0 < 0 is false");
+        assert!(accepts(&m, 2, 5, &[("i", 1), ("x", 2)]), "T[1]=1 < 2");
+        assert!(!accepts(&m, 2, 5, &[("i", 1), ("x", 1)]), "1 < 1 is false");
+    }
+
+    /// The mirror direction of arm 1 (`reverse = true`): `x < T[i]`.
+    #[test]
+    fn variable_vs_word_comparison_keeps_the_operand_order() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let m = as_automaton_expression(act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![variable("x"), word_expression("T[i]", thue_morse("i"))],
+        ))
+        .m;
+        assert!(accepts(&m, 2, 5, &[("i", 1), ("x", 0)]), "0 < T[1] == 1");
+        assert!(!accepts(&m, 2, 5, &[("i", 1), ("x", 1)]), "1 < 1 is false");
+        assert!(!accepts(&m, 2, 5, &[("i", 0), ("x", 0)]), "0 < 0 is false");
+    }
+
+    /// WB-023 (`docs/WALNUT-BUGS.md`): arm 1 alone labels its result with just
+    /// `word.toString()`, dropping the operator and the other operand — every sibling arm
+    /// uses `a + op + b`. Ported verbatim; this pins the (wrong) Walnut text.
+    #[test]
+    fn wb023_word_vs_arithmetic_result_string_drops_the_operator_and_operand() {
+        let n = ns("msd_2");
+        let operator = Operator::relational(0, "<", Rc::clone(&n));
+        let result = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i")), variable("x")],
+        );
+        assert_eq!(
+            result.to_string(),
+            "T[i]",
+            "WB-023: Walnut drops '<x' here; a corrected port would say 'T[i]<x'"
+        );
+
+        // Every sibling arm DOES include the operator and both operands — the contrast
+        // that makes this a defect rather than a house style.
+        let sibling = act_once(
+            &operator,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i")), alphabet_letter(1)],
+        );
+        assert_eq!(sibling.to_string(), "T[i]<@1");
+    }
+
+    // =====================================================================
+    // Word-automaton arithmetic (`processBinaryOperator` arms 0, 1, 2, 4)
+    // =====================================================================
+
+    /// Arm 1 (`reverse = true`) computes `output - 1`; arm 2 (`reverse = false`) computes
+    /// `1 - output`. The two differ, so this is the test that catches a flipped `reverse`.
+    #[test]
+    fn word_arithmetic_against_a_constant_respects_operand_order() {
+        let n = ns("msd_2");
+        let minus = Operator::arithmetic(0, "-", Rc::clone(&n));
+
+        let result = act_once(
+            &minus,
+            &mut FreshIdentifiers::new(),
+            vec![word_expression("T[i]", thue_morse("i")), alphabet_letter(1)],
+        );
+        let mut outputs = match &result {
+            Expression::Word(we) => we.word_automaton.fa.o.clone(),
+            other => panic!("expected a WordExpression, got {other:?}"),
+        };
+        outputs.sort_unstable();
+        assert_eq!(outputs, vec![-1, 0], "T[i] - 1 maps {{0,1}} to {{-1,0}}");
+
+        let result = act_once(
+            &minus,
+            &mut FreshIdentifiers::new(),
+            vec![alphabet_letter(1), word_expression("T[i]", thue_morse("i"))],
+        );
+        let mut outputs = match &result {
+            Expression::Word(we) => we.word_automaton.fa.o.clone(),
+            other => panic!("expected a WordExpression, got {other:?}"),
+        };
+        outputs.sort_unstable();
+        assert_eq!(outputs, vec![0, 1], "1 - T[i] maps {{0,1}} to {{1,0}}");
+    }
+
+    /// Arm 0: two word automata combine pointwise, `a` is mutated and re-pushed, and
+    /// `b`'s pending-quantification list is appended to `a`'s.
+    #[test]
+    fn word_plus_word_combines_outputs_and_merges_quantification_lists() {
+        let n = ns("msd_2");
+        let plus = Operator::arithmetic(0, "+", Rc::clone(&n));
+        let left = Expression::Word(Box::new(WordExpression::new(
+            "T[i]",
+            thue_morse("i"),
+            Automaton::true_false(true),
+            vec!["tmpA".to_string()],
+        )));
+        let right = Expression::Word(Box::new(WordExpression::new(
+            "U[i]",
+            always_one("i"),
+            Automaton::true_false(true),
+            vec!["tmpB".to_string()],
+        )));
+        let result = act_once(&plus, &mut FreshIdentifiers::new(), vec![left, right]);
+        match &result {
+            Expression::Word(we) => {
+                let mut outputs = we.word_automaton.fa.o.clone();
+                outputs.sort_unstable();
+                assert_eq!(outputs, vec![1, 2], "{{0,1}} + 1 == {{1,2}}");
+                assert_eq!(
+                    we.identifiers_to_quantify,
+                    vec!["tmpA".to_string(), "tmpB".to_string()]
+                );
+            }
+            other => panic!("expected a WordExpression, got {other:?}"),
+        }
+        // Ported quirk: the displayed expression is still just the LEFT operand's.
+        assert_eq!(result.to_string(), "T[i]");
+    }
+
+    /// Arm 4, including the `o == 0 && MULT` special case (`:183-185`): `T[i] * x` yields
+    /// `c = T[i] * x`, which for a Thue–Morse `T` means `c == 0` on even-popcount indices
+    /// and `c == x` on odd ones.
+    #[test]
+    fn word_times_variable_rewrites_per_output_including_the_zero_shortcut() {
+        let n = ns("msd_2");
+        let times = Operator::arithmetic(0, "*", Rc::clone(&n));
+        let mut fresh = FreshIdentifiers::new();
+        let result = act_once(
+            &times,
+            &mut fresh,
+            vec![word_expression("T[i]", thue_morse("i")), variable("x")],
+        );
+        assert_eq!(fresh.issued(), 1);
+        assert_eq!(result.to_string(), "(T[i]*x)");
+        let ae = match result {
+            Expression::Arithmetic(ae) => ae,
+            other => panic!("expected an ArithmeticExpression, got {other:?}"),
+        };
+        let c = ae.identifier.clone();
+        let mut labels = ae.m.label.clone();
+        labels.sort();
+        let mut expected = vec!["i".to_string(), "x".to_string(), c.clone()];
+        expected.sort();
+        assert_eq!(labels, expected);
+
+        // i = 1: T[1] == 1, so c == x.
+        assert!(accepts(&ae.m, 2, 5, &[("i", 1), ("x", 3), (&c, 3)]));
+        assert!(!accepts(&ae.m, 2, 5, &[("i", 1), ("x", 3), (&c, 2)]));
+        // i = 3: T[3] == 0, so c == 0 whatever x is — the `o == 0 && MULT` arm.
+        assert!(accepts(&ae.m, 2, 5, &[("i", 3), ("x", 3), (&c, 0)]));
+        assert!(!accepts(&ae.m, 2, 5, &[("i", 3), ("x", 3), (&c, 3)]));
+    }
+
+    // =====================================================================
+    // Errors and pinned quirks
+    // =====================================================================
+
+    #[test]
+    fn arithmetic_rejects_an_automaton_operand_with_walnuts_exact_message() {
+        let n = ns("msd_2");
+        let plus = Operator::arithmetic(0, "+", Rc::clone(&n));
+
+        // Rejected as the RIGHT operand (`act`, `:91-92`).
+        let mut stack = vec![
+            variable("x"),
+            Expression::Automaton(AutomatonExpression::new("y=1", Automaton::true_false(true))),
+        ];
+        let err = plus
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "operator + cannot be applied to the operand y=1 of type \
+             Main.EvalComputations.Expressions.AutomatonExpression"
+        );
+
+        // ... and as the LEFT operand (`processBinaryOperator`, `:127-128`).
+        let mut stack = vec![
+            Expression::Automaton(AutomatonExpression::new("y=1", Automaton::true_false(true))),
+            variable("x"),
+        ];
+        let err = plus
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "operator + cannot be applied to the operand y=1 of type \
+             Main.EvalComputations.Expressions.AutomatonExpression"
+        );
+    }
+
+    /// `getIntConstantForWord`'s overflow path. The wording differs between the two
+    /// classes ("comparison" vs "arithmetic"), so both are pinned.
+    #[test]
+    fn a_number_literal_too_large_for_a_word_output_reports_walnuts_message() {
+        let n = ns("msd_2");
+        let huge = BigInt::from(i64::MAX);
+
+        let eq = Operator::relational(0, "=", Rc::clone(&n));
+        let mut stack = vec![
+            word_expression("T[i]", thue_morse("i")),
+            big_literal(huge.clone(), &n),
+        ];
+        let err = eq
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "number literal {huge} used in word automaton output comparison must fit in a \
+                 Java int, found: {huge}"
+            )
+        );
+
+        let plus = Operator::arithmetic(0, "+", Rc::clone(&n));
+        let mut stack = vec![
+            word_expression("T[i]", thue_morse("i")),
+            big_literal(huge.clone(), &n),
+        ];
+        let err = plus
+            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "number literal {huge} used in word automaton output arithmetic must fit in a \
+                 Java int, found: {huge}"
+            )
+        );
+    }
+
+    /// WB-003 (`docs/WALNUT-BUGS.md`): `0 * x` short-circuits to the literal `0` without
+    /// ever building or validating an automaton for `x`. Ported verbatim — including the
+    /// synthetic name minted at `ArithmeticOperator.java:155` and then thrown away.
+    #[test]
+    fn wb003_zero_times_a_variable_short_circuits_and_wastes_a_fresh_name() {
+        let n = ns("msd_2");
+        let times = Operator::arithmetic(0, "*", Rc::clone(&n));
+
+        for operands in [
+            vec![number_literal(0, &n), variable("never_declared")],
+            vec![variable("never_declared"), number_literal(0, &n)],
+            vec![alphabet_letter(0), variable("never_declared")],
+            vec![variable("never_declared"), alphabet_letter(0)],
+        ] {
+            let mut fresh = FreshIdentifiers::new();
+            let result = act_once(&times, &mut fresh, operands);
+            match &result {
+                Expression::NumberLiteral(ne) => {
+                    assert_eq!(*ne.value(), BigInt::from(0));
+                    assert!(Rc::ptr_eq(ne.base(), &n));
+                }
+                other => panic!("expected the folded literal 0, got {other:?}"),
+            }
+            assert_eq!(
+                fresh.issued(),
+                1,
+                "WB-003: `c` is minted at :155 before the short-circuit discards it"
+            );
+        }
+    }
+
+    /// `*` between a NON-zero constant and a variable takes the ordinary path and does
+    /// build a real automaton — the contrast that keeps the WB-003 test above honest.
+    #[test]
+    fn a_nonzero_constant_times_a_variable_builds_a_real_automaton() {
+        let n = ns("msd_2");
+        let times = Operator::arithmetic(0, "*", Rc::clone(&n));
+        let mut fresh = FreshIdentifiers::new();
+        let result = act_once(
+            &times,
+            &mut fresh,
+            vec![number_literal(3, &n), variable("x")],
+        );
+        let ae = match result {
+            Expression::Arithmetic(ae) => ae,
+            other => panic!("expected an ArithmeticExpression, got {other:?}"),
+        };
+        let c = ae.identifier.clone();
+        assert!(accepts(&ae.m, 2, 5, &[("x", 4), (&c, 12)]));
+        assert!(!accepts(&ae.m, 2, 5, &[("x", 4), (&c, 11)]));
+    }
+
+    /// Every non-relational, non-arithmetic operator kind still falls through to the
+    /// inherited no-op (`LogicalOperator.act` is U10) — pinned so U10's author sees this
+    /// test flip rather than silently changing behavior.
+    #[test]
+    fn logical_operator_kinds_are_still_a_no_op_pending_u10() {
+        let operators = [
+            Operator::logical_connective(0, "&"),
+            Operator::logical_connective(0, "~"),
+            Operator::logical_connective(0, "`"),
+            Operator::quantifier(0, "E", 1),
+            Operator::left_paren(0),
+            Operator::right_paren(0),
+        ];
+        for operator in operators {
+            let mut fresh = FreshIdentifiers::new();
+            let mut stack = vec![variable("x"), variable("y")];
+            operator.act(&mut fresh, &mut stack).unwrap();
+            assert_eq!(stack.len(), 2, "{operator} must not touch the stack yet");
+            assert_eq!(fresh.issued(), 0);
+        }
     }
 }

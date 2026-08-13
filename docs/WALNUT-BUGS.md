@@ -167,15 +167,28 @@ bug costs a silent wrong answer somewhere downstream.
 
 ## WB-003 — `0 * x` short-circuits before the variable operand is bound or validated
 
-- **Where:** arithmetic-expression evaluation (`Main/EvalComputations/Expressions`), the multiply
-  path.
+- **Where:** `Main/EvalComputations/Token/ArithmeticOperator.java`, `processBinaryOperator`
+  (`:201-224`) — four structurally identical `if (… isZero()/constant == 0 …) && opp.equals(Ops.MULT)`
+  early returns, one per (left/right) × (number-literal/`@`-letter) combination. *(Located precisely
+  in Phase 3a's U9; the original Phase-0 entry pointed at `Main/EvalComputations/Expressions`, which
+  is where the operand types live, not where the short-circuit is.)* A **fifth** instance of the same
+  rule lives in the word-automaton rewrite arm of the same method (`:183-185`, `o == 0 && opp.equals(
+  Ops.MULT)`), where the per-output conjunct for a zero output is `c = 0` and likewise never mentions
+  the other operand's identifier.
 - **What:** `0*x`, `x*0`, and similar literal-zero multiplications short-circuit to the constant
   `0` without ever binding `x` into an automaton or checking it's a real, in-scope variable. A
   typo'd or nonexistent variable name silently passes validation as long as it's multiplied by a
   literal `0`.
 - **Trigger:** any query containing `0 * <undeclared-or-misspelled-name>` (or the reverse order).
 - **Found:** Phase 0, Item 4 second wave, 2026-08-08.
-- **Rust port:** `not yet reached` — the parser/expression evaluator is `wr-logic` Phase 2+ scope.
+- **Rust port:** `ported verbatim (quirk)` as of Phase 3a's U9 — `Operator::process_binary_operator`
+  (`crates/wr-logic/src/token.rs`) reproduces all four early returns (and the `o == 0 && MULT`
+  word-rewrite arm) at Java's exact positions, including the fact that the synthetic identifier `c` is
+  minted at `ArithmeticOperator.java:155` *before* the short-circuit throws it away, so the
+  fresh-name counter still advances. Pinned by
+  `wb003_zero_times_a_variable_short_circuits_and_wastes_a_fresh_name`, which covers all four
+  operand shapes, with `a_nonzero_constant_times_a_variable_builds_a_real_automaton` as the
+  contrasting non-short-circuited case.
 - **Upstream:** not filed.
 - **Severity:** minor — silently accepts a malformed query rather than erroring; doesn't produce a
   numerically wrong answer for any *valid* query (the constant-`0` result is correct on its own
@@ -988,6 +1001,62 @@ bug costs a silent wrong answer somewhere downstream.
   hand-written input shape; bounded by the fact that no real corpus fixture hits it and that
   `AutomatonDFA`'s own `is_fao()` guard is one `read_automaton_txt_impl` fix away from covering
   this too (the check already exists correctly in one place, it's just not reached first).
+
+---
+
+## WB-023 — `RelationalOperator.act`'s word-vs-arithmetic arm labels its result with only the WORD, dropping the operator and the other operand
+
+- **Where:** `Main/EvalComputations/Token/RelationalOperator.java`, `act(Stack<Expression>)` (`:134`):
+  `S.push(new AutomatonExpression(word.toString(), M));` — the arm that handles a word automaton
+  compared against an arithmetic/variable expression (`:99-134`).
+- **What:** all **seven** other arms of the same method label their result `a + op + b`
+  (`:93`, `:140`, `:146`, `:152`, `:159`, `:165`, `:171`) — the full comparison as written. This one
+  arm alone uses `word.toString()`, i.e. just the word occurrence's own text, silently discarding
+  the operator symbol and the entire right-hand operand. So `T[i]<x` evaluates to an
+  `AutomatonExpression` whose `expressionInString` is the literal `T[i]`. Nothing in the automaton
+  or the decision procedure reads that string, but every later `WalnutException` that prints the
+  operand does — `invalidOperator`/`invalidDualOperators` (`WalnutException.java:76-82`) — so the
+  wrong text reaches real, user-visible CLI output. Same defect *class* as WB-020 (a wrong
+  `expressionInString` surfacing through an operand-printing error message), different site and
+  different mechanism (dropped operands, not a stray character).
+- **Trigger (empirically confirmed live through the real `walnut-java` CLI —
+  `java -cp target/Walnut-all.jar Main.Prover`, home dir seeded with the stock
+  `Word Automata Library/T.txt` (Thue–Morse); JDK 17, 2026-08-12):** the command file
+
+  ```
+  eval wb023a "(T[i]<x)+1=y";
+  eval wb023b "(x<z)+1=y";
+  ```
+
+  prints, respectively,
+
+  ```
+  operator + cannot be applied to the operand T[i] of type Main.EvalComputations.Expressions.AutomatonExpression
+  operator + cannot be applied to the operand x<z of type Main.EvalComputations.Expressions.AutomatonExpression
+  ```
+
+  — note the first says `T[i]` where it should say `T[i]<x`, while the second (an all-variable
+  comparison, i.e. a *sibling* arm) correctly names the whole comparison `x<z`. The explicit
+  parentheses are needed only to make the comparison the operand of `+`: `+` has priority 20 and
+  `<` has 40, so `T[i] < x + 1` would otherwise parse as `T[i] < (x+1)`.
+- **Found:** Phase 3a, U9 (`crates/wr-logic/src/token.rs`, `Operator::act_relational`), 2026-08-12,
+  while porting `RelationalOperator.act`'s eight-arm operand dispatch — the inconsistency is visible
+  by reading the eight `S.push` calls side by side.
+- **Rust port:** `ported verbatim (quirk)`. `Operator::act_relational`'s word-vs-arithmetic arm
+  pushes `AutomatonExpression::new(word_expr.to_string(), m)` with an inline `WB-023` comment, while
+  every sibling arm builds `format!("{a}{op}{b}")`. Pinned by
+  `wb023_word_vs_arithmetic_result_string_drops_the_operator_and_operand`
+  (`crates/wr-logic/src/token.rs`), which asserts the wrong string `"T[i]"` for the affected arm AND
+  the right string `"T[i]<@1"` for a sibling arm, so the test cannot pass if the two ever converge.
+- **Upstream:** not filed. One-line fix: `new AutomatonExpression(a + op + b, M)`, matching the
+  other seven arms. Note the correct text is `a + op + b` (the ORIGINAL operand order), not
+  `word + op + arithmetic` — the arm handles both operand orders via its `reverse` flag, so
+  reconstructing from `word`/`arithmetic` would print `x<T[i]` as `T[i]<x`.
+- **Severity:** low — cosmetic, diagnostics-only (no automaton, language, or output-file content
+  depends on this string), but genuinely reaches user-visible CLI error text, and is actively
+  misleading there: it names an operand that is not the one that failed. No golden `error*` fixture
+  combines a word-vs-arithmetic comparison result with a type-mismatched operator (checked), so
+  Tier 1 neither pins nor contradicts this entry.
 
 ---
 

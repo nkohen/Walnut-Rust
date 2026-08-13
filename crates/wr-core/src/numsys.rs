@@ -141,8 +141,9 @@ use crate::automaton::Automaton;
 use crate::fa::Fa;
 use crate::logicalops::{and, not, reverse};
 use crate::quantify::{quantify, QuantifyError};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::rc::Rc;
@@ -530,13 +531,38 @@ impl RelationalOp {
     /// (contrast [`ArithmeticOp::arith`], where narrowing back to `i32` is the whole
     /// reason for [`NumSysError::ArithmeticIntOverflow`] existing).
     pub fn compare(self, a: i32, b: i32) -> bool {
+        self.holds_for(a.cmp(&b))
+    }
+
+    /// `RelationalOperator.compare(Ops, BigInteger, BigInteger)`
+    /// (`RelationalOperator.java:183-193`) — the **primary** Java overload, of which
+    /// [`Self::compare`] is the `int` specialization (Java's `compare(Ops, int, int)`
+    /// literally widens both operands and calls this one, `:179-181`).
+    ///
+    /// Added in Phase 3a's U9, whose caller is `RelationalOperator.act`'s
+    /// constant-folding branch (`RelationalOperator.java:92-95`): there the operands come
+    /// from `getConstantValue`, which returns a `NumberLiteralExpression`'s **unbounded**
+    /// `BigInteger` value, so narrowing to `i32` first would be a real behavior change
+    /// (`123456789012345678901234567890 > 5` must still fold to `true`, not overflow).
+    ///
+    /// Both overloads route through the same private `holds_for`, so the two can
+    /// never drift apart — the pairing is pinned by
+    /// `relational_op_compare_int_and_big_int_agree_on_every_op`.
+    pub fn compare_big_int(self, a: &BigInt, b: &BigInt) -> bool {
+        self.holds_for(a.cmp(b))
+    }
+
+    /// The single, shared decision table behind both [`Self::compare`] overloads —
+    /// Java's `switch (op)` over `a.compareTo(b)`'s sign (`:185-192`), expressed once
+    /// over [`Ordering`] instead of twice over two numeric types.
+    fn holds_for(self, ordering: Ordering) -> bool {
         match self {
-            RelationalOp::Equal => a == b,
-            RelationalOp::NotEqual => a != b,
-            RelationalOp::LessThan => a < b,
-            RelationalOp::GreaterThan => a > b,
-            RelationalOp::LessEqThan => a <= b,
-            RelationalOp::GreaterEqThan => a >= b,
+            RelationalOp::Equal => ordering == Ordering::Equal,
+            RelationalOp::NotEqual => ordering != Ordering::Equal,
+            RelationalOp::LessThan => ordering == Ordering::Less,
+            RelationalOp::GreaterThan => ordering == Ordering::Greater,
+            RelationalOp::LessEqThan => ordering != Ordering::Greater,
+            RelationalOp::GreaterEqThan => ordering != Ordering::Less,
         }
     }
 }
@@ -575,12 +601,15 @@ impl ArithmeticOp {
     /// `ProductStrategies.determineOutput`'s `ARITHMETIC_OPERATORS` branch,
     /// `ProductStrategies.java:176-178`). Added in Phase 3a's U6.
     ///
-    /// Java's two-step design (compute in `BigInteger`, then narrow with
-    /// `.intValueExact()`) is collapsed into one `i64`-intermediate computation: `i64`
-    /// cannot overflow for any `+`/`-`/`*`/floor-`/` of two `i32` inputs (max magnitude
-    /// `~2^63` vs. the `~2^33` this domain can ever produce), so it stands in for
-    /// `BigInteger`'s unbounded precision exactly here, and the final `i32::try_from`
-    /// reproduces `intValueExact()`'s narrowing check.
+    /// Java's two-step design — compute in `BigInteger`, then narrow with
+    /// `.intValueExact()` — is reproduced literally as of Phase 3a's U9: this method is
+    /// now exactly `arith_big_int(BigInt::from(a), BigInt::from(b))` followed by the
+    /// narrowing check, mirroring `ArithmeticOperator.java:236-238`. (U6 originally
+    /// inlined an `i64`-intermediate equivalent here, correct but a second copy of the
+    /// floor-division correction; U9 needed the `BigInteger` form for
+    /// `ArithmeticOperator.act`'s constant folding, so the two were collapsed onto one
+    /// implementation rather than left to drift. Observable behavior — results, error
+    /// variants, and the overflow message's exact text — is unchanged.)
     ///
     /// - [`Self::Div`]: **floor** division (rounds toward negative infinity), NOT
     ///   Java/Rust's default truncate-toward-zero. Java's `a.divideAndRemainder(b)`
@@ -604,19 +633,49 @@ impl ArithmeticOp {
     ///   for why it is a DIFFERENT text from [`NumSysError::UnexpectedArithmeticOperator`]).
     /// - Overflow: [`NumSysError::ArithmeticIntOverflow`] — see that variant's docs.
     pub fn arith(self, a: i32, b: i32) -> Result<i32, NumSysError> {
-        let a = a as i64;
-        let b = b as i64;
-        let result = match self {
+        let result = self.arith_big_int(&BigInt::from(a), &BigInt::from(b))?;
+        i32::try_from(&result).map_err(|_| {
+            NumSysError::ArithmeticIntOverflow(format!(
+                "{a} {op} {b} = {result}",
+                op = self.symbol()
+            ))
+        })
+    }
+
+    /// `ArithmeticOperator.arith(Ops, BigInteger, BigInteger)`
+    /// (`ArithmeticOperator.java:240-258`) — the **primary** Java overload (see
+    /// [`Self::arith`], which is its `int` specialization and now delegates here).
+    ///
+    /// Added in Phase 3a's U9 for `ArithmeticOperator.act`'s constant-folding branch
+    /// (`ArithmeticOperator.java:150-154`), which pushes the *unbounded* `BigInteger`
+    /// result straight into a new `NumberLiteralExpression` — no `intValueExact` step at
+    /// all — so narrowing there would be a real behavior change, not an optimization.
+    ///
+    /// - [`Self::Div`]: **floor** division (rounds toward negative infinity), NOT
+    ///   truncation toward zero. Java's `a.divideAndRemainder(b)` truncates, then (`:251`)
+    ///   subtracts `1` from the quotient exactly when the remainder is nonzero AND the
+    ///   operands' signs differ. Ported literally, including using the *sign* comparison
+    ///   (`a.signum() != b.signum()`) rather than a `< 0` test: the two agree on every
+    ///   input that reaches the correction, because a nonzero remainder already implies
+    ///   `a != 0` and the `b == 0` case returned above.
+    /// - [`Self::UnaryNegative`]: the `default:` arm (`:256`),
+    ///   [`NumSysError::UnexpectedOperator`].
+    /// - Division by zero: [`NumSysError::DivisionByZero`] (`:249`).
+    ///
+    /// Unlike [`Self::arith`] this cannot overflow — `BigInteger` is unbounded, and so is
+    /// [`BigInt`].
+    pub fn arith_big_int(self, a: &BigInt, b: &BigInt) -> Result<BigInt, NumSysError> {
+        Ok(match self {
             ArithmeticOp::Plus => a + b,
             ArithmeticOp::Minus => a - b,
             ArithmeticOp::Mult => a * b,
             ArithmeticOp::Div => {
-                if b == 0 {
+                if b.sign() == Sign::NoSign {
                     return Err(NumSysError::DivisionByZero);
                 }
                 let q = a / b;
                 let r = a % b;
-                if r != 0 && (a < 0) != (b < 0) {
+                if r.sign() != Sign::NoSign && a.sign() != b.sign() {
                     q - 1
                 } else {
                     q
@@ -625,12 +684,6 @@ impl ArithmeticOp {
             ArithmeticOp::UnaryNegative => {
                 return Err(NumSysError::UnexpectedOperator(self.symbol()));
             }
-        };
-        i32::try_from(result).map_err(|_| {
-            NumSysError::ArithmeticIntOverflow(format!(
-                "{a} {op} {b} = {result}",
-                op = self.symbol()
-            ))
         })
     }
 }
@@ -3863,6 +3916,98 @@ mod tests {
         // value and the final `i32::try_from` catches it.
         let err = ArithmeticOp::Div.arith(i32::MIN, -1).unwrap_err();
         assert!(matches!(err, NumSysError::ArithmeticIntOverflow(_)));
+    }
+
+    /// The two `compare` overloads must agree everywhere — they share
+    /// `RelationalOp::holds_for`, and this pins that they still do (a reviewer's
+    /// standing objection to "two overloads, one behavior" claims).
+    #[test]
+    fn relational_op_compare_int_and_big_int_agree_on_every_op() {
+        let ops = [
+            RelationalOp::Equal,
+            RelationalOp::NotEqual,
+            RelationalOp::LessThan,
+            RelationalOp::GreaterThan,
+            RelationalOp::LessEqThan,
+            RelationalOp::GreaterEqThan,
+        ];
+        for op in ops {
+            for a in [-3i32, -1, 0, 1, 3] {
+                for b in [-3i32, -1, 0, 1, 3] {
+                    assert_eq!(
+                        op.compare(a, b),
+                        op.compare_big_int(&BigInt::from(a), &BigInt::from(b)),
+                        "{op:?} disagrees on ({a}, {b})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The whole reason the `BigInteger` overload exists: values far outside `i32`
+    /// must compare exactly rather than overflow (`RelationalOperator.act`'s
+    /// constant-folding branch never narrows).
+    #[test]
+    fn relational_op_compare_big_int_is_exact_far_outside_i32() {
+        let huge = BigInt::from(i64::MAX) * BigInt::from(1_000_000);
+        let five = BigInt::from(5);
+        assert!(RelationalOp::GreaterThan.compare_big_int(&huge, &five));
+        assert!(!RelationalOp::LessThan.compare_big_int(&huge, &five));
+        assert!(RelationalOp::NotEqual.compare_big_int(&huge, &(&huge + 1)));
+        assert!(RelationalOp::Equal.compare_big_int(&huge, &huge.clone()));
+    }
+
+    /// `arith_big_int`'s floor-division correction, checked directly (the `i32`
+    /// `arith` tests above exercise the same code path through the narrowing wrapper,
+    /// but Phase 3a's U9 calls THIS entry point for constant folding).
+    #[test]
+    fn arithmetic_op_arith_big_int_div_floors_toward_negative_infinity() {
+        let cases: [(i64, i64, i64); 8] = [
+            (7, 2, 3),
+            (-7, 2, -4),
+            (7, -2, -4),
+            (-7, -2, 3),
+            (-8, 2, -4), // exact: no correction even though the signs differ
+            (8, -2, -4), // exact
+            (0, 5, 0),
+            (-1, 5, -1),
+        ];
+        for (a, b, expected) in cases {
+            assert_eq!(
+                ArithmeticOp::Div.arith_big_int(&BigInt::from(a), &BigInt::from(b)),
+                Ok(BigInt::from(expected)),
+                "floor({a} / {b})"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_op_arith_big_int_errors_match_the_int_overload() {
+        assert_eq!(
+            ArithmeticOp::Div.arith_big_int(&BigInt::from(5), &BigInt::from(0)),
+            Err(NumSysError::DivisionByZero)
+        );
+        assert_eq!(
+            ArithmeticOp::UnaryNegative.arith_big_int(&BigInt::from(1), &BigInt::from(2)),
+            Err(NumSysError::UnexpectedOperator("_"))
+        );
+    }
+
+    /// Unbounded, unlike [`ArithmeticOp::arith`]: no `ArithmeticIntOverflow`, because
+    /// there is no narrowing step (`ArithmeticOperator.act`'s constant folding keeps the
+    /// full `BigInteger`).
+    #[test]
+    fn arithmetic_op_arith_big_int_never_overflows() {
+        let big = BigInt::from(i64::MAX);
+        assert_eq!(
+            ArithmeticOp::Mult.arith_big_int(&big, &big),
+            Ok(&big * &big)
+        );
+        // The same multiplication through the `i32` overload is an overflow error.
+        assert!(matches!(
+            ArithmeticOp::Mult.arith(i32::MAX, 2),
+            Err(NumSysError::ArithmeticIntOverflow(_))
+        ));
     }
 
     #[test]
