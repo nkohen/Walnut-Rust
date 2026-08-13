@@ -5,7 +5,7 @@ full unit breakdown — read it before doing anything else if this is a cold sta
 updated at each unit-merge checkpoint so a fresh session (after a pause, e.g. a usage-limit reset)
 can resume immediately without re-deriving state.
 
-## Done and merged (master is green at these units) — 16 of 22 Phase 3a units
+## Done and merged (master is green at these units) — 17 of 22 Phase 3a units
 
 - **U0** — `TRUE_FALSE_AUTOMATON`/`TRUE_AUTOMATON` retrofit (`4758462`)
 - **U0a** — `Logging.java` port (`5d9f714`)
@@ -21,20 +21,22 @@ can resume immediately without re-deriving state.
 - **U4** — Word/Function/macro token construction (`83410c0`)
 - **U12** — `AutomatonWriter` `.txt`/`.gv`/`.ba` (`2e0befb`)
 - **U13** — custom-base reader headers + `readTransducer`/`readComments`/`AutomatonDFA(String)` (`63e0927`)
-- **U9** — `RelationalOperator`/`ArithmeticOperator` `act()` semantics (`ad69512`, current `master` HEAD).
-  Both adversarial reviewers returned clean (no correctness-fatal/correctness-risk findings) —
-  merged directly, no fixer needed.
+- **U9** — `RelationalOperator`/`ArithmeticOperator` `act()` semantics (`ad69512`). Both adversarial
+  reviewers returned clean — merged directly, no fixer needed.
+- **U8** — regex engine, Brics-dialect parser + Thompson construction (`2fb3f76`, current `master`
+  HEAD). Two reviewers found no correctness-fatal defects but did find one real, previously-unlogged
+  correctness-risk (a second face of the alphabet-offset wraparound bug, triggered by legitimate
+  large alphabet sizes rather than out-of-alphabet digits — logged as **WB-025**) plus a false
+  doc claim and a property-test gap; all three fixed by a fixer pass before merge.
 
-`cargo test --workspace` was green on `master` as of `ad69512` (wr-cli 13, wr-core 384, wr-io 98,
-wr-logic 225, wr-cts 22, differential 1, wr-core-integration-tests 2 — all passing). `cargo fmt
---all -- --check` clean, `cargo clippy --workspace --all-targets` clean. **23**
-genuine Walnut (Java) bugs found and logged so far (WB-001 through WB-023 — see
-`docs/WALNUT-BUGS.md`), several found empirically via real `walnut-java` CLI/jar reproduction
-during this phase alone (WB-011 through WB-023). **WB-022 is U13's** (Rust-port NFAO-reader gap);
-**WB-023 is U9's** (`RelationalOperator.act`'s word-vs-arithmetic mislabeled result string) — U9's
-diff originally numbered its own finding "WB-022" too (parallel-worktree collision, resolved
-during U9's rebase per the established pattern: renumbered every `WB-022`/`wb022` occurrence in
-U9's diff, both in `docs/WALNUT-BUGS.md` and in `crates/wr-logic/src/token.rs`, to `WB-023`/`wb023`).
+`cargo test --workspace` was green on `master` as of `2fb3f76` (wr-cli 13, wr-core 434, wr-io 98,
+wr-logic 225, wr-cts 22, differential 3, wr-core-integration-tests 2 — all passing). `cargo fmt
+--all -- --check` clean, `cargo clippy --workspace --all-targets` clean. **25**
+genuine Walnut (Java) bugs found and logged so far (WB-001 through WB-025 — see
+`docs/WALNUT-BUGS.md`). **WB-022 is U13's** (Rust-port NFAO-reader gap), **WB-023 is U9's**
+(`RelationalOperator.act` mislabeled result string), **WB-024/WB-025 are both U8's** (the
+`RichAlphabet`/`BricsConverter` `+128`-offset collision — WB-024 for out-of-alphabet digits,
+WB-025 for the same offset overflowing on legitimate large alphabet sizes near 65535).
 
 **Process notes for whoever resumes:**
 - **Dependency-order slip (already happened once, don't repeat it)**: check each unit's REAL
@@ -47,56 +49,49 @@ U9's diff, both in `docs/WALNUT-BUGS.md` and in `crates/wr-logic/src/token.rs`, 
   renumbering the later unit's entries to continue the sequence (heading text AND every in-body
   self-reference — the entry's own prose, AND any `wbNNN_test_name` test function names /
   `WB-NNN`-citing doc comments in the corresponding `.rs` file(s) — grep for both the `WB-NNN` and
-  lowercase `wbNNN` spellings across the whole diff, not just the doc file, before considering a
-  rebase conflict resolved). This has now happened at least five times in this phase (U6/U4/U12
-  all landed a "WB-016"; U13 landed "WB-022"; U9 independently claimed the same number and was
-  renumbered to WB-023 on merge). **U8 (in flight, see below) reports its own local "WB-022" too
-  — this WILL collide again and need renumbering to WB-024 (or higher, if anything else lands
-  first) when U8 merges.**
+  lowercase `wbNNN`/`wb_NNN` spellings across the whole diff, not just the doc file, before
+  considering a rebase conflict resolved). **U8 was a double collision** (it independently claimed
+  BOTH "WB-022" and "WB-023" locally, both already taken by U13/U9 on master by the time it
+  rebased) — resolved by renumbering both to WB-024/WB-025 via a small Python script that located
+  the incoming diff hunk by its heading text and did a scoped find-replace, then verifying via
+  grep across `docs/WALNUT-BUGS.md` AND the touched `.rs`/test files. This pattern has now
+  recurred six times this phase; treat any future rebase touching `docs/WALNUT-BUGS.md` as
+  needing this check by default, not as a surprise.
 - Several agent runs stalled on a 600s stream-watchdog timeout (infra hiccup, not a task problem)
   — relaunching the same unit fresh has resolved it every time so far.
 
 ## In flight right now
 
-- **U8** — regex engine (hand-rolled Brics-dialect recursive-descent parser + Thompson
-  construction, transliterated from the real `dk.brics:automaton` 1.12-4 sources jar). Authoring
-  complete in worktree `/Users/nkohen/dev/walnut-rs/.claude/worktrees/agent-a0ec2c14b70a1ab1a`
-  (branch `worktree-agent-a0ec2c14b70a1ab1a`, based on `2e0befb` — now 3 commits behind `master`,
-  will need a rebase before merge, which will surface the WB-022→WB-024 renumbering, and should
-  be re-diffed against current `master`/`numsys.rs`/`token.rs` for unrelated drift since U9 also
-  touched `wr-core`/`wr-logic` files this unit might brush against — check for conflicts, not
-  just the WB doc). Author reported: `crates/wr-core/src/regex.rs` (~1549 LOC) +
-  `crates/wr-core/src/regex/tests.rs` (~866 LOC, 49 tests incl. property tests) +
-  `tests/differential/tests/reg_brics_regex.rs` (60-case differential gate against real
-  `walnut-java` output, all matching) + a new WB-022 (its own numbering) for the
-  `RichAlphabet`/`BricsConverter` `+128`-offset collision the plan pre-identified, ported verbatim.
-  `cargo test --workspace` reported green in-worktree at author-done time (wr-core 428 = 379+49,
-  fmt/clippy clean). Two split-context adversarial reviewers dispatched (background, task ids not
-  recorded here — check `/workflows` or agent list if resuming cold), not yet returned. **Next
-  action when reviews return**: reconcile findings, dispatch a fixer if needed, rebase onto
-  current `master`, resolve the WB-022→WB-024 collision (rename in `docs/WALNUT-BUGS.md` AND
-  `crates/wr-core/src/regex.rs`/`regex/tests.rs` wherever `WB-022`/`wb022` appears — same
-  grep-both-spellings discipline as every prior collision), re-verify
-  `cargo test --workspace`/`fmt`/`clippy` post-rebase, merge, clean up worktree.
-- **U14** — `Session.java` (path-builder methods only; `Logging` already out of scope, ported as
-  U0a) as an explicit context struct implementing U1's `PredicateEnv` trait for real (currently
-  only an in-memory test double exists). Target `wr-cli` (`session.rs`, new file). Depends on U1,
-  U5, U12, U13 — all done, so this was dispatched now to keep the pipeline moving while U8's
-  reviews run. Opus tier per the plan (the plan's "2nd sanctioned mechanical-fidelity deviation" —
-  Java's `Session` uses static/global path state, the Rust port uses an explicit struct instead,
-  matching the same idiom `PredicateEnv`/`FreshIdentifiers` already established). Isolated
-  subagent, self-contained. **Done-when** (per the plan): a `PredicateEnv` impl backed by real
-  files works against a temp directory tree. Not yet returned as of this checkpoint.
+- **U10** — `LogicalOperator.java` (162 LOC) — boolean-connective dispatch (mostly thin wrappers
+  over already-shipped `wr-core::logicalops` primitives) **and the actual quantifier-elimination
+  DRIVING logic**: `E`→`wr-core::quantify`'s ∃-projection, `A`→¬∃¬ (wiring the already-proven
+  Tier-4 duality identity into real formula evaluation), `I`→leading-zero removal +
+  `wr-core::infinite::infinite`. This is **the decision-procedure crux** of the whole port — Opus,
+  isolated subagent, dispatched to worktree
+  `/Users/nkohen/dev/walnut-rs/.claude/worktrees/agent-ae9fba69726977be1` (branch
+  `worktree-agent-ae9fba69726977be1`, based on `2fb3f76`). Not yet returned as of this checkpoint.
+  Explicitly briefed to check U0's `TRUE_FALSE_AUTOMATON` short-circuit composes correctly with
+  `A`/`I` quantifier driving (a re-review the Phase 3 plan flagged as needed once U0 landed — check
+  whether it happened). **When it returns: this needs the FULL two-reviewer adversarial loop,
+  reviewer model ≠ Opus (the author), given CLAUDE.md's explicit trust-critical/decision-procedure
+  rule** — do not shortcut this one even if the diff looks clean, it's the highest-stakes unit
+  remaining in Phase 3a.
+- **U14** — `Session.java` (path-builder methods only) as an explicit context struct implementing
+  U1's `PredicateEnv` trait for real (currently only an in-memory test double exists). Target
+  `wr-cli` (`session.rs`, new file). Opus tier, isolated subagent, worktree
+  `/Users/nkohen/dev/walnut-rs/.claude/worktrees/agent-abb70bfad6d31e50d` (branch
+  `worktree-agent-abb70bfad6d31e50d`, based on `ad69512` — now 2 commits behind `master`, will need
+  rebase before merge). Not yet returned as of this checkpoint. **Done-when**: a `PredicateEnv`
+  impl backed by real files works against a temp directory tree. Briefed to be aware of (not
+  re-log) WB-005/WB-006, both directly about `Session.java`.
 
 ## Blocked until the above land
 
-- **U10** (LogicalOperator + quantifier-elimination driving) — U9 is done, so **U10 is now
-  unblocked**; not yet dispatched (review/merge bandwidth was on U9/U8/U13 this round). Good next
-  dispatch once U8/U14 free up.
 - **U11** (shared postfix executor — the Phase 3a checkpoint: literal predicate string → Automaton
-  using only `wr-logic`+`wr-core`) needs U9 (**done**) AND U10 (not started).
+  using only `wr-logic`+`wr-core`) needs U9 (**done**) AND U10 (in flight) — **the next dispatch
+  once U10 lands**, and arguably the single most important remaining checkpoint in Phase 3a.
 - **U15** (`EvalDef.java`) needs U11 AND U14 (in flight).
-- **U16** (`Reg.java` + `alphabet` command) needs U8 (in flight) AND U14 (in flight).
+- **U16** (`Reg.java` + `alphabet` command) needs U8 (**done**) AND U14 (in flight).
 
 See the plan file's "Phase 3a units" table for full details on each.
 
@@ -107,15 +102,15 @@ See the plan file's "Phase 3a units" table for full details on each.
   by a modeled subagent) → fixer if either review finds `correctness-fatal`/`correctness-risk` →
   verify (`cargo test --workspace`/`fmt`/`clippy`) → commit in the worktree → rebase onto current
   `master` → fast-forward merge → `git worktree remove` + `git branch -d` to clean up.
-- U9 was the first unit this phase where BOTH reviewers returned completely clean (no findings at
-  all, not even minor) — straight to merge, no fixer round needed. Don't assume this is typical;
-  keep dispatching the full two-reviewer loop for every remaining trust-critical unit regardless.
-- Watch for cross-unit file overlap when rebasing (U0/U0b both touched `automaton.rs`/`numsys.rs`
-  and rebased clean, but always verify post-rebase — don't assume). U8's rebase in particular now
-  needs checking against U9's `numsys.rs` changes, not just the WB-doc collision.
+- U9 was the first (and so far only) unit this phase where BOTH reviewers returned completely
+  clean. U8's two reviewers together found 3 real issues (1 correctness-risk, 1 doc defect, 1
+  test-gap) despite neither alone flagging a correctness-FATAL defect — a reminder that "no
+  fatal finding" is not the same as "nothing to fix," and that reading BOTH reports in full before
+  deciding whether a fixer pass is needed remains important even when the summary sounds clean.
+- Watch for cross-unit file overlap when rebasing — U8 touched `crates/wr-core/src/lib.rs` and
+  `product.rs` (a visibility change only) in addition to its own new `regex.rs`; U10 (in flight)
+  will likely touch `crates/wr-logic/src/token.rs` again (same file U9 just extended) — check that
+  rebase carefully when it lands, not just the WB-doc collision.
 - This session hit two unrelated agent-infrastructure stalls (a 600s stream-watchdog timeout) on
   earlier units, both resolved by simply relaunching the same agent fresh — not a sign of a deeper
   problem, just retry if it recurs.
-- **U10 is now unblocked** (its last dependency, U9, just landed) — dispatch once U8/U14 stop
-  needing review-bandwidth attention. After U10, U11 (the Phase 3a integration checkpoint) becomes
-  reachable.
