@@ -1291,6 +1291,82 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-030 — two shipped help files are Windows-1252 but `HelpMessages` reads them as UTF-8, so `help reg;` and `help image;` print `�` where upstream wrote `…`, `’` and `–`
+
+- **Where:** `Main/HelpMessages.java`, `printHelpFile` (`:217`) — `new BufferedReader(new
+  FileReader(file))`, the charset-less `FileReader` constructor, i.e. `Charset.defaultCharset()`.
+  The data is `Help Documentation/Commands/Automata/reg.txt` and
+  `Help Documentation/Commands/Morphisms And Word Automata/image.txt`.
+- **What:** those two files are the only non-ASCII ones in the 34-file help tree, and they are
+  encoded in **Windows-1252**, not UTF-8: `reg.txt` has `0x85` (an intended `…`) on line 3 and two
+  `0x92`s (intended `’`) on line 13; `image.txt` has `0x96` (an intended en dash `–`, in
+  "Math. Systems Theory 6, 164–192") on line 7. None of the four is valid UTF-8, so on any JVM
+  whose default charset is UTF-8 — which is every JVM since JEP 400 (Java 18+), and the
+  oracle's JDK 17 on macOS as well — `InputStreamReader`'s `CodingErrorAction.REPLACE` turns each
+  into `U+FFFD`. The user sees mojibake in the middle of the `reg` command's own syntax line. The
+  output is also **platform-dependent** on JDK ≤17: the same build on a Windows JVM whose default
+  charset *is* cp1252 prints the intended punctuation.
+- **Trigger (minimal, verified):** `help reg;` or `help image;` at the Walnut prompt. Verified two
+  ways against the real `walnut-java`: (a) a standalone `BufferedReader`/`FileReader` probe over
+  both files on JDK 17.0.20 reported `defaultCharset=UTF-8` and exactly four `U+FFFD`s at
+  (line 3, idx 37), (line 13, idx 411), (line 13, idx 614) and (line 7, idx 120); (b) the real
+  `Main.Prover` CLI, whose `help reg;` / `help image;` transcript decodes as UTF-8 with `U+FFFD`
+  at precisely those positions.
+- **Found:** Phase 3b, U22 review, 2026-08-13, while porting `HelpMessages.java`.
+- **Rust port:** `ported verbatim (quirk)` — `crates/wr-cli/data/help/` stores `U+FFFD` at those
+  four positions, so `wr_cli::help_messages::help_command` reproduces real Walnut's *observed*
+  output byte for byte rather than the punctuation upstream evidently meant. Deliberately **not**
+  decoded as cp1252: that would be a silent divergence from the oracle, and this catalog's whole
+  point is that the fix is a scheduled decision, not an agent's side effect. Pinned by
+  `help_reg_output_is_exact_including_the_wb_030_replacement_chars` and
+  `help_image_output_is_exact_including_the_wb_030_replacement_char`, both exact-string goldens
+  cross-checked against the real CLI's transcript.
+- **Upstream:** `not filed`. The clean fix is upstream and one-line-ish either way: re-save both
+  files as UTF-8 with the intended `…`/`’`/`–` (best), or pin the reader with
+  `new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8)` *after* re-saving.
+  Note the first alone is sufficient and also fixes the JDK-≤17 platform dependence.
+- **Severity:** low — cosmetic, confined to help text, no effect on any decision-procedure result.
+  Worth logging because it is a *data*-side defect the port would otherwise have silently
+  "corrected", and because it is the reason two of this repo's data files are not byte-identical
+  to their upstream originals.
+
+---
+
+## WB-031 — `parseHelpArguments` splits on whitespace with no quoting, so the `Morphisms And Word Automata` group can never be named: its group-level and per-group help are unreachable
+
+- **Where:** `Main/HelpMessages.java`, `parseHelpArguments` (`:77-97`, the terminal
+  `s.split("\\s+")`) against `helpCommand`'s token-count dispatch (`:30-62`). The offending datum
+  is the directory name `Help Documentation/Commands/Morphisms And Word Automata/`.
+- **What:** `helpCommand` routes purely on `tokens.length`: 1 → group listing or command search,
+  2 → `help <group> <command>`, **≥3 → `Too many arguments.`**. The tokenizer has no quoting or
+  escaping of any kind, so a group name containing spaces cannot be delivered as one token. One
+  of Walnut's four help groups is named `Morphisms And Word Automata` — four whitespace tokens by
+  itself. Consequently `help Morphisms And Word Automata;` (4 tokens) and
+  `help Morphisms And Word Automata promote;` (5 tokens) both hit `Too many arguments`, and there
+  is **no** input that reaches either the group-listing or the two-token mode for that group. The
+  eight commands in it (`alphabet`, `image`, `join`, `minimize`, `morphism`, `promote`, `rsplit`,
+  `split`) are reachable only through the one-token whole-tree search (`help promote;`), and only
+  because no command name is duplicated across groups — `showCommandHelpAcrossAllGroups` takes the
+  first `listFiles` hit in unspecified filesystem order and would otherwise be nondeterministic.
+- **Trigger (minimal, verified):** `help Morphisms And Word Automata promote;` against the real
+  `walnut-java` CLI prints `Too many arguments. Usage: help [group] [command];`, not `promote`'s
+  help. Same for the 4-token `help Morphisms And Word Automata;`.
+- **Found:** Phase 3b, U22 review, 2026-08-13, alongside WB-030. Logged separately because the
+  root cause is code (the tokenizer's contract), not the help data, and because fixing WB-030 does
+  nothing for this.
+- **Rust port:** `ported verbatim (quirk)` — `wr_cli::help_messages::help_command` takes the raw
+  command line and runs the same tokenizer, so it answers `Too many arguments` identically. Pinned
+  by `test_help_promote_from_morphisms_group`, which asserts the error for both token counts and
+  additionally exercises the (correct but unreachable) two-token dispatch through the internal
+  helper so the dead path stays covered and visibly labelled as dead.
+- **Upstream:** `not filed`. Cheapest real fix is to greedily match the longest known group name
+  before splitting the remainder, or to accept a quoted group name; renaming the directory to a
+  single token (e.g. `Morphisms`) also works but changes documented output.
+- **Severity:** low — a discoverability defect, not a wrong answer; the affected help text is
+  still reachable via `help <command>;`.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

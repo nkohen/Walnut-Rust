@@ -1,6 +1,6 @@
 The "reg" command creates an automaton based on a specified regular expression. The syntax for the "reg" command is:
 
-	reg <name> <number system/alphabet>  <number system/alphabet> "<regular expression>"
+	reg <name> <number system/alphabet> � <number system/alphabet> "<regular expression>"
 
 Results saved in: Result/, Automata Library/.
 
@@ -10,7 +10,7 @@ Regular expressions consist of regular operations such as:
 	- concatenation
 	- Kleene star (*)
 	
-The alphabet for the regular expressions are arbitrary tuples of integers. One may define regular expressions on an alphabet of 0-9, but can also specify, for example, [1, -1, 1][0, 1, -1]* to mean 10* in the first coordinate, -11* in the second, and 1-1* in the third. In particular, one can specify numbers above 9 and below 0, provided brackets are used (eg. 1[10]* is 1 followed by an arbitrary number of 10s and similar for 1[-1]*). Brackets may also be used for numbers 0-9 (eg. [1][10]*) but are not mandatory in this case. A number system or alphabet must be supplied for each coordinate in the expressions tuples.
+The alphabet for the regular expressions are arbitrary tuples of integers. One may define regular expressions on an alphabet of 0-9, but can also specify, for example, [1, -1, 1][0, 1, -1]* to mean 10* in the first coordinate, -11* in the second, and 1-1* in the third. In particular, one can specify numbers above 9 and below 0, provided brackets are used (eg. 1[10]* is 1 followed by an arbitrary number of 10�s and similar for 1[-1]*). Brackets may also be used for numbers 0-9 (eg. [1][10]*) but are not mandatory in this case. A number system or alphabet must be supplied for each coordinate in the expression�s tuples.
 
 Sample usages of the "reg" command:
 
