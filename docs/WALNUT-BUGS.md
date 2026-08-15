@@ -1763,6 +1763,99 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-036 — `Morphism.toWordAutomaton` builds a state count that can exceed its own transition-table length, crashing on write whenever a morphism's domain doesn't cover every value referenced in an image
+
+- **Where:** `Automata/Morphism.java`, `toWordAutomaton` (`:78-92`), specifically the
+  combination of `determineMaxEntry` (`:118-128`, drives `Q = maxEntry + 1`) and
+  `determineTransitions` (`:95-107`, builds a `List<Int2ObjectRBTreeMap<IntList>>` with exactly
+  `mapping.size()` entries, indexed by DOMAIN-LETTER SORT POSITION rather than by the letter's own
+  value).
+- **What:** `promotion.getFa().setFields(maxEntry + 1, …, newD)` (`:84-85`) declares `Q = maxEntry +
+  1` states but hands `FA.t` a transition list (`newD`) with only `mapping.size()` entries — no
+  check anywhere that the two agree. They agree exactly when the morphism's domain is precisely
+  `{0, …, mapping.size() - 1}` *and* every image value is `<= mapping.size() - 1` too (the "well-formed
+  morphism promotion" shape every real Walnut fixture uses, e.g. `MorphismTest`'s `gam`/`g`
+  morphisms). They do NOT agree whenever an image references a value that is itself not a domain
+  letter with a small-enough sort position — e.g. `0->05 1->10`: two domain letters (`{0,1}`), but
+  the image of `0` references `5`, so `maxEntry = 5` and `Q = 6`, while `newD.size() = 2`. Nothing
+  in `toWordAutomaton` itself touches the mismatched states, so the method returns normally — the
+  crash happens the first time anything walks `FA.t.getNfaD(q)`/`getEntriesNfaD(q)` for a state `q
+  >= mapping.size()`, and `TransitionsNFA.getNfaState`/`getEntriesNfaD` are bare `List.get(q)`
+  calls with no bounds check of their own (`TransitionsNFA.java:44,53`). In practice this fires
+  during `AutomatonWriter.writeTxtFormatToStream`'s own per-state loop (`for (int q = 0; q < Q;
+  q++) writeState(...)`, `AutomatonWriter.java:54-55`) — i.e. the very first ordinary `.txt`/`.gv`
+  write of the promoted automaton, which `promote`'s own `P.writeAutomata(...)` call performs
+  unconditionally.
+- **Trigger:** any `promote` whose morphism's domain doesn't cover every value referenced in some
+  image. **Confirmed live** against `Walnut-all.jar` (2026-08-15):
+  - `Morphism Library/badmor.txt` = `0 -> 05` / `1 -> 10`.
+  - `morphism badmor "0->05 1->10";` then `promote P badmor;` prints
+    `java.lang.IndexOutOfBoundsException: Index 2 out of bounds for length 2`, and the session
+    continues into the REPL (`Prover.dispatch`'s top-level `catch (RuntimeException)` recovers).
+  - Control: `morphism h "0->01 1->10"; promote P h;` (Thue-Morse, domain and range both `{0,1}`)
+    promotes and writes cleanly.
+- **Found:** Phase 3b, U24 (porting `Morphism::to_word_automaton` for the `promote` command),
+  2026-08-15. Not found by tracing alone — `setNfaTransitions`/`TransitionsNFA`'s complete absence
+  of any length-reconciliation between `Q` and the transition list was confirmed by reading
+  `TransitionsNFA.java` directly, then the crash was reproduced against the real jar before being
+  logged here, per this project's "verify by tracing the call graph rather than guessing" standard.
+- **Rust port:** `ported verbatim (quirk)` in spirit — Java doesn't reject this shape either, it
+  just crashes downstream — but represented as an explicit `Result::Err`
+  (`wr_core::morphism::MorphismError::DomainDoesNotCoverImageRange`) raised INSIDE
+  `to_word_automaton` itself, before ever constructing the malformed `Fa`, rather than deferred to
+  wherever this port's own writer/canonicalize/etc. would eventually panic on the same shape. This
+  differs slightly from the WB-002/013/033/034/035 precedent (which reproduce Java's crash at the
+  same call-graph position Java itself crashes at): here, letting the malformed `Fa` (whose
+  `d.len() != q`) escape `to_word_automaton` at all would plant a live index-out-of-bounds panic
+  for ANY later caller in this crate that assumes `Fa`'s fundamental `d.len() == q` invariant (which
+  is essentially every algorithm in `wr-core` — `canonicalize`, the writer, `equiv`, …), not just the
+  one write path Java happens to hit first. Catching it at construction time is strictly more
+  robust and changes no answer for any well-formed morphism. Pinned by
+  `to_word_automaton_wb036_domain_gap_is_rejected_up_front` (`wr-core`) and
+  `promote_command_wb036_domain_gap_surfaces_as_an_error_not_a_panic` (`wr-cli`, exercising the
+  real `promote` command dispatch end-to-end).
+- **Upstream:** not filed. A guard in `toWordAutomaton` (e.g. reject when `newD.size() < maxEntry +
+  1`, or better, require the domain be exactly `{0, …, maxEntry}` and say so) would fix it in Java;
+  the more useful fix is documenting that `promote`'s morphism must have domain = image-value-range
+  (a real, load-bearing precondition nothing in Walnut currently states anywhere).
+- **Severity:** low — a loud crash rather than a silently wrong answer, on an input shape (a
+  morphism whose image references a value outside its own domain) that is easy to construct by
+  accident but that every real Walnut fixture and test avoids; not reachable through `image`
+  (`Image.image` never calls `toWordAutomaton`).
+
+---
+
+## WB-037 — `Join.joinCommand` crashes on `join <name>;` with zero automata specified
+
+- **Where:** `Main/Commands/Join.java`, `joinCommand` (`:58`) — `Automaton N =
+  subautomata.remove(0);`, with no empty-list guard.
+- **What:** `Prover.RE_FOR_join_CMD`'s automata group is `(...)*` (zero-or-more), so a command with
+  no `name[x]...` operands at all — `join J;` — is syntactically valid and reaches `joinCommand`
+  with an empty `subautomata` list. `List.remove(0)` on an empty `ArrayList` throws
+  `IndexOutOfBoundsException` unconditionally; nothing upstream (the regex match, or `joinCommand`
+  itself before this line) rejects the empty-operand shape first.
+- **Trigger:** `join <anyName> ;` — a syntactically well-formed but semantically empty `join`
+  command. **Confirmed live** against `Walnut-all.jar` (2026-08-15): `join J ;` prints
+  `java.lang.IndexOutOfBoundsException: Index 0 out of bounds for length 0`, and the session
+  continues into the REPL (`Prover.dispatch`'s top-level `catch (RuntimeException)` recovers).
+- **Found:** Phase 3b, U24 (porting `Join.joinCommand`), 2026-08-15, while reasoning about what
+  `subautomata.remove(0)`/`new LinkedList<>(subautomata)` do when the regex-captured automata blob
+  contains zero `name[x]...` matches — confirmed against the real jar before logging, per this
+  project's "verify, don't guess" standard.
+- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err`
+  (`wr_cli::join::JoinError::NoAutomataSpecified`) rather than an uncaught panic — the same
+  WB-002/033/034/035/036 reasoning: Java's own `IndexOutOfBoundsException` is an unchecked
+  `RuntimeException` `Prover.dispatch`'s top-level catch recovers from, so a Rust `panic!` (which
+  would abort this port's process, absent a `catch_unwind` boundary it doesn't have) is *less*
+  faithful, not more. Pinned by `join_command_wb037_zero_automata_is_rejected_not_a_panic`.
+- **Upstream:** not filed. A one-line guard (`if (subautomata.isEmpty()) throw new
+  WalnutException("join requires at least one automaton");`, or similar) would fix it in Java.
+- **Severity:** low — a loud crash, not a silently wrong answer, and only reachable by typing a
+  `join` command with no operands at all (a command that could do nothing useful even if it
+  succeeded).
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has

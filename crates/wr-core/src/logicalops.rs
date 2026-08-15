@@ -234,7 +234,13 @@ use std::rc::Rc;
 /// free function here, rather than inlined at each call site, purely to preserve this
 /// module's existing call shape (`totalize(&mut a.fa)`) across its several callers
 /// below.
-fn totalize(fa: &mut Fa) {
+///
+/// `pub` as of U24: `Main/Commands/Join.java:82-83` (`first.fa.totalize();
+/// next.fa.totalize();`) calls this exact real `FA.totalize()`, not `Fa::totalize`'s
+/// stricter assert-based cousin — `crate::join`'s port needs the identical relaxed
+/// behavior (a `join` operand is expected to already be deterministic in practice,
+/// but Java's own `totalize()` never asserts that, so neither should the port).
+pub fn totalize(fa: &mut Fa) {
     fa.totalize_relaxed(0);
 }
 

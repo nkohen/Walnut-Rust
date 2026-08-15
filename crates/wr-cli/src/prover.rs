@@ -103,11 +103,18 @@ use crate::automaton_ops::{
     combine_command, concat_command, intersect_command, star_command, union_command,
     AutomatonOpsError,
 };
+use crate::convert::{convert_command, ConvertError};
 use crate::describe::{describe, DescribeError};
 use crate::eval_def::{eval_def_command_with_stdout, EvalDefError};
+use crate::image::{image, ImageError};
+use crate::join::{join_command, JoinError};
 use crate::macro_cmd::macro_command;
 use crate::meta_commands::{MetaCommandError, MetaCommands};
-use crate::prover_helper::{clear_screen_to, ProverHelperError};
+use crate::morphism::{morphism_command_to, promote_command, MorphismCommandError};
+use crate::prover_helper::{
+    clear_screen_to, determine_in_library, export_automata_to, inf_from_address_to,
+    ProverHelperError,
+};
 use crate::quotient::{left_quotient_command, right_quotient_command, QuotientError};
 use crate::reg::{reg, RegError};
 use crate::reverse::{reverse_command, ReverseError};
@@ -601,6 +608,14 @@ pub enum ProverError {
     Describe(DescribeError),
     /// U23, batch A: `minimize`/`fixleadzero`/`fixtrailzero`.
     SimpleTransform(SimpleTransformError),
+    /// `morphism`/`promote` (`crate::morphism`).
+    Morphism(MorphismCommandError),
+    /// `image` (`crate::image`).
+    Image(ImageError),
+    /// `join` (`crate::join`).
+    Join(JoinError),
+    /// `convert` (`crate::convert`).
+    Convert(ConvertError),
     /// **Port-specific.** A command this project deliberately does not implement.
     UnsupportedCommand {
         command: &'static str,
@@ -638,6 +653,10 @@ impl std::fmt::Display for ProverError {
             ProverError::Quotient(e) => write!(f, "{e}"),
             ProverError::Describe(e) => write!(f, "{e}"),
             ProverError::SimpleTransform(e) => write!(f, "{e}"),
+            ProverError::Morphism(e) => write!(f, "{e}"),
+            ProverError::Image(e) => write!(f, "{e}"),
+            ProverError::Join(e) => write!(f, "{e}"),
+            ProverError::Convert(e) => write!(f, "{e}"),
             ProverError::UnsupportedCommand { command, reason } => write!(
                 f,
                 "The {command} command is out of scope for walnut-rs ({reason})."
@@ -675,7 +694,11 @@ impl LoggableError for ProverError {
             | ProverError::Io(_)
             | ProverError::Reverse(_)
             | ProverError::Describe(_)
-            | ProverError::SimpleTransform(_) => true,
+            | ProverError::SimpleTransform(_)
+            | ProverError::Morphism(_)
+            | ProverError::Image(_)
+            | ProverError::Join(_)
+            | ProverError::Convert(_) => true,
             // Two exceptions to the paragraph above, both non-`WalnutException` Java
             // throwables faithfully surfaced by U23's review fixes.
             ProverError::AutomatonOps(e) => !matches!(e, AutomatonOpsError::NumberFormat(_)),
@@ -740,6 +763,10 @@ prover_error_from! {
     QuotientError => Quotient,
     DescribeError => Describe,
     SimpleTransformError => SimpleTransform,
+    MorphismCommandError => Morphism,
+    ImageError => Image,
+    JoinError => Join,
+    ConvertError => Convert,
 }
 
 // ---------------------------------------------------------------------------
@@ -977,13 +1004,7 @@ impl Prover {
                 )?))
             }
             // `:492-494` -> `AutomatonLogicalOps.convertNS`
-            CONVERT => {
-                match_or_fail(&patterns().convert, s, CONVERT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: CONVERT,
-                    unit: "U24",
-                })
-            }
+            CONVERT => Ok(Some(self.convert_command(s)?)),
             // `:495-497`
             DEF | EVAL => Ok(Some(self.eval_def_commands(s)?)),
             // `:498-500` -> `Describe.describe`
@@ -1004,13 +1025,7 @@ impl Prover {
             // `:501-503` -- no body; `dispatch` already computed `exitVal`.
             EXIT | QUIT => Ok(None),
             // `:504-506` -> `ProverHelper.exportAutomata`
-            EXPORT => {
-                match_or_fail(&patterns().export, s, EXPORT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: EXPORT,
-                    unit: "U24",
-                })
-            }
+            EXPORT => Ok(Some(self.export_command(s)?)),
             // `:507-509` -> `AutomatonLogicalOps.fixLeadingZerosProblem`
             FIXLEADZERO => {
                 let caps = match_or_fail(&patterns().fixleadzero, s, FIXLEADZERO)?;
@@ -1042,21 +1057,14 @@ impl Prover {
                 unit: "U22",
             }),
             // `:514-516` -> `Image.image`
-            IMAGE => {
-                match_or_fail(&patterns().image, s, IMAGE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: IMAGE,
-                    unit: "U24",
-                })
-            }
-            // `:517-519` -> `ProverHelper.infFromAddress` (already ported; the arm still
-            // needs U24's decision about the command's console output contract).
+            IMAGE => Ok(Some(self.image_command(s)?)),
+            // `:517-519` -> `ProverHelper.infFromAddress` (already ported). Java's
+            // `case INF -> { infCommand(s); }` discards the boolean return and falls
+            // through to `processCommand`'s trailing `return null` -- same shape as
+            // `MORPHISM` below.
             INF => {
-                match_or_fail(&patterns().inf, s, INF)?;
-                Err(ProverError::NotYetImplemented {
-                    command: INF,
-                    unit: "U24",
-                })
+                self.inf_command(s)?;
+                Ok(None)
             }
             // `:520-522` -> `Intersect.intersect`
             INTERSECT => {
@@ -1066,13 +1074,7 @@ impl Prover {
                 Ok(Some(intersect_command(&self.session, s, automata, name)?))
             }
             // `:523-525` -> `Join.joinCommand`
-            JOIN => {
-                match_or_fail(&patterns().join, s, JOIN)?;
-                Err(ProverError::NotYetImplemented {
-                    command: JOIN,
-                    unit: "U24",
-                })
-            }
+            JOIN => Ok(Some(self.join_command(s)?)),
             // `:526-528` -> `Quotient.leftQuotient`
             LEFTQUO => {
                 let caps = match_or_fail(&patterns().leftquo, s, LEFTQUO)?;
@@ -1115,13 +1117,13 @@ impl Prover {
                     new_name,
                 )?))
             }
-            // `:538-540` -> `Main.Commands.Morphism.morphismCommand`
+            // `:538-540` -> `Main.Commands.Morphism.morphismCommand`. Java's
+            // `case MORPHISM -> { morphismCommand(s); }` discards nothing (the Java
+            // method itself returns `void`) and falls through to `processCommand`'s
+            // trailing `return null`.
             MORPHISM => {
-                match_or_fail(&patterns().morphism, s, MORPHISM)?;
-                Err(ProverError::NotYetImplemented {
-                    command: MORPHISM,
-                    unit: "U24",
-                })
+                self.morphism_command(s)?;
+                Ok(None)
             }
             // `:541-543` -> `Ost.ostCommand`. Ostrowski numeration is DROP scope.
             OST => {
@@ -1132,13 +1134,7 @@ impl Prover {
                 })
             }
             // `:544-546` -> `Morphism.toWordAutomaton`
-            PROMOTE => {
-                match_or_fail(&patterns().promote, s, PROMOTE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: PROMOTE,
-                    unit: "U24",
-                })
-            }
+            PROMOTE => Ok(Some(self.promote_command(s)?)),
             // `:547-549`
             REG => Ok(Some(self.reg_command(s)?)),
             // `:550-552` -> `Reverse.reverseCommand`
@@ -1352,6 +1348,117 @@ impl Prover {
         )?)
     }
 
+    /// `Prover.morphismCommand(String)` (`:632-635`) -> `Main.Commands.Morphism.
+    /// morphismCommand`. Note `GROUP_MORPHISM_DEFINITION == 0` (Java's WHOLE MATCH,
+    /// not a typo — see that constant's own doc comment in this file).
+    fn morphism_command(&mut self, s: &str) -> Result<(), ProverError> {
+        let caps = match_or_fail(&patterns().morphism, s, MORPHISM)?;
+        let definition = group(&caps, s, GROUP_MORPHISM_DEFINITION).unwrap_or("");
+        let name = group(&caps, s, GROUP_MORPHISM_NAME).unwrap_or("");
+        // `&mut self.out`, not the real-stdout `morphism_command` convenience wrapper --
+        // matches `eval_def_commands`' own injectable-sink convention (`Prover.out` is
+        // everything Java writes with a bare `System.out.print`, see the struct's own
+        // doc comment).
+        morphism_command_to(&self.session, definition, name, &mut self.out)?;
+        Ok(())
+    }
+
+    /// `Prover.promoteCommand(String)` (`:637-650`) -> `Morphism.toWordAutomaton`.
+    fn promote_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().promote, s, PROMOTE)?;
+        let morphism_name = group(&caps, s, GROUP_PROMOTE_MORPHISM).unwrap_or("");
+        let name = group(&caps, s, GROUP_PROMOTE_NAME).unwrap_or("");
+        Ok(promote_command(&self.session, s, morphism_name, name)?)
+    }
+
+    /// `Prover.imageCommand(String)` (`:652-656`) -> `Image.image`.
+    fn image_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().image, s, IMAGE)?;
+        let morphism_name = group(&caps, s, GROUP_IMAGE_MORPHISM).unwrap_or("");
+        let old_name = group(&caps, s, GROUP_IMAGE_OLD_NAME).unwrap_or("");
+        let new_name = group(&caps, s, GROUP_IMAGE_NEW_NAME).unwrap_or("");
+        Ok(image(
+            &self.session,
+            &mut self.logging,
+            s,
+            morphism_name,
+            old_name,
+            new_name,
+            self.print_flag,
+        )?)
+    }
+
+    /// `Prover.infCommand(String)` (`:658-661`) -> `ProverHelper.infFromAddress`
+    /// (already ported). Java's `boolean` return is discarded by `processCommand`'s
+    /// `INF -> { infCommand(s); }` arm (no `return`) — see [`Self::process_command`].
+    fn inf_command(&mut self, s: &str) -> Result<bool, ProverError> {
+        let caps = match_or_fail(&patterns().inf, s, INF)?;
+        let name = group(&caps, s, GROUP_INF_NAME).unwrap_or("");
+        Ok(inf_from_address_to(&self.session, name, &mut self.out)?)
+    }
+
+    /// `Prover.joinCommand(String)` (`:677-680`) -> `Join.joinCommand`.
+    fn join_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().join, s, JOIN)?;
+        let automata = group(&caps, s, GROUP_JOIN_AUTOMATA).unwrap_or("");
+        let name = group(&caps, s, GROUP_JOIN_NAME).unwrap_or("");
+        Ok(join_command(&self.session, s, automata, name)?)
+    }
+
+    /// `Prover.convertCommand(String)` (`:724-745`).
+    fn convert_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().convert, s, CONVERT)?;
+        let new_dollar_sign = group(&caps, s, GROUP_CONVERT_NEW_DOLLAR_SIGN).unwrap_or("");
+        let new_name = group(&caps, s, GROUP_CONVERT_NEW_NAME).unwrap_or("");
+        let msd_or_lsd = group(&caps, s, GROUP_CONVERT_MSD_OR_LSD).unwrap_or("");
+        let base = group(&caps, s, GROUP_CONVERT_BASE).unwrap_or("");
+        let old_dollar_sign = group(&caps, s, GROUP_CONVERT_OLD_DOLLAR_SIGN).unwrap_or("");
+        let old_name = group(&caps, s, GROUP_CONVERT_OLD_NAME).unwrap_or("");
+        Ok(convert_command(
+            &self.session,
+            s,
+            new_dollar_sign,
+            new_name,
+            msd_or_lsd,
+            base,
+            old_dollar_sign,
+            old_name,
+        )?)
+    }
+
+    /// `Prover.exportCommand(String)` (`:805-814`) -> `ProverHelper.exportAutomata`
+    /// (already ported).
+    fn export_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().export, s, EXPORT)?;
+        let filename = group(&caps, s, GROUP_EXPORT_NAME).unwrap_or("");
+        let in_file_name = format!("{filename}{TXT_EXTENSION}");
+        let export_type = group(&caps, s, GROUP_EXPORT_TYPE).unwrap_or("");
+        let is_dfao = group(&caps, s, GROUP_EXPORT_DOLLAR_SIGN) != Some("$");
+
+        // `Automaton M = new Automaton(ProverHelper.determineInLibrary(isDFAO,
+        //  inFileName));` (`:811`) -- `ProverHelperError::Read` is the same variant
+        // `ProverHelper.infFromAddress`'s own automaton read already uses.
+        let in_library = determine_in_library(self.session.paths(), is_dfao, &in_file_name);
+        let m = self
+            .session
+            .libraries()
+            .read_library_automaton(&in_library)
+            .map_err(ProverHelperError::Read)?;
+
+        // `ProverHelper.exportAutomata(s, filename, exportType, M, isDFAO);` (`:812`).
+        export_automata_to(
+            self.session.paths(),
+            Some(s),
+            filename,
+            export_type,
+            &m,
+            is_dfao,
+            &mut self.out,
+        )?;
+
+        Ok(TestCase::from_automaton(m))
+    }
+
     // -- the reader loop --------------------------------------------------------
 
     /// `Prover.readBuffer(BufferedReader, boolean console)` (`:354-399`) — the ONE loop
@@ -1490,19 +1597,39 @@ impl Prover {
 /// The distinction is invisible in Rust (one `Result`, one error enum) but load-bearing in
 /// `Prover.readBuffer`, whose two `catch` clauses do opposite things — see the call site.
 ///
-/// Only [`ProverError::Io`] qualifies today, and nothing constructs it yet: every command
-/// currently wired up is a Java method that does *not* declare `throws IOException`. The
-/// three that do — `morphismCommand` (`:632`), `promoteCommand` (`:637`), `imageCommand`
-/// (`:652`) — belong to U24, so this classification has to be right *before* those land,
-/// not after. `transduceCommand` (`:693-704`) itself declares no `throws` clause either
-/// (`AutomatonReader.readTransducer`'s `IOException`s are already wrapped into unchecked
-/// `WalnutException`s, same as `readAutomaton`'s), so [`ProverError::Transduce`] is
-/// classified `false` here too — this port's own `TransduceCommandError::Io` sub-variant
-/// (a real disk-write failure while writing the result) is this crate's own
-/// Result-propagating idiom, not Java's checked `IOException`, exactly like
-/// `RegError`/`AlphabetError`'s own `Io` sub-variants already fold to `false` above.
+/// As of U24, three real Java methods declare `throws IOException`:
+/// `morphismCommand` (`:632`), `promoteCommand` (`:637`), and `imageCommand` (`:652`)
+/// — `transduce` is the fourth and still belongs to U26. `joinCommand`/`convertCommand`
+/// do **not** declare `throws IOException` at all, so a real Java compile PROVES no
+/// checked `IOException` ever escapes them.
+///
+/// This port's per-module error enums do not distinguish, at the `Io` variant level,
+/// which underlying I/O call produced a failure — so the rule applied below is: for
+/// [`MorphismCommandError`]/[`ImageError`] (the three genuinely `throws IOException`
+/// Java methods), their `Io` sub-variant is IO-class (`true`); every other variant of
+/// every command error is RuntimeException-class (`false`). This is deliberately
+/// CONSERVATIVE, not a precise per-call-site match: `Morphism::write_to_file`'s two
+/// writes (`morphism`) and `Files.readString`/`UtilityMethods.readFromFile`
+/// (`promote`/`image`) are genuine, uncaught-in-Java `IOException` sources that really
+/// do escape to `readBuffer`'s OUTER catch — but SOME `Io` instances in this port will
+/// actually originate from `crate::automaton_output::write_automata`'s copy step
+/// instead, which real `Automaton.writeAutomata` swallows internally (see that
+/// module's own docs) and which therefore would NOT escape this far in Java. Treating
+/// every `Io` from these two modules as IO-class is the safer of the two possible
+/// readings ("this command is one of the three that CAN throw a real IOException"),
+/// not a false claim that every instance definitely would have in Java.
+///
+/// [`JoinError`]/[`ConvertError`] have no such ambiguity: their `Io` variant exists
+/// ONLY because of this port's own `write_automata` propagate-rather-than-swallow
+/// idiom deviation (`crate::automaton_output`'s own documented, deliberate choice) —
+/// never a Java-observable event, since `joinCommand`/`convertCommand` cannot let an
+/// `IOException` escape at all (the Java compiler would reject that). So `false`,
+/// alongside their other variants.
 fn is_io_class_error(e: &ProverError) -> bool {
     match e {
+        // See the paragraph above: conservative, not per-call-site-precise.
+        ProverError::Morphism(MorphismCommandError::Io(_))
+        | ProverError::Image(ImageError::Io(_)) => true,
         ProverError::Io(_) => true,
         // Exhaustive on purpose: a new variant must make this decision deliberately.
         ProverError::InvalidCommand(_)
@@ -1530,6 +1657,10 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::Quotient(_)
         | ProverError::Describe(_)
         | ProverError::SimpleTransform(_)
+        | ProverError::Morphism(_)
+        | ProverError::Image(_)
+        | ProverError::Join(_)
+        | ProverError::Convert(_)
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
     }
@@ -2078,6 +2209,44 @@ mod tests {
         }
     }
 
+    /// U24's own extension of the classification above: `morphismCommand`/
+    /// `promoteCommand`/`imageCommand` are the three real Java methods that declare
+    /// `throws IOException` (see [`is_io_class_error`]'s doc comment), so ONLY their
+    /// `Io` sub-variant is IO-class; `joinCommand`/`convertCommand` declare no such
+    /// thing, so NONE of their variants (including their own `Io`, which exists purely
+    /// as this port's `write_automata` idiom deviation) are.
+    #[test]
+    fn u24_command_errors_classify_by_javas_throws_ioexception_declaration() {
+        assert!(
+            is_io_class_error(&ProverError::Morphism(MorphismCommandError::Io(
+                io::Error::other("boom")
+            ))),
+            "morphismCommand/promoteCommand declare throws IOException"
+        );
+        assert!(
+            is_io_class_error(&ProverError::Image(ImageError::Io(io::Error::other(
+                "boom"
+            )))),
+            "imageCommand declares throws IOException"
+        );
+        assert!(
+            !is_io_class_error(&ProverError::Morphism(MorphismCommandError::Parse(
+                wr_io::parse_methods::ParseMethodsError::NoValidMorphismMappings
+            ))),
+            "a non-Io MorphismCommandError variant is still RuntimeException-class"
+        );
+        assert!(
+            !is_io_class_error(&ProverError::Join(JoinError::Io(io::Error::other("boom")))),
+            "joinCommand declares no throws IOException at all"
+        );
+        assert!(
+            !is_io_class_error(&ProverError::Convert(ConvertError::Io(io::Error::other(
+                "boom"
+            )))),
+            "convertCommand declares no throws IOException at all"
+        );
+    }
+
     // ------------------------------------------------------------- parseSetup
 
     #[test]
@@ -2441,6 +2610,98 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // ---------------------------------------------------------------- U24: batch B
+
+    /// The task's own required end-to-end case: a genuine Thue-Morse-shaped morphism,
+    /// through the real command chain `morphism -> promote -> image` (verified against
+    /// the real `Main/Commands/Morphism.java`/`Prover.promoteCommand`/`Image.java`
+    /// call graph, not assumed — `promote`'s morphism-to-word-automaton construction
+    /// is exactly the classical Thue-Morse-generating DFAO, see
+    /// `wr_core::morphism::Morphism::to_word_automaton`'s own
+    /// `to_word_automaton_thue_morse_shape` test).
+    #[test]
+    fn morphism_promote_image_thue_morse_chain_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, capture) = prover("thue-morse-chain");
+
+        assert!(p.dispatch(r#"morphism h "0->01,1->10";"#).unwrap());
+        assert_eq!(
+            capture.text(),
+            "Defined with domain [0, 1] and range {0, 1}"
+        );
+        assert!(dir.join("Morphism Library").join("h.txt").is_file());
+        assert!(dir.join("Result").join("h.txt").is_file());
+
+        // `T` is exactly the Thue-Morse-sequence-generating DFAO.
+        assert!(p.dispatch("promote T h;").unwrap());
+        assert!(dir.join("Word Automata Library").join("T.txt").is_file());
+        assert!(dir.join("Result").join("T.txt").is_file());
+
+        // The classical Thue-Morse identity h(T) = T -- `image` applies `h` to `T`.
+        assert!(p.dispatch("image FS h T;").unwrap());
+        assert!(dir.join("Word Automata Library").join("FS.txt").is_file());
+        assert!(dir.join("Result").join("FS.txt").is_file());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn join_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, _) = prover("join-e2e");
+
+        // A word automaton (DFAO): Thue-Morse via `promote`.
+        assert!(p.dispatch(r#"morphism h "0->01,1->10";"#).unwrap());
+        assert!(p.dispatch("promote T h;").unwrap());
+        // A plain automaton via `reg`, in a DIFFERENT track variable.
+        assert!(p.dispatch("reg S msd_2 \"0*1\";").unwrap());
+
+        assert!(p.dispatch("join J T[x] S[y];").unwrap());
+        // Any sub-automaton from the Word Automata Library makes the join's own output
+        // a DFAO too (`crate::join`'s own doc comment).
+        assert!(dir.join("Word Automata Library").join("J.txt").is_file());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn convert_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, _) = prover("convert-e2e");
+        assert!(p.dispatch("reg S msd_2 \"0*1\";").unwrap());
+        // No `$` before `C` -> newIsDFAO -> Word Automata Library; `$S` -> oldIsDFAO ==
+        // false -> read from the Automata Library, where `reg` wrote `S`.
+        assert!(p.dispatch("convert C msd_4 $S;").unwrap());
+        assert!(dir.join("Word Automata Library").join("C.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inf_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, capture) = prover("inf-e2e");
+        // Every binary string starting with `1` (no leading zero): infinitely many
+        // DISTINCT represented values, so this survives `infFromAddress`'s own
+        // `removeLeadingZeros` step (unlike e.g. `0*1`, whose every accepted word
+        // represents the single value 1).
+        assert!(p.dispatch("reg S msd_2 \"1(0|1)*\";").unwrap());
+        assert!(p.dispatch("inf S;").unwrap());
+        assert!(
+            capture
+                .text()
+                .starts_with("Automaton accepts infinite values, including regex:"),
+            "{}",
+            capture.text()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, capture) = prover("export-e2e");
+        assert!(p.dispatch("reg S msd_2 \"0*1\";").unwrap());
+        assert!(p.dispatch("export $S gv;").unwrap());
+        assert!(dir.join("Result").join("S.gv").is_file());
+        assert!(capture.text().starts_with("Writing to "));
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn test_runs_end_to_end_through_dispatch_reporting_shortfall_then_success() {
         let (mut p, dir, capture) = prover("test-dispatch");
@@ -2508,15 +2769,12 @@ mod tests {
     #[test]
     fn every_unimplemented_command_has_an_arm_that_reports_its_owning_unit() {
         let (mut p, dir, _) = prover("stubs");
+        // `convert`/`export`/`image`/`inf`/`join`/`morphism`/`promote` are U24's own
+        // batch (implemented as of this unit, see `every_command_pattern_pins_its_group_indices`'s
+        // siblings and each command's own `dispatch`-level test below) and are
+        // therefore no longer in this list.
         let cases = [
-            ("convert new lsd_3 $old;", "U24"),
-            ("export $M gv;", "U24"),
             ("help;", "U22"),
-            ("image I h T;", "U24"),
-            ("inf T;", "U24"),
-            ("join J A [x];", "U24"),
-            (r#"morphism h "0->01,1->10";"#, "U24"),
-            ("promote P h;", "U24"),
             ("rsplit S [+] T;", "U24"),
             ("split S T [+];", "U24"),
         ];

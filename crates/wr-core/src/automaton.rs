@@ -213,6 +213,47 @@ pub struct Automaton {
     /// [`Automaton::canonize`]) is a cheap no-op. Always starts `false` — there is no
     /// public constructor parameter for it, matching a freshly bound/relabeled automaton.
     label_sorted: bool,
+    /// A **representation choice**, not a field Java has at this layer — Java's
+    /// `canonized` memo lives on `FA` itself (`FA.java:50`), not `Automaton`. Added in
+    /// U24, for [`crate::morphism::Morphism::to_word_automaton`]: `Morphism.java:88`
+    /// calls `promotion.fa.setCanonized(true)` specifically so a promoted morphism's
+    /// states (each one a domain letter, most of them typically unreachable from `q0`)
+    /// are never dropped by canonicalization — see [`Fa::canonicalize`]'s doc comment
+    /// for why that would otherwise be a real, state-count-changing divergence, not just
+    /// a renumbering.
+    ///
+    /// **Why this lives here and not on [`Fa`].** [`Fa`]'s fields are all `pub`, and a
+    /// grep of every `.canonicalize()` call site in this workspace (2026-08, at the time
+    /// this field was added) shows production code reaches it exclusively through
+    /// [`Automaton::canonize`]/[`Automaton::force_canonize`] — never directly. Adding
+    /// `canonized` to `Fa` instead would require every one of the ~230
+    /// `Fa { … }` struct-literal constructions across this workspace (tests overwhelmingly)
+    /// to gain a new field, for a flag only two methods on `Automaton` ever consult. Storing
+    /// it here instead keeps the *observable* behavior identical (the flag still gates the
+    /// exact same [`Fa::canonicalize`] call) while confining the blast radius to this file's
+    /// two existing struct literals ([`Automaton::new`]/[`Automaton::true_false`]) — matching
+    /// the task's explicit "add the flag to `Fa`, OR otherwise guarantee the promoted
+    /// automaton is never auto-canonicalized" latitude. If a future unit adds a genuine
+    /// `Fa`-level (not `Automaton`-wrapped) caller of `canonicalize()`, this guarantee would
+    /// need to move or be duplicated — none exists today.
+    ///
+    /// **Narrower than Java's memo, deliberately.** Java's `canonizeInternal` sets
+    /// `this.canonized = true` after every successful run, so an ordinary automaton that
+    /// has already been canonized skips redundant work on a second `canonize()` call.
+    /// This field does NOT replicate that: [`Automaton::canonize`] never sets it back to
+    /// `true` on its own, only [`Automaton::set_canonized`] does. So every pre-existing
+    /// call site's behavior is 100% unchanged (the flag is `false` by construction and
+    /// nothing but the new [`Morphism::to_word_automaton`] call site ever flips it) —
+    /// this is a permanent, opt-in SUPPRESSION flag for one specific producer, not a
+    /// general performance memo. Implementing the fuller Java semantics (auto-memoizing
+    /// after every `canonize()`) was considered and rejected as out of this unit's
+    /// scope: it would change the behavior of every existing `canonize()` call site
+    /// (would a later mutation between two `canonize()` calls need to be picked up? every
+    /// current call site assumes yes, since this port has always unconditionally
+    /// recomputed) for a performance question this unit was not asked to resolve.
+    ///
+    /// [`Morphism::to_word_automaton`]: crate::morphism::Morphism::to_word_automaton
+    canonized: bool,
 }
 
 impl Automaton {
@@ -245,6 +286,7 @@ impl Automaton {
             ns_name,
             encoder,
             label_sorted: false,
+            canonized: false,
         }
     }
 
@@ -265,6 +307,7 @@ impl Automaton {
             ns_name: Vec::new(),
             encoder: Vec::new(),
             label_sorted: false,
+            canonized: false,
         }
     }
 
@@ -1006,19 +1049,58 @@ impl Automaton {
         }
     }
 
-    /// `Automaton.canonize` (`Automaton.java:328-331`).
+    /// `Automaton.canonize` (`Automaton.java:328-331`), now also consulting
+    /// [`Automaton::canonized`] before delegating to [`Fa::canonicalize`] — see that
+    /// field's doc comment (added U24) for why this flag lives here rather than on
+    /// [`Fa`], and why it is a narrower, opt-in suppression rather than Java's full
+    /// auto-memoizing `canonized` flag. Every pre-U24 call site is unaffected: the flag
+    /// starts (and, absent an explicit [`Automaton::set_canonized`] call, stays) `false`.
     pub fn canonize(&mut self) {
+        if self.canonized {
+            return;
+        }
         self.sort_label();
         self.fa.canonicalize();
     }
 
-    /// `Automaton.forceCanonize` (`Automaton.java:332-335`). Java resets the private
-    /// `fa.canonized` flag before calling `canonize()`, since `FA.canonizeInternal`
-    /// memoizes behind it; this crate's [`Fa::canonicalize`] carries no such flag (see
-    /// its own module docs — it always recomputes), so there is nothing to reset here.
-    /// Kept as a distinct method anyway for call-site parity with Java.
+    /// `Automaton.forceCanonize` (`Automaton.java:332-335`): resets
+    /// [`Automaton::canonized`] to `false` first, then canonizes unconditionally —
+    /// matching Java's `fa.setCanonized(false); canonize();` exactly (Java resets the
+    /// same `canonized` flag [`Automaton::canonize`] now consults, just one layer down
+    /// on `FA` rather than here).
     pub fn force_canonize(&mut self) {
+        self.canonized = false;
         self.canonize();
+    }
+
+    /// `FA.setCanonized(boolean)` (`FA.java:590-592`), moved to this layer — see
+    /// [`Automaton::canonized`]'s doc comment. [`crate::morphism::Morphism::to_word_automaton`]
+    /// is this port's one caller (mirroring `Morphism.java:88`'s `promotion.fa.setCanonized(true)`),
+    /// but the setter is `pub` rather than `pub(crate)` since a future unit outside
+    /// `wr-core` (or a test) may need the same "never auto-canonicalize this automaton"
+    /// guarantee for a different producer.
+    pub fn set_canonized(&mut self, canonized: bool) {
+        self.canonized = canonized;
+    }
+
+    /// Whether [`Automaton::canonize`] is currently suppressed. Java has no public
+    /// getter for `FA.canonized` (only `setCanonized`); this exists purely so tests (and
+    /// any future caller) can observe the flag without reaching into the automaton's
+    /// state some other way.
+    pub fn is_canonized(&self) -> bool {
+        self.canonized
+    }
+
+    /// `Automaton.getArity()` (`Automaton.java:498-501`): the number of tracks, or `0`
+    /// for a trivial (TRUE/FALSE) automaton regardless of `alphabet.len()` (which is
+    /// always `0` for one anyway — see [`Automaton::true_false`] — so the explicit
+    /// check below is belt-and-suspenders, matching Java's own explicit check).
+    pub fn arity(&self) -> usize {
+        if self.fa.is_true_false_automaton() {
+            0
+        } else {
+            self.alphabet.len()
+        }
     }
 
     /// `Automaton.bind` (`Automaton.java:438-444`). BOTH halves of Java's guard clause
@@ -1673,6 +1755,91 @@ mod tests {
         let mut a = two_track_b_then_a_automaton();
         a.force_canonize();
         assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // --- canonized suppression flag (U24, for `Morphism::to_word_automaton`) ---
+
+    #[test]
+    fn set_canonized_true_suppresses_canonize() {
+        // Same unreachable-state shape as `canonize_sorts_label_and_canonicalizes_fa`,
+        // but flagged `canonized` first -- `canonize()` must be a complete no-op:
+        // neither the label sort nor the state-dropping BFS may run.
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1]);
+        let mut d1 = BTreeMap::new();
+        d1.insert(0, vec![2]);
+        let mut d2 = BTreeMap::new();
+        d2.insert(0, vec![1]);
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 1,
+                q: 3,
+                alphabet_size: 4,
+                o: vec![0, 0, 1],
+                d: vec![d0, d1, d2],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["b".to_string(), "a".to_string()],
+            vec![Some(true), Some(true)],
+        );
+
+        assert!(!a.is_canonized());
+        a.set_canonized(true);
+        assert!(a.is_canonized());
+        a.canonize();
+
+        assert_eq!(
+            a.label,
+            vec!["b".to_string(), "a".to_string()],
+            "label must NOT be sorted while canonized is set"
+        );
+        assert_eq!(a.fa.q0, 1, "q0 must be untouched");
+        assert_eq!(
+            a.fa.q, 3,
+            "the unreachable state must survive -- this is the whole point of the flag"
+        );
+    }
+
+    #[test]
+    fn force_canonize_overrides_the_suppression_flag() {
+        let mut a = two_track_b_then_a_automaton();
+        a.set_canonized(true);
+        a.force_canonize();
+        assert!(
+            !a.is_canonized(),
+            "force_canonize resets the flag before canonizing, matching Java's \
+             fa.setCanonized(false); canonize();"
+        );
+        assert_eq!(
+            a.label,
+            vec!["a".to_string(), "b".to_string()],
+            "force_canonize must still relabel even though canonized was set"
+        );
+    }
+
+    #[test]
+    fn set_canonized_false_is_a_pre_existing_call_sites_default_and_has_no_effect() {
+        // Every call site before U24 never touched this flag at all -- pin that
+        // `canonize()`'s default (unflagged) behavior is completely unchanged.
+        let mut a = two_track_b_then_a_automaton();
+        assert!(!a.is_canonized());
+        a.canonize();
+        assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // --- arity ---
+
+    #[test]
+    fn arity_is_the_track_count_for_an_ordinary_automaton() {
+        let a = two_track_b_then_a_automaton();
+        assert_eq!(a.arity(), 2);
+    }
+
+    #[test]
+    fn arity_is_zero_for_a_trivial_automaton() {
+        assert_eq!(Automaton::true_false(true).arity(), 0);
+        assert_eq!(Automaton::true_false(false).arity(), 0);
     }
 
     // --- bind / removeSameInputs / reduceDimension ---

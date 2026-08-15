@@ -17,11 +17,15 @@
 pub mod alphabet;
 pub mod automaton_ops;
 pub mod automaton_output;
+pub mod convert;
 pub mod describe;
 pub mod eval_def;
 pub mod help_messages;
+pub mod image;
+pub mod join;
 pub mod macro_cmd;
 pub mod meta_commands;
+pub mod morphism;
 pub mod prover;
 pub mod prover_helper;
 pub mod quotient;

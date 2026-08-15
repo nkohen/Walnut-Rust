@@ -380,6 +380,19 @@ fn install_quiet_hook() {
     });
 }
 
+/// `Image.determineImageNumberSystemPrefix`'s inline throw (`Main/Commands/Image.java:50`).
+pub fn image_requires_unary_word_automaton(word_name: &str) -> String {
+    format!("Image requires a unary word automaton: {word_name}")
+}
+
+/// `Join.joinCommand`'s inline throw (`Main/Commands/Join.java:53`).
+pub fn join_input_count_mismatch(automaton_name: &str) -> String {
+    format!(
+        "Number of inputs of word automata {automaton_name} does not match number of \
+         inputs specified."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +545,14 @@ mod tests {
         );
         assert_eq!(no_strategy_found("XYZ"), "No strategy found for: XYZ");
         assert_eq!(number_format_exception("x"), "For input string: \"x\"");
+        assert_eq!(
+            image_requires_unary_word_automaton("multi"),
+            "Image requires a unary word automaton: multi"
+        );
+        assert_eq!(
+            join_input_count_mismatch("unaryAuto"),
+            "Number of inputs of word automata unaryAuto does not match number of inputs \
+             specified."
+        );
     }
 }

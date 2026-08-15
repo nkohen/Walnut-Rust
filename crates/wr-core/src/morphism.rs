@@ -25,33 +25,50 @@
 //! [`Morphism::make_inter_predicate`]'s generated predicate text, both matching
 //! Java's `TreeMap` (sorted-by-key) order exactly via `BTreeMap`'s same guarantee.
 //!
-//! # Not ported: `toWordAutomaton` (`:78-107`) and its private helpers
+//! # `toWordAutomaton` (`:78-107`) and its private helpers — ported in U24
 //!
-//! `determineTransitions`/`determineMaxEntry`/`determineMaxImageLength` (`:95-132`)
-//! exist solely to serve `toWordAutomaton`, which promotes a `Morphism` into a
-//! `WordAutomaton`-shaped `Automaton` (one state per domain letter, one transition
-//! per image position). Per this unit's explicit scope (it is "WordAutomaton-from-
-//! morphism functionality," grouped with `buildTransitionsFromMorphism`/`convertNS`
-//! as later, `Automaton`-consuming work — see `logicalops.rs`'s "Not ported"
-//! section for the sibling helpers), it is deferred to a follow-on unit rather than
-//! built here.
+//! [`Morphism::to_word_automaton`] plus its private helpers
+//! [`determine_transitions`]/[`determine_max_entry`]/[`determine_max_image_length`]
+//! (`determineTransitions`/`determineMaxEntry`/`determineMaxImageLength`, `:95-132`)
+//! promote a `Morphism` into a `WordAutomaton`-shaped [`crate::automaton::Automaton`]
+//! (one state per domain letter, one transition per image position) — the primitive
+//! `wr-cli`'s U24 `promote` command needs. Deferred by this file's original author
+//! (grouped with `buildTransitionsFromMorphism`/`convertNS` as later,
+//! `Automaton`-consuming work — see `logicalops.rs`'s "Not ported" section for the
+//! sibling helpers), landed here once `promote` was the unit that actually needed it.
 //!
-//! **Note for that unit — one genuinely missing primitive.** Most of what
-//! `toWordAutomaton` needs already exists in this crate as of this unit:
-//! `Automaton::richAlphabet` (`automaton.rs`), `Fa::set_fields` (`fa.rs`), and
-//! `NumberSystem::MSD_UNDERSCORE`/its `msd_<k>` constructor (`numsys.rs`). But
-//! `Morphism.java:88` calls `promotion.fa.setCanonized(true)`, and [`crate::fa::Fa`]
-//! has **no `canonized` field at all** — the memo was cut in U0/U1 (see
-//! [`crate::fa::Fa::canonicalize`]'s doc). That is not a bookkeeping detail here:
-//! Java sets the flag precisely so the promoted automaton is never canonicalized
-//! ("this word automaton is purely symbolic in input and we want it in the exact
-//! order given", `:87`), and `canonizeInternal` *drops states BFS cannot reach from
-//! `q0`*. A promoted morphism's states are its domain letters, most of which are
-//! typically unreachable, so letting canonicalization run would change the
-//! automaton's state COUNT and its state↔letter correspondence — a language-level
-//! difference, not a renumbering. The follow-on unit must therefore either add a
-//! `canonized` flag to `Fa` or otherwise guarantee the promoted automaton is never
-//! auto-canonicalized; it cannot simply call `set_fields` and move on.
+//! **The one genuinely missing primitive this unit had to add: `Fa`/`Automaton`
+//! carried no `canonized` memo at all.** `Morphism.java:88` calls
+//! `promotion.fa.setCanonized(true)` specifically so the promoted automaton is never
+//! canonicalized ("this word automaton is purely symbolic in input and we want it in
+//! the exact order given", `:87`) — `canonizeInternal` *drops states BFS cannot reach
+//! from `q0`*, and a promoted morphism's states are its domain letters, most of which
+//! are typically unreachable, so letting canonicalization run would change the
+//! automaton's state COUNT and its state↔letter correspondence, a language-level
+//! difference, not a renumbering. **Resolved by adding the flag to
+//! [`crate::automaton::Automaton`], not to [`crate::fa::Fa`]** — see
+//! [`crate::automaton::Automaton::canonized`]'s doc comment for the full argument
+//! (in short: every production caller of [`crate::fa::Fa::canonicalize`] already goes
+//! through [`crate::automaton::Automaton::canonize`]/`force_canonize`, so gating there
+//! is behaviorally identical to gating on `Fa` while confining the new field to two
+//! existing struct literals instead of the ~230 `Fa { … }` literals across this
+//! workspace that adding it to `Fa` itself would break).
+//!
+//! **A second genuine bug found while porting this method, logged as WB-036 (see
+//! `docs/WALNUT-BUGS.md`).** Java's `toWordAutomaton` builds `Q = maxEntry + 1`
+//! states but a transition table (`newD`) with only `mapping.size()` entries, indexed
+//! by DOMAIN-LETTER SORT POSITION, not by the letter's own value — with no check that
+//! the two agree. Whenever the morphism's domain doesn't cover every value up to
+//! `maxEntry` (e.g. `0->05 1->10`: two domain letters, but images reference value `5`,
+//! so `Q = 6` while the transition list has only 2 entries), any later access to a
+//! state past `mapping.size() - 1` — confirmed to include `AutomatonWriter`'s own
+//! per-state loop, i.e. `promote`'s ordinary output path — throws Java's
+//! `IndexOutOfBoundsException`. [`Morphism::to_word_automaton`] reproduces this as
+//! [`MorphismError::DomainDoesNotCoverImageRange`], checked at construction time
+//! (before ever handing back a malformed automaton whose `Fa::d.len() != Fa::q`,
+//! an invariant essentially every other algorithm in this crate assumes) rather than
+//! deferred to wherever Java's crash happens to surface — see WB-036 for the full
+//! empirical repro against real `walnut-java`.
 //!
 //! # `escapedInt` / `write`
 //!
@@ -85,12 +102,13 @@
 //! un-self-checking method is a normal "caller's contract" shape, not a reachable
 //! defect. Ported verbatim (no defensive check added here, matching Java).
 //!
-//! No genuine Walnut bug (wrong output / crash on a plausible, contract-respecting
-//! input) was found while porting this file — unlike some `Automata/` files, there
-//! is no unguarded `mapping.get(letter)`-style lookup on a letter outside the
-//! morphism's domain anywhere in `Morphism.java`; the only two places that read
-//! `mapping` (`write`, `makeInterPredicate`) both iterate `entrySet()` rather than
-//! index into it by an externally supplied letter.
+//! No genuine Walnut bug was found in the original (`from_mapping`/`write`/
+//! `require_positive_uniform_length`/`make_inter_predicate`) portion of this file —
+//! unlike some `Automata/` files, there is no unguarded `mapping.get(letter)`-style
+//! lookup on a letter outside the morphism's domain anywhere in those methods; the
+//! two that read `mapping` (`write`, `makeInterPredicate`) both iterate `entrySet()`
+//! rather than index into it by an externally supplied letter. `toWordAutomaton`
+//! (ported later, U24) is different — see WB-036 above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -100,7 +118,8 @@ use std::path::Path;
 
 /// `WalnutException.morphismNotUniform()` / the inline `WalnutException` at
 /// `Morphism.java:193` — both thrown (as unchecked exceptions) by
-/// `requirePositiveUniformLength` (`:188-195`).
+/// `requirePositiveUniformLength` (`:188-195`) — plus, as of U24, the two failure
+/// modes of [`Morphism::to_word_automaton`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MorphismError {
     /// `length < 0` (non-uniform morphism). `WalnutException.morphismNotUniform()`
@@ -109,6 +128,17 @@ pub enum MorphismError {
     /// `length == 0` (uniform, but every image is empty). The inline
     /// `WalnutException` at `Morphism.java:193`.
     NotPositiveUniform,
+    /// `determineMaxEntry` (`Morphism.java:118-128`): some image contains a negative
+    /// value. `WalnutException.morphismNegative()` (`WalnutException.java:83`).
+    NegativeValue,
+    /// WB-036 (`docs/WALNUT-BUGS.md`): the morphism's domain doesn't cover every
+    /// value `0..=maxEntry` referenced in some image, so `toWordAutomaton` would
+    /// build an `FA` with more states than transition-table entries — a shape real
+    /// Java doesn't reject either, but that reliably throws
+    /// `IndexOutOfBoundsException` the moment anything (in practice,
+    /// `AutomatonWriter`'s own per-state loop) touches one of the missing states.
+    /// See the module docs and WB-036 for the full derivation and empirical repro.
+    DomainDoesNotCoverImageRange,
 }
 
 impl fmt::Display for MorphismError {
@@ -123,6 +153,16 @@ impl fmt::Display for MorphismError {
                     "A morphism applied to a word automaton must have positive uniform length."
                 )
             }
+            // Verbatim `WalnutException.morphismNegative()`.
+            MorphismError::NegativeValue => {
+                write!(f, "Cannot promote a morphism with negative values.")
+            }
+            MorphismError::DomainDoesNotCoverImageRange => write!(
+                f,
+                "morphism domain does not cover every value referenced in an image \
+                 (WB-036: real Walnut throws IndexOutOfBoundsException for this shape \
+                 once the promoted automaton is written)"
+            ),
         }
     }
 }
@@ -213,6 +253,81 @@ impl Morphism {
         out.flush()
     }
 
+    /// `toWordAutomaton()` (`:78-92`) — promotes this morphism into a
+    /// `WordAutomaton`-shaped [`crate::automaton::Automaton`]: one state per domain
+    /// letter (state `q`'s output is `q` itself), one transition per image position
+    /// (`d[q][position] = image[q][position]`), over a single track whose alphabet is
+    /// `0..maxImageLength` (the base of the "number system" this promoted automaton
+    /// is read in — see module docs' NS section below). See the module docs for the
+    /// `canonized` flag this sets (so the caller's typically-mostly-unreachable
+    /// domain-letter states survive being written out) and WB-036 (the domain/image
+    /// mismatch this validates against, up front, before ever returning a malformed
+    /// automaton).
+    ///
+    /// Unlike [`Morphism::require_positive_uniform_length`]/
+    /// [`Morphism::make_inter_predicate`]'s caller (`Image.image`, which enforces
+    /// uniformity first), `toWordAutomaton`'s one real caller — `Prover.promoteCommand`
+    /// — never calls `requirePositiveUniformLength` first, and this method has no
+    /// uniformity requirement of its own either: `maxImageLength` is simply the
+    /// LONGEST image among all letters, and a shorter letter's image just leaves that
+    /// letter's state without a transition on the higher digit positions (a dead run,
+    /// not an error). Ported faithfully — no uniformity check added here.
+    ///
+    /// # NS: `msd_<maxImageLength>`, represented as `msd[0] = Some(true)`
+    ///
+    /// Java constructs a real `NumberSystem(MSD_UNDERSCORE + maxImageLength)` and adds
+    /// it to `promotion.getNS()` (`:91`). This crate's `Automaton` doesn't carry a
+    /// `NumberSystem` object at all (`automaton.rs`'s own module docs: "deliberately
+    /// NOT full Java parity" — see also `wr-io`'s `writer.rs`, which reconstructs the
+    /// same canonical name from `msd`+`alphabet.len()` for the identical reason), only
+    /// the msd/lsd direction (`Automaton::msd`) and the custom-base restriction
+    /// (`Automaton::all_reps`, unused here — `msd_<k>` is not a custom base). A plain
+    /// `msd_<k>` `NumberSystem`'s alphabet is exactly `intRangeList(k)`
+    /// (`NumberSystem.java`'s standard-base constructor), which is precisely what this
+    /// method's own `alphabet` local already is — so `msd = vec![Some(true)]` captures
+    /// every fact this crate's `Automaton` can represent about that `NumberSystem`,
+    /// with nothing lost that any ported caller reads.
+    pub fn to_word_automaton(&self) -> Result<crate::automaton::Automaton, MorphismError> {
+        use crate::automaton::Automaton;
+        use crate::fa::Fa;
+
+        let max_image_length = determine_max_image_length(&self.mapping);
+        let max_entry = determine_max_entry(&self.mapping)?;
+        let new_d = determine_transitions(&self.mapping);
+
+        // WB-036: `newD.len() == self.mapping.len()`, indexed by domain-letter SORT
+        // POSITION, not value; `Q = max_entry + 1` states are about to be declared.
+        // If the domain doesn't cover every value up to `max_entry`, some state in
+        // `mapping.len()..Q` has no transition-table entry at all -- Java doesn't
+        // check this either, it just crashes the first time anything touches that
+        // state's row. Checked here, before ever building the malformed `Fa`, whose
+        // `d.len() != q` would otherwise be a live landmine for every other algorithm
+        // in this crate (all of which assume that invariant).
+        let q = max_entry as usize + 1;
+        if new_d.len() < q {
+            return Err(MorphismError::DomainDoesNotCoverImageRange);
+        }
+
+        let mut fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 0,
+            alphabet_size: max_image_length,
+            o: Vec::new(),
+            d: Vec::new(),
+        };
+        // `promotion.getFa().setFields(maxEntry + 1, new IntArrayList(
+        //  UtilityMethods.intRangeList(maxEntry + 1)), newD);` (`:84-85`) -- the
+        // output vector is `0, 1, ..., maxEntry`, i.e. state `q`'s output IS `q`.
+        fa.set_fields(q, (0..=max_entry).collect(), new_d);
+
+        let alphabet = vec![(0..max_image_length as i32).collect::<Vec<i32>>()];
+        let mut promotion = Automaton::new(fa, alphabet, Vec::new(), vec![Some(true)]);
+        // `promotion.fa.setCanonized(true);` (`:87-88`) -- see module docs.
+        promotion.set_canonized(true);
+        Ok(promotion)
+    }
+
     /// `requirePositiveUniformLength()` (`:188-195`) — see module docs for why
     /// this returns `Result` rather than panicking.
     pub fn require_positive_uniform_length(&self) -> Result<(), MorphismError> {
@@ -272,6 +387,54 @@ fn escaped_int(y: i32) -> String {
     }
 }
 
+/// `determineTransitions(Map<Integer, IntList>)` (`:95-107`): one entry per domain
+/// letter, IN `mapping`'s SORTED-KEY ORDER (i.e. list index `k` is the `k`-th
+/// smallest domain letter, not the letter's own value — see [`Morphism::to_word_automaton`]'s
+/// WB-036 doc note on why that distinction matters), mapping each image POSITION to
+/// a singleton destination-state list holding that position's value.
+fn determine_transitions(mapping: &BTreeMap<i32, Vec<i32>>) -> Vec<BTreeMap<i32, Vec<usize>>> {
+    mapping
+        .values()
+        .map(|image| {
+            let mut xmap = BTreeMap::new();
+            for (i, &y) in image.iter().enumerate() {
+                // `y >= 0` is guaranteed here: `to_word_automaton` calls
+                // `determine_max_entry` (which rejects any negative value) before
+                // this function, matching Java's own `maxEntry`-before-`newD`
+                // statement order in `toWordAutomaton` (`:82-83`).
+                xmap.insert(i as i32, vec![y as usize]);
+            }
+            xmap
+        })
+        .collect()
+}
+
+/// `determineMaxEntry(Map<Integer, IntList>)` (`:118-128`): the largest value
+/// appearing in any image, or `0` for a mapping whose images are all empty (Java's
+/// `maxEntry` starts at `0` and only ever increases). Errors on the FIRST negative
+/// value found, in `mapping`'s (sorted-key, then within-image) iteration order —
+/// matching Java's early `throw` inside the same nested loop that also tracks the
+/// max, not a separate up-front scan.
+fn determine_max_entry(mapping: &BTreeMap<i32, Vec<i32>>) -> Result<i32, MorphismError> {
+    let mut max_entry = 0;
+    for image in mapping.values() {
+        for &y in image {
+            if y < 0 {
+                return Err(MorphismError::NegativeValue);
+            } else if y > max_entry {
+                max_entry = y;
+            }
+        }
+    }
+    Ok(max_entry)
+}
+
+/// `determineMaxImageLength(Map<Integer, IntList>)` (`:130-140`): the length of the
+/// longest image among all domain letters, or `0` for an empty `mapping`.
+fn determine_max_image_length(mapping: &BTreeMap<i32, Vec<i32>>) -> usize {
+    mapping.values().map(Vec::len).max().unwrap_or(0)
+}
+
 /// `determineUniformLength(Map<Integer, IntList>)` (`:143-155`). `-1` if any two
 /// entries' images differ in length; the length shared by every entry otherwise
 /// (including `0` for an empty `mapping` — Java's `firstElement` flag never flips,
@@ -319,6 +482,144 @@ mod tests {
         assert_eq!(h.mapping.get(&0), Some(&vec![0, 1]));
         assert_eq!(h.mapping.get(&1), Some(&vec![1, 0]));
         assert_eq!(h.range, BTreeSet::from([0, 1]));
+    }
+
+    // -- MorphismTest.testGamMorphism / to_word_automaton (U24) --------------------
+
+    #[test]
+    fn to_word_automaton_gam_matches_real_walnut_transition_table() {
+        // Direct port of `MorphismTest.testGamMorphism`: gam = "0->01 1->21 2->03 3->23",
+        // asserted against `P.getFa().getT().getNfaD().toString()`'s real value,
+        // `"[{0=>[0], 1=>[1]}, {0=>[2], 1=>[1]}, {0=>[0], 1=>[3]}, {0=>[2], 1=>[3]}]"`.
+        let h = Morphism::from_mapping(map(&[
+            (0, &[0, 1]),
+            (1, &[2, 1]),
+            (2, &[0, 3]),
+            (3, &[2, 3]),
+        ]));
+        assert_eq!(h.length, 2);
+        let p = h.to_word_automaton().unwrap();
+
+        assert_eq!(p.fa.q, 4);
+        assert_eq!(p.fa.alphabet_size, 2);
+        assert_eq!(p.alphabet, vec![vec![0, 1]]);
+        assert_eq!(p.msd, vec![Some(true)]);
+        assert!(p.is_canonized());
+        // State q's output IS q.
+        assert_eq!(p.fa.o, vec![0, 1, 2, 3]);
+
+        let expected: Vec<BTreeMap<i32, Vec<usize>>> = vec![
+            BTreeMap::from([(0, vec![0]), (1, vec![1])]),
+            BTreeMap::from([(0, vec![2]), (1, vec![1])]),
+            BTreeMap::from([(0, vec![0]), (1, vec![3])]),
+            BTreeMap::from([(0, vec![2]), (1, vec![3])]),
+        ];
+        assert_eq!(p.fa.d, expected);
+    }
+
+    #[test]
+    fn to_word_automaton_thue_morse_shape() {
+        // The Thue-Morse morphism, end-to-end through `to_word_automaton`: both the
+        // domain and the range are exactly `{0, 1}`, the simplest well-formed case.
+        let h = Morphism::from_mapping(map(&[(0, &[0, 1]), (1, &[1, 0])]));
+        let p = h.to_word_automaton().unwrap();
+
+        assert_eq!(p.fa.q, 2);
+        assert_eq!(p.fa.alphabet_size, 2);
+        assert_eq!(p.fa.o, vec![0, 1]);
+        let expected: Vec<BTreeMap<i32, Vec<usize>>> = vec![
+            BTreeMap::from([(0, vec![0]), (1, vec![1])]),
+            BTreeMap::from([(0, vec![1]), (1, vec![0])]),
+        ];
+        assert_eq!(p.fa.d, expected);
+    }
+
+    #[test]
+    fn to_word_automaton_does_not_require_uniform_length() {
+        // Unlike `Image.image` (which calls `requirePositiveUniformLength` first),
+        // `Prover.promoteCommand` never does -- ported faithfully, no uniformity
+        // check added here. `0->0` (image length 1), `1->10` (image length 2).
+        let h = Morphism::from_mapping(map(&[(0, &[0]), (1, &[1, 0])]));
+        assert_eq!(h.length, -1, "non-uniform");
+        let p = h.to_word_automaton().unwrap();
+
+        assert_eq!(p.fa.alphabet_size, 2, "max image length");
+        assert_eq!(p.fa.q, 2, "max_entry(=1) + 1");
+        // Letter 0's image is just `[0]`: only position 0 has a transition.
+        assert_eq!(p.fa.d[0].len(), 1);
+        assert!(p.fa.d[0].contains_key(&0));
+        assert!(!p.fa.d[0].contains_key(&1));
+    }
+
+    #[test]
+    fn to_word_automaton_preserves_a_state_unreachable_from_q0_via_the_canonized_flag() {
+        // 0->1, 1->0 (a 2-cycle reachable from q0=0), 2->2 (a state nothing but
+        // ITSELF ever transitions into, so unreachable from q0). This is the whole
+        // reason `Morphism.java:88` sets `setCanonized(true)`: without it, an
+        // ordinary `canonize()` call (which `AutomatonWriter`'s real `.txt`/`.gv`
+        // paths always make) would silently drop state 2 and its domain-letter
+        // correspondence.
+        let h = Morphism::from_mapping(map(&[(0, &[1]), (1, &[0]), (2, &[2])]));
+        let mut p = h.to_word_automaton().unwrap();
+        assert_eq!(p.fa.q, 3);
+        assert!(p.is_canonized());
+
+        p.canonize();
+        assert_eq!(
+            p.fa.q, 3,
+            "the canonized flag must survive an ordinary canonize() call"
+        );
+    }
+
+    #[test]
+    fn to_word_automaton_state_would_genuinely_be_dropped_without_the_flag() {
+        // Sanity companion to the test above -- confirms state 2 really is
+        // unreachable (so canonicalize's pruning is legitimate) by explicitly
+        // clearing the flag before canonizing.
+        let h = Morphism::from_mapping(map(&[(0, &[1]), (1, &[0]), (2, &[2])]));
+        let mut p = h.to_word_automaton().unwrap();
+        p.set_canonized(false);
+        p.canonize();
+        assert_eq!(p.fa.q, 2, "state 2 is genuinely unreachable from q0=0");
+    }
+
+    #[test]
+    fn to_word_automaton_rejects_negative_values() {
+        let h = Morphism::from_mapping(map(&[(0, &[0, -1]), (1, &[1, 0])]));
+        let err = h.to_word_automaton().unwrap_err();
+        assert_eq!(err, MorphismError::NegativeValue);
+        assert_eq!(
+            err.to_string(),
+            "Cannot promote a morphism with negative values."
+        );
+    }
+
+    #[test]
+    fn to_word_automaton_wb036_domain_gap_is_rejected_up_front() {
+        // "0->05 1->10": two domain letters {0,1}, but the image of `0` references
+        // value 5, which is not itself a domain letter -- Q = 6 but the transition
+        // table has only 2 entries. Real Java doesn't reject this either; it
+        // silently builds the malformed `FA` and crashes with
+        // `IndexOutOfBoundsException` the first time anything touches states
+        // 2..=5 -- confirmed empirically against real `walnut-java`'s `promote`
+        // command. See WB-036 in `docs/WALNUT-BUGS.md`.
+        let h = Morphism::from_mapping(map(&[(0, &[0, 5]), (1, &[1, 0])]));
+        let err = h.to_word_automaton().unwrap_err();
+        assert_eq!(err, MorphismError::DomainDoesNotCoverImageRange);
+    }
+
+    #[test]
+    fn to_word_automaton_on_an_empty_mapping_is_the_domain_gap_error() {
+        // Totality edge case beyond what real Java can reach (`parseMorphism` rejects
+        // an empty mapping outright, `parse_methods.rs`'s
+        // `morphism_no_valid_mappings_errors`) -- `from_mapping` makes the empty map
+        // representable (see its own doc comment), so this pins what
+        // `to_word_automaton` does with it rather than leaving it undefined:
+        // `max_entry = 0` (the vacuous case), `Q = 1`, but zero transition-table
+        // entries -- the same WB-036 shape, degenerate case included.
+        let h = Morphism::from_mapping(BTreeMap::new());
+        let err = h.to_word_automaton().unwrap_err();
+        assert_eq!(err, MorphismError::DomainDoesNotCoverImageRange);
     }
 
     // -- MorphismTest.testImageLength ---------------------------------------------
