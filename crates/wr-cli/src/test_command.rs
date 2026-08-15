@@ -7,7 +7,7 @@
 //!
 //! # `ProductBFS`, and what `wr_core::search` already did for this unit
 //!
-//! Java's `findNextAcceptedWord` (`:71-95`) drives `Automata.Search.ProductBFS`'s
+//! Java's `findNextAcceptedWord` (`:71-97`) drives `Automata.Search.ProductBFS`'s
 //! generic `int[]`-tuple BFS ([`wr_core::search::shortest_witness_word_int`], ported by
 //! U19) over a 3-field product state `[M-state, min(length read, |previous|+1),
 //! lexicographic-comparison-with-previous]`. U19 also added
@@ -28,15 +28,52 @@
 //! reject a component with more than one destination per `(state, symbol)` as a hard
 //! [`wr_core::search::SearchError`] — a deliberate strengthening *this port itself*
 //! introduced (see that module's docs), not something Java's `ProductBFS`/`Test` do.
-//! `Test.findNextAcceptedWord`'s step closure (`:86`) just takes
+//! `Test.findNextAcceptedWord`'s step closure (`:90`) just takes
 //! `destinations.getInt(0)` with no determinism check at all, trusting its caller
 //! (`Test.testCommand`, via `AutomatonDFA.readAutomatonDFAFromFile`) to have already
 //! guaranteed a DFA. [`find_next_accepted_word`] below is a direct, mechanical port of
 //! that literal indexing — it does not add the stricter guard, matching
 //! `findAccepted`'s own public signature (`Automaton M`, not `AutomatonDFA M` —
-//! `TestTest.java` calls it directly with plain `Automaton`s built by hand). The real
-//! CLI path ([`test_command`]) still gets the determinism guarantee, the same way Java's
-//! does: by loading through [`wr_core::automaton::AutomatonDFA::from`].
+//! `TestTest.java` calls it directly with plain `Automaton`s built by hand).
+//!
+//! One consequence of keeping [`find_accepted`] `pub` and plain-`Automaton`-taking has
+//! to be paid for explicitly, though: a hand-built **nondeterministic FAO** (a word
+//! automaton with an output `> 1`) would reach `AutomatonDFA::require_dfa_storage`'s
+//! `panic!("NFAOs are not supported..")` through the `removeLeadingZeros` pre-pass,
+//! where Java throws a catchable `WalnutException.nonDeterministicO()`. A `pub` CLI API
+//! that aborts the process where Java cleanly errors is the wrong shape for a crate
+//! boundary, so [`find_accepted`] screens for exactly that case up front and returns
+//! [`TestError::NonDeterministicO`] (Java's own message) instead. The `wr-core` panic
+//! itself is left alone — it has other callers and is not this unit's to change.
+//!
+//! # What the CLI path actually guarantees about determinism (and WB-022)
+//!
+//! Java's `Test.testCommand` gets its DFA guarantee from
+//! `AutomatonDFA.readAutomatonDFAFromFile`, whose `AutomatonReader.readAutomaton` has an
+//! `isFAO()` check that **rejects** a genuinely nondeterministic FAO file outright with
+//! `WalnutException.nonDeterministicO()`, and determinizes only the plain-NFA case.
+//! [`test_command_to`] below does *not* reproduce that: `wr-io`'s reader (pre-existing
+//! code, not this unit's) has no `isFAO()` guard and silently determinizes **any**
+//! nondeterministic input, NFAO included, so a file Java would reject is instead
+//! accepted here and enumerated as its determinized boolean projection. That gap is
+//! already logged and deliberately deferred as **WB-022** in `docs/WALNUT-BUGS.md` (it
+//! is a Rust-port scope gap, not a Java bug); this module neither widens nor closes it,
+//! and the paragraph above is what stands in for it on the direct-Rust-caller path.
+//!
+//! # Resource cap: the handoff `wr_core::search`'s docs make to this unit
+//!
+//! `wr_core::search`'s module docs state that neither search function is resource-capped
+//! (matching Java) and that "whoever wires U25 to real user-supplied automata is
+//! therefore responsible for imposing the cap at that layer". [`test_command_to`] is
+//! that layer: `needed` comes straight from user text (`Prover.java`'s `\d+` capture
+//! group), so an unguarded `test foo 2147483647` would ask for a
+//! `Vec::with_capacity(i32::MAX)` — a ~51 GB allocation, which in Rust aborts rather
+//! than throwing Java's catchable `OutOfMemoryError`. [`MAX_NEEDED`] is that cap: a
+//! **deliberate, port-specific deviation** from Java's unbounded `new
+//! ArrayList<>(needed)`, rejecting absurd counts with a clean [`TestError`] instead.
+//! It bounds the allocation and the outer loop's iteration count; it does *not* bound
+//! any single [`find_next_accepted_word`] call, whose BFS is `O(Q · |Σ| · |previous|)`
+//! per invocation and inherits `ProductBFS`'s own lack of a budget.
 
 use std::io::{self, Write};
 
@@ -58,8 +95,18 @@ pub enum TestError {
     /// Propagated from `Session`'s library file resolution (`AutomatonDFA(String
     /// address)` -> `AutomatonReader.readAutomaton`).
     Read(PredicateEnvError),
-    /// Propagated from `AutomatonLogicalOps.removeLeadingZeros` (`Test.java:41-42`).
+    /// Propagated from `AutomatonLogicalOps.removeLeadingZeros` (`Test.java:43`).
     RemoveLeadingZeros(RemoveLeadingZerosError),
+    /// `WalnutException.nonDeterministicO()` — a nondeterministic FAO handed to
+    /// [`find_accepted`] directly. See this module's docs: Java throws this (catchable)
+    /// from the same `removeLeadingZeros` pre-pass where `wr-core` would instead
+    /// `panic!`, so this variant is the guard that keeps a `pub` API from aborting the
+    /// process. Unreachable through [`test_command_to`] (see WB-022).
+    NonDeterministicO,
+    /// **Port-specific**, no Java analogue: `needed` exceeds [`MAX_NEEDED`]. See this
+    /// module's "Resource cap" docs for why this deviation from Java's unbounded `new
+    /// ArrayList<>(needed)` is deliberate.
+    NeededTooLarge { needed: i32 },
     /// A real I/O failure while writing the command's console output. See
     /// `crate::automaton_output`'s module docs on why this crate propagates write
     /// failures rather than swallowing them the way Java's `System.out.println` does.
@@ -75,6 +122,14 @@ impl std::fmt::Display for TestError {
             ),
             TestError::Read(e) => write!(f, "{e}"),
             TestError::RemoveLeadingZeros(e) => write!(f, "{e}"),
+            TestError::NonDeterministicO => {
+                write!(f, "{}", crate::walnut_exception::non_deterministic_o())
+            }
+            TestError::NeededTooLarge { needed } => write!(
+                f,
+                "The test command refuses to enumerate {needed} inputs; \
+                 the limit is {MAX_NEEDED}."
+            ),
             TestError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -105,9 +160,13 @@ impl From<io::Error> for TestError {
 /// Reads `testName` from the Automata Library (`AutomatonDFA.readAutomatonDFAFromFile`),
 /// prints the first `needed` shortlex-smallest accepted inputs (or every accepted input,
 /// with a shortfall message, if fewer than `needed` exist), and returns whether at least
-/// `needed` inputs were found. Writes to the real process stdout; see
-/// [`test_command_to`] for the injectable-sink form the CLI dispatch layer and this
-/// module's own tests use.
+/// `needed` inputs were found.
+///
+/// **Trap:** this writes to the real process stdout, so it escapes any output-capturing
+/// harness. Nothing in this crate calls it — `crate::prover`'s `test` arm goes through
+/// [`test_command_to`] with the `Prover`'s own sink, and so should any future caller;
+/// this form exists only to keep `Test.testCommand`'s zero-argument-sink signature
+/// traceable.
 pub fn test_command(session: &Session, test_name: &str, needed: i32) -> Result<bool, TestError> {
     test_command_to(session, test_name, needed, &mut io::stdout())
 }
@@ -125,9 +184,13 @@ pub fn test_command_to(
         .paths()
         .read_file_for_automata_library(&format!("{test_name}{}", crate::prover::TXT_EXTENSION));
     let automaton = session.libraries().read_library_automaton(&address)?;
-    let dfa = AutomatonDFA::from(automaton);
+    // `AutomatonDFA` is consumed back into its `Automaton` here only because
+    // `find_accepted` mutates its argument's `label` in place, matching Java (see its
+    // doc). The determinism the wrapper asserted still holds — `randomLabel` touches
+    // nothing but the track labels.
+    let mut m = AutomatonDFA::from(automaton).into_automaton();
 
-    let accepted = find_accepted(dfa.automaton(), needed)?;
+    let accepted = find_accepted(&mut m, needed)?;
 
     // `if (accepted.size() < needed) { System.out.println(...); }` (`:25-27`).
     if (accepted.len() as i64) < needed as i64 {
@@ -143,22 +206,52 @@ pub fn test_command_to(
     Ok(accepted.len() as i64 >= needed as i64)
 }
 
+/// The largest `needed` [`find_accepted`] will accept — see this module's "Resource cap"
+/// docs. One million is far past any plausible manual-inspection use of `test` (Java's
+/// own `TestTest`/`ProverHelperTest` cases ask for 10 at most) while still leaving the
+/// `Vec::with_capacity` below a few megabytes rather than tens of gigabytes.
+pub const MAX_NEEDED: i32 = 1_000_000;
+
 /// `Test.findAccepted(Automaton M, int needed)` (`:34-59`) — public, like Java's, since
 /// `TestTest.java` (and this module's own tests) call it directly with hand-built
 /// [`Automaton`]s, not only through [`test_command`]'s file-loading path.
-pub fn find_accepted(a: &Automaton, needed: i32) -> Result<Vec<String>, TestError> {
+///
+/// Takes `&mut Automaton` rather than `&Automaton` because Java's `M.randomLabel()`
+/// (`:42`) mutates the **caller's** object — only the `M = removeLeadingZeros(M, ..)`
+/// rebinding on the next line is local. A `&Automaton` + internal clone would silently
+/// diverge from that, so the labelling is applied in place here too. (Java's own only
+/// production caller, `testCommand`, uses a local variable and cannot observe it; a
+/// direct Rust caller can, exactly as a direct Java caller can.)
+pub fn find_accepted(a: &mut Automaton, needed: i32) -> Result<Vec<String>, TestError> {
     if needed <= 0 {
         return Ok(Vec::new());
+    }
+    // Port-specific, see [`MAX_NEEDED`]. Placed after the `needed <= 0` short-circuit so
+    // the ordering of Java's own early return is untouched.
+    if needed > MAX_NEEDED {
+        return Err(TestError::NeededTooLarge { needed });
     }
     let needed = needed as usize;
 
     // "We do not want to count multiple representations of the same value as distinct
     // accepted values. This preserves the existing behavior that skips representations
-    // beginning with 0 (or [0,0], etc., for higher-arity numeric inputs)." (`:39-42`).
-    let mut m = a.clone();
-    m.random_label();
-    let labels = m.label.clone();
-    let m = remove_leading_zeros(&m, &labels)?;
+    // beginning with 0 (or [0,0], etc., for higher-arity numeric inputs)." (`:39-41`).
+    a.random_label();
+    let labels = a.label.clone();
+    // The `pub`-API panic guard described in this module's docs: `removeLeadingZeros`
+    // folds its per-track constraints into `and(A, M)`, which routes through
+    // `AutomatonDFA::from` -> `require_dfa_storage`, which `panic!`s (rather than
+    // erroring) on a nondeterministic FAO. Mirrors that function's own precondition
+    // exactly, including its `isTRUE_FALSE_AUTOMATON` short-circuit; skipped when the
+    // label list is empty, since `removeLeadingZeros` then returns before the `and`.
+    if !labels.is_empty()
+        && !a.fa.is_true_false_automaton()
+        && !a.fa.is_deterministic()
+        && a.is_fao()
+    {
+        return Err(TestError::NonDeterministicO);
+    }
+    let m = remove_leading_zeros(a, &labels)?;
 
     let mut accepted = Vec::with_capacity(needed);
     let mut previous: Option<Vec<i32>> = None;
@@ -174,11 +267,11 @@ pub fn find_accepted(a: &Automaton, needed: i32) -> Result<Vec<String>, TestErro
     Ok(accepted)
 }
 
-/// `Test.findNextAcceptedWord(Automaton M, Word<Integer> previous)` (`:71-95`) — see this
+/// `Test.findNextAcceptedWord(Automaton M, Word<Integer> previous)` (`:71-97`) — see this
 /// module's docs for why it is a direct 3-tuple port rather than a reuse of
 /// [`wr_core::search::shortest_accepted_word`].
 ///
-/// Product state layout, verbatim from Java's doc comment (`:63-68`):
+/// Product state layout, verbatim from Java's doc comment (`:66-69`):
 /// `[0]` state of `M`; `[1]` `min(length read so far, previous.length() + 1)`; `[2]`
 /// lexicographic comparison with `previous` while the current length is
 /// `<= previous.length()`.
@@ -196,7 +289,7 @@ fn find_next_accepted_word(
         };
     }
 
-    // `int[] start = { M.fa.getQ0(), 0, 0 };` (`:78`).
+    // `int[] start = { M.fa.getQ0(), 0, 0 };` (`:79`).
     let start = [m.fa.q0 as i32, 0, 0];
     let prev_len_plus_one = previous.map_or(1, |p| p.len() as i32 + 1);
 
@@ -205,7 +298,7 @@ fn find_next_accepted_word(
         m.fa.alphabet_size,
         |state, symbol, out| {
             // `IntList destinations = M.fa.getT().getNfaStateDests(state[0], symbol); if
-            // (destinations == null || destinations.isEmpty()) return false;` (`:82-84`).
+            // (destinations == null || destinations.isEmpty()) return false;` (`:85-88`).
             // No determinism check — see this module's docs.
             let Some(dests) = m.fa.d[state[0] as usize].get(&symbol) else {
                 return false;
@@ -327,8 +420,8 @@ mod tests {
 
     #[test]
     fn find_accepted_throws_on_unmaterialized_true_automaton() {
-        let a = Automaton::true_false(true);
-        let err = find_accepted(&a, 3).unwrap_err();
+        let mut a = Automaton::true_false(true);
+        let err = find_accepted(&mut a, 3).unwrap_err();
         assert!(matches!(err, TestError::UnmaterializedTrueAutomaton));
         assert_eq!(
             err.to_string(),
@@ -338,17 +431,63 @@ mod tests {
 
     #[test]
     fn find_accepted_empty_on_false_automaton() {
-        let a = Automaton::true_false(false);
-        assert_eq!(find_accepted(&a, 3).unwrap(), Vec::<String>::new());
+        let mut a = Automaton::true_false(false);
+        assert_eq!(find_accepted(&mut a, 3).unwrap(), Vec::<String>::new());
     }
 
     #[test]
     fn find_accepted_needed_zero_or_negative_is_empty_without_touching_the_automaton() {
         // `needed <= 0` short-circuits before the TRUE automaton's TRUE_FALSE check would
         // ever run -- so this must NOT error, unlike `find_accepted(&true_automaton, 3)`.
-        let a = Automaton::true_false(true);
-        assert_eq!(find_accepted(&a, 0).unwrap(), Vec::<String>::new());
-        assert_eq!(find_accepted(&a, -5).unwrap(), Vec::<String>::new());
+        let mut a = Automaton::true_false(true);
+        assert_eq!(find_accepted(&mut a, 0).unwrap(), Vec::<String>::new());
+        assert_eq!(find_accepted(&mut a, -5).unwrap(), Vec::<String>::new());
+    }
+
+    // --- the two port-specific guards: the `pub`-API panic screen and the resource cap ---
+
+    #[test]
+    fn find_accepted_rejects_a_nondeterministic_fao_instead_of_panicking() {
+        // A word automaton (some output > 1, so `is_fao`) that is nondeterministic: state
+        // 0 goes to BOTH states on symbol 0. Feeding this through `removeLeadingZeros`'
+        // `and` would reach `AutomatonDFA::require_dfa_storage`'s
+        // `panic!("NFAOs are not supported..")`; Java throws a catchable
+        // `WalnutException.nonDeterministicO()` there, so this must be an `Err`, never an
+        // abort.
+        let mut d = vec![BTreeMap::new(), BTreeMap::new()];
+        d[0].insert(0, vec![0, 1]);
+        d[1].insert(0, vec![1]);
+        let fa = Fa {
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![0, 7],
+            d,
+            true_false: None,
+        };
+        let mut a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
+        assert!(a.is_fao() && !a.fa.is_deterministic(), "sanity");
+        let err = find_accepted(&mut a, 1).unwrap_err();
+        assert!(matches!(err, TestError::NonDeterministicO));
+        assert_eq!(err.to_string(), "NFAOs are not supported..");
+    }
+
+    #[test]
+    fn find_accepted_rejects_an_absurd_needed_rather_than_allocating_51gb() {
+        // `Vec::with_capacity(i32::MAX as usize)` is a ~51GB allocation, which Rust
+        // ABORTS (unlike Java's catchable OutOfMemoryError). See `MAX_NEEDED`.
+        let mut a = accept_everything_automaton();
+        let err = find_accepted(&mut a, i32::MAX).unwrap_err();
+        assert!(matches!(
+            err,
+            TestError::NeededTooLarge { needed: i32::MAX }
+        ));
+        assert!(err.to_string().contains("1000000"), "{err}");
+        // The boundary itself is accepted (it just runs, so only check it isn't rejected).
+        assert!(matches!(
+            find_accepted(&mut a, MAX_NEEDED + 1),
+            Err(TestError::NeededTooLarge { .. })
+        ));
     }
 
     // --- find_accepted: a real (non-trivial) automaton, both the shortfall and the
@@ -376,15 +515,48 @@ mod tests {
 
     #[test]
     fn find_accepted_stops_when_the_language_is_exhausted_rather_than_looping() {
-        let a = finite_two_word_automaton();
-        assert_eq!(find_accepted(&a, 5).unwrap(), vec!["0", "1"]);
+        let mut a = finite_two_word_automaton();
+        assert_eq!(find_accepted(&mut a, 5).unwrap(), vec!["0", "1"]);
     }
 
     #[test]
     fn find_accepted_returns_exactly_what_is_asked_for_when_enough_exists() {
-        let a = finite_two_word_automaton();
-        assert_eq!(find_accepted(&a, 1).unwrap(), vec!["0"]);
-        assert_eq!(find_accepted(&a, 2).unwrap(), vec!["0", "1"]);
+        let mut a = finite_two_word_automaton();
+        assert_eq!(find_accepted(&mut a, 1).unwrap(), vec!["0"]);
+        assert_eq!(find_accepted(&mut a, 2).unwrap(), vec!["0", "1"]);
+    }
+
+    #[test]
+    fn find_accepted_labels_the_callers_own_automaton_in_place_like_javas_random_label() {
+        // Java's `M.randomLabel()` (`:42`) mutates the caller's object; only the
+        // `removeLeadingZeros` rebinding is local. Pin that this port does the same.
+        let mut a = finite_two_word_automaton();
+        a.label = Vec::new();
+        find_accepted(&mut a, 1).unwrap();
+        assert_eq!(a.label, vec!["0".to_string()]);
+    }
+
+    /// A 1-state automaton that self-loops on its only symbol and accepts nothing. Its
+    /// reachable state space is a single state, but the search would revisit it at ever
+    /// growing lengths forever without `find_next_accepted_word`'s
+    /// `out[1] = min(old_length + 1, |previous| + 1)` length cap (`Test.java:91`), which
+    /// collapses every length past `|previous| + 1` onto one product state. So this test
+    /// is a TERMINATION test: the assertion matters far less than the fact that it
+    /// returns at all.
+    #[test]
+    fn find_accepted_terminates_on_a_self_looping_automaton_with_no_accepting_state() {
+        let mut d = vec![BTreeMap::new()];
+        d[0].insert(0, vec![0]);
+        let fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 1,
+            o: vec![0],
+            d,
+            true_false: None,
+        };
+        let mut a = Automaton::new(fa, vec![vec![0]], vec!["x".to_string()], vec![None]);
+        assert_eq!(find_accepted(&mut a, 3).unwrap(), Vec::<String>::new());
     }
 
     /// A single-track, explicit-alphabet (`msd: None`, not an arithmetic `msd_2` track)
@@ -416,10 +588,49 @@ mod tests {
         // `TestTest.testFindAcceptedRegression`'s own expected list, verbatim -- see
         // `accept_everything_automaton`'s doc comment for why a hand-built equivalent
         // reproduces it exactly without shipping the real `.txt` fixture.
-        let a = accept_everything_automaton();
+        let mut a = accept_everything_automaton();
         let expected: Vec<&str> =
             vec!["0", "1", "00", "01", "10", "11", "000", "001", "010", "011"];
-        assert_eq!(find_accepted(&a, 10).unwrap(), expected);
+        assert_eq!(find_accepted(&mut a, 10).unwrap(), expected);
+    }
+
+    // --- the `removeLeadingZeros` pre-pass (`Test.java:43`), the one part of
+    //     `findAccepted` that every `msd: None` test above leaves as a no-op ---
+
+    #[test]
+    fn find_accepted_runs_the_leading_zero_pre_pass_on_an_arithmetic_track() {
+        // `accept_everything_automaton`'s transition table exactly, but with the track
+        // declared msd (an arithmetic base-2 track) instead of an explicit alphabet. The
+        // language is still every binary string, but `removeLeadingZeros` now restricts
+        // the enumeration to one representation per VALUE: no listed word may start with
+        // 0 (`ε`, the leading-zero-free encoding of 0, is excluded separately by the
+        // search's own `state[1] != 0` non-empty requirement). Deleting the pre-pass
+        // turns this back into `accept_everything_automaton`'s `0, 1, 00, ...` list,
+        // which is what makes this the regression test for it.
+        let mut a = accept_everything_automaton();
+        a.msd = vec![Some(true)];
+        let expected: Vec<&str> = vec!["1", "10", "11", "100", "101", "110", "111", "1000"];
+        assert_eq!(find_accepted(&mut a, 8).unwrap(), expected);
+    }
+
+    #[test]
+    fn find_accepted_on_hard_inf_test_matches_javas_expected_words() {
+        // `TestTest.TestTestCommand`, ported verbatim -- the ONLY case in Java's own
+        // suite that exercises `removeLeadingZeros` through `findAccepted`, on its real
+        // 284-state `msd_2` fixture. That fixture is copied BYTE-FOR-BYTE from
+        // `walnut-java/src/test/resources/unitTests/hardInfTest.txt` (GPLv3, Walnut --
+        // see this repo's `NOTICE`) to `crates/wr-cli/tests/fixtures/hardInfTest.txt`;
+        // do not hand-edit it, or the expected words below stop being Java's.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("hardInfTest.txt");
+        let read = || {
+            AutomatonDFA::from(wr_io::reader::read_automaton_txt(&path).unwrap()).into_automaton()
+        };
+        assert_eq!(find_accepted(&mut read(), 0).unwrap(), Vec::<String>::new());
+        assert_eq!(find_accepted(&mut read(), 1).unwrap(), vec!["101"]);
+        assert_eq!(find_accepted(&mut read(), 2).unwrap(), vec!["101", "1010"]);
     }
 
     // --- find_accepted: multi-track (bracket-preserving) formatting, mirrors
@@ -441,17 +652,49 @@ mod tests {
             d,
             true_false: None,
         };
-        let a = Automaton::new(
+        let mut a = Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
             vec!["x".to_string(), "y".to_string()],
             vec![None, None],
         );
-        let accepted = find_accepted(&a, 2).unwrap();
+        let accepted = find_accepted(&mut a, 2).unwrap();
         assert_eq!(accepted.len(), 2);
         for s in &accepted {
             assert!(s.starts_with('[') && s.ends_with(']'), "{s}");
         }
+        // Java's own assertion (above) only checks the brackets, which leaves the tuple
+        // SEPARATOR unpinned -- `List.toString()` joins with ", ", and dropping the space
+        // passes every bracket-only check. These exact values are the real
+        // `walnut-java` output for this automaton.
+        assert_eq!(accepted, vec!["[0, 0]", "[1, 0]"]);
+        assert_eq!(
+            find_accepted(&mut a, 4).unwrap(),
+            vec!["[0, 0]", "[1, 0]", "[0, 1]", "[1, 1]"]
+        );
+    }
+
+    #[test]
+    fn find_accepted_brackets_single_arity_digits_outside_zero_through_nine() {
+        // `formatAcceptedWord`'s guard is `singleArity && 0 <= d && d <= 9` (`:122`), not
+        // just `singleArity`: a single-track alphabet may legally contain negative or
+        // multi-digit values, and those keep their brackets so the output stays
+        // unambiguous (`[10]`, not a `1` followed by a `0`). With an all-0..9 alphabet
+        // the guard's two bounds are dead, which is what leaves them untested elsewhere.
+        let mut d = vec![BTreeMap::new()];
+        for sym in 0..3 {
+            d[0].insert(sym, vec![0]);
+        }
+        let fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 3,
+            o: vec![1],
+            d,
+            true_false: None,
+        };
+        let mut a = Automaton::new(fa, vec![vec![-1, 0, 10]], vec!["x".to_string()], vec![None]);
+        assert_eq!(find_accepted(&mut a, 3).unwrap(), vec!["[-1]", "0", "[10]"]);
     }
 
     // --- test_command_to: end to end through Session, mirrors

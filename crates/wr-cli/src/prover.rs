@@ -1392,6 +1392,13 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::EvalDef(_)
         | ProverError::Reg(_)
         | ProverError::Alphabet(_)
+        // `Helper` and `Test` each carry their own nested `Io` variant (a failed write to
+        // the command's output sink). Those stay NON-I/O-class, deliberately and
+        // consistently with each other: Java's `System.out.println` cannot throw
+        // `IOException` at all, so neither `ProverHelper` nor `Test` has an I/O failure
+        // mode for `readBuffer` to classify — the variants are this port's own
+        // propagate-instead-of-swallow decision (`crate::automaton_output`'s docs), and a
+        // console-write failure must not end the REPL read loop when Java's would not.
         | ProverError::Helper(_)
         | ProverError::Test(_)
         | ProverError::NumberFormat(_)
