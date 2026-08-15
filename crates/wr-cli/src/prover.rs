@@ -106,6 +106,7 @@ use crate::reg::{reg, RegError};
 use crate::session::{Session, SessionPaths, PROMPT, WALNUT_VERSION};
 use crate::test_case::TestCase;
 use crate::test_command::{test_command_to, TestError};
+use crate::transduce::TransduceCommandError;
 use crate::walnut_exception as msg;
 
 // ---------------------------------------------------------------------------
@@ -573,6 +574,7 @@ pub enum ProverError {
     Alphabet(AlphabetError),
     Helper(ProverHelperError),
     Test(TestError),
+    Transduce(TransduceCommandError),
     Io(io::Error),
     /// `Integer.parseInt(m.group(GROUP_TEST_NUM))`'s `NumberFormatException`
     /// (`Prover.testCommand`, `:685`) — the `\d+`-constrained capture group can still
@@ -605,6 +607,7 @@ impl std::fmt::Display for ProverError {
             ProverError::Alphabet(e) => write!(f, "{e}"),
             ProverError::Helper(e) => write!(f, "{e}"),
             ProverError::Test(e) => write!(f, "{e}"),
+            ProverError::Transduce(e) => write!(f, "{e}"),
             ProverError::Io(e) => write!(f, "{e}"),
             ProverError::NumberFormat(input) => {
                 write!(f, "{}", msg::number_format_exception(input))
@@ -642,6 +645,7 @@ impl LoggableError for ProverError {
             | ProverError::Alphabet(_)
             | ProverError::Helper(_)
             | ProverError::Test(_)
+            | ProverError::Transduce(_)
             | ProverError::Io(_) => true,
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
@@ -689,6 +693,7 @@ prover_error_from! {
     AlphabetError => Alphabet,
     ProverHelperError => Helper,
     TestError => Test,
+    TransduceCommandError => Transduce,
     io::Error => Io,
 }
 
@@ -1120,13 +1125,7 @@ impl Prover {
                 Ok(None)
             }
             // `:568-570` -> `Transducer.transduceNonDeterministic`
-            TRANSDUCE => {
-                match_or_fail(&patterns().transduce, s, TRANSDUCE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: TRANSDUCE,
-                    unit: "U26",
-                })
-            }
+            TRANSDUCE => Ok(Some(self.transduce_command(s)?)),
             // `:571-573` -> `Union.union`
             UNION => {
                 match_or_fail(&patterns().union, s, UNION)?;
@@ -1211,6 +1210,31 @@ impl Prover {
         let regexp = group(&caps, s, R_REGEXP).unwrap_or("").to_string();
         let name = group(&caps, s, R_NAME).unwrap_or("").to_string();
         Ok(reg(&self.session, &list_of_alphabets, &regexp, &name)?)
+    }
+
+    /// `Prover.transduceCommand(String)` (`:693-704`).
+    fn transduce_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
+        let caps = match_or_fail(&patterns().transduce, s, TRANSDUCE)?;
+        let new_name = group(&caps, s, GROUP_TRANSDUCE_NEW_NAME)
+            .unwrap_or("")
+            .to_string();
+        let transducer_name = group(&caps, s, GROUP_TRANSDUCE_TRANSDUCER)
+            .unwrap_or("")
+            .to_string();
+        // `boolean isDFAO = !(m.group(GROUP_TRANSDUCE_DOLLAR_SIGN).equals("$"));` (`:698`).
+        let is_dfao = group(&caps, s, GROUP_TRANSDUCE_DOLLAR_SIGN) != Some("$");
+        let old_name = group(&caps, s, GROUP_TRANSDUCE_OLD_NAME)
+            .unwrap_or("")
+            .to_string();
+        Ok(crate::transduce::transduce_command(
+            &self.session,
+            s,
+            &mut self.logging,
+            &transducer_name,
+            is_dfao,
+            &old_name,
+            &new_name,
+        )?)
     }
 
     /// `Prover.alphabetCommand(String)` (`:764-771`). Note it reads
@@ -1376,9 +1400,15 @@ impl Prover {
 ///
 /// Only [`ProverError::Io`] qualifies today, and nothing constructs it yet: every command
 /// currently wired up is a Java method that does *not* declare `throws IOException`. The
-/// four that do — `morphismCommand` (`:632`), `promoteCommand` (`:637`), `imageCommand`
-/// (`:652`) and `transduce` — belong to U24/U26, so this classification has to be right
-/// *before* those land, not after.
+/// three that do — `morphismCommand` (`:632`), `promoteCommand` (`:637`), `imageCommand`
+/// (`:652`) — belong to U24, so this classification has to be right *before* those land,
+/// not after. `transduceCommand` (`:693-704`) itself declares no `throws` clause either
+/// (`AutomatonReader.readTransducer`'s `IOException`s are already wrapped into unchecked
+/// `WalnutException`s, same as `readAutomaton`'s), so [`ProverError::Transduce`] is
+/// classified `false` here too — this port's own `TransduceCommandError::Io` sub-variant
+/// (a real disk-write failure while writing the result) is this crate's own
+/// Result-propagating idiom, not Java's checked `IOException`, exactly like
+/// `RegError`/`AlphabetError`'s own `Io` sub-variants already fold to `false` above.
 fn is_io_class_error(e: &ProverError) -> bool {
     match e {
         ProverError::Io(_) => true,
@@ -1401,6 +1431,7 @@ fn is_io_class_error(e: &ProverError) -> bool {
         // console-write failure must not end the REPL read loop when Java's would not.
         | ProverError::Helper(_)
         | ProverError::Test(_)
+        | ProverError::Transduce(_)
         | ProverError::NumberFormat(_)
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
@@ -2126,6 +2157,34 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// `transduce` through real `Prover::dispatch` -- U26's own more detailed coverage
+    /// (semantic equivalence, the size guard, WB-034) lives in `crate::transduce`'s own
+    /// tests; this just confirms the command is wired to the real handler here, not a
+    /// `NotYetImplemented` stub, and that the DFAO write side effect (`writeAutomata(...,
+    /// true)`, unlike `reg`/`alphabet`'s `false`) lands in the Word Automata Library.
+    #[test]
+    fn transduce_runs_end_to_end_through_dispatch() {
+        let (mut p, dir, _) = prover("transduce");
+        fs::create_dir_all(dir.join("Transducer Library")).unwrap();
+        fs::write(
+            dir.join("Transducer Library").join("RUNSUM2.txt"),
+            "{0, 1}\n\n0\n0 -> 0 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 1\n1 -> 0 / 0\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Word Automata Library").join("T.txt"),
+            "# The Thue-Morse sequence.\nmsd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 0\n",
+        )
+        .unwrap();
+
+        assert!(p.dispatch("transduce test527 RUNSUM2 T;").unwrap());
+        assert!(dir
+            .join("Word Automata Library")
+            .join("test527.txt")
+            .is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn reg_runs_end_to_end_through_dispatch() {
         let (mut p, dir, _) = prover("reg");
@@ -2247,7 +2306,6 @@ mod tests {
             ("rsplit S [+] T;", "U24"),
             ("split S T [+];", "U24"),
             ("star S A;", "U23"),
-            ("transduce N T $M;", "U26"),
             ("union U A B;", "U23"),
         ];
         for (command, unit) in cases {
