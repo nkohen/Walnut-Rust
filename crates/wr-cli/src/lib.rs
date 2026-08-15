@@ -24,4 +24,5 @@ pub mod prover_helper;
 pub mod reg;
 pub mod session;
 pub mod test_case;
+pub mod test_command;
 pub mod walnut_exception;

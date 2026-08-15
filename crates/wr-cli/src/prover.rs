@@ -105,6 +105,7 @@ use crate::prover_helper::{clear_screen_to, ProverHelperError};
 use crate::reg::{reg, RegError};
 use crate::session::{Session, SessionPaths, PROMPT, WALNUT_VERSION};
 use crate::test_case::TestCase;
+use crate::test_command::{test_command_to, TestError};
 use crate::walnut_exception as msg;
 
 // ---------------------------------------------------------------------------
@@ -571,7 +572,12 @@ pub enum ProverError {
     Reg(RegError),
     Alphabet(AlphabetError),
     Helper(ProverHelperError),
+    Test(TestError),
     Io(io::Error),
+    /// `Integer.parseInt(m.group(GROUP_TEST_NUM))`'s `NumberFormatException`
+    /// (`Prover.testCommand`, `:685`) — the `\d+`-constrained capture group can still
+    /// overflow `i32`, which `PAT_FOR_test_CMD` does not guard against.
+    NumberFormat(String),
     /// **Port-specific.** A command this project deliberately does not implement.
     UnsupportedCommand {
         command: &'static str,
@@ -598,7 +604,11 @@ impl std::fmt::Display for ProverError {
             ProverError::Reg(e) => write!(f, "{e}"),
             ProverError::Alphabet(e) => write!(f, "{e}"),
             ProverError::Helper(e) => write!(f, "{e}"),
+            ProverError::Test(e) => write!(f, "{e}"),
             ProverError::Io(e) => write!(f, "{e}"),
+            ProverError::NumberFormat(input) => {
+                write!(f, "{}", msg::number_format_exception(input))
+            }
             ProverError::UnsupportedCommand { command, reason } => write!(
                 f,
                 "The {command} command is out of scope for walnut-rs ({reason})."
@@ -631,7 +641,11 @@ impl LoggableError for ProverError {
             | ProverError::Reg(_)
             | ProverError::Alphabet(_)
             | ProverError::Helper(_)
+            | ProverError::Test(_)
             | ProverError::Io(_) => true,
+            // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
+            // same bucket as `MetaCommandError::NumberFormat`.
+            ProverError::NumberFormat(_) => false,
             // This port's own scope errors; no Java analogue.
             ProverError::UnsupportedCommand { .. } | ProverError::NotYetImplemented { .. } => true,
         }
@@ -644,6 +658,7 @@ impl LoggableError for ProverError {
     fn kind(&self) -> String {
         match self {
             ProverError::InvalidFile(_) => "java.lang.IllegalArgumentException".to_string(),
+            ProverError::NumberFormat(_) => "java.lang.NumberFormatException".to_string(),
             ProverError::Meta(e) => e.kind(),
             _ => "Main.WalnutException".to_string(),
         }
@@ -673,6 +688,7 @@ prover_error_from! {
     RegError => Reg,
     AlphabetError => Alphabet,
     ProverHelperError => Helper,
+    TestError => Test,
     io::Error => Io,
 }
 
@@ -1088,13 +1104,20 @@ impl Prover {
                     unit: "U23",
                 })
             }
-            // `:565-567` -> `Test.testCommand`
+            // `:565-567` -> `Prover.testCommand` -> `Test.testCommand`. Java's switch arm
+            // (`case TEST -> { testCommand(s); }`) discards `testCommand`'s `boolean`
+            // return and falls through to the switch's own `return null;`, so this arm
+            // does the same: run the command for its console output/errors, then `Ok(None)`.
             TEST => {
-                match_or_fail(&patterns().test, s, TEST)?;
-                Err(ProverError::NotYetImplemented {
-                    command: TEST,
-                    unit: "U25",
-                })
+                let caps = match_or_fail(&patterns().test, s, TEST)?;
+                let test_name = group(&caps, s, GROUP_TEST_NAME).unwrap_or("");
+                let needed_str = group(&caps, s, GROUP_TEST_NUM).unwrap_or("");
+                // `Integer.parseInt(m.group(GROUP_TEST_NUM))` (`:685`).
+                let needed: i32 = needed_str
+                    .parse()
+                    .map_err(|_| ProverError::NumberFormat(needed_str.to_string()))?;
+                test_command_to(&self.session, test_name, needed, &mut self.out)?;
+                Ok(None)
             }
             // `:568-570` -> `Transducer.transduceNonDeterministic`
             TRANSDUCE => {
@@ -1370,6 +1393,8 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::Reg(_)
         | ProverError::Alphabet(_)
         | ProverError::Helper(_)
+        | ProverError::Test(_)
+        | ProverError::NumberFormat(_)
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
     }
@@ -2126,6 +2151,58 @@ mod tests {
     }
 
     #[test]
+    fn test_runs_end_to_end_through_dispatch_reporting_shortfall_then_success() {
+        let (mut p, dir, capture) = prover("test-dispatch");
+        // `FINITE_TWO_WORD_AUTOMATON` from `TestTest.java`: language exactly `{"0", "1"}`.
+        fs::write(
+            dir.join("Automata Library").join("finiteTwoWord.txt"),
+            "{0,1}\n\n0 0\n0 -> 1\n1 -> 1\n\n1 1\n",
+        )
+        .unwrap();
+
+        // `dispatch`'s own `bool` is the REPL "keep going" signal (`!(EXIT|QUIT)`), NOT
+        // `Test.testCommand`'s shortfall/success verdict -- Java's `processCommand` switch
+        // arm (`case TEST -> { testCommand(s); }`) discards that verdict too (no `return`),
+        // so both calls below report `Ok(true)` regardless of how many inputs were found;
+        // the observable behavior is the printed console output.
+        //
+        // Only 2 inputs are accepted; asking for 5 reports the shortfall
+        // (`TestTest.testTestCommandReportsShortfallAndSuccess`'s first half).
+        assert!(p.dispatch("test finiteTwoWord 5;").unwrap());
+        assert_eq!(
+            capture.text(),
+            "finiteTwoWord only accepts 2 inputs, which are as follows: \n0\n1\n"
+        );
+
+        // Asking for no more than what's accepted prints no shortfall message (the second
+        // half of the same Java test); `capture` keeps accumulating, so the first call's
+        // output is still the prefix.
+        assert!(p.dispatch("test finiteTwoWord 1;").unwrap());
+        assert_eq!(
+            capture.text(),
+            "finiteTwoWord only accepts 2 inputs, which are as follows: \n0\n1\n0\n"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_reports_walnuts_error_on_a_bad_needed_count() {
+        // The `\d+` capture group can still overflow `i32` -- `Integer.parseInt`'s
+        // `NumberFormatException`, propagated (not a `WalnutException`).
+        let (mut p, dir, _) = prover("test-number-format");
+        let err = p
+            .dispatch("test whatever 99999999999999999999;")
+            .unwrap_err();
+        assert!(matches!(err, ProverError::NumberFormat(_)));
+        assert_eq!(
+            err.to_string(),
+            "For input string: \"99999999999999999999\""
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_malformed_invocation_of_an_unimplemented_command_still_reports_walnuts_error() {
         let (mut p, dir, _) = prover("malformed");
         // `union` needs at least a name; the regex fails before the stub is reached.
@@ -2163,7 +2240,6 @@ mod tests {
             ("rsplit S [+] T;", "U24"),
             ("split S T [+];", "U24"),
             ("star S A;", "U23"),
-            ("test T 5;", "U25"),
             ("transduce N T $M;", "U26"),
             ("union U A B;", "U23"),
         ];
