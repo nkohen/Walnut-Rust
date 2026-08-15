@@ -377,6 +377,19 @@ pub enum ActError {
     /// variant stands in for a real Java `NullPointerException` (WB-002), surfaced as an
     /// `Err` rather than a panic; see [`wr_core::infinite::InfiniteError`].
     Infinite(InfiniteError),
+    /// A `wr-core` guard that ports a Java `RuntimeException` as a `panic!`/`assert!`
+    /// (rather than as an `Err`) fired inside `act()`, and
+    /// [`wr_core::walnut_panic::catch_walnut_panic`] recovered its message.
+    ///
+    /// Java's `Main/Commands/EvalDef.compute` catches **any** `RuntimeException` a token's
+    /// `act()` throws (`EvalDef.java:123-128`), not just the subset this port happens to model
+    /// as `Err`. This variant is how the rest of that surface — e.g.
+    /// `wr_core::product`'s same-label/different-alphabet guard, which real Walnut raises as a
+    /// plain `WalnutException` from deep inside the cross product — reaches the same
+    /// position-annotated error message instead of killing the process. The payload is the
+    /// guard's message verbatim, so [`fmt::Display`] prints it unchanged. Added by U27, after
+    /// the Tier-1 corpus's `error190.txt` fixture showed the gap.
+    Thrown(String),
 }
 
 impl From<TokenError> for ActError {
@@ -437,6 +450,8 @@ impl fmt::Display for ActError {
             // Both carry verbatim Walnut text of their own.
             ActError::RemoveLeadingZeros(e) => write!(f, "{e}"),
             ActError::Infinite(e) => write!(f, "{e}"),
+            // The recovered panic payload IS the Java exception message.
+            ActError::Thrown(message) => write!(f, "{message}"),
         }
     }
 }

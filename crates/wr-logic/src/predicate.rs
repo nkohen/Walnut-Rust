@@ -1036,12 +1036,14 @@ impl Predicate {
         // instance, deliberately NOT resolved through `env.number_system` (Ruling 1's
         // shared-`Rc` cache); see `Function`'s own doc comment in `token.rs` for why
         // that non-sharing is preserved rather than "fixed".
-        let ns = wr_core::numsys::NumberSystem::new(default_number_system).map_err(|source| {
-            PredicateEnvError::NumberSystem {
-                name: default_number_system.to_string(),
-                source,
-            }
-        })?;
+        //
+        // It goes through the ENVIRONMENT nonetheless
+        // ([`PredicateEnv::fresh_number_system`], whose default impl is still unshared),
+        // because Java's `NumberSystem` constructor itself reads `Custom Bases/` via
+        // `Session`. Calling `wr_core::numsys::NumberSystem::new` directly here — which has
+        // no file access by design — silently restricted every `$name(…)` call to plain
+        // `msd_k`/`lsd_k` bases; see that method's docs.
+        let ns = env.fresh_number_system(default_number_system)?;
 
         // `:485-487`: `new Function(defaultNumberSystem, realStartingPosition +
         // matcher.start(1), matcher.group(1), A, arguments.size())`.

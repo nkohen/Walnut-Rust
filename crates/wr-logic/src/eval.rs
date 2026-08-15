@@ -187,6 +187,7 @@ use std::time::Instant;
 use wr_core::automaton::Automaton;
 use wr_core::logging::{LoggableError, Logging};
 use wr_core::numsys::NumSysError;
+use wr_core::walnut_panic::catch_walnut_panic;
 
 use crate::expr::{ExprError, Expression};
 use crate::predicate::{LexError, Predicate};
@@ -372,6 +373,13 @@ impl LoggableError for ActError {
             // WB-002: a real, UNCAUGHT `NullPointerException` in Java, not a
             // `WalnutException`.
             ActError::Infinite(_) => false,
+            // A recovered `wr-core` guard panic. Every guard this variant can currently carry
+            // ports a deliberately-thrown Java `WalnutException` (`wr_core::product`'s
+            // same-label/different-alphabet guard, `wr_core::logicalops`'s quotient subset
+            // guard, …), so it is `handled`: a message-only line, no invented JVM frames.
+            // Note the classification is about the JAVA throw site, not about the fact that
+            // this port used `panic!` to model it.
+            ActError::Thrown(_) => true,
         }
     }
 
@@ -459,7 +467,18 @@ pub fn compute(
 
     for t in post_order {
         let time_before = Instant::now();
-        if let Err(source) = t.act(fresh, &mut stack) {
+        // `try { ... t.act(expressions); ... } catch (RuntimeException e)` (`:112-128`).
+        // Java's catch covers **every** unchecked exception `act()` can throw, and several
+        // `wr-core` guards port a `WalnutException` as a `panic!`/`assert!` rather than as an
+        // `Err` (`wr_core::product`'s same-label/different-alphabet guard is the one the
+        // Tier-1 corpus exercises, via `error190.txt`). Without this boundary such a guard
+        // would kill the process instead of producing Walnut's positioned error message —
+        // strictly less faithful than Java. See `wr_core::walnut_panic`.
+        let outcome = match catch_walnut_panic(|| t.act(fresh, &mut stack)) {
+            Ok(inner) => inner,
+            Err(message) => Err(ActError::Thrown(message)),
+        };
+        if let Err(source) = outcome {
             // `Logging.printTruncatedStackTrace(e)` (`:124`) on the ORIGINAL exception,
             // before the position-appending wrapper below is built.
             logging.print_truncated_stack_trace(&source);

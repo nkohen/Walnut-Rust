@@ -50,4 +50,5 @@ pub mod search;
 pub mod transducer;
 pub mod trim;
 pub mod util;
+pub mod walnut_panic;
 pub mod word_automaton;

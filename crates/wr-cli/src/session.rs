@@ -688,6 +688,15 @@ impl PredicateEnv for FileLibraries {
         Ok(ns)
     }
 
+    /// `new NumberSystem(name)` (`Token/Function.java:52`) — genuinely unmemoized, exactly as
+    /// Java's direct constructor call is, but resolving `Custom Bases/` through this session
+    /// the same way that constructor does through the static `Session`. Overriding the trait's
+    /// clone-out-of-the-cache default keeps the "`$name(…)` does not share the memoized
+    /// handle" behavior visible here rather than only in the type.
+    fn fresh_number_system(&self, name: &str) -> Result<NumberSystem, PredicateEnvError> {
+        self.load_number_system(name)
+    }
+
     fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
         // `Predicate.java:295`:
         // `new Automaton(Session.getReadFileForWordsLibrary(name + ".txt"))`.

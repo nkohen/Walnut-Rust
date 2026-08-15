@@ -336,6 +336,16 @@ fn join_two_inputs_for_cross_product(
 /// If two same-labeled tracks have different alphabets (`WalnutException` message
 /// ported verbatim: "in computing cross product of two automaton, variables with the
 /// same label must have the same alphabet").
+///
+/// The panic message is **exactly** that Java text and nothing else — deliberately a bare
+/// `panic!` on an explicit comparison rather than `assert_eq!`, because
+/// [`crate::walnut_panic::catch_walnut_panic`] surfaces the payload to the user as Walnut's
+/// own error message, and `assert_eq!`'s payload would prepend `assertion \`left == right\`
+/// failed:` and append both operands' `Debug` dumps. `Main/Commands/EvalDef.compute`'s
+/// `catch (RuntimeException e)` catches this in real Java and rethrows it with the offending
+/// token's position; `wr_logic::eval::compute` does the same, which is what makes the
+/// corpus's own `error190.txt` reproduce. (Found by Tier 1: before U27 this `assert_eq!`
+/// killed the process on fixture 190, `eval test190 "Ez,x,y $func(z,x,y,17)"`.)
 fn compute_same_inputs(a: &Automaton, b: &Automaton) -> Vec<i32> {
     let mut same_inputs_in_a_and_b = vec![NOT_SAME_INPUT_IN_BOTH; b.label.len()];
     for ((slot, b_label_i), b_alphabet_i) in same_inputs_in_a_and_b
@@ -346,10 +356,9 @@ fn compute_same_inputs(a: &Automaton, b: &Automaton) -> Vec<i32> {
         if let Some(j) = a.label.iter().position(|l| l == b_label_i) {
             let set_a: HashSet<i32> = a.alphabet[j].iter().copied().collect();
             let set_b: HashSet<i32> = b_alphabet_i.iter().copied().collect();
-            assert_eq!(
-                set_a, set_b,
-                "in computing cross product of two automaton, variables with the same label must have the same alphabet"
-            );
+            if set_a != set_b {
+                panic!("in computing cross product of two automaton, variables with the same label must have the same alphabet");
+            }
             *slot = j as i32;
         }
     }

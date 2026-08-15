@@ -1076,4 +1076,124 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    // ------------------------------------------------------------------------
+    // `$name(…)` over a CUSTOM base (regression, Phase 3b U27)
+    // ------------------------------------------------------------------------
+
+    /// `Predicate.putFunction` builds the `$name(…)` token's own number system with Java's
+    /// `new NumberSystem(number_system)` (`Token/Function.java:52`) — a constructor that
+    /// reads `Custom Bases/` through `Session`. This port originally called
+    /// `wr_core::numsys::NumberSystem::new` directly there, which by design has no file
+    /// access, so **every** `$name(…)` call under a custom base failed with "Number system
+    /// msd_fib is not defined." even though the very same query's relational tokens
+    /// resolved it fine.
+    ///
+    /// The Tier-1 golden corpus caught this: 15 of `IntegrationTest.initialize()`'s own
+    /// prelude definitions (`fibonacci_occurs`, `fibonacci_border`, … — every `?msd_fib`
+    /// definition that calls another one) failed, silently leaving the library files 60+
+    /// later fixtures read from missing. Fixed by routing the construction through
+    /// [`wr_logic::predicate_env::PredicateEnv::fresh_number_system`], which `FileLibraries`
+    /// implements with the same unmemoized, file-resolving build Java's constructor does.
+    #[test]
+    fn a_function_token_resolves_a_custom_base_number_system() {
+        let (session, dir) = temp_session("fn-custom-base");
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for f in ["msd_fib.txt", "msd_fib_addition.txt"] {
+            fs::copy(fixtures.join(f), dir.join("Custom Bases").join(f)).unwrap();
+        }
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        let mut fresh = FreshIdentifiers::new();
+        let mut stdout = Vec::new();
+
+        // Writes `Automata Library/fibhelper.txt`, whose own header declares `msd_fib`.
+        eval_def_command_with_stdout(
+            &session,
+            &mut logging,
+            &mut fresh,
+            false,
+            false,
+            "?msd_fib i >= 1",
+            Some("fibhelper"),
+            None,
+            &mut stdout,
+        )
+        .unwrap();
+
+        // The `$`-call: this is the path that used to fail.
+        let tc = eval_def_command_with_stdout(
+            &session,
+            &mut logging,
+            &mut fresh,
+            false,
+            false,
+            "?msd_fib $fibhelper(i) & i <= 5",
+            Some("usefib"),
+            None,
+            &mut stdout,
+        )
+        .expect("a $name(...) call under a custom base must resolve that base");
+        assert_eq!(tc.automaton_pairs().len(), 1);
+        assert!(tc.automaton_pairs()[0].automaton().is_some());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------------
+    // A `wr-core` guard panic inside `act()` is an ERROR, not a crash (regression)
+    // ------------------------------------------------------------------------
+
+    /// `Main/Commands/EvalDef.compute` wraps each token's `act()` in
+    /// `catch (RuntimeException e)` and rethrows with the token's position appended
+    /// (`EvalDef.java:123-128`). Several `wr-core` guards port a Java `WalnutException` as a
+    /// `panic!`, so without a `catch_unwind` at that same point the port **killed the
+    /// process** where Walnut prints a message and carries on.
+    ///
+    /// This is golden-corpus fixture 190 verbatim — its `func` predicate mixes `msd_3`,
+    /// `msd_2` and `msd_10` tracks, so calling it with a repeated argument makes
+    /// `wr_core::product`'s cross product see two same-labeled tracks with different
+    /// alphabets. `walnut-java` records the expected message in
+    /// `src/test/resources/integrationTests/error190.txt`; this test pins the same two lines.
+    #[test]
+    fn a_wr_core_guard_panic_inside_act_becomes_a_positioned_error() {
+        let (session, dir) = temp_session("act-guard-panic");
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        let mut fresh = FreshIdentifiers::new();
+        let mut stdout = Vec::new();
+
+        eval_def_command_with_stdout(
+            &session,
+            &mut logging,
+            &mut fresh,
+            false,
+            false,
+            "(?msd_3 c < 5) & (a = b+1) & (?msd_10 e = 17)",
+            Some("func"),
+            None,
+            &mut stdout,
+        )
+        .unwrap();
+
+        let err = eval_def_command_with_stdout(
+            &session,
+            &mut logging,
+            &mut fresh,
+            false,
+            false,
+            "Ez,x,y $func(z,x,y,17)",
+            Some("mixed"),
+            None,
+            &mut stdout,
+        )
+        .expect_err("the cross product's same-label/different-alphabet guard must fire");
+        assert_eq!(
+            err.to_string(),
+            "in computing cross product of two automaton, variables with the same label \
+             must have the same alphabet\n\t: char at 8"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

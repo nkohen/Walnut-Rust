@@ -378,6 +378,29 @@ pub trait PredicateEnv {
     /// it is not `&mut NumberSystem` and must not be wrapped in a `RefCell` here.
     fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError>;
 
+    /// `new NumberSystem(name)` — the **unmemoized, freshly constructed** form, as opposed
+    /// to [`Self::number_system`]'s `getComputeIfAbsent` cache lookup.
+    ///
+    /// Java has exactly one call site for this shape: `Token/Function.java:52`, the `$name(…)`
+    /// token's own `ns` field (see [`crate::token::Function`]'s docs on why that non-sharing is
+    /// preserved rather than "fixed"). It matters that this is a real *environment* method and
+    /// not a direct `wr_core::numsys::NumberSystem::new` call, because Java's `NumberSystem`
+    /// constructor reads `Custom Bases/` through `Session` — so `$fibonacci_factoreq(i,j,n)`
+    /// under `?msd_fib` resolves the custom base in Java, and a port that bypassed the
+    /// environment here could only ever build plain `msd_k`/`lsd_k` bases and would reject
+    /// every custom-base `$`-call. (It did: this method was added in Phase 3b's U27 after the
+    /// Tier-1 golden corpus caught exactly that — 15 of the corpus prelude's own `msd_fib`
+    /// definitions failed with "Number system msd_fib is not defined.")
+    ///
+    /// The default implementation clones out of [`Self::number_system`]'s shared handle, which
+    /// is correct for any environment (the two differ only in whether the memo table is
+    /// populated as a side effect — not observable, since the table is a pure memo). An
+    /// implementation backed by real files should override it with a genuinely unmemoized
+    /// build, which is what Java does.
+    fn fresh_number_system(&self, name: &str) -> Result<NumberSystem, PredicateEnvError> {
+        Ok((*self.number_system(name)?).clone())
+    }
+
     /// `new Automaton(Session.getReadFileForWordsLibrary(name + ".txt"))`
     /// (`Predicate.java:295`) — the automaton for a word/sequence occurrence like
     /// `T[i]` or `.AUTOMATON[i]`.

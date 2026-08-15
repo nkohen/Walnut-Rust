@@ -56,11 +56,14 @@
 //!   three parts — the msd/lsd direction (`Automaton::msd`) and, as of U23's review fixes,
 //!   the number system's NAME (`Automaton::ns_name`, load-bearing because
 //!   `NumberSystem.isNSDiffering` compares by name and `msd_fib` is otherwise
-//!   indistinguishable from `msd_2`). **Still not populated**: `Automaton::all_reps`, the
-//!   custom base's valid-representation restriction — so an automaton read from a file
-//!   with an `msd_fib` header does not carry that restriction the way Java's would. That
-//!   is a pre-existing gap, unchanged here; `wr-cli`'s `alphabet`/`reg` commands are
-//!   currently the only producers that install it.
+//!   indistinguishable from `msd_2`) — and, as of U27, the third: `Automaton::all_reps`,
+//!   the custom base's valid-representation restriction (`msd_fib.txt`'s "no `11`
+//!   substring"). That third one is load-bearing, not bookkeeping:
+//!   `Automaton::apply_all_representations` — which `not`, `=>` and the `A` quantifier all
+//!   run — reads exactly `all_reps`, so while it was empty, complementing an `msd_fib`
+//!   automaton loaded from a library file admitted words that are not valid Zeckendorf
+//!   representations at all. The Tier-1 golden corpus caught it (12 fixtures, 352-371); see
+//!   `a_custom_base_header_carries_its_valid_representation_restriction`.
 //! - Then repeated state blocks: `<id> <output>` (first declared block's `id` becomes
 //!   `q0`, **not necessarily `0`**), each followed by zero or more transition lines
 //!   `<sym1> <sym2> ... -> <dest1> [<dest2> ...]` (one token per track, each a signed
@@ -91,6 +94,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use wr_core::automaton::{Automaton, AutomatonDFA};
 use wr_core::fa::Fa;
@@ -336,7 +340,8 @@ fn read_automaton_txt_impl(
     }
 
     let trimmed_header = header_line.trim();
-    let (alphabet, msd, ns_names) = parse_header(trimmed_header, custom_bases, in_progress)?;
+    let (alphabet, msd, ns_names, all_reps) =
+        parse_header(trimmed_header, custom_bases, in_progress)?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -362,6 +367,12 @@ fn read_automaton_txt_impl(
     // `Automaton::ns_name`). Without the name, `isNSDiffering` cannot tell `msd_fib` from
     // `msd_2`.
     automaton.set_ns_names(ns_names);
+    // The third part: the custom base's valid-representation restriction. Java gets this for
+    // free (it stores the `NumberSystem` objects themselves), and it is load-bearing —
+    // `Automaton::apply_all_representations`, which every `~`/`=>`/`A` runs, consults exactly
+    // this. Without it, complementing an `msd_fib` automaton read from a library file admits
+    // words that are not valid Zeckendorf representations. See this module's docs.
+    automaton.set_all_reps(all_reps);
 
     let mut output: BTreeMap<usize, i32> = BTreeMap::new();
     let mut transitions: BTreeMap<usize, BTreeMap<i32, Vec<usize>>> = BTreeMap::new();
@@ -516,12 +527,26 @@ enum HeaderToken {
         /// base is otherwise indistinguishable from the plain base with the same alphabet
         /// cardinality — see [`wr_core::automaton::Automaton::ns_name`].
         name: String,
+        /// [`NumberSystem::all_representations`] for this track: the "set of all valid
+        /// representations" restriction a custom base declares in its `<name>.txt` file
+        /// (`msd_fib.txt` = "no `11` substring"). `None` for every standard `msd_<k>`/
+        /// `lsd_<k>` base, and for a custom base that ships no `<name>.txt`.
+        ///
+        /// Populating this is what makes `~`/`=>`/`A` behave correctly on an automaton
+        /// loaded from a library file — see [`read_automaton_txt_with_custom_bases`]'s
+        /// "valid representations" note.
+        all_reps: Option<Rc<Automaton>>,
     },
 }
 
 /// Per-track alphabet, per-track msd/lsd (`None` for an explicit-set track), and per-track
 /// number-system name (`None` for an explicit-set track, which has no `NumberSystem`).
-type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>, Vec<Option<String>>);
+type HeaderSpec = (
+    Vec<Vec<i32>>,
+    Vec<Option<bool>>,
+    Vec<Option<String>>,
+    Vec<Option<Rc<Automaton>>>,
+);
 
 fn parse_header(
     line: &str,
@@ -531,6 +556,7 @@ fn parse_header(
     let mut alphabet = Vec::new();
     let mut msd = Vec::new();
     let mut ns_names: Vec<Option<String>> = Vec::new();
+    let mut all_reps: Vec<Option<Rc<Automaton>>> = Vec::new();
     let mut rest = line.trim();
     while !rest.is_empty() {
         rest = rest.trim_start();
@@ -566,22 +592,25 @@ fn parse_header(
                 alphabet.push(values);
                 msd.push(None);
                 ns_names.push(None);
+                all_reps.push(None);
             }
             HeaderToken::Ns {
                 msd: is_msd,
                 alphabet: track_alphabet,
                 name,
+                all_reps: track_all_reps,
             } => {
                 alphabet.push(track_alphabet);
                 msd.push(Some(is_msd));
                 ns_names.push(Some(name));
+                all_reps.push(track_all_reps);
             }
         }
     }
     if alphabet.is_empty() {
         return Err(ReadError::MalformedHeader);
     }
-    Ok((alphabet, msd, ns_names))
+    Ok((alphabet, msd, ns_names, all_reps))
 }
 
 fn parse_ns_token(
@@ -595,6 +624,7 @@ fn parse_ns_token(
                 msd: true,
                 alphabet: (0..base).collect(),
                 name: word.to_string(),
+                all_reps: None,
             }),
             Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
@@ -605,6 +635,7 @@ fn parse_ns_token(
                 msd: false,
                 alphabet: (0..base).collect(),
                 name: word.to_string(),
+                all_reps: None,
             }),
             Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
@@ -617,11 +648,13 @@ fn parse_ns_token(
             msd: true,
             alphabet: vec![0, 1],
             name: format!("{}2", numsys::MSD_UNDERSCORE),
+            all_reps: None,
         }),
         "lsd" => Ok(HeaderToken::Ns {
             msd: false,
             alphabet: vec![0, 1],
             name: format!("{}2", numsys::LSD_UNDERSCORE),
+            all_reps: None,
         }),
         _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
     }
@@ -647,6 +680,9 @@ fn custom_base_token(
         msd: ns.is_msd(),
         alphabet: ns.get_alphabet().to_vec(),
         name: ns.name().to_string(),
+        // `Automaton.getNS().get(i).getAllRepresentations()` — Java keeps the resolved
+        // `NumberSystem` object itself, so this comes for free there. See this module's docs.
+        all_reps: ns.all_representations().cloned(),
     })
 }
 
@@ -874,7 +910,8 @@ pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, Re
     // `Automaton` (`TransducerData` carries only the alphabet/msd it needs), and Java's
     // `readTransducer` likewise keeps the `NumberSystem` list only inside its scratch
     // parse state.
-    let (alphabet, msd, _ns_names) = parse_header(trimmed_header, None, &mut BTreeSet::new())?;
+    let (alphabet, msd, _ns_names, _all_reps) =
+        parse_header(trimmed_header, None, &mut BTreeSet::new())?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -1125,21 +1162,22 @@ mod tests {
 
     #[test]
     fn bare_msd_defaults_to_base_2() {
-        let (alphabet, msd, _) = parse_header("msd", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _, _) = parse_header("msd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(true)]);
     }
 
     #[test]
     fn bare_lsd_defaults_to_base_2() {
-        let (alphabet, msd, _) = parse_header("lsd", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _, _) = parse_header("lsd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(false)]);
     }
 
     #[test]
     fn msd_k_and_lsd_k_parse_explicit_bases() {
-        let (alphabet, msd, _) = parse_header("msd_5 lsd_3", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _, _) =
+            parse_header("msd_5 lsd_3", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1, 2, 3, 4], vec![0, 1, 2]]);
         assert_eq!(msd, vec![Some(true), Some(false)]);
     }
@@ -1372,6 +1410,52 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// U27 fix, found by the Tier-1 golden corpus. The reader used to leave
+    /// [`wr_core::automaton::Automaton::all_reps`] empty even for a custom-base header, so an
+    /// automaton loaded from `Automata Library/foo.txt` carried no valid-representation
+    /// restriction — and `Automaton::apply_all_representations` (which every `~`/`=>`/`A`
+    /// runs) therefore silently did nothing to it. Observable effect: complementing an
+    /// `msd_fib` library automaton admitted words with a `11` substring, i.e. strings that are
+    /// not Zeckendorf representations at all. `?msd_fib ~$fibonacci_in(m,1,n)` came out with
+    /// 10 states instead of real Walnut's 5, and 12 corpus fixtures (352-371) diverged.
+    #[test]
+    fn a_custom_base_header_carries_its_valid_representation_restriction() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-reps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cb_dir = dir.join("Custom Bases");
+        std::fs::create_dir_all(&cb_dir).unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), cb_dir.join("msd_fib.txt")).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            cb_dir.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+
+        let path = dir.join("two_track.txt");
+        std::fs::write(
+            &path,
+            "msd_fib msd_fib\n\n0 1\n0 0 -> 0\n0 1 -> 0\n1 0 -> 0\n1 1 -> 0\n",
+        )
+        .unwrap();
+        let a = read_automaton_txt_with_custom_bases(&path, &cb_dir).unwrap();
+        assert_eq!(a.all_reps.len(), 2, "one entry per track");
+        assert!(
+            a.all_reps.iter().all(|r| r.is_some()),
+            "every msd_fib track must carry the base's all-representations automaton"
+        );
+
+        // A standard base declares no such restriction (Java: `allRepresentations` stays
+        // null unless a `Custom Bases/<name>.txt` exists), and an explicit `{...}` track
+        // has no number system at all.
+        let plain = dir.join("plain.txt");
+        std::fs::write(&plain, "msd_2 {0,1}\n\n0 1\n0 0 -> 0\n").unwrap();
+        let p = read_automaton_txt_with_custom_bases(&plain, &cb_dir).unwrap();
+        assert_eq!(p.all_reps.len(), 2);
+        assert!(p.all_reps.iter().all(|r| r.is_none()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// U23 review fix, finding #1. The reader used to discard the resolved
     /// [`NumberSystem`]'s NAME, keeping only `(alphabet, msd)` — which for `msd_fib` is
     /// `([0, 1], true)`, i.e. byte-identical to `msd_2`'s. Downstream,
@@ -1422,7 +1506,7 @@ mod tests {
     /// `msd_2`, exactly as before this unit.
     #[test]
     fn a_bare_msd_or_lsd_header_is_named_msd_2_or_lsd_2() {
-        let (_, _, names) = parse_header("msd lsd {0, 1}", None, &mut BTreeSet::new()).unwrap();
+        let (_, _, names, _) = parse_header("msd lsd {0, 1}", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(
             names,
             vec![Some("msd_2".to_string()), Some("lsd_2".to_string()), None]

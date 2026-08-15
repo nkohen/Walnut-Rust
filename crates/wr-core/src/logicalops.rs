@@ -1192,6 +1192,22 @@ pub enum ConvertNsError {
     /// how WB-013 (the same "null NS reaches an unguarded dereference" shape) is already
     /// handled in `wr-logic`.
     NoNumberSystem,
+    /// `NumberSystem.parseBase`'s own guard (`NumberSystem.java:237-243`):
+    /// `"Base of automaton's number system must be > 1 and int, found: <base>"`.
+    ///
+    /// `<base>` is `determineBase(name)` — everything after the FIRST `_` of the number
+    /// system's name — and the guard fires when that is not `^\d+$` or parses to `<= 1`.
+    /// Live on a perfectly ordinary input: `convert x msd_2 FTM;` where `FTM` is a word
+    /// automaton over `msd_fib` gives `found: fib` (golden-corpus fixture 554).
+    ///
+    /// Added by U27: this port used to derive the source base from the track's *alphabet
+    /// size*, which for `msd_fib` is 2 — so `convert`ing an `msd_fib` automaton to `msd_2`
+    /// reported "New and old number systems are identical: msd_2" instead. See
+    /// [`convert_ns`].
+    BaseNotAPositiveInt {
+        /// The offending substring, e.g. `"fib"`.
+        found: String,
+    },
     /// `"New and old number systems are identical: <name>"` (`:467`). Carries the
     /// reconstructed `msd_k`/`lsd_k` name Java prints via `ns.getName()`.
     IdenticalNumberSystems {
@@ -1229,6 +1245,10 @@ impl fmt::Display for ConvertNsError {
             ConvertNsError::NoNumberSystem => write!(
                 f,
                 "Cannot invoke \"Automata.NumberSystem.parseBase()\" because \"ns\" is null"
+            ),
+            ConvertNsError::BaseNotAPositiveInt { found } => write!(
+                f,
+                "Base of automaton's number system must be > 1 and int, found: {found}"
             ),
             ConvertNsError::IdenticalNumberSystems { name } => {
                 write!(f, "New and old number systems are identical: {name}")
@@ -1452,6 +1472,32 @@ fn java_log(x: f64) -> f64 {
 /// `root <= 1000` slice of that sweep against expectations captured from the real JVM.
 fn truncated_log_ratio(x: i32, root: i32) -> i32 {
     (java_log(f64::from(x)) / java_log(f64::from(root))) as i32
+}
+
+/// `NumberSystem.parseBase()` (`NumberSystem.java:237-243`), including its
+/// `determineBase` (`:265-267`) helper: the base is everything after the FIRST `_` of the
+/// number system's name, and it must match `UtilityMethods.PATTERN_NUMBER` (`^\d+$`,
+/// `UtilityMethods.java:35`) and parse to `> 1`.
+///
+/// A name with no `_` at all cannot occur here — every name reaching this point comes from
+/// [`crate::automaton::Automaton::track_ns_names`], which either replays a recorded
+/// `NumberSystem.getName()` (always normalized to `<msd|lsd>_<base>`, see
+/// `normalizeNumberSystemToken`) or builds `msd_<k>`/`lsd_<k>` itself. Java's
+/// `name.substring(name.indexOf("_") + 1)` on an underscore-free string would return the
+/// whole string (`indexOf` = -1), which then fails the `isNumber` check for anything
+/// non-numeric — reproduced here by treating "no `_`" as "the whole name is the base".
+fn parse_base(name: &str) -> Result<i32, ConvertNsError> {
+    let base_str = match name.split_once('_') {
+        Some((_, rest)) => rest,
+        None => name,
+    };
+    let is_number = !base_str.is_empty() && base_str.bytes().all(|b| b.is_ascii_digit());
+    match base_str.parse::<i32>() {
+        Ok(base) if is_number && base > 1 => Ok(base),
+        _ => Err(ConvertNsError::BaseNotAPositiveInt {
+            found: base_str.to_string(),
+        }),
+    }
 }
 
 /// The `msd_k`/`lsd_k` name Java would have built for a track, used only to fill in
@@ -1873,7 +1919,21 @@ pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), C
     let Some(from_msd) = a.msd[0] else {
         return Err(ConvertNsError::NoNumberSystem);
     };
-    let from_base = a.alphabet[0].len() as i32;
+    // `ns.parseBase()` (`NumberSystem.java:237-243`) parses the base out of the number
+    // system's NAME, not out of its alphabet: `determineBase(name)` is everything after the
+    // first `_`, and a non-`^\d+$` (or `<= 1`) result is a hard error.
+    //
+    // Deriving it from `a.alphabet[0].len()` instead — which is what this port did before
+    // U27 — is exact for every plain `msd_k`/`lsd_k` base and WRONG for a custom one:
+    // `msd_fib`'s alphabet is `{0, 1}`, so `convert x msd_2 FTM;` silently took the
+    // `from_base == to_base` branch and reported "New and old number systems are identical"
+    // where real Walnut reports `found: fib` (golden-corpus fixture 554).
+    // `Automaton::track_ns_names` supplies the real name, falling back to the exact
+    // `msd_<alphabet size>` reconstruction wherever no name was recorded.
+    let from_name = a.track_ns_names()[0]
+        .clone()
+        .expect("msd[0] is Some, so track_ns_names[0] is Some");
+    let from_base = parse_base(&from_name)?;
 
     // If the old and new bases are the same, check if only MSD/LSD is changing.
     if from_base == to_base {
@@ -4015,6 +4075,72 @@ mod tests {
             vec!["x".to_string()],
             vec![Some(msd)],
         )
+    }
+
+    /// U27 fix, found by the Tier-1 golden corpus (fixture 554,
+    /// `convert test554 msd_2 FTM;` where `FTM` is a word automaton over `msd_fib`).
+    ///
+    /// Java's `ns.parseBase()` reads the base out of the number system's NAME and rejects
+    /// `fib` outright. This port derived it from the track's ALPHABET SIZE — 2 for
+    /// `msd_fib` — so the call silently took the `from_base == to_base` branch and reported
+    /// "New and old number systems are identical: msd_2": a different error for a different
+    /// reason, and (worse) a *successful* conversion for `convert x lsd_2 FTM;`, which
+    /// would have reversed a Zeckendorf automaton as if it were binary.
+    #[test]
+    fn convert_ns_parses_the_base_from_the_name_not_the_alphabet_size() {
+        let mut a = epsilon_only(2, true);
+        a.set_ns_names(vec![Some("msd_fib".to_string())]);
+        let err = convert_ns(&mut a, true, 2).expect_err("`fib` is not a base");
+        assert_eq!(
+            err.to_string(),
+            "Base of automaton's number system must be > 1 and int, found: fib"
+        );
+        // The msd<->lsd flip must be rejected for the same reason, rather than silently
+        // reversing the automaton as if it were plain base 2.
+        let err = convert_ns(&mut a, false, 2).expect_err("`fib` is not a base");
+        assert_eq!(
+            err.to_string(),
+            "Base of automaton's number system must be > 1 and int, found: fib"
+        );
+
+        // A track with no recorded name still reconstructs exactly (`msd_<alphabet size>`),
+        // so plain bases are unaffected by the change.
+        let mut plain = epsilon_only(2, true);
+        assert!(matches!(
+            convert_ns(&mut plain, true, 2),
+            Err(ConvertNsError::IdenticalNumberSystems { ref name }) if name == "msd_2"
+        ));
+    }
+
+    /// `parseBase`'s own boundary cases, straight off `NumberSystem.java:237-243`.
+    #[test]
+    fn parse_base_matches_javas_pattern_number_and_greater_than_one_guard() {
+        assert_eq!(parse_base("msd_2"), Ok(2));
+        assert_eq!(parse_base("lsd_10"), Ok(10));
+        // `<= 1` is rejected even though it IS a number.
+        assert!(matches!(
+            parse_base("msd_1"),
+            Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "1"
+        ));
+        assert!(matches!(
+            parse_base("msd_0"),
+            Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "0"
+        ));
+        // `^\d+$` — a sign is NOT a number to Java's `PATTERN_NUMBER`.
+        assert!(matches!(
+            parse_base("msd_-2"),
+            Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "-2"
+        ));
+        assert!(matches!(
+            parse_base("msd_fib"),
+            Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "fib"
+        ));
+        // `determineBase` splits on the FIRST underscore, so a `neg_` name reports the
+        // whole remainder — matching Java exactly.
+        assert!(matches!(
+            parse_base("msd_neg_2"),
+            Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "neg_2"
+        ));
     }
 
     /// Tier 2: `AutomatonLogicalOpsTest.testConvertNSSameBaseFlipsMsdLsd` (`:236-255`).
