@@ -152,6 +152,28 @@ impl Fa {
         self.o[s] != 0
     }
 
+    /// `Transitions.determineTransitionCount()`, both implementations
+    /// (`TransitionsDFA.java:149-155`, `TransitionsNFA.java:125-132`) — used by
+    /// `Main.Commands.Describe`'s `"Transition count:"` line.
+    ///
+    /// Java has two implementations because it has two storage representations:
+    /// `TransitionsDFA` counts *distinct symbol keys* per state (`int2IntMap.keySet()
+    /// .size()`, since a DFA table maps `symbol -> one target`), while `TransitionsNFA`
+    /// sums *destination-list lengths* per state (`entry.getValue().size()`, since one
+    /// symbol can map to several targets). This crate's [`Fa`] has only ONE storage shape
+    /// (`d: Vec<BTreeMap<i32, Vec<usize>>>`, used for both deterministic and
+    /// nondeterministic tables — see this module's own docs), so a single sum of
+    /// destination-list lengths reproduces BOTH Java methods at once: on a genuinely
+    /// deterministic table every list has exactly one element, so "sum of list lengths"
+    /// and "count of keys" agree exactly.
+    pub fn determine_transition_count(&self) -> u64 {
+        self.d
+            .iter()
+            .flat_map(|row| row.values())
+            .map(|dests| dests.len() as u64)
+            .sum()
+    }
+
     /// `FA.isFAO()` (`FA.java:64-71`): true iff some state's output is `> 1`, i.e. this
     /// is a word automaton (DFAO) rather than a plain accept/reject predicate automaton.
     ///
@@ -736,6 +758,50 @@ mod tests {
         assert!(fa.is_accepting(1));
         assert!(!fa.is_accepting(0));
         assert!(!fa.is_language_empty());
+    }
+
+    #[test]
+    fn determine_transition_count_sums_destination_list_lengths() {
+        // `contains_one_dfa` has 4 transitions total (2 states x 2 symbols, every one
+        // present, deterministic -- a singleton destination list each).
+        let fa = contains_one_dfa();
+        assert_eq!(fa.determine_transition_count(), 4);
+    }
+
+    #[test]
+    fn determine_transition_count_counts_every_nfa_destination_not_just_every_key() {
+        // One state, one symbol, TWO destinations -- Java's TransitionsNFA sums
+        // destination-list lengths, so this must count as 2, not 1 (which a
+        // key-counting implementation, correct only for a true DFA table, would give).
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 1,
+            o: vec![0, 0],
+            d: vec![
+                {
+                    let mut m = BTreeMap::new();
+                    m.insert(0, vec![0, 1]);
+                    m
+                },
+                BTreeMap::new(),
+            ],
+        };
+        assert_eq!(fa.determine_transition_count(), 2);
+    }
+
+    #[test]
+    fn determine_transition_count_is_zero_for_a_zero_state_automaton() {
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 0,
+            alphabet_size: 2,
+            o: vec![],
+            d: vec![],
+        };
+        assert_eq!(fa.determine_transition_count(), 0);
     }
 
     #[test]

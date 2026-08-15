@@ -803,12 +803,12 @@ pub fn parse_base_of(name: &str) -> Result<i32, NumSysError> {
 /// type's struct docs), which loses the BASE half of the name. Comparing the stand-in
 /// would silently call `msd_2` and `msd_3` "not differing", which is precisely one of
 /// the cases `NumberSystemTest.testIsNSDifferingAllBranches` asserts IS differing. So
-/// this takes the per-track names directly (`None` = Java's `null` entry); wiring it
-/// to a real `Automaton` is left to whichever unit ports `Union`/`Concat`, which is
-/// also the unit that has to decide whether `Automaton` grows a real number-system
-/// field. It has no production caller in this crate yet — kept, rather than deferred
-/// wholesale, on the same reasoning as `Automaton::unlabel` (a faithful,
-/// self-contained port a later unit will want as-is).
+/// this takes the per-track names directly (`None` = Java's `null` entry).
+///
+/// **Wired as of U23** (`wr-cli`'s `union`/`concat` commands): each call site passes
+/// [`crate::automaton::Automaton::track_ns_names`], which reconstructs a plain
+/// `msd_k`/`lsd_k` name from the stand-in — see that method's own docs for the
+/// resulting scope narrowing on custom bases (never over-approximates "differing").
 pub fn is_ns_differing(
     nns: &[Option<&str>],
     first_ns: &[Option<&str>],

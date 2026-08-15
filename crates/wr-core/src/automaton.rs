@@ -633,6 +633,93 @@ impl Automaton {
         }
     }
 
+    /// `Automaton.normalizeNumberSystems` (`Automaton.java:160-181`) — used by
+    /// `Main/Commands/Concat.java:74` and `Main/Commands/Star.java:27` right after
+    /// `FA.concatStates`/`FA.starStates`, to strip a custom base's "all representations"
+    /// restriction from any track that carries one, because a concatenation/Kleene-star
+    /// NFA transition can introduce digit combinations the restriction never admitted.
+    ///
+    /// # Why this is a straight `all_reps[i] = None` per switched track, not a full `setAlphabet` call
+    ///
+    /// Java's real body constructs a fresh `NumberSystem` per switched track
+    /// (`new NumberSystem(ns.determineBaseNameUnderscore() + (max + 1))`, `:169`) and
+    /// passes it to `setAlphabet(false, numberSystems, richAlphabet.getA())` (`:176`).
+    /// The crucial detail, easy to miss: **the alphabet argument is `richAlphabet.getA()`
+    /// — the automaton's CURRENT, unchanged alphabet**, not a freshly computed `0..=max`
+    /// range. So inside `setAlphabet`, `M.richAlphabet.setA(alphabet)` installs the exact
+    /// same digit lists back, `rebuildTransitions`'s `isInNewAlphabet` check therefore
+    /// admits every existing transition (nothing is pruned), and `setupEncoder()`
+    /// recomputes an identical encoder from an identical alphabet. The only *observable*
+    /// change `setAlphabet` makes here is installing a `NumberSystem` whose
+    /// `useAllRepresentations()` is `false` — i.e., exactly `all_reps[i] = None` in this
+    /// crate's parallel-vector stand-in (see [`Automaton::all_reps`]'s field docs) — plus
+    /// re-running `determinizeAndMinimize`/`forceCanonize`/
+    /// `applyAllRepresentationsWithOutput`, all three of which this crate's `Automaton`
+    /// already exposes and are called here directly. The wider "new base" fact
+    /// (`max + 1`) is real in Java's `NumberSystem` object but has no representation in
+    /// this crate's stand-in beyond `alphabet.len()` — which, per the paragraph above,
+    /// Java itself leaves unchanged here, so there is nothing to reconstruct.
+    ///
+    /// Ported behavior, not a Java bug: `switchNS` (hence the whole method) is a no-op
+    /// unless at least one track's number system `useAllRepresentations()` — i.e. carries
+    /// a genuine custom base (`msd_fib`, …). Every plain `msd_k`/`lsd_k` automaton this
+    /// crate's `concat`/`star` callers see in ordinary KEEP-scope use takes the early
+    /// `return` below, matching Java's own `if (switchNS)` guard exactly.
+    pub fn normalize_number_systems(&mut self) {
+        let mut switch_ns = false;
+        for slot in self.all_reps.iter_mut() {
+            if slot.is_some() {
+                switch_ns = true;
+                *slot = None;
+            }
+        }
+        if !switch_ns {
+            return;
+        }
+        self.determinize_and_minimize();
+        self.force_canonize();
+        self.apply_all_representations_with_output();
+    }
+
+    /// The `msd_k`/`lsd_k` name Java's `NumberSystem.getName()` would report for each
+    /// track of this automaton, reconstructed from this crate's `msd`/`alphabet`
+    /// stand-in (see [`Automaton`]'s struct docs on why no real `NumberSystem` is stored
+    /// per track). `None` where the track carries no arithmetic number system at all
+    /// (`msd[i] == None`), mirroring Java's literal `null` `NS` list entry.
+    ///
+    /// # Scope note, not a Java bug: base-*k* only
+    ///
+    /// This reconstructs only a plain base-*k* name from the track's alphabet
+    /// cardinality (`alphabet[i].len()`). A custom-base track (`msd_fib`, …) that
+    /// happens to share the same alphabet cardinality and direction as some plain
+    /// `msd_k` is reported here as `msd_k`, not its real custom name — this crate's
+    /// `Automaton` does not retain the original `NumberSystem` object per track (only
+    /// the two facts [`Automaton::msd`]/[`Automaton::all_reps`] carry), so there is no
+    /// name to recover for that case. Used by
+    /// [`crate::numsys::is_ns_differing`]'s two `wr-cli` call sites (`union`/`concat`,
+    /// whose Java originals compare by `NumberSystem.getName()`) and by
+    /// `Main.Commands.Describe`'s `"Number systems:"` line — both accept this
+    /// narrowing, which only ever UNDER-approximates "differing" (two automata that
+    /// really are on different custom bases but collide on alphabet size and direction
+    /// are misreported as having the same name, never the reverse), documented at each
+    /// call site.
+    pub fn track_ns_names(&self) -> Vec<Option<String>> {
+        self.msd
+            .iter()
+            .zip(self.alphabet.iter())
+            .map(|(msd, alphabet)| {
+                msd.map(|is_msd| {
+                    let prefix = if is_msd {
+                        crate::numsys::MSD_UNDERSCORE
+                    } else {
+                        crate::numsys::LSD_UNDERSCORE
+                    };
+                    format!("{prefix}{}", alphabet.len())
+                })
+            })
+            .collect()
+    }
+
     /// `RichAlphabet.isInNewAlphabet` (`RichAlphabet.java:51-58`): true iff every track's
     /// decoded digit is still present in the corresponding track of `new_alphabet`. Half
     /// of the self-contained portion of `Automaton.setAlphabet` (see module docs on why
@@ -2170,5 +2257,78 @@ mod tests {
             vec![None],
         );
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored")))]);
+    }
+
+    // ------------------------------------------------------------------------
+    // `normalize_number_systems` / `track_ns_names` (U23: `Main.Commands.Concat`/`Star`'s
+    // `Automaton.normalizeNumberSystems` call, and `Describe`'s NS-name reconstruction).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn normalize_number_systems_is_a_no_op_when_no_track_has_a_restriction() {
+        let mut a = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![Some(true)],
+        );
+        let before_q = a.fa.q;
+        let before_o = a.fa.o.clone();
+        a.normalize_number_systems();
+        assert_eq!(a.fa.q, before_q);
+        assert_eq!(a.fa.o, before_o);
+        assert!(a.all_reps[0].is_none());
+    }
+
+    #[test]
+    fn normalize_number_systems_drops_the_restriction_on_a_switched_track() {
+        let mut a = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![Some(true)],
+        );
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x")))]);
+        assert!(a.all_reps[0].is_some(), "precondition: track is switched");
+
+        a.normalize_number_systems();
+
+        assert!(
+            a.all_reps[0].is_none(),
+            "the restriction must be dropped on the switched track"
+        );
+        // Still a well-formed, deterministic automaton -- `determinizeAndMinimize` ran.
+        assert!(a.fa.is_deterministic());
+    }
+
+    #[test]
+    fn normalize_number_systems_only_drops_switched_tracks_not_every_track() {
+        let mut a = Automaton::new(
+            trivial_fa(4),
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".into(), "y".into()],
+            vec![Some(true), Some(true)],
+        );
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x"))), None]);
+        a.normalize_number_systems();
+        assert!(a.all_reps[0].is_none());
+        assert!(
+            a.all_reps[1].is_none(),
+            "track 1 had no restriction to begin with"
+        );
+    }
+
+    #[test]
+    fn track_ns_names_reconstructs_msd_and_lsd_names_and_skips_non_arithmetic_tracks() {
+        let a = Automaton::new(
+            trivial_fa(30),
+            vec![vec![0, 1], vec![0, 1, 2], vec![0, 1, 2, 3, 4]],
+            vec!["x".into(), "y".into(), "z".into()],
+            vec![Some(true), Some(false), None],
+        );
+        assert_eq!(
+            a.track_ns_names(),
+            vec![Some("msd_2".to_string()), Some("lsd_3".to_string()), None,]
+        );
     }
 }

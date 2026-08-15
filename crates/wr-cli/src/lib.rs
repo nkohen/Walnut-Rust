@@ -15,14 +15,20 @@
 //! shape `wr-core`/`wr-io`/`wr-logic` already use.
 
 pub mod alphabet;
+pub mod automaton_ops;
 pub mod automaton_output;
+pub mod describe;
 pub mod eval_def;
 pub mod help_messages;
+pub mod macro_cmd;
 pub mod meta_commands;
 pub mod prover;
 pub mod prover_helper;
+pub mod quotient;
 pub mod reg;
+pub mod reverse;
 pub mod session;
+pub mod simple_transforms;
 pub mod test_case;
 pub mod test_command;
 pub mod transduce;

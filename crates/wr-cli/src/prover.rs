@@ -99,11 +99,22 @@ use wr_core::util::validate_file;
 use wr_logic::predicate_env::FreshIdentifiers;
 
 use crate::alphabet::{alphabet_command, AlphabetError};
+use crate::automaton_ops::{
+    combine_command, concat_command, intersect_command, star_command, union_command,
+    AutomatonOpsError,
+};
+use crate::describe::{describe, DescribeError};
 use crate::eval_def::{eval_def_command_with_stdout, EvalDefError};
+use crate::macro_cmd::macro_command;
 use crate::meta_commands::{MetaCommandError, MetaCommands};
 use crate::prover_helper::{clear_screen_to, ProverHelperError};
+use crate::quotient::{left_quotient_command, right_quotient_command, QuotientError};
 use crate::reg::{reg, RegError};
+use crate::reverse::{reverse_command, ReverseError};
 use crate::session::{Session, SessionPaths, PROMPT, WALNUT_VERSION};
+use crate::simple_transforms::{
+    fix_lead_zero_command, fix_trail_zero_command, minimize_command, SimpleTransformError,
+};
 use crate::test_case::TestCase;
 use crate::test_command::{test_command_to, TestError};
 use crate::transduce::TransduceCommandError;
@@ -580,6 +591,16 @@ pub enum ProverError {
     /// (`Prover.testCommand`, `:685`) — the `\d+`-constrained capture group can still
     /// overflow `i32`, which `PAT_FOR_test_CMD` does not guard against.
     NumberFormat(String),
+    /// U23, batch A: `combine`/`concat`/`union`/`intersect`/`star`.
+    AutomatonOps(AutomatonOpsError),
+    /// U23, batch A: `reverse`.
+    Reverse(ReverseError),
+    /// U23, batch A: `rightquo`/`leftquo`.
+    Quotient(QuotientError),
+    /// U23, batch A: `describe`.
+    Describe(DescribeError),
+    /// U23, batch A: `minimize`/`fixleadzero`/`fixtrailzero`.
+    SimpleTransform(SimpleTransformError),
     /// **Port-specific.** A command this project deliberately does not implement.
     UnsupportedCommand {
         command: &'static str,
@@ -612,6 +633,11 @@ impl std::fmt::Display for ProverError {
             ProverError::NumberFormat(input) => {
                 write!(f, "{}", msg::number_format_exception(input))
             }
+            ProverError::AutomatonOps(e) => write!(f, "{e}"),
+            ProverError::Reverse(e) => write!(f, "{e}"),
+            ProverError::Quotient(e) => write!(f, "{e}"),
+            ProverError::Describe(e) => write!(f, "{e}"),
+            ProverError::SimpleTransform(e) => write!(f, "{e}"),
             ProverError::UnsupportedCommand { command, reason } => write!(
                 f,
                 "The {command} command is out of scope for walnut-rs ({reason})."
@@ -646,7 +672,12 @@ impl LoggableError for ProverError {
             | ProverError::Helper(_)
             | ProverError::Test(_)
             | ProverError::Transduce(_)
-            | ProverError::Io(_) => true,
+            | ProverError::Io(_)
+            | ProverError::AutomatonOps(_)
+            | ProverError::Reverse(_)
+            | ProverError::Quotient(_)
+            | ProverError::Describe(_)
+            | ProverError::SimpleTransform(_) => true,
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
@@ -695,6 +726,11 @@ prover_error_from! {
     TestError => Test,
     TransduceCommandError => Transduce,
     io::Error => Io,
+    AutomatonOpsError => AutomatonOps,
+    ReverseError => Reverse,
+    QuotientError => Quotient,
+    DescribeError => Describe,
+    SimpleTransformError => SimpleTransform,
 }
 
 // ---------------------------------------------------------------------------
@@ -913,19 +949,17 @@ impl Prover {
             }
             // `:486-488` -> `Combine.combineCommand`
             COMBINE => {
-                match_or_fail(&patterns().combine, s, COMBINE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: COMBINE,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().combine, s, COMBINE)?;
+                let automata = group(&caps, s, GROUP_COMBINE_AUTOMATA).unwrap_or("");
+                let name = group(&caps, s, GROUP_COMBINE_NAME).unwrap_or("");
+                Ok(Some(combine_command(&self.session, s, automata, name)?))
             }
             // `:489-491` -> `Concat.concat`
             CONCAT => {
-                match_or_fail(&patterns().concat, s, CONCAT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: CONCAT,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().concat, s, CONCAT)?;
+                let automata = group(&caps, s, GROUP_CONCAT_AUTOMATA).unwrap_or("");
+                let name = group(&caps, s, GROUP_CONCAT_NAME).unwrap_or("");
+                Ok(Some(concat_command(&self.session, s, automata, name)?))
             }
             // `:492-494` -> `AutomatonLogicalOps.convertNS`
             CONVERT => {
@@ -939,11 +973,18 @@ impl Prover {
             DEF | EVAL => Ok(Some(self.eval_def_commands(s)?)),
             // `:498-500` -> `Describe.describe`
             DESCRIBE => {
-                match_or_fail(&patterns().describe, s, DESCRIBE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: DESCRIBE,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().describe, s, DESCRIBE)?;
+                let is_dfao = group(&caps, s, GROUP_DESCRIBE_DOLLAR_SIGN) != Some("$");
+                let in_file_name = format!(
+                    "{}{TXT_EXTENSION}",
+                    group(&caps, s, GROUP_DESCRIBE_NAME).unwrap_or("")
+                );
+                Ok(Some(describe(
+                    &self.session,
+                    &mut self.logging,
+                    is_dfao,
+                    &in_file_name,
+                )?))
             }
             // `:501-503` -- no body; `dispatch` already computed `exitVal`.
             EXIT | QUIT => Ok(None),
@@ -957,19 +998,27 @@ impl Prover {
             }
             // `:507-509` -> `AutomatonLogicalOps.fixLeadingZerosProblem`
             FIXLEADZERO => {
-                match_or_fail(&patterns().fixleadzero, s, FIXLEADZERO)?;
-                Err(ProverError::NotYetImplemented {
-                    command: FIXLEADZERO,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().fixleadzero, s, FIXLEADZERO)?;
+                let old_name = group(&caps, s, GROUP_FIXLEADZERO_OLD_NAME).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_FIXLEADZERO_NEW_NAME).unwrap_or("");
+                Ok(Some(fix_lead_zero_command(
+                    &self.session,
+                    s,
+                    old_name,
+                    new_name,
+                )?))
             }
             // `:510-512` -> `AutomatonLogicalOps.fixTrailingZerosProblem`
             FIXTRAILZERO => {
-                match_or_fail(&patterns().fixtrailzero, s, FIXTRAILZERO)?;
-                Err(ProverError::NotYetImplemented {
-                    command: FIXTRAILZERO,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().fixtrailzero, s, FIXTRAILZERO)?;
+                let old_name = group(&caps, s, GROUP_FIXTRAILZERO_OLD_NAME).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_FIXTRAILZERO_NEW_NAME).unwrap_or("");
+                Ok(Some(fix_trail_zero_command(
+                    &self.session,
+                    s,
+                    old_name,
+                    new_name,
+                )?))
             }
             // `:513` -> `HelpMessages.helpCommand`. Note Java does NOT return here: the
             // arm falls through to the method's trailing `return null`.
@@ -996,11 +1045,10 @@ impl Prover {
             }
             // `:520-522` -> `Intersect.intersect`
             INTERSECT => {
-                match_or_fail(&patterns().intersect, s, INTERSECT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: INTERSECT,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().intersect, s, INTERSECT)?;
+                let automata = group(&caps, s, GROUP_INTERSECT_AUTOMATA).unwrap_or("");
+                let name = group(&caps, s, GROUP_INTERSECT_NAME).unwrap_or("");
+                Ok(Some(intersect_command(&self.session, s, automata, name)?))
             }
             // `:523-525` -> `Join.joinCommand`
             JOIN => {
@@ -1012,11 +1060,17 @@ impl Prover {
             }
             // `:526-528` -> `Quotient.leftQuotient`
             LEFTQUO => {
-                match_or_fail(&patterns().leftquo, s, LEFTQUO)?;
-                Err(ProverError::NotYetImplemented {
-                    command: LEFTQUO,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().leftquo, s, LEFTQUO)?;
+                let old_name1 = group(&caps, s, GROUP_QUO_OLD_NAME1).unwrap_or("");
+                let old_name2 = group(&caps, s, GROUP_QUO_OLD_NAME2).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_QUO_NEW_NAME).unwrap_or("");
+                Ok(Some(left_quotient_command(
+                    &self.session,
+                    s,
+                    old_name1,
+                    old_name2,
+                    new_name,
+                )?))
             }
             // `:529-531` -- reachable only through `dispatchForIntegrationTest`;
             // `dispatch` special-cases `load` before the switch. Java discards the
@@ -1028,19 +1082,23 @@ impl Prover {
             }
             // `:532-534`
             MACRO => {
-                match_or_fail(&patterns().macro_cmd, s, MACRO)?;
-                Err(ProverError::NotYetImplemented {
-                    command: MACRO,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().macro_cmd, s, MACRO)?;
+                let name = group(&caps, s, M_NAME).unwrap_or("");
+                let definition = group(&caps, s, M_DEFINITION).unwrap_or("");
+                macro_command(&self.session, name, definition, &mut self.out);
+                Ok(None)
             }
             // `:535-537` -> `WordAutomaton.minimizeSelfWithOutput`
             MINIMIZE => {
-                match_or_fail(&patterns().minimize, s, MINIMIZE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: MINIMIZE,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().minimize, s, MINIMIZE)?;
+                let old_name = group(&caps, s, GROUP_MINIMIZE_OLD_NAME).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_MINIMIZE_NEW_NAME).unwrap_or("");
+                Ok(Some(minimize_command(
+                    &self.session,
+                    s,
+                    old_name,
+                    new_name,
+                )?))
             }
             // `:538-540` -> `Main.Commands.Morphism.morphismCommand`
             MORPHISM => {
@@ -1070,19 +1128,34 @@ impl Prover {
             REG => Ok(Some(self.reg_command(s)?)),
             // `:550-552` -> `Reverse.reverseCommand`
             REVERSE => {
-                match_or_fail(&patterns().reverse, s, REVERSE)?;
-                Err(ProverError::NotYetImplemented {
-                    command: REVERSE,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().reverse, s, REVERSE)?;
+                let is_dfao = group(&caps, s, GROUP_REVERSE_DOLLAR_SIGN) != Some("$");
+                let in_file_name = format!(
+                    "{}{TXT_EXTENSION}",
+                    group(&caps, s, GROUP_REVERSE_OLD_NAME).unwrap_or("")
+                );
+                let new_name = group(&caps, s, GROUP_REVERSE_NEW_NAME).unwrap_or("");
+                Ok(Some(reverse_command(
+                    &self.session,
+                    s,
+                    &in_file_name,
+                    is_dfao,
+                    new_name,
+                )?))
             }
             // `:553-555` -> `Quotient.rightQuotient`
             RIGHTQUO => {
-                match_or_fail(&patterns().rightquo, s, RIGHTQUO)?;
-                Err(ProverError::NotYetImplemented {
-                    command: RIGHTQUO,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().rightquo, s, RIGHTQUO)?;
+                let old_name1 = group(&caps, s, GROUP_QUO_OLD_NAME1).unwrap_or("");
+                let old_name2 = group(&caps, s, GROUP_QUO_OLD_NAME2).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_QUO_NEW_NAME).unwrap_or("");
+                Ok(Some(right_quotient_command(
+                    &self.session,
+                    s,
+                    old_name1,
+                    old_name2,
+                    new_name,
+                )?))
             }
             // `:556-558` -> `Split.processSplitCommand(…, true, …)`. Note the error name
             // Java uses here is `REVERSE_SPLIT` ("reverse split"), not "rsplit".
@@ -1103,11 +1176,10 @@ impl Prover {
             }
             // `:562-564` -> `Star.star`
             STAR => {
-                match_or_fail(&patterns().star, s, STAR)?;
-                Err(ProverError::NotYetImplemented {
-                    command: STAR,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().star, s, STAR)?;
+                let old_name = group(&caps, s, GROUP_STAR_OLD_NAME).unwrap_or("");
+                let new_name = group(&caps, s, GROUP_STAR_NEW_NAME).unwrap_or("");
+                Ok(Some(star_command(&self.session, s, old_name, new_name)?))
             }
             // `:565-567` -> `Prover.testCommand` -> `Test.testCommand`. Java's switch arm
             // (`case TEST -> { testCommand(s); }`) discards `testCommand`'s `boolean`
@@ -1128,11 +1200,10 @@ impl Prover {
             TRANSDUCE => Ok(Some(self.transduce_command(s)?)),
             // `:571-573` -> `Union.union`
             UNION => {
-                match_or_fail(&patterns().union, s, UNION)?;
-                Err(ProverError::NotYetImplemented {
-                    command: UNION,
-                    unit: "U23",
-                })
+                let caps = match_or_fail(&patterns().union, s, UNION)?;
+                let automata = group(&caps, s, GROUP_UNION_AUTOMATA).unwrap_or("");
+                let name = group(&caps, s, GROUP_UNION_NAME).unwrap_or("");
+                Ok(Some(union_command(&self.session, s, automata, name)?))
             }
             // `:574` -- unreachable from `dispatch` (the name was already checked against
             // `RE_FOR_THE_LIST_OF_CMDS`), but ported verbatim.
@@ -1433,6 +1504,11 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::Test(_)
         | ProverError::Transduce(_)
         | ProverError::NumberFormat(_)
+        | ProverError::AutomatonOps(_)
+        | ProverError::Reverse(_)
+        | ProverError::Quotient(_)
+        | ProverError::Describe(_)
+        | ProverError::SimpleTransform(_)
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
     }
@@ -2204,6 +2280,69 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// U23, batch A: every one of the 13 dispatch arms (`combine`, `concat`, `union`,
+    /// `intersect`, `star`, `reverse`, `rightquo`, `leftquo`, `describe`, `minimize`,
+    /// `fixleadzero`, `fixtrailzero`, `macro`) runs REAL logic through
+    /// [`Prover::dispatch`] -- the regex capture + command-name lookup + argument
+    /// extraction this test exercises is the exact same path `walnut-rs`'s binary and
+    /// `read_buffer`/`run` use, not a shortcut that calls the underlying `wr-cli`
+    /// command function directly.
+    #[test]
+    fn u23_batch_a_commands_run_real_logic_through_dispatch() {
+        let (mut p, dir, _) = prover("u23-batch-a");
+
+        // Two small `msd_2` predicate automata to fold the rest of this batch over.
+        assert!(p.dispatch("reg a msd_2 \"0*1\";").unwrap());
+        assert!(p.dispatch("reg b msd_2 \"1\";").unwrap());
+        assert!(dir.join("Automata Library").join("a.txt").is_file());
+        assert!(dir.join("Automata Library").join("b.txt").is_file());
+
+        assert!(p.dispatch("union u a b;").unwrap());
+        assert!(dir.join("Automata Library").join("u.txt").is_file());
+
+        assert!(p.dispatch("intersect i a b;").unwrap());
+        assert!(dir.join("Automata Library").join("i.txt").is_file());
+
+        assert!(p.dispatch("concat cc a b;").unwrap());
+        assert!(dir.join("Automata Library").join("cc.txt").is_file());
+
+        assert!(p.dispatch("star st a;").unwrap());
+        assert!(dir.join("Automata Library").join("st.txt").is_file());
+
+        // `combine` writes into the WORD library (it always produces a DFAO).
+        assert!(p.dispatch("combine co a=1 b=2;").unwrap());
+        assert!(dir.join("Word Automata Library").join("co.txt").is_file());
+
+        // `minimize` reads/writes the WORD library too.
+        assert!(p.dispatch("minimize mn co;").unwrap());
+        assert!(dir.join("Word Automata Library").join("mn.txt").is_file());
+
+        assert!(p.dispatch("reverse r $a;").unwrap());
+        assert!(dir.join("Automata Library").join("r.txt").is_file());
+
+        assert!(p.dispatch("rightquo rq a b;").unwrap());
+        assert!(dir.join("Automata Library").join("rq.txt").is_file());
+
+        assert!(p.dispatch("leftquo lq a b;").unwrap());
+        assert!(dir.join("Automata Library").join("lq.txt").is_file());
+
+        assert!(p.dispatch("fixleadzero fl a;").unwrap());
+        assert!(dir.join("Automata Library").join("fl.txt").is_file());
+
+        assert!(p.dispatch("fixtrailzero ft a;").unwrap());
+        assert!(dir.join("Automata Library").join("ft.txt").is_file());
+
+        // `describe` writes nothing; just confirm it runs to completion (not
+        // `NotYetImplemented`) and produces command-log detail.
+        assert!(p.dispatch("describe $a;").unwrap());
+
+        assert!(p.dispatch(r#"macro mm "x = 1";"#).unwrap());
+        let macro_text = fs::read_to_string(dir.join("Macro Library").join("mm.txt")).unwrap();
+        assert_eq!(macro_text, "x = 1");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     /// Exercises the `{…}`-set branch of the shared alphabet-list sub-pattern, including
     /// its escaped `\-`/`\+` signs, through real dispatch.
     #[test]
@@ -2284,29 +2423,16 @@ mod tests {
     fn every_unimplemented_command_has_an_arm_that_reports_its_owning_unit() {
         let (mut p, dir, _) = prover("stubs");
         let cases = [
-            ("combine c a b;", "U23"),
-            ("concat C A B;", "U23"),
             ("convert new lsd_3 $old;", "U24"),
-            ("describe $M;", "U23"),
             ("export $M gv;", "U24"),
-            ("fixleadzero N $M;", "U23"),
-            ("fixtrailzero N $M;", "U23"),
             ("help;", "U22"),
             ("image I h T;", "U24"),
             ("inf T;", "U24"),
-            ("intersect I A B;", "U23"),
             ("join J A [x];", "U24"),
-            ("leftquo Q A B;", "U23"),
-            (r#"macro m "x = 1";"#, "U23"),
-            ("minimize N M;", "U23"),
             (r#"morphism h "0->01,1->10";"#, "U24"),
             ("promote P h;", "U24"),
-            ("reverse R $M;", "U23"),
-            ("rightquo Q A B;", "U23"),
             ("rsplit S [+] T;", "U24"),
             ("split S T [+];", "U24"),
-            ("star S A;", "U23"),
-            ("union U A B;", "U23"),
         ];
         for (command, unit) in cases {
             let err = p.dispatch(command).unwrap_err();
