@@ -673,11 +673,13 @@ impl LoggableError for ProverError {
             | ProverError::Test(_)
             | ProverError::Transduce(_)
             | ProverError::Io(_)
-            | ProverError::AutomatonOps(_)
             | ProverError::Reverse(_)
-            | ProverError::Quotient(_)
             | ProverError::Describe(_)
             | ProverError::SimpleTransform(_) => true,
+            // Two exceptions to the paragraph above, both non-`WalnutException` Java
+            // throwables faithfully surfaced by U23's review fixes.
+            ProverError::AutomatonOps(e) => !matches!(e, AutomatonOpsError::NumberFormat(_)),
+            ProverError::Quotient(e) => e.is_walnut_exception(),
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
@@ -693,7 +695,14 @@ impl LoggableError for ProverError {
     fn kind(&self) -> String {
         match self {
             ProverError::InvalidFile(_) => "java.lang.IllegalArgumentException".to_string(),
-            ProverError::NumberFormat(_) => "java.lang.NumberFormatException".to_string(),
+            ProverError::NumberFormat(_)
+            | ProverError::AutomatonOps(AutomatonOpsError::NumberFormat(_)) => {
+                "java.lang.NumberFormatException".to_string()
+            }
+            // `RichAlphabet.encode`'s corrupt index (WB-010); see `QuotientError::Runtime`.
+            ProverError::Quotient(QuotientError::Runtime(_)) => {
+                "java.lang.ArrayIndexOutOfBoundsException".to_string()
+            }
             ProverError::Meta(e) => e.kind(),
             _ => "Main.WalnutException".to_string(),
         }
@@ -959,7 +968,13 @@ impl Prover {
                 let caps = match_or_fail(&patterns().concat, s, CONCAT)?;
                 let automata = group(&caps, s, GROUP_CONCAT_AUTOMATA).unwrap_or("");
                 let name = group(&caps, s, GROUP_CONCAT_NAME).unwrap_or("");
-                Ok(Some(concat_command(&self.session, s, automata, name)?))
+                Ok(Some(concat_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    automata,
+                    name,
+                )?))
             }
             // `:492-494` -> `AutomatonLogicalOps.convertNS`
             CONVERT => {
@@ -1179,7 +1194,13 @@ impl Prover {
                 let caps = match_or_fail(&patterns().star, s, STAR)?;
                 let old_name = group(&caps, s, GROUP_STAR_OLD_NAME).unwrap_or("");
                 let new_name = group(&caps, s, GROUP_STAR_NEW_NAME).unwrap_or("");
-                Ok(Some(star_command(&self.session, s, old_name, new_name)?))
+                Ok(Some(star_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    old_name,
+                    new_name,
+                )?))
             }
             // `:565-567` -> `Prover.testCommand` -> `Test.testCommand`. Java's switch arm
             // (`case TEST -> { testCommand(s); }`) discards `testCommand`'s `boolean`
@@ -2339,6 +2360,71 @@ mod tests {
         assert!(p.dispatch(r#"macro mm "x = 1";"#).unwrap());
         let macro_text = fs::read_to_string(dir.join("Macro Library").join("mm.txt")).unwrap();
         assert_eq!(macro_text, "x = 1");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// U23 review fix, finding #6. The batch-A test above asserts only "the command
+    /// succeeded and wrote a file" for most arms, which a swapped-operand port bug would
+    /// sail straight through — `concat`, `rightquo` and `leftquo` are all ASYMMETRIC in
+    /// their two automaton arguments and still produce a perfectly valid output file when
+    /// the operands are exchanged. This pins the LANGUAGE of each, in both orders,
+    /// through real dispatch.
+    #[test]
+    fn asymmetric_batch_a_commands_respect_their_operand_order() {
+        let (mut p, dir, _) = prover("u23-operand-order");
+        // L(a) = 0*1 = {1, 01, 001, ...}; L(b) = {1}; L(z) = {0}.
+        assert!(p.dispatch("reg a msd_2 \"0*1\";").unwrap());
+        assert!(p.dispatch("reg b msd_2 \"1\";").unwrap());
+        assert!(p.dispatch("reg z msd_2 \"0\";").unwrap());
+
+        let language_of = |name: &str| {
+            wr_io::reader::read_automaton_txt(
+                dir.join("Automata Library").join(format!("{name}.txt")),
+            )
+            .unwrap()
+        };
+
+        // --- concat. `L(a)·L(b)` contains "011" (= "01" then "1"); `L(b)·L(a)` cannot —
+        // everything in it starts with a `1`. (Both also carry WB-009's leak of the first
+        // operand's own language, which contains no "011" either way.)
+        assert!(p.dispatch("concat ab a b;").unwrap());
+        assert!(p.dispatch("concat ba b a;").unwrap());
+        assert!(
+            language_of("ab").fa.accepts_word(&[0, 1, 1]),
+            "concat a b must accept \"011\""
+        );
+        assert!(
+            !language_of("ba").fa.accepts_word(&[0, 1, 1]),
+            "concat b a must NOT accept \"011\" -- operand order is load-bearing"
+        );
+
+        // --- rightquo. `{z : z·w ∈ L(a) for some w ∈ L(b)}` = `{z : z1 ∈ 0*1}` = `0*`,
+        // which contains "0". The swap is `{z : z·w ∈ L(b)={1}}` = `{ε}`, which does not.
+        assert!(p.dispatch("rightquo rab a b;").unwrap());
+        assert!(p.dispatch("rightquo rba b a;").unwrap());
+        assert!(
+            language_of("rab").fa.accepts_word(&[0]),
+            "rightquo a b must accept \"0\""
+        );
+        assert!(
+            !language_of("rba").fa.accepts_word(&[0]),
+            "rightquo b a must NOT accept \"0\""
+        );
+
+        // --- leftquo. `{w : u·w ∈ L(a) for some u ∈ L(z)={0}}` = `{w : 0w ∈ 0*1}`, which
+        // contains "1". The swap needs some u ∈ L(a) to be a prefix of "0" — none is — so
+        // it is empty.
+        assert!(p.dispatch("leftquo laz a z;").unwrap());
+        assert!(p.dispatch("leftquo lza z a;").unwrap());
+        assert!(
+            language_of("laz").fa.accepts_word(&[1]),
+            "leftquo a z must accept \"1\""
+        );
+        assert!(
+            !language_of("lza").fa.accepts_word(&[1]),
+            "leftquo z a must NOT accept \"1\""
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

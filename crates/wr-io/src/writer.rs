@@ -30,18 +30,16 @@
 //! round-tripping: [`crate::reader::parse_header`] treats any run of whitespace as a
 //! single separator.
 //!
-//! **A known, pre-existing representation gap, not new to this unit**: `wr_core::
-//! Automaton` (as of Phase 2/3a) carries only a per-track `msd: Option<bool>` direction
-//! flag, not a full `NumberSystem` object with its original name string (see
-//! `automaton.rs`'s own module docs: "deliberately NOT full Java parity"). So this
-//! writer can only ever emit the CANONICAL `msd_<base>`/`lsd_<base>` form (`base` =
-//! that track's alphabet length) for an arithmetic track — never a custom-base name
-//! (`msd_fib`, ...), and never the literal bare `msd`/`lsd` spelling a header might
-//! originally have used (both round-trip identically through
-//! [`crate::reader::parse_header`] anyway, which treats bare `msd`/`lsd` as exactly
-//! `msd_2`/`lsd_2`). Custom-base header round-tripping, if ever needed, requires
-//! `Automaton` to carry the real name — out of this unit's scope (U12), same boundary
-//! U13's custom-base reader support already documents from the read side.
+//! **Number-system names**: Java writes `numberSystem.toString()` (`AutomatonWriter.java:72`),
+//! i.e. `NumberSystem.getName()`. Since U23's review fixes, `wr_core::Automaton` carries
+//! that name per track ([`wr_core::automaton::Automaton::ns_name`], surfaced through
+//! `track_ns_names()`), so this writer emits it verbatim — a custom base (`msd_fib`, ...)
+//! now round-trips through write→read instead of being flattened to the `msd_2` its
+//! alphabet cardinality alone suggests. Where no name was recorded (an automaton this
+//! crate built in memory, always on a plain base), it falls back to the canonical
+//! `msd_<base>`/`lsd_<base>` reconstruction, which is exactly what Java's name would be
+//! (`NumberSystem.normalizeNumberSystemToken` maps bare `msd`/`lsd` to `msd_2`/`lsd_2`),
+//! so no previously-correct output changes.
 //!
 //! # `.gv` (Graphviz) format
 //!
@@ -191,14 +189,15 @@ pub fn write_automaton_txt<P: AsRef<Path>>(automaton: &mut Automaton, path: P) -
 /// `AutomatonWriter.writeAlphabet` (`:60-76`) — see this module's docs for the
 /// faithfully-preserved asymmetric-spacing quirk.
 fn write_alphabet<W: Write>(automaton: &Automaton, out: &mut W) -> io::Result<()> {
-    for i in 0..automaton.alphabet.len() {
-        match automaton.msd[i] {
-            Some(is_msd) => {
+    // `numberSystem.toString()` (`:72`) == `NumberSystem.getName()`; see this module's docs.
+    let names = automaton.track_ns_names();
+    for (i, name) in names.iter().enumerate() {
+        match name {
+            Some(name) => {
                 if i > 0 {
                     write!(out, " ")?;
                 }
-                let base = automaton.alphabet[i].len();
-                write!(out, "{}_{}", if is_msd { "msd" } else { "lsd" }, base)?;
+                out.write_all(name.as_bytes())?;
             }
             None => {
                 write!(

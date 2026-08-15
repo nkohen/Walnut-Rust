@@ -43,8 +43,9 @@ impl std::error::Error for DescribeError {}
 
 /// The `List<NumberSystem>.toString()` rendering Java's `"Number systems:" +
 /// M.getNS()` produces — `[msd_2, null]`-style, via
-/// [`wr_core::automaton::Automaton::track_ns_names`] (see that method's docs for the
-/// custom-base scope narrowing this inherits).
+/// [`wr_core::automaton::Automaton::track_ns_names`], which reports each track's real
+/// `NumberSystem.getName()` (so a custom-base automaton prints `[msd_fib]`, not the
+/// `[msd_2]` its alphabet cardinality alone would suggest).
 fn ns_list_display(names: &[Option<String>]) -> String {
     let parts: Vec<String> = names
         .iter()
@@ -177,9 +178,49 @@ mod tests {
         assert!(tc.details().contains("File location:"));
         assert!(tc.details().contains("Comments:"));
         assert!(tc.details().contains("State count:2"));
+        // The one line fed by `Fa::determine_transition_count`: 2 states x 2 symbols,
+        // every destination list of length 1, so 4 — NOT 2 (states) and not 2 (keys per
+        // state), the two values a wrong summation would produce.
+        assert!(
+            tc.details().contains("Transition count:4"),
+            "details were: {}",
+            tc.details()
+        );
         assert!(tc.details().contains("Alphabet size:2"));
         assert!(tc.details().contains("Number systems:[msd_2]"));
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// U23 review fix, finding #4: `"Number systems:"` reconstructed the name from
+    /// `(msd, alphabet.len())`, so a custom base printed as the plain base with the same
+    /// alphabet cardinality (`[msd_2]` for `msd_fib`). Same root cause as the fail-open
+    /// `isNSDiffering` guard; fixed by threading the real `NumberSystem.getName()`.
+    #[test]
+    fn describe_prints_a_custom_bases_real_name_not_the_base_k_lookalike() {
+        let (session, dir) = temp_session("custom-base");
+        // The real shipped `msd_fib` files — see `crates/wr-io/tests/fixtures/ATTRIBUTION.md`.
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../wr-io/tests/fixtures")
+            .canonicalize()
+            .unwrap();
+        for name in ["msd_fib.txt", "msd_fib_addition.txt"] {
+            fs::copy(fixtures.join(name), dir.join("Custom Bases").join(name)).unwrap();
+        }
+        fs::write(
+            dir.join("Automata Library").join("F.txt"),
+            "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n",
+        )
+        .unwrap();
+
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        let tc = describe(&session, &mut logging, false, "F.txt").unwrap();
+        assert!(
+            tc.details().contains("Number systems:[msd_fib]"),
+            "details were: {}",
+            tc.details()
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -340,10 +340,15 @@ fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Q
     let new_alphabet: Vec<Vec<i32>> = kept.iter().map(|&i| a.alphabet[i].clone()).collect();
     let new_label: Vec<String> = kept.iter().map(|&i| a.label[i].clone()).collect();
     let new_msd: Vec<Option<bool>> = kept.iter().map(|&i| a.msd[i]).collect();
-    // `removeIndices(A.getNS(), I)` removes the whole per-track `NumberSystem`, i.e. both
-    // halves of this crate's stand-in (`Automaton::all_reps`'s invariant, U5).
+    // `removeIndices(A.getNS(), I)` removes the whole per-track `NumberSystem`, i.e. all
+    // three parts of this crate's stand-in (`Automaton::all_reps`'s invariant, U5, plus
+    // `Automaton::ns_name`).
     let new_all_reps: Vec<Option<std::rc::Rc<Automaton>>> =
         kept.iter().map(|&i| a.all_reps[i].clone()).collect();
+    let new_ns_names: Vec<Option<String>> = kept
+        .iter()
+        .map(|&i| a.ns_name.get(i).cloned().flatten())
+        .collect();
     let new_alphabet_size: usize = new_alphabet.iter().map(|t| t.len()).product();
 
     // Building the reduced `Automaton` here (rather than mutating `a` in place) is what
@@ -352,6 +357,7 @@ fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Q
     // `encode`.
     let mut projected = Automaton::new(a.fa.clone(), new_alphabet, new_label, new_msd);
     projected.set_all_reps(new_all_reps);
+    projected.set_ns_names(new_ns_names);
     projected.fa.alphabet_size = new_alphabet_size;
 
     // `permutation[old] = new` (`:83-85`): re-encode each decoded tuple minus the

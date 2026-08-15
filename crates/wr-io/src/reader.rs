@@ -50,6 +50,17 @@
 //!   the *decision* logic; this module supplies the actual file reads). Any OTHER
 //!   unrecognized token is still [`ReadError::UnsupportedNumeration`], never silently
 //!   misread.
+//!
+//!   Java stores the resolved `NumberSystem` objects themselves in `A.getNS()`; this
+//!   crate's `Automaton` keeps a decomposed stand-in, and the reader populates two of its
+//!   three parts — the msd/lsd direction (`Automaton::msd`) and, as of U23's review fixes,
+//!   the number system's NAME (`Automaton::ns_name`, load-bearing because
+//!   `NumberSystem.isNSDiffering` compares by name and `msd_fib` is otherwise
+//!   indistinguishable from `msd_2`). **Still not populated**: `Automaton::all_reps`, the
+//!   custom base's valid-representation restriction — so an automaton read from a file
+//!   with an `msd_fib` header does not carry that restriction the way Java's would. That
+//!   is a pre-existing gap, unchanged here; `wr-cli`'s `alphabet`/`reg` commands are
+//!   currently the only producers that install it.
 //! - Then repeated state blocks: `<id> <output>` (first declared block's `id` becomes
 //!   `q0`, **not necessarily `0`**), each followed by zero or more transition lines
 //!   `<sym1> <sym2> ... -> <dest1> [<dest2> ...]` (one token per track, each a signed
@@ -325,7 +336,7 @@ fn read_automaton_txt_impl(
     }
 
     let trimmed_header = header_line.trim();
-    let (alphabet, msd) = parse_header(trimmed_header, custom_bases, in_progress)?;
+    let (alphabet, msd, ns_names) = parse_header(trimmed_header, custom_bases, in_progress)?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -346,6 +357,11 @@ fn read_automaton_txt_impl(
         label,
         msd,
     );
+    // Java's `AutomatonReader` stores the resolved `NumberSystem` objects themselves in
+    // `A.getNS()`; this crate keeps the two facts it needs plus the name (see
+    // `Automaton::ns_name`). Without the name, `isNSDiffering` cannot tell `msd_fib` from
+    // `msd_2`.
+    automaton.set_ns_names(ns_names);
 
     let mut output: BTreeMap<usize, i32> = BTreeMap::new();
     let mut transitions: BTreeMap<usize, BTreeMap<i32, Vec<usize>>> = BTreeMap::new();
@@ -492,11 +508,20 @@ enum HeaderToken {
     Ns {
         msd: bool,
         alphabet: Vec<i32>,
+        /// `NumberSystem.getName()` for this track, already normalized the way Java's
+        /// `NumberSystem.normalizeNumberSystemToken` (`:273-295`) would: bare `msd`/`lsd`
+        /// become `msd_2`/`lsd_2`, an `msd_<k>`/`lsd_<k>` token is itself, and a
+        /// custom-base token is the resolved [`NumberSystem`]'s own name. Kept because
+        /// `NumberSystem.isNSDiffering` compares number systems BY NAME, and a custom
+        /// base is otherwise indistinguishable from the plain base with the same alphabet
+        /// cardinality — see [`wr_core::automaton::Automaton::ns_name`].
+        name: String,
     },
 }
 
-/// Per-track alphabet, and per-track msd/lsd (`None` for an explicit-set track).
-type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>);
+/// Per-track alphabet, per-track msd/lsd (`None` for an explicit-set track), and per-track
+/// number-system name (`None` for an explicit-set track, which has no `NumberSystem`).
+type HeaderSpec = (Vec<Vec<i32>>, Vec<Option<bool>>, Vec<Option<String>>);
 
 fn parse_header(
     line: &str,
@@ -505,6 +530,7 @@ fn parse_header(
 ) -> Result<HeaderSpec, ReadError> {
     let mut alphabet = Vec::new();
     let mut msd = Vec::new();
+    let mut ns_names: Vec<Option<String>> = Vec::new();
     let mut rest = line.trim();
     while !rest.is_empty() {
         rest = rest.trim_start();
@@ -539,20 +565,23 @@ fn parse_header(
             HeaderToken::Set(values) => {
                 alphabet.push(values);
                 msd.push(None);
+                ns_names.push(None);
             }
             HeaderToken::Ns {
                 msd: is_msd,
                 alphabet: track_alphabet,
+                name,
             } => {
                 alphabet.push(track_alphabet);
                 msd.push(Some(is_msd));
+                ns_names.push(Some(name));
             }
         }
     }
     if alphabet.is_empty() {
         return Err(ReadError::MalformedHeader);
     }
-    Ok((alphabet, msd))
+    Ok((alphabet, msd, ns_names))
 }
 
 fn parse_ns_token(
@@ -565,6 +594,7 @@ fn parse_ns_token(
             Ok(base) => Ok(HeaderToken::Ns {
                 msd: true,
                 alphabet: (0..base).collect(),
+                name: word.to_string(),
             }),
             Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
@@ -574,18 +604,24 @@ fn parse_ns_token(
             Ok(base) => Ok(HeaderToken::Ns {
                 msd: false,
                 alphabet: (0..base).collect(),
+                name: word.to_string(),
             }),
             Err(_) => custom_base_token(word, custom_bases, in_progress),
         };
     }
+    // `NumberSystem.normalizeNumberSystemToken` (`:284-286`): a bare `msd`/`lsd` token IS
+    // named `msd_2`/`lsd_2`, so that — not the bare word — is what `isNSDiffering` would
+    // compare.
     match word {
         "msd" => Ok(HeaderToken::Ns {
             msd: true,
             alphabet: vec![0, 1],
+            name: format!("{}2", numsys::MSD_UNDERSCORE),
         }),
         "lsd" => Ok(HeaderToken::Ns {
             msd: false,
             alphabet: vec![0, 1],
+            name: format!("{}2", numsys::LSD_UNDERSCORE),
         }),
         _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
     }
@@ -610,6 +646,7 @@ fn custom_base_token(
     Ok(HeaderToken::Ns {
         msd: ns.is_msd(),
         alphabet: ns.get_alphabet().to_vec(),
+        name: ns.name().to_string(),
     })
 }
 
@@ -833,7 +870,11 @@ pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, Re
         .ok_or(ReadError::EmptyFile)?;
 
     let trimmed_header = header_line.trim();
-    let (alphabet, msd) = parse_header(trimmed_header, None, &mut BTreeSet::new())?;
+    // The NS names go unused here: a transducer's own header names never reach an
+    // `Automaton` (`TransducerData` carries only the alphabet/msd it needs), and Java's
+    // `readTransducer` likewise keeps the `NumberSystem` list only inside its scratch
+    // parse state.
+    let (alphabet, msd, _ns_names) = parse_header(trimmed_header, None, &mut BTreeSet::new())?;
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -1084,21 +1125,21 @@ mod tests {
 
     #[test]
     fn bare_msd_defaults_to_base_2() {
-        let (alphabet, msd) = parse_header("msd", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _) = parse_header("msd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(true)]);
     }
 
     #[test]
     fn bare_lsd_defaults_to_base_2() {
-        let (alphabet, msd) = parse_header("lsd", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _) = parse_header("lsd", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1]]);
         assert_eq!(msd, vec![Some(false)]);
     }
 
     #[test]
     fn msd_k_and_lsd_k_parse_explicit_bases() {
-        let (alphabet, msd) = parse_header("msd_5 lsd_3", None, &mut BTreeSet::new()).unwrap();
+        let (alphabet, msd, _) = parse_header("msd_5 lsd_3", None, &mut BTreeSet::new()).unwrap();
         assert_eq!(alphabet, vec![vec![0, 1, 2, 3, 4], vec![0, 1, 2]]);
         assert_eq!(msd, vec![Some(true), Some(false)]);
     }
@@ -1329,6 +1370,63 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// U23 review fix, finding #1. The reader used to discard the resolved
+    /// [`NumberSystem`]'s NAME, keeping only `(alphabet, msd)` — which for `msd_fib` is
+    /// `([0, 1], true)`, i.e. byte-identical to `msd_2`'s. Downstream,
+    /// `NumberSystem.isNSDiffering` compares by name, so `union`/`intersect`/`concat`
+    /// silently accepted `msd_fib` and `msd_2` operands as "the same number system".
+    #[test]
+    fn a_custom_base_header_records_its_real_name_not_the_base_k_lookalike() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-cb-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cb_dir = dir.join("Custom Bases");
+        std::fs::create_dir_all(&cb_dir).unwrap();
+        std::fs::copy(fixture("msd_fib.txt"), cb_dir.join("msd_fib.txt")).unwrap();
+        std::fs::copy(
+            fixture("msd_fib_addition.txt"),
+            cb_dir.join("msd_fib_addition.txt"),
+        )
+        .unwrap();
+
+        let fib_path = dir.join("fib.txt");
+        std::fs::write(&fib_path, "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+        let fib = read_automaton_txt_with_custom_bases(&fib_path, &cb_dir).unwrap();
+
+        let two_path = dir.join("two.txt");
+        std::fs::write(&two_path, "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+        let two = read_automaton_txt_with_custom_bases(&two_path, &cb_dir).unwrap();
+
+        // Identical by every fact the pre-fix `Automaton` carried...
+        assert_eq!(fib.alphabet, two.alphabet);
+        assert_eq!(fib.msd, two.msd);
+        // ...and distinguishable only by the name, which is now kept.
+        assert_eq!(fib.track_ns_names(), vec![Some("msd_fib".to_string())]);
+        assert_eq!(two.track_ns_names(), vec![Some("msd_2".to_string())]);
+
+        // The writer emits `numberSystem.toString()` (`AutomatonWriter.java:72`), so the
+        // custom base round-trips instead of being flattened to `msd_2`.
+        let mut fib_out = fib;
+        let out_path = dir.join("fib_out.txt");
+        crate::writer::write_automaton_txt(&mut fib_out, &out_path).unwrap();
+        let text = std::fs::read_to_string(&out_path).unwrap();
+        assert_eq!(text.lines().next().unwrap(), "msd_fib");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `NumberSystem.normalizeNumberSystemToken` (`:284-286`) maps a bare `msd`/`lsd` to
+    /// `msd_2`/`lsd_2`, so those — not the bare words — are the names Java compares. This
+    /// also keeps the writer's output stable: a bare-`msd` header still writes back as
+    /// `msd_2`, exactly as before this unit.
+    #[test]
+    fn a_bare_msd_or_lsd_header_is_named_msd_2_or_lsd_2() {
+        let (_, _, names) = parse_header("msd lsd {0, 1}", None, &mut BTreeSet::new()).unwrap();
+        assert_eq!(
+            names,
+            vec![Some("msd_2".to_string()), Some("lsd_2".to_string()), None]
+        );
     }
 
     /// The [`CustomBaseResolver`] seam really is consulted **per file name**, not collapsed

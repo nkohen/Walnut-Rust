@@ -703,6 +703,9 @@ impl Transducer {
         // real caller produces, the two behave identically.
         if m.all_reps.len() == m.alphabet.len() && m.msd.len() == m.alphabet.len() {
             n.set_all_reps(m.all_reps.clone());
+            if m.ns_name.len() == m.alphabet.len() {
+                n.set_ns_names(m.ns_name.clone());
+            }
         }
 
         // ---- Find P and Q so the transducer's transition function becomes ultimately

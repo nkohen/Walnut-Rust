@@ -379,9 +379,19 @@ pub fn set_alphabet(
         .iter()
         .map(|o| o.as_ref().map(|ns| ns.is_msd()))
         .collect();
-    // `set_all_reps` requires `msd` already parallel to `alphabet` -- just established
-    // above.
+    // `set_all_reps`/`set_ns_names` require `msd` already parallel to `alphabet` -- just
+    // established above. The third part of the per-track `NumberSystem` stand-in is the
+    // NAME (`wr_core::automaton::Automaton::ns_name`): a track switched to a literal
+    // `{...}` set has no number system and therefore no name, and a track switched to a
+    // custom base must carry that base's real name or `isNSDiffering` cannot later tell
+    // it apart from the plain base with the same alphabet cardinality.
     m.set_all_reps(all_reps_from_ns(number_systems));
+    m.set_ns_names(
+        number_systems
+            .iter()
+            .map(|o| o.as_ref().map(|ns| ns.name().to_string()))
+            .collect(),
+    );
 
     // `M.determineAlphabetSize(); M.richAlphabet.setupEncoder();` (`:205-206`).
     m.determine_alphabet_size();

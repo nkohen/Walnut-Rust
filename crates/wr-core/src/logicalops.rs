@@ -627,9 +627,10 @@ pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> 
     other_clone.alphabet = a.alphabet.clone();
     other_clone.setup_encoder();
     other_clone.fa.alphabet_size = a.fa.alphabet_size;
-    // `otherClone.setNS(A.getNS())` (`:206`) — both halves of the per-track stand-in.
+    // `otherClone.setNS(A.getNS())` (`:206`) — all three parts of the per-track stand-in.
     other_clone.msd = a.msd.clone();
     other_clone.set_all_reps(a.all_reps.clone());
+    other_clone.set_ns_names(a.ns_name.clone());
 
     for i in 0..a.fa.q {
         // A temporary automaton identical to `a` except that it starts from state `i`.
@@ -1002,6 +1003,7 @@ fn remove_leading_zeros_helper(
     // all-representations restriction, which `or`/`xor`/`imply`/`iff` re-apply after
     // totalizing (`and` never totalizes, so it never needs to).
     m.set_all_reps(a.all_reps.clone());
+    m.set_ns_names(a.ns_name.clone());
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
@@ -1479,6 +1481,11 @@ fn ns_name(is_msd: bool, base: i32) -> String {
 fn set_number_system_and_alphabet(a: &mut Automaton, is_msd: bool, new_base: i32) {
     a.msd = vec![Some(is_msd)];
     a.all_reps = vec![None];
+    // Java installs `new NumberSystem(<msd|lsd>_ + newBase)`, whose name is exactly what
+    // `Automaton::track_ns_names` reconstructs from the `0..new_base` alphabet installed
+    // on the next line — so `None` ("no recorded name, reconstruct it") is the right
+    // entry here, not a stale carry-over of the pre-conversion base's name.
+    a.ns_name = vec![None];
     a.alphabet = vec![util::int_range_list(new_base)];
     a.fa.alphabet_size = new_base as usize;
     a.setup_encoder();

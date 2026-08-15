@@ -377,6 +377,7 @@ fn update_axb_fields(
         axb.label.push(a.label[i].clone());
         axb.msd.push(a.msd[i]);
         axb.all_reps.push(a.all_reps[i].clone());
+        axb.ns_name.push(a.ns_name.get(i).cloned().flatten());
     }
     for (i, &j) in same_inputs_in_a_and_b.iter().enumerate() {
         if j == NOT_SAME_INPUT_IN_BOTH {
@@ -384,6 +385,7 @@ fn update_axb_fields(
             axb.label.push(b.label[i].clone());
             axb.msd.push(b.msd[i]);
             axb.all_reps.push(b.all_reps[i].clone());
+            axb.ns_name.push(b.ns_name.get(i).cloned().flatten());
         } else {
             let j = j as usize;
             // Java's `AxB.getNS().set(j, bNS.get(i))` replaces the whole `NumberSystem`
@@ -395,6 +397,9 @@ fn update_axb_fields(
             if b.msd[i].is_some() && axb.msd[j].is_none() {
                 axb.msd[j] = b.msd[i];
                 axb.all_reps[j] = b.all_reps[i].clone();
+                if j < axb.ns_name.len() {
+                    axb.ns_name[j] = b.ns_name.get(i).cloned().flatten();
+                }
             }
         }
     }

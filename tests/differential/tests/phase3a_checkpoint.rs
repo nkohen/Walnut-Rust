@@ -328,6 +328,16 @@ fn custom_base_relational_comparison_matches_real_walnut() {
     );
 
     let a = run_eval(&session, "?msd_fib x < y", "fib_cmp", None).unwrap();
+    // U23's review fixes made `Automaton` carry each track's real `NumberSystem.getName()`
+    // (Java's `getNS().set(i, this)`), so a result built out of `msd_fib`'s own comparison
+    // automaton reports `msd_fib` — not the `msd_2` its `{0, 1}` alphabet alone suggests.
+    // That name is what `NumberSystem.isNSDiffering` compares and what
+    // `AutomatonWriter.writeAlphabet` emits, so getting it wrong here would let
+    // `union`/`intersect`/`concat` silently mix this result with a genuine base-2 one.
+    assert_eq!(
+        a.track_ns_names(),
+        vec![Some("msd_fib".to_string()), Some("msd_fib".to_string())]
+    );
     assert_equivalent_to_fixture(a, "fib_cmp", true, "fib_cmp");
     fs::remove_dir_all(&dir).ok();
 }
@@ -628,6 +638,9 @@ fn reg_over_a_custom_base_number_system_matches_real_walnut() {
     let tc = reg(&session, "msd_fib ", "0*1", "fib_reg")
         .unwrap_or_else(|e| panic!("reg over msd_fib must build, got {e}"));
     let a = tc.automaton_pairs()[0].automaton().unwrap().clone();
+    // Same U23 review-fix property as `custom_base_relational_comparison_matches_real_walnut`,
+    // through the OTHER producer that installs number systems (`Reg.java:34`'s `R.setNS(NS)`).
+    assert_eq!(a.track_ns_names(), vec![Some("msd_fib".to_string())]);
     assert_equivalent_to_fixture(a, "fib_reg", false, "fib_reg (msd_fib)");
     fs::remove_dir_all(&dir).ok();
 }

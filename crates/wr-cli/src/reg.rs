@@ -98,9 +98,17 @@ pub fn reg(
     let dfa = AutomatonDFA::from_encoded_regex(&encoded_regex, alphabets, msd)?;
     let mut automaton = dfa.into_automaton();
 
-    // `R.setNS(NS);` (`Reg.java:34`) -- the all-representations half; `msd` (the other
-    // half) is already installed via `from_encoded_regex`'s `msd` parameter above.
+    // `R.setNS(NS);` (`Reg.java:34`) -- the all-representations and NAME parts; `msd` (the
+    // third) is already installed via `from_encoded_regex`'s `msd` parameter above. The
+    // name matters downstream: `union`/`intersect`/`concat` compare number systems BY NAME
+    // (`NumberSystem.isNSDiffering`), so a `reg`-built custom-base automaton that lost its
+    // name would compare equal to a plain base with the same alphabet cardinality.
     automaton.set_all_reps(all_reps_from_ns(&ns));
+    automaton.set_ns_names(
+        ns.iter()
+            .map(|o| o.as_ref().map(|n| n.name().to_string()))
+            .collect(),
+    );
 
     // `R.writeAutomata(regex, Session.getWriteAddressForAutomataLibrary(), regName,
     // false);` (`Reg.java:35`). Java's `regex` argument here is the ENCODED regex string

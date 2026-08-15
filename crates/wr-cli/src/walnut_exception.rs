@@ -300,9 +300,120 @@ pub fn number_format_exception(input: &str) -> String {
     format!("For input string: \"{input}\"")
 }
 
+// ---------------------------------------------------------------------------
+// Panic → catchable-error boundary
+// ---------------------------------------------------------------------------
+
+/// Runs `f`, converting a panic escaping it into `Err(panic message)`.
+///
+/// # Why this exists
+///
+/// Several `wr-core` primitives replicate a Java `RuntimeException` (usually a
+/// `WalnutException`) as a `panic!`/`assert!` — see e.g.
+/// `wr_core::logicalops::right_quotient`'s subset guard and
+/// `wr_core::product`'s `create_basic_automaton` guards. In Java those are **caught**:
+/// `Prover.dispatch`'s handler prints them and the REPL keeps going, so one bad
+/// `rightquo`/`combine` costs you a command, not a session. In Rust a panic has no
+/// `catch_unwind` boundary anywhere in this workspace, so the same input **kills the
+/// process** — losing an entire `load`ed batch file. That is strictly less faithful than
+/// Java, not a ported quirk.
+///
+/// Changing those `wr-core` primitives' signatures to return `Result` is a wider
+/// cross-cutting decision (they have other, infallibility-assuming callers), so the
+/// boundary is drawn here instead, at the CLI command that Java itself wraps in a
+/// try/catch. The panic message is the Java exception message verbatim wherever the
+/// `wr-core` guard ported one; where it is this crate's own wording (the WB-010 encode
+/// panic, whose Java counterpart is an `ArrayIndexOutOfBoundsException` with a JVM-generated
+/// message), the text necessarily differs — the *behavior* (report and continue) is what
+/// is being matched.
+///
+/// # Console noise
+///
+/// Rust's default panic hook writes `thread '…' panicked at …` to stderr before
+/// unwinding. That has no Java analogue, so the hook is silenced **for the duration of
+/// this call on this thread only** (a thread-local flag consulted by a wrapper hook
+/// installed once). Panics anywhere else — including on other threads running
+/// concurrently, which matters for the test harness — still print normally.
+pub fn catch_walnut_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    install_quiet_hook();
+    let result = SILENCE_PANIC.with(|s| {
+        let previous = s.get();
+        s.set(true);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        s.set(previous);
+        r
+    });
+    result.map_err(|payload| panic_payload_message(&payload))
+}
+
+/// The panic message, however it was raised: `panic!("literal")` yields a `&'static str`
+/// payload, `panic!("{fmt}")`/`assert!(cond, "{fmt}")` a `String`. Anything else has no
+/// message at all, which Java's `getMessage()` also models as `null`; the placeholder
+/// matches what `Throwable.toString()` would show for a message-less exception.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::new()
+    }
+}
+
+thread_local! {
+    static SILENCE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static QUIET_HOOK: std::sync::Once = std::sync::Once::new();
+
+/// Installs (once, process-wide) a panic hook that defers to whatever hook was in place
+/// before, except on a thread that is currently inside [`catch_walnut_panic`].
+fn install_quiet_hook() {
+    QUIET_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if SILENCE_PANIC.with(|s| s.get()) {
+                return;
+            }
+            previous(info);
+        }));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catch_walnut_panic_passes_a_success_through_untouched() {
+        assert_eq!(catch_walnut_panic(|| 6 * 7), Ok(42));
+    }
+
+    #[test]
+    fn catch_walnut_panic_recovers_both_panic_payload_shapes() {
+        // `panic!("literal")` / `assert!(cond, "literal")` -> `&'static str` payload.
+        assert_eq!(
+            catch_walnut_panic(|| panic!("Second A's alphabet must be a subset")),
+            Err::<(), _>("Second A's alphabet must be a subset".to_string())
+        );
+        // A formatted message -> `String` payload.
+        let digit = 7;
+        assert_eq!(
+            catch_walnut_panic(|| panic!("digit {digit} not in track 0's alphabet")),
+            Err::<(), _>("digit 7 not in track 0's alphabet".to_string())
+        );
+    }
+
+    /// The silencing flag must be scoped to the guarded call: a panic raised AFTER one
+    /// completes still reaches the default hook (otherwise a genuine bug elsewhere in the
+    /// process would be swallowed silently).
+    #[test]
+    fn catch_walnut_panic_restores_the_silence_flag_on_both_paths() {
+        let _ = catch_walnut_panic(|| panic!("inner"));
+        assert!(!SILENCE_PANIC.with(|s| s.get()));
+        let _ = catch_walnut_panic(|| ());
+        assert!(!SILENCE_PANIC.with(|s| s.get()));
+    }
 
     /// Every message, pinned verbatim against `WalnutException.java`. This is the whole
     /// point of the module: if one of these strings is ever "cleaned up", this test fails.

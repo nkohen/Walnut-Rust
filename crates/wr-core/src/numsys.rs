@@ -805,10 +805,13 @@ pub fn parse_base_of(name: &str) -> Result<i32, NumSysError> {
 /// the cases `NumberSystemTest.testIsNSDifferingAllBranches` asserts IS differing. So
 /// this takes the per-track names directly (`None` = Java's `null` entry).
 ///
-/// **Wired as of U23** (`wr-cli`'s `union`/`concat` commands): each call site passes
-/// [`crate::automaton::Automaton::track_ns_names`], which reconstructs a plain
-/// `msd_k`/`lsd_k` name from the stand-in — see that method's own docs for the
-/// resulting scope narrowing on custom bases (never over-approximates "differing").
+/// **Wired as of U23** (`wr-cli`'s `union`/`intersect`/`concat` commands): each call site
+/// passes [`crate::automaton::Automaton::track_ns_names`], which reports the track's real
+/// `NumberSystem.getName()` where one was recorded ([`crate::automaton::Automaton::ns_name`])
+/// and reconstructs `msd_k`/`lsd_k` from the alphabet otherwise. Recording the real name is
+/// load-bearing, not cosmetic: without it a custom base (`msd_fib`) is indistinguishable
+/// from the plain base with the same alphabet cardinality (`msd_2`), and this guard fails
+/// OPEN — reporting "same number system" for two genuinely different numerations.
 pub fn is_ns_differing(
     nns: &[Option<&str>],
     first_ns: &[Option<&str>],
@@ -1213,6 +1216,19 @@ impl NumberSystem {
         let mut less_than =
             Self::set_less_than_automaton(name, &alphabet, is_msd, files.less_than.resolve())?;
         let mut equality = equality_automaton(&alphabet, is_msd);
+
+        // `addition.getNS().set(i, this)` (`:364-366`), `lessThan.getNS().set(i, this)`
+        // (`:392`) and `initBasicAutomaton`'s equivalent for `equality` install THIS
+        // number system on every track — carrying its NAME, which
+        // `NumberSystem.isNSDiffering` compares by and which
+        // `AutomatonWriter.writeAlphabet` emits. The msd/lsd half is already installed by
+        // the two setters above; this is the name half (see `Automaton::ns_name`). For a
+        // plain `msd_k` this is exactly what `track_ns_names` would reconstruct anyway;
+        // for a custom base it is the only way `msd_fib` survives into everything these
+        // three automata are later combined into.
+        for a in [&mut addition, &mut less_than, &mut equality] {
+            a.set_ns_names(vec![Some(name.to_string()); a.alphabet.len()]);
+        }
 
         // `allRepresentations = loadAutomatonOrNull(name, TXT_EXTENSION, base)` (`:147`).
         let all_representations = match files.all_representations.resolve() {
@@ -1873,6 +1889,8 @@ impl NumberSystem {
     fn make_constant(&self, fa: Fa, constant: i32) -> Automaton {
         let alphabet = self.get_alphabet().to_vec();
         let mut m = Automaton::new(fa, vec![alphabet], Vec::new(), vec![Some(self.is_msd)]);
+        // `getNS().add(numSys)` (`AutomatonDFA.java:58`) attaches `this`, name included.
+        m.set_ns_names(vec![Some(self.name.clone())]);
         m.determine_alphabet_size();
         m.setup_encoder();
         m.canonize();

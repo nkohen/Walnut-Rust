@@ -22,13 +22,62 @@ pub enum QuotientError {
     /// See `crate::automaton_output::write_automata`'s docs for why this propagates
     /// rather than being swallowed-and-logged the way Java's `writeAutomata` is.
     Io(std::io::Error),
+    /// One of `AutomatonLogicalOps.rightQuotient`/`leftQuotient`'s subset-alphabet
+    /// `WalnutException`s, ported in `wr-core` as an `assert!` and recovered at this
+    /// crate's boundary — see [`crate::walnut_exception::catch_walnut_panic`]. Message
+    /// verbatim from `wr-core`'s guard, which is verbatim from Java's.
+    Walnut(String),
+    /// Any OTHER panic escaping the quotient primitive, standing in for an uncaught Java
+    /// `RuntimeException` that is not a `WalnutException` — hence rendered by
+    /// `Prover`'s handler with a stack-trace header rather than message-only.
+    ///
+    /// The known live instance is `docs/WALNUT-BUGS.md` **WB-010**: Java's `leftQuotient`
+    /// checks the subset guard in the wrong direction, so a genuinely-mismatched pair
+    /// slips past it and dies later inside `RichAlphabet.encode` — an
+    /// `ArrayIndexOutOfBoundsException` in Java, this crate's own
+    /// `"digit N not in track i's alphabet"` panic here. **Known text gap**: the panic
+    /// message this carries is walnut-rs's wording, not the JVM's
+    /// `"Index -1 out of bounds for length …"`, because the two implementations fail at
+    /// different points for different reasons (Java corrupts an index and indexes an
+    /// array with it; `Automaton::encode` refuses up front — a documented, pre-existing
+    /// improvement of this crate over Java's silent `indexOf == -1`). Only the
+    /// report-and-continue *behavior* is matched.
+    Runtime(String),
 }
+
+impl QuotientError {
+    /// Classifies a caught panic message: the two ported `WalnutException` texts are
+    /// [`QuotientError::Walnut`] (message-only in Java's handler), anything else is
+    /// [`QuotientError::Runtime`] (stack-trace header).
+    fn from_panic(message: String) -> Self {
+        if message == RIGHT_QUOTIENT_SUBSET_MESSAGE || message == LEFT_QUOTIENT_SUBSET_MESSAGE {
+            QuotientError::Walnut(message)
+        } else {
+            QuotientError::Runtime(message)
+        }
+    }
+
+    /// Java's handler treats a `WalnutException` as message-only and anything else as a
+    /// stack-trace-headed report; `crate::prover::ProverError` delegates here for that
+    /// triage.
+    pub(crate) fn is_walnut_exception(&self) -> bool {
+        !matches!(self, QuotientError::Runtime(_))
+    }
+}
+
+/// `AutomatonLogicalOps.rightQuotient`'s guard message, as `wr_core::logicalops` spells it.
+const RIGHT_QUOTIENT_SUBSET_MESSAGE: &str =
+    "Second A's alphabet must be a subset of the first A's alphabet for right quotient.";
+/// `AutomatonLogicalOps.leftQuotient`'s guard message, as `wr_core::logicalops` spells it.
+const LEFT_QUOTIENT_SUBSET_MESSAGE: &str =
+    "First A's alphabet must be a subset of the second A's alphabet for left quotient.";
 
 impl std::fmt::Display for QuotientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QuotientError::Read(e) => write!(f, "{e}"),
             QuotientError::Io(e) => write!(f, "{e}"),
+            QuotientError::Walnut(m) | QuotientError::Runtime(m) => f.write_str(m),
         }
     }
 }
@@ -65,7 +114,8 @@ pub fn right_quotient_command(
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    let mut c = right_quotient(&m1, &m2, false);
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| right_quotient(&m1, &m2, false))
+        .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,
@@ -87,7 +137,8 @@ pub fn left_quotient_command(
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    let mut c = left_quotient(&m1, &m2);
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| left_quotient(&m1, &m2))
+        .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,
@@ -206,6 +257,96 @@ mod tests {
             "\"01\" with \"0\" quotiented off the left is \"1\""
         );
         assert!(!c.fa.accepts_word(&[0, 1]));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A single-track automaton over a 3-symbol alphabet, so its alphabet is a strict
+    /// SUPERSET of [`single_symbol_automaton`]'s `{0, 1}` — the shape both quotient
+    /// subset guards reject (in opposite directions).
+    fn wider_alphabet_automaton() -> Automaton {
+        let mut d0 = BTreeMap::new();
+        d0.insert(2, vec![1]);
+        Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 3,
+                o: vec![0, 1],
+                d: vec![d0, BTreeMap::new()],
+            },
+            vec![vec![0, 1, 2]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        )
+    }
+
+    /// U23 review fix, finding #2. `wr_core::logicalops::right_quotient`'s subset guard is
+    /// an `assert!` replicating Java's `WalnutException`; Java's REPL catches it and keeps
+    /// going, while an unwrapped Rust panic here kills the whole process (there is no
+    /// `catch_unwind` boundary in this workspace), taking a `load`ed batch session with
+    /// it.
+    #[test]
+    fn right_quotient_reports_a_mismatched_alphabet_as_an_error_not_a_panic() {
+        let (session, dir) = temp_session("right-mismatch");
+        write_library_automaton(&dir, "A", single_symbol_automaton(1));
+        write_library_automaton(&dir, "B", wider_alphabet_automaton());
+
+        let err = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap_err();
+        assert!(matches!(err, QuotientError::Walnut(_)));
+        assert_eq!(err.to_string(), RIGHT_QUOTIENT_SUBSET_MESSAGE);
+        assert!(
+            err.is_walnut_exception(),
+            "Java throws a WalnutException here, so it renders message-only"
+        );
+        assert!(!dir.join("Automata Library").join("c.txt").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `leftquo` half. `left_quotient`'s own guard is WB-010's wrong-direction one,
+    /// so this pair slips past it and dies deeper, inside `Automaton::encode` — Java's
+    /// equivalent is an uncaught `ArrayIndexOutOfBoundsException`, also caught by the
+    /// REPL. Either way the command must fail and the session must survive; see
+    /// [`QuotientError::Runtime`] on the message-text gap.
+    #[test]
+    fn left_quotient_reports_a_mismatched_alphabet_as_an_error_not_a_panic() {
+        let (session, dir) = temp_session("left-mismatch");
+        write_library_automaton(&dir, "A", single_symbol_automaton(1));
+        write_library_automaton(&dir, "B", wider_alphabet_automaton());
+
+        let err = left_quotient_command(&session, "leftquo c A B;", "A", "B", "c").unwrap_err();
+        assert!(
+            matches!(err, QuotientError::Walnut(_) | QuotientError::Runtime(_)),
+            "must be a recovered error, not a process-killing panic; got {err:?}"
+        );
+        assert!(!dir.join("Automata Library").join("c.txt").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both quotients are ASYMMETRIC in their two automaton arguments, so a swapped-operand
+    /// port bug would still write a file and still produce a valid automaton — only a
+    /// language assertion catches it. (`right_quotient(a, b) = { z : ∃w ∈ L(b), zw ∈ L(a) }`.)
+    #[test]
+    fn quotient_operand_order_is_not_interchangeable() {
+        let (session, dir) = temp_session("quo-order");
+        write_library_automaton(&dir, "A", accepts_zero_one());
+        write_library_automaton(&dir, "B", single_symbol_automaton(1));
+
+        let right = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap();
+        let c = right.automaton_pairs()[0].automaton().unwrap();
+        assert!(
+            c.fa.accepts_word(&[0]),
+            "\"01\" / \"1\" on the right is \"0\""
+        );
+
+        // Swapping the operands is a genuinely different question ("strip '01' off the
+        // right of '1'"), whose answer is the empty language -- so it does NOT accept "0".
+        let swapped = right_quotient_command(&session, "rightquo d B A;", "B", "A", "d").unwrap();
+        let d = swapped.automaton_pairs()[0].automaton().unwrap();
+        assert!(
+            !d.fa.accepts_word(&[0]),
+            "operand order must matter: the swap has a different language"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

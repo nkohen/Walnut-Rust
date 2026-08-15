@@ -119,6 +119,12 @@ use std::rc::Rc;
 const NO_CONTEXT_CANNOT_FAIL: &str =
     "determinize with no metacommand context always takes the SC arm, which is infallible";
 
+/// `Automaton.normalizeNumberSystems`'s unconditional warning (`Automaton.java:178-179`),
+/// verbatim — see [`Automaton::normalize_number_systems`]. `pub` so `wr-cli`'s tests can
+/// assert on the exact text without re-typing it.
+pub const ALPHABET_CHANGED_WARNING: &str =
+    "WARN: The alphabet of the resulting automaton was changed. Use the alphabet command to change as desired.";
+
 /// A multi-track automaton: the raw [`Fa`] plus enough track metadata to encode/decode
 /// symbols and (for `wr-logic`) know which tracks are quantifiable and how to fix up
 /// leading/trailing zeros after projection.
@@ -168,6 +174,36 @@ pub struct Automaton {
     /// single-threaded throughout, and `PORTING.md`'s Ruling 1 already picked `Rc` over
     /// `Arc` for `NumberSystem` handles for the same reason.
     pub all_reps: Vec<Option<Rc<Automaton>>>,
+    /// The THIRD fact this crate keeps from Java's per-track `NumberSystem` object:
+    /// `NumberSystem.getName()` (`NumberSystem.java:249`) — `"msd_2"`, `"lsd_3"`,
+    /// `"msd_fib"`, … — where the provenance is known, `None` where it is not.
+    ///
+    /// # Why the name has to be stored and cannot be reconstructed
+    ///
+    /// `NumberSystem.isNSDiffering` (`NumberSystem.java:179-192`, the guard behind
+    /// `union`/`intersect`/`concat`'s `"Automata must have the same number system(s)."`)
+    /// compares number systems **by name**. Reconstructing a name from
+    /// `(msd[i], alphabet[i].len())` — which is all [`Automaton::msd`] and
+    /// [`Automaton::alphabet`] carry — is exact for a plain `msd_k`/`lsd_k` base (Java's
+    /// `normalizeNumberSystemToken`, `:273-295`, maps bare `msd`/`lsd` to `msd_2`/`lsd_2`,
+    /// so every plain base's name *is* `msd_<alphabet size>`), but it is WRONG for a
+    /// custom base: `msd_fib`'s alphabet is `{0, 1}` with `msd` direction, so a
+    /// reconstruction reports it as `msd_2` and `isNSDiffering` then answers "same number
+    /// system" for two automata on genuinely different numerations — a fail-open guard
+    /// that silently produces a meaningless mixed-numeration result where real Walnut
+    /// refuses. Hence this field, populated from the resolved [`crate::numsys::NumberSystem`]
+    /// wherever one exists (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`).
+    ///
+    /// # Invariant
+    ///
+    /// Parallel to [`Automaton::msd`]/[`Automaton::all_reps`]/[`Automaton::alphabet`], and
+    /// moved in lockstep with them at every site that permutes, removes, merges, or
+    /// appends tracks — Java has one `List<NumberSystem>` carrying all three facts at
+    /// once, so they cannot drift there and must not drift here. `None` is always a SAFE
+    /// entry in the sense that [`Automaton::track_ns_names`] then falls back to the
+    /// base-*k* reconstruction, which is exact for every plain base; only a custom-base
+    /// track genuinely needs a `Some`.
+    pub ns_name: Vec<Option<String>>,
     /// `encoder[i]` = product of `alphabet[0..i]`'s sizes (`encoder[0] == 1`). Cached at
     /// construction, matching Java's `RichAlphabet.encoder` (there computed lazily on
     /// first `encode()` call; here eagerly, since this crate always needs it).
@@ -199,12 +235,14 @@ impl Automaton {
     ) -> Self {
         let encoder = Self::compute_encoder(&alphabet);
         let all_reps = vec![None; alphabet.len()];
+        let ns_name = vec![None; alphabet.len()];
         Automaton {
             fa,
             alphabet,
             label,
             msd,
             all_reps,
+            ns_name,
             encoder,
             label_sorted: false,
         }
@@ -224,6 +262,7 @@ impl Automaton {
             label: Vec::new(),
             msd: Vec::new(),
             all_reps: Vec::new(),
+            ns_name: Vec::new(),
             encoder: Vec::new(),
             label_sorted: false,
         }
@@ -256,8 +295,9 @@ impl Automaton {
         self.alphabet.clear();
         self.encoder.clear();
         self.msd.clear();
-        // Java's single `NS = null` covers both halves of this crate's NS stand-in.
+        // Java's single `NS = null` covers all three parts of this crate's NS stand-in.
         self.all_reps.clear();
+        self.ns_name.clear();
         self.label.clear();
         self.label_sorted = false;
     }
@@ -293,6 +333,36 @@ impl Automaton {
         self.all_reps = all_reps;
     }
 
+    /// Installs the per-track [`Automaton::ns_name`] entries wholesale — the naming part
+    /// of Java's `Automaton.setNS(List<NumberSystem>)`. Every caller that has real
+    /// [`crate::numsys::NumberSystem`] objects in hand (`wr-io`'s reader, `wr-cli`'s
+    /// `alphabet`/`reg`) should call this alongside [`Automaton::set_all_reps`], so the
+    /// name that `NumberSystem.isNSDiffering` compares survives into this crate.
+    ///
+    /// # Panics
+    ///
+    /// If `names` is not one entry per track, or if a `Some` name sits on a track whose
+    /// `msd` is `None` (Java's `null` `NS` entry has no name to report).
+    pub fn set_ns_names(&mut self, names: Vec<Option<String>>) {
+        assert_eq!(
+            names.len(),
+            self.alphabet.len(),
+            "set_ns_names: one entry per track required"
+        );
+        assert_eq!(
+            self.msd.len(),
+            self.alphabet.len(),
+            "set_ns_names: msd must already be parallel to alphabet"
+        );
+        for (i, entry) in names.iter().enumerate() {
+            assert!(
+                entry.is_none() || self.msd[i].is_some(),
+                "set_ns_names: track {i} has a number-system name but no number system"
+            );
+        }
+        self.ns_name = names;
+    }
+
     /// Debug-only check of [`Automaton::all_reps`]'s documented invariant. Deliberately
     /// side-effect-free (`PORTING.md`'s "`debug_assert!` erasing side effects" regression
     /// class) — it only reads.
@@ -308,6 +378,18 @@ impl Automaton {
                 .zip(self.msd.iter())
                 .all(|(reps, msd)| reps.is_none() || msd.is_some()),
             "a track with an all-representations automaton must have a number system"
+        );
+        debug_assert_eq!(
+            self.ns_name.len(),
+            self.msd.len(),
+            "ns_name must stay parallel to msd"
+        );
+        debug_assert!(
+            self.ns_name
+                .iter()
+                .zip(self.msd.iter())
+                .all(|(name, msd)| name.is_none() || msd.is_some()),
+            "a track with a number-system name must have a number system"
         );
     }
 
@@ -665,12 +747,42 @@ impl Automaton {
     /// a genuine custom base (`msd_fib`, …). Every plain `msd_k`/`lsd_k` automaton this
     /// crate's `concat`/`star` callers see in ordinary KEEP-scope use takes the early
     /// `return` below, matching Java's own `if (switchNS)` guard exactly.
-    pub fn normalize_number_systems(&mut self) {
+    ///
+    /// # The renamed number system, and the `WARN` line
+    ///
+    /// The replacement `NumberSystem` Java builds for a switched track is named
+    /// `ns.determineBaseNameUnderscore() + (max + 1)` (`:169`), `max` being the largest
+    /// digit in **that track's** alphabet — so `msd_fib`'s track becomes `msd_2`, and the
+    /// name genuinely changes. [`Automaton::ns_name`] records that new name explicitly
+    /// rather than leaning on [`Automaton::track_ns_names`]'s reconstruction, because
+    /// `max + 1` and `alphabet[i].len()` coincide only for a contiguous-from-zero
+    /// alphabet.
+    ///
+    /// The trailing `Logging.logMessage(true, "WARN: …")` (`:177-179`, carrying an
+    /// explicit `// always print this` comment in the original) is emitted here verbatim,
+    /// hence the `logging` parameter — it is a user-facing warning that the result's
+    /// alphabet changed, not one of the progress/timing detail lines this port skips.
+    pub fn normalize_number_systems(&mut self, logging: &mut crate::logging::Logging) {
         let mut switch_ns = false;
-        for slot in self.all_reps.iter_mut() {
-            if slot.is_some() {
+        for i in 0..self.all_reps.len() {
+            if self.all_reps[i].is_some() {
                 switch_ns = true;
-                *slot = None;
+                self.all_reps[i] = None;
+                // `new NumberSystem(ns.determineBaseNameUnderscore() + (max + 1))`
+                // (`:168-169`): `max` is `Collections.max(richAlphabet.getA().get(i))`.
+                let renamed = self.msd[i].and_then(|is_msd| {
+                    self.alphabet[i].iter().max().map(|max| {
+                        let prefix = if is_msd {
+                            crate::numsys::MSD_UNDERSCORE
+                        } else {
+                            crate::numsys::LSD_UNDERSCORE
+                        };
+                        format!("{prefix}{}", max + 1)
+                    })
+                });
+                if i < self.ns_name.len() {
+                    self.ns_name[i] = renamed;
+                }
             }
         }
         if !switch_ns {
@@ -679,43 +791,51 @@ impl Automaton {
         self.determinize_and_minimize();
         self.force_canonize();
         self.apply_all_representations_with_output();
+        // `// always print this` (`:177`) — `Logging.logMessage(true, …)`.
+        logging.log_message_with(true, ALPHABET_CHANGED_WARNING);
     }
 
-    /// The `msd_k`/`lsd_k` name Java's `NumberSystem.getName()` would report for each
-    /// track of this automaton, reconstructed from this crate's `msd`/`alphabet`
-    /// stand-in (see [`Automaton`]'s struct docs on why no real `NumberSystem` is stored
-    /// per track). `None` where the track carries no arithmetic number system at all
+    /// The name Java's `NumberSystem.getName()` would report for each track of this
+    /// automaton. `None` where the track carries no arithmetic number system at all
     /// (`msd[i] == None`), mirroring Java's literal `null` `NS` list entry.
     ///
-    /// # Scope note, not a Java bug: base-*k* only
+    /// Prefers the REAL name recorded in [`Automaton::ns_name`] — threaded through from
+    /// the resolved [`crate::numsys::NumberSystem`] by every caller that has one
+    /// (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`), so a custom base reports
+    /// `msd_fib` and not the `msd_2` its alphabet cardinality alone would suggest. Falls
+    /// back to reconstructing `msd_<alphabet size>`/`lsd_<alphabet size>` only where no
+    /// name was recorded — i.e. for an automaton this crate built in memory with no
+    /// reader/`NumberSystem` provenance, which is always a plain base-*k* one, for which
+    /// the reconstruction is exact (Java's `normalizeNumberSystemToken`, `:273-295`, maps
+    /// bare `msd`/`lsd` to `msd_2`/`lsd_2`, so a plain base's name IS `msd_<base>`).
     ///
-    /// This reconstructs only a plain base-*k* name from the track's alphabet
-    /// cardinality (`alphabet[i].len()`). A custom-base track (`msd_fib`, …) that
-    /// happens to share the same alphabet cardinality and direction as some plain
-    /// `msd_k` is reported here as `msd_k`, not its real custom name — this crate's
-    /// `Automaton` does not retain the original `NumberSystem` object per track (only
-    /// the two facts [`Automaton::msd`]/[`Automaton::all_reps`] carry), so there is no
-    /// name to recover for that case. Used by
-    /// [`crate::numsys::is_ns_differing`]'s two `wr-cli` call sites (`union`/`concat`,
-    /// whose Java originals compare by `NumberSystem.getName()`) and by
-    /// `Main.Commands.Describe`'s `"Number systems:"` line — both accept this
-    /// narrowing, which only ever UNDER-approximates "differing" (two automata that
-    /// really are on different custom bases but collide on alphabet size and direction
-    /// are misreported as having the same name, never the reverse), documented at each
-    /// call site.
+    /// Used by [`crate::numsys::is_ns_differing`]'s `wr-cli` call sites
+    /// (`union`/`intersect`/`concat`, whose Java originals compare by
+    /// `NumberSystem.getName()`) and by `Main.Commands.Describe`'s `"Number systems:"`
+    /// line.
+    ///
+    /// A recorded name is ignored on a track whose `msd` is `None`, so the result always
+    /// agrees with Java on which entries are `null` even if a caller's parallel vectors
+    /// were built inconsistently (which [`Automaton::set_ns_names`] rejects outright).
     pub fn track_ns_names(&self) -> Vec<Option<String>> {
         self.msd
             .iter()
+            .enumerate()
             .zip(self.alphabet.iter())
-            .map(|(msd, alphabet)| {
-                msd.map(|is_msd| {
-                    let prefix = if is_msd {
-                        crate::numsys::MSD_UNDERSCORE
-                    } else {
-                        crate::numsys::LSD_UNDERSCORE
-                    };
-                    format!("{prefix}{}", alphabet.len())
-                })
+            .map(|((i, msd), alphabet)| {
+                msd.map(
+                    |is_msd| match self.ns_name.get(i).and_then(|n| n.as_ref()) {
+                        Some(name) => name.clone(),
+                        None => {
+                            let prefix = if is_msd {
+                                crate::numsys::MSD_UNDERSCORE
+                            } else {
+                                crate::numsys::LSD_UNDERSCORE
+                            };
+                            format!("{prefix}{}", alphabet.len())
+                        }
+                    },
+                )
             })
             .collect()
     }
@@ -872,9 +992,10 @@ impl Automaton {
         self.alphabet = permuted_alphabet;
         self.encoder = permuted_encoder;
         self.msd = Self::permute(&self.msd, &label_permutation);
-        // Java permutes the single `NS` list, which carries both halves of this crate's
-        // per-track number-system stand-in (`Automaton.java:377`).
+        // Java permutes the single `NS` list, which carries all three parts of this
+        // crate's per-track number-system stand-in (`Automaton.java:377`).
         self.all_reps = Self::permute(&self.all_reps, &label_permutation);
+        self.ns_name = Self::permute(&self.ns_name, &label_permutation);
 
         for row in self.fa.d.iter_mut() {
             let mut permuted_row = BTreeMap::new();
@@ -1021,8 +1142,9 @@ impl Automaton {
         same_label_indices.remove(0);
         remove_indices(&mut automaton.msd, &same_label_indices);
         // Java's `removeIndices(A.getNS(), I)` removes the whole `NumberSystem` entry,
-        // i.e. both halves of this crate's stand-in.
+        // i.e. all three parts of this crate's stand-in.
         remove_indices(&mut automaton.all_reps, &same_label_indices);
+        remove_indices(&mut automaton.ns_name, &same_label_indices);
         automaton.alphabet = new_alphabet;
         automaton.encoder = new_encoder;
         automaton.determine_alphabet_size();
@@ -2274,7 +2396,7 @@ mod tests {
         );
         let before_q = a.fa.q;
         let before_o = a.fa.o.clone();
-        a.normalize_number_systems();
+        a.normalize_number_systems(&mut crate::logging::Logging::new());
         assert_eq!(a.fa.q, before_q);
         assert_eq!(a.fa.o, before_o);
         assert!(a.all_reps[0].is_none());
@@ -2291,7 +2413,7 @@ mod tests {
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x")))]);
         assert!(a.all_reps[0].is_some(), "precondition: track is switched");
 
-        a.normalize_number_systems();
+        a.normalize_number_systems(&mut crate::logging::Logging::new());
 
         assert!(
             a.all_reps[0].is_none(),
@@ -2310,7 +2432,7 @@ mod tests {
             vec![Some(true), Some(true)],
         );
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x"))), None]);
-        a.normalize_number_systems();
+        a.normalize_number_systems(&mut crate::logging::Logging::new());
         assert!(a.all_reps[0].is_none());
         assert!(
             a.all_reps[1].is_none(),
@@ -2330,5 +2452,100 @@ mod tests {
             a.track_ns_names(),
             vec![Some("msd_2".to_string()), Some("lsd_3".to_string()), None,]
         );
+    }
+
+    /// U23 review fix, finding #1: the reconstruction above is a FALLBACK, not the
+    /// answer. A custom base whose alphabet cardinality and direction happen to match a
+    /// plain `msd_k` must still report its own name — otherwise
+    /// `NumberSystem.isNSDiffering` (which compares by name) calls two genuinely
+    /// different numerations "the same number system" and `union`/`intersect`/`concat`
+    /// silently produce a mixed-numeration result.
+    #[test]
+    fn track_ns_names_prefers_the_recorded_name_over_the_base_k_reconstruction() {
+        let mut a = Automaton::new(
+            trivial_fa(4),
+            // `msd_fib`'s real alphabet IS `{0, 1}`, i.e. indistinguishable from `msd_2`'s
+            // by cardinality alone — that collision is the whole bug.
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".into(), "y".into()],
+            vec![Some(true), Some(true)],
+        );
+        a.set_ns_names(vec![Some("msd_fib".to_string()), None]);
+        assert_eq!(
+            a.track_ns_names(),
+            vec![Some("msd_fib".to_string()), Some("msd_2".to_string())],
+            "track 0 keeps its real name; track 1 (no name recorded) falls back"
+        );
+    }
+
+    #[test]
+    fn ns_names_survive_a_label_sort_permutation_and_a_dimension_reduction() {
+        let mut a = Automaton::new(
+            trivial_fa(4),
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["y".into(), "x".into()],
+            vec![Some(true), Some(true)],
+        );
+        a.set_ns_names(vec![Some("msd_fib".to_string()), Some("msd_2".to_string())]);
+        a.sort_label();
+        assert_eq!(a.label, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(
+            a.track_ns_names(),
+            vec![Some("msd_2".to_string()), Some("msd_fib".to_string())],
+            "the name must follow its own track through the permutation"
+        );
+    }
+
+    #[test]
+    fn set_ns_names_rejects_a_name_on_a_track_with_no_number_system() {
+        let mut a = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![None],
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            a.set_ns_names(vec![Some("msd_fib".to_string())]);
+        }));
+        assert!(result.is_err());
+    }
+
+    /// U23 review fix, finding #5: Java's `normalizeNumberSystems` ends with an
+    /// explicitly-commented `// always print this` warning. It is user-facing (the
+    /// result's alphabet changed), not one of the progress/timing detail lines this port
+    /// skips, so it must be emitted — and only when the normalization actually did
+    /// something.
+    #[test]
+    fn normalize_number_systems_emits_the_alphabet_changed_warning_only_when_it_switches() {
+        let mut quiet = crate::logging::Logging::new();
+        let mut unswitched = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![Some(true)],
+        );
+        unswitched.normalize_number_systems(&mut quiet);
+        assert!(
+            !quiet.command_log().contains(ALPHABET_CHANGED_WARNING),
+            "no track was switched, so Java's `if (switchNS)` guard skips the warning"
+        );
+
+        let mut loud = crate::logging::Logging::new();
+        let mut switched = Automaton::new(
+            trivial_fa(2),
+            vec![vec![0, 1]],
+            vec!["x".into()],
+            vec![Some(true)],
+        );
+        switched.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x")))]);
+        switched.set_ns_names(vec![Some("msd_fib".to_string())]);
+        switched.normalize_number_systems(&mut loud);
+        assert!(
+            loud.command_log().contains(ALPHABET_CHANGED_WARNING),
+            "a switched track must produce the warning verbatim"
+        );
+        // `new NumberSystem(determineBaseNameUnderscore() + (max + 1))` (`:169`): the
+        // track is no longer on the custom base, and says so.
+        assert_eq!(switched.track_ns_names(), vec![Some("msd_2".to_string())]);
     }
 }

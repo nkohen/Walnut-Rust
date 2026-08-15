@@ -33,11 +33,23 @@
 //!
 //! Both call sites use [`wr_core::numsys::is_ns_differing`], which (per that function's
 //! own docs) needed a real `Automaton` wired in as of this unit — done via
-//! [`wr_core::automaton::Automaton::track_ns_names`] (see that method's docs for the
-//! resulting, deliberate scope narrowing on custom bases).
+//! [`wr_core::automaton::Automaton::track_ns_names`]. That method reports each track's
+//! REAL `NumberSystem.getName()`, threaded through from `wr-io`'s reader
+//! ([`wr_core::automaton::Automaton::ns_name`]); an earlier draft of this unit
+//! reconstructed the name from `(msd, alphabet.len())` instead, which made the guard
+//! **fail open** on custom bases — `union u fib1 two1;` with an `msd_fib` operand and an
+//! `msd_2` one silently produced a mixed-numeration result where real Walnut refuses with
+//! `"Automata must have the same number system(s)."`.
+//!
+//! # Panics recovered at this boundary
+//!
+//! `combine` reaches `wr-core` guards that replicate Java `WalnutException`s as `assert!`s;
+//! see [`crate::walnut_exception::catch_walnut_panic`] for why they are caught here rather
+//! than being allowed to kill the process.
 
 use wr_core::automaton::Automaton;
 use wr_core::fa::Fa;
+use wr_core::logging::Logging;
 use wr_core::logicalops::{and, combine, or};
 use wr_core::numsys::{is_ns_differing, TXT_EXTENSION};
 use wr_logic::predicate_env::PredicateEnvError;
@@ -59,6 +71,15 @@ pub enum AutomatonOpsError {
     /// the ad hoc `throw new WalnutException("...")` calls in `Combine`/`Union`/
     /// `Intersect`/`Concat`, preserved verbatim.
     Walnut(String),
+    /// `Integer.parseInt(u.substring(1))`'s `NumberFormatException` (`Combine.java:38`).
+    /// `PAT_FOR_AN_AUTOMATON_IN_combine_CMD`'s `(=-?\d+)?` group constrains the token to
+    /// digits but NOT to `i32`'s range, so `combine c A=99999999999;` reaches `parseInt`
+    /// with an out-of-range literal and throws — the command then fails outright, writing
+    /// no output file. NOT a `WalnutException`, hence its own variant rather than
+    /// [`AutomatonOpsError::Walnut`]: `Prover`'s handler renders it with a stack-trace
+    /// header (`crate::prover::ProverError`'s `LoggableError` triage), exactly as Java's
+    /// uncaught `NumberFormatException` is.
+    NumberFormat(String),
 }
 
 impl std::fmt::Display for AutomatonOpsError {
@@ -67,6 +88,13 @@ impl std::fmt::Display for AutomatonOpsError {
             AutomatonOpsError::Read(e) => write!(f, "{e}"),
             AutomatonOpsError::Io(e) => write!(f, "{e}"),
             AutomatonOpsError::Walnut(m) => f.write_str(m),
+            AutomatonOpsError::NumberFormat(input) => {
+                write!(
+                    f,
+                    "{}",
+                    crate::walnut_exception::number_format_exception(input)
+                )
+            }
         }
     }
 }
@@ -112,7 +140,13 @@ fn scan_automaton_names(s: &str) -> Vec<String> {
 /// explicit_output)`, `explicit_output` being `None` when the optional suffix did not
 /// participate (Java: `u.isEmpty()`) — [`combine_command`] applies the "default to the
 /// 1-based argument position" rule Java's caller does, not this scanner.
-fn scan_combine_tokens(s: &str) -> Vec<(String, Option<i32>)> {
+///
+/// Fallible because Java's `Integer.parseInt` is: the pattern admits an arbitrarily long
+/// digit run, so an out-of-`i32`-range `=N` throws `NumberFormatException` rather than
+/// being silently ignored. Returning `Option`-and-discarding-the-error here would demote
+/// that to "no `=N` was given", which silently substitutes the positional-index default
+/// and produces a DIFFERENT, wrong DFAO instead of failing.
+fn scan_combine_tokens(s: &str) -> Result<Vec<(String, Option<i32>)>, AutomatonOpsError> {
     let chars: Vec<char> = s.chars().collect();
     let mut result = Vec::new();
     let mut i = 0;
@@ -139,7 +173,10 @@ fn scan_combine_tokens(s: &str) -> Vec<(String, Option<i32>)> {
                     // A valid `=-?\d+` suffix: `u.substring(1)` in Java drops only the
                     // leading `=`, keeping a leading `-` if present.
                     let text: String = chars[i + 1..j].iter().collect();
-                    explicit_output = text.parse::<i32>().ok();
+                    explicit_output = Some(
+                        text.parse::<i32>()
+                            .map_err(|_| AutomatonOpsError::NumberFormat(text.clone()))?,
+                    );
                     i = j;
                 }
             }
@@ -148,7 +185,7 @@ fn scan_combine_tokens(s: &str) -> Vec<(String, Option<i32>)> {
             i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
 /// `Automaton.readAutomatonFromFile(String automataName)` (`Automaton.java:148-150`) —
@@ -190,7 +227,7 @@ pub fn combine_command(
     combine_automata: &str,
     combine_name: &str,
 ) -> Result<TestCase, AutomatonOpsError> {
-    let tokens = scan_combine_tokens(combine_automata);
+    let tokens = scan_combine_tokens(combine_automata)?;
     let mut automata_names = Vec::with_capacity(tokens.len());
     let mut outputs: Vec<i32> = Vec::with_capacity(tokens.len());
     for (index, (name, explicit_output)) in tokens.into_iter().enumerate() {
@@ -217,7 +254,17 @@ pub fn combine_command(
     }
 
     // `AutomatonLogicalOps.combine(first, subautomata, outputs)` (`:61`).
-    let mut c = combine(&first, subautomata, &outputs);
+    //
+    // Wrapped because `combine` reaches `wr_core::product::create_basic_automaton`, whose
+    // two `WalnutException` guards ("...cannot be true or false automata." /
+    // "...must have labeled inputs.") and whose alphabet-consistency check are `assert!`s
+    // here. Both are reachable from ordinary CLI input — `combine c A B;` with operands of
+    // different arity, or with the same variable declared over different alphabets — and
+    // Java catches the resulting `WalnutException` in `Prover.dispatch`, prints it, and
+    // keeps the REPL alive. See `crate::walnut_exception::catch_walnut_panic`.
+    let mut c =
+        crate::walnut_exception::catch_walnut_panic(|| combine(&first, subautomata, &outputs))
+            .map_err(AutomatonOpsError::Walnut)?;
 
     // `C.writeAutomata(s, Session.getWriteAddressForWordsLibrary(), combineName, true);`
     // (`:63`).
@@ -348,7 +395,11 @@ pub fn intersect_command(
 
 /// `Concat.concat(Automaton automaton, Automaton other)` (`Concat.java:59-83`, private) —
 /// the pairwise fold [`concat_command`] applies left to right.
-fn concat_pair(automaton: Automaton, other: &Automaton) -> Result<Automaton, AutomatonOpsError> {
+fn concat_pair(
+    automaton: Automaton,
+    other: &Automaton,
+    logging: &mut Logging,
+) -> Result<Automaton, AutomatonOpsError> {
     // `NumberSystem.isNSDiffering(other.getNS(), automaton.getNS(),
     // automaton.richAlphabet.getA(), other.richAlphabet.getA())` (`:64`) -- note Java's
     // own argument order pairs `other`'s NS names with `automaton`'s alphabet; harmless,
@@ -367,7 +418,7 @@ fn concat_pair(automaton: Automaton, other: &Automaton) -> Result<Automaton, Aut
     let original_q = automaton.fa.q;
     Fa::concat_states(&other.fa, &mut n.fa, original_q);
 
-    n.normalize_number_systems();
+    n.normalize_number_systems(logging);
     n.determinize_and_minimize();
     n.apply_all_representations();
     Ok(n)
@@ -377,6 +428,7 @@ fn concat_pair(automaton: Automaton, other: &Automaton) -> Result<Automaton, Aut
 /// (`Concat.java:22-41`).
 pub fn concat_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     concat_automata: &str,
     concat_name: &str,
@@ -394,7 +446,7 @@ pub fn concat_command(
 
     for name in iter {
         let n = read_from_automata_library(session, &name).map_err(AutomatonOpsError::Read)?;
-        c = concat_pair(c, &n)?;
+        c = concat_pair(c, &n, logging)?;
     }
 
     write_automata(
@@ -413,10 +465,10 @@ pub fn concat_command(
 // ---------------------------------------------------------------------------
 
 /// `Star.star(Automaton automaton)` (`Star.java:21-36`).
-fn star(automaton: &Automaton) -> Automaton {
+fn star(automaton: &Automaton, logging: &mut Logging) -> Automaton {
     let mut n = automaton.clone();
     Fa::star_states(&automaton.fa, &mut n.fa);
-    n.normalize_number_systems();
+    n.normalize_number_systems(logging);
     n.force_canonize();
     n.determinize_and_minimize();
     n.apply_all_representations();
@@ -426,12 +478,13 @@ fn star(automaton: &Automaton) -> Automaton {
 /// `Star.star(String s, String oldName, String newName)` (`Star.java:11-19`).
 pub fn star_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name: &str,
     new_name: &str,
 ) -> Result<TestCase, AutomatonOpsError> {
     let m = read_from_automata_library(session, old_name).map_err(AutomatonOpsError::Read)?;
-    let mut c = star(&m);
+    let mut c = star(&m, logging);
     write_automata(
         session,
         &mut c,
@@ -513,7 +566,7 @@ mod tests {
     #[test]
     fn scan_combine_tokens_defaults_and_explicit_outputs() {
         assert_eq!(
-            scan_combine_tokens(" A B=5 C=-3 "),
+            scan_combine_tokens(" A B=5 C=-3 ").unwrap(),
             vec![
                 ("A".to_string(), None),
                 ("B".to_string(), Some(5)),
@@ -616,7 +669,8 @@ mod tests {
     #[test]
     fn concat_requires_at_least_two_automata() {
         let (session, dir) = temp_session("concat-too-few");
-        let err = concat_command(&session, "concat c A;", "A", "c").unwrap_err();
+        let err =
+            concat_command(&session, &mut Logging::new(), "concat c A;", "A", "c").unwrap_err();
         assert_eq!(
             err.to_string(),
             "Concatenation requires at least two automata as input."
@@ -638,7 +692,8 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_zero);
         write_library_automaton(&dir, "B", accepts_one);
 
-        let tc = concat_command(&session, "concat c A B;", "A B", "c").unwrap();
+        let tc =
+            concat_command(&session, &mut Logging::new(), "concat c A B;", "A B", "c").unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[0, 1]), "\"01\" must be accepted");
         assert!(!c.fa.accepts_word(&[1, 0]), "\"10\" must be rejected");
@@ -656,7 +711,7 @@ mod tests {
         let (session, dir) = temp_session("star");
         write_library_automaton(&dir, "A", single_symbol_automaton(1));
 
-        let tc = star_command(&session, "star c A;", "A", "c").unwrap();
+        let tc = star_command(&session, &mut Logging::new(), "star c A;", "A", "c").unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[]), "empty word must be accepted");
         assert!(c.fa.accepts_word(&[1, 1, 1]));
@@ -683,6 +738,140 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Automata must have the same number system(s)."
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The real `walnut-java` `Custom Bases/msd_fib.txt` / `msd_fib_addition.txt`, read
+    /// straight out of `wr-io`'s fixture directory rather than duplicated here — see
+    /// `crates/wr-io/tests/fixtures/ATTRIBUTION.md` for their provenance (GPLv3, Mousavi
+    /// et al.). Copied into `dir/Custom Bases/` so the session resolves the base exactly
+    /// as Java's `Session.getReadAddressForCustomBases` would.
+    fn install_msd_fib(dir: &std::path::Path) {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../wr-io/tests/fixtures")
+            .canonicalize()
+            .expect("wr-io fixture directory exists in this workspace");
+        for name in ["msd_fib.txt", "msd_fib_addition.txt"] {
+            fs::copy(fixtures.join(name), dir.join("Custom Bases").join(name)).unwrap();
+        }
+    }
+
+    /// U23 review fix, finding #1 — the fail-open guard, at the command level.
+    ///
+    /// `msd_fib`'s alphabet is `{0, 1}` in the msd direction, i.e. indistinguishable from
+    /// `msd_2`'s by everything except the NAME. Real Walnut refuses this pairing with
+    /// `"Automata must have the same number system(s)."`; before this fix walnut-rs
+    /// accepted it and silently wrote a meaningless mixed-numeration result.
+    #[test]
+    fn union_rejects_a_custom_base_paired_with_the_base_k_that_shares_its_alphabet() {
+        let (session, dir) = temp_session("union-custom-base");
+        install_msd_fib(&dir);
+        let lib = dir.join("Automata Library");
+        fs::write(lib.join("FIB.txt"), "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+        fs::write(lib.join("TWO.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+
+        let err = union_command(&session, "union c FIB TWO;", " FIB TWO ", "c").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Automata must have the same number system(s)."
+        );
+        assert!(
+            !lib.join("c.txt").exists(),
+            "the guard must fire before any output is written"
+        );
+
+        // ...and the same-base pairing still goes through, so the guard is not merely
+        // rejecting everything.
+        fs::write(lib.join("TWO2.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+        union_command(&session, "union d TWO TWO2;", " TWO TWO2 ", "d").unwrap();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Same root cause, through `intersect` and `concat` — both consume the same
+    /// `ns_differs` primitive, with `concat`'s own (differently-worded) message.
+    #[test]
+    fn intersect_and_concat_reject_a_custom_base_paired_with_base_k_too() {
+        let (session, dir) = temp_session("mixed-custom-base");
+        install_msd_fib(&dir);
+        let lib = dir.join("Automata Library");
+        fs::write(lib.join("FIB.txt"), "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+        fs::write(lib.join("TWO.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+
+        let err =
+            intersect_command(&session, "intersect c FIB TWO;", " FIB TWO ", "c").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Automata must have the same number system(s)."
+        );
+
+        let err = concat_command(
+            &session,
+            &mut Logging::new(),
+            "concat c FIB TWO;",
+            " FIB TWO ",
+            "c",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Automata to be concatenated must have the same number system(s)."
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------ combine hardening
+
+    /// U23 review fix, finding #3. `(=-?\d+)?` constrains the suffix to digits but not to
+    /// `i32`'s range, so Java's `Integer.parseInt` throws `NumberFormatException` and the
+    /// command fails outright. Discarding the parse error (the pre-fix `.ok()`) demoted
+    /// that to "no `=N` was given" and silently used the positional-index default — a
+    /// different, wrong DFAO written to disk instead of an error.
+    #[test]
+    fn combine_rejects_an_out_of_i32_range_output_value_instead_of_defaulting() {
+        let (session, dir) = temp_session("combine-overflow");
+        write_library_automaton(&dir, "A", contains_one());
+
+        let err = combine_command(&session, "combine c A=99999999999;", " A=99999999999 ", "c")
+            .unwrap_err();
+        assert!(matches!(err, AutomatonOpsError::NumberFormat(_)));
+        assert_eq!(err.to_string(), "For input string: \"99999999999\"");
+        assert!(
+            !dir.join("Word Automata Library").join("c.txt").exists(),
+            "Java writes no output file when parseInt throws"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// U23 review fix, finding #2. `wr_core::product::create_basic_automaton`'s
+    /// `WalnutException` guards are `assert!`s; unwrapped, they killed the whole process
+    /// (no `catch_unwind` boundary exists in this workspace), losing an entire `load`ed
+    /// batch-file session where Java loses only the one command.
+    #[test]
+    fn combine_reports_a_wr_core_guard_as_an_error_instead_of_killing_the_process() {
+        let (session, dir) = temp_session("combine-arity");
+        // Arity 1 vs arity 2: `cross_product`'s "must have labeled inputs" guard.
+        write_library_automaton(&dir, "A", contains_one());
+        let two_track = Automaton::new(
+            wr_core::fa::Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 4,
+                o: vec![1],
+                d: vec![std::collections::BTreeMap::new()],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            vec![Some(true), Some(true)],
+        );
+        write_library_automaton(&dir, "P2", two_track);
+
+        let err = combine_command(&session, "combine c A P2;", " A P2 ", "c").unwrap_err();
+        assert!(matches!(err, AutomatonOpsError::Walnut(_)));
+        assert!(
+            err.to_string().contains("crossProduct"),
+            "the recovered message is Java's own guard text, got {err}"
         );
         fs::remove_dir_all(&dir).ok();
     }
