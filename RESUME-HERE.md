@@ -1,77 +1,99 @@
-# RESUME-HERE — Phase 3a: COMPLETE
+# RESUME-HERE — Phase 3b: 11 of 12 units complete; U27 (golden corpus) remains
 
-Phase 3a (`.claude/plans/synthetic-prancing-aurora.md`) is finished: all 22 units plus the exit
-checkpoint are merged to `master`, `cargo test --workspace` is green, `cargo fmt`/`clippy` are
-clean. `CLAUDE.md`'s "Current status" section now carries the authoritative summary of what
-landed — read that first if you're resuming cold. This file's job going forward is process notes
-for whoever picks up Phase 3b (which needs the user's explicit go-ahead per
-`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating doctrine before any code starts).
+**2026-08-15 checkpoint.** All 11 implementation units of Phase 3b (U17–U26) are merged to
+`master`, each through the full implementer → two-split-context-adversarial-reviewer → fixer →
+verify → merge loop. `cargo test --workspace` is green, `cargo fmt`/`clippy` clean, as of commit
+`e3a9847`. `docs/WALNUT-BUGS.md` is at **37 entries** (WB-001–WB-037), no gaps or duplicates
+(verify again before filing a new one — `grep -n "^## WB-" docs/WALNUT-BUGS.md | awk -F'WB-'
+'{print $2}' | awk '{print $1}' | sort -n | uniq -c | awk '$1>1{print}'`).
 
-## Immediate next step if the user gives the Phase 3b go-ahead
+**Only U27 (the Tier-1 golden-corpus harness) remains** to close out Phase 3b's actual DESIGN.md
+exit criterion ("Tier 1 green; eval/def/reg, and now everything else, work"). It has NOT been
+started — no go-ahead requested yet, and it's a large, distinctly-scoped unit (per the original
+plan: consumes `walnut-java/phase0-artifacts/subset-filter.json`'s 591 subset-relevant fixtures,
+extended with several exclusion rules — deferred-OTF strategies, a transitive-dependency rule for
+DROP-scope `split`/`rsplit` consumers, the 7 CAS-matrix fixtures checking equivalence-only, the 15
+`details*` fixtures needing exact pre-minimization state-count parity per an earlier user
+decision — spawns the real `wr-cli` binary per command file). Read the corrected plan at
+`~/.claude/plans/zany-sauteeing-pudding.md` (outside this repo, in the user's plans directory) for
+the full delta against the original `.claude/plans/synthetic-prancing-aurora.md`, and re-verify its
+assumptions against current code before starting, the same way this phase's own start re-verified
+Phase 3b's original assumptions.
 
-Per the plan's "Phase 3b units" table: `Morphism`, `convertNS`, `Search/ProductBFS`, `Transducer`
-(the remaining `wr-core` primitives, all previously deferred), then `Prover.java`'s real
-dispatch/REPL/command-file reading/`MetaCommands` (wiring real parsed values into Phase 3a's U0c
-no-op `DeterminizeContext` hook), all remaining `Commands/*` (batched — `Combine`/`Concat`/
-`Union`/`Intersect`/`Star`/`Reverse`/`Quotient`/`Describe`/inline `minimize`/`fixleadzero`/
-`fixtrailzero`, `morphism`/`image`/`promote`/`join`/`convert`/`inf`/`export`, `test`,
-`transduce`), `HelpMessages`, and finally the Tier-1 golden-corpus harness (`tests/golden`,
-consuming `walnut-java/phase0-artifacts/subset-filter.json`) — the actual DESIGN.md Phase-3 exit
-criterion ("Tier 1 green; eval/def/reg work").
+## What landed in U17–U26 (chronological, each with real adversarial-review findings)
 
-**RESOLVED (Phase 3b, L1) — was the one real open item Phase 3a left behind — scope corrected
-below, read it before assuming this covers more than it does.** `eval`/`def` over `lsd_*`
-numeration used to fail with `QuantifyError::UnsupportedLsdFixup` (`wr-core::quantify`),
-pre-existing Phase-2 scope debt confirmed live by Phase 3a's exit checkpoint. It was reported as
-"lsd + a quantifier", but the real blast radius was wider: because `wr_core::numsys` calls
-`quantify` to build its own automata, *any* `lsd_k` comparison or arithmetic against a constant
-`>= 2` failed too — `?lsd_2 x >= 2`, with no user-written quantifier anywhere. L1 wired
-`AutomatonLogicalOps.fixTrailingZerosProblem` into `quantify`'s `Some(false)` arm (the plain port
-of Java's `AutomatonQuantification.java:46`, which U5 had already made available and U6 chose not
-to call), deleted the now-unconstructible `UnsupportedLsdFixup` variant, flipped the four tests
-that pinned the rejection into tests of the computed language, and added the positive coverage
-that had never existed: `wr-core`'s `quantify_on_an_lsd_automaton_runs_the_trailing_zero_fixup`
-(msd/lsd contrast on one transition table), `numsys`'s
-`lsd_composed_constructions_compute_the_right_language` +
-`msd_and_lsd_composed_constructions_agree_after_reversal` (Tier 4), `wr-logic`'s
-`lsd_numeration_evaluates_end_to_end`, and `tests/differential/tests/lsd_numeration.rs` (five
-cases against real `walnut-java` output, incl. a three-track `lsd_3` one).
-**Scope, precisely** (a first draft of this note overclaimed and was corrected on review): verified
-for `lsd_k` only (not `lsd_fib`/custom-base) — `∃` and closed `∀` (`¬∃¬`) both confirmed correct.
-**Not verified**: the `I` quantifier over `lsd` (dispatches through `wr_core::infinite::infinite`,
-which never calls `quantify` — this fix neither touched nor tested it), and `reg` over `lsd_*`
-(also never routes through `quantify`; has its own separate, pre-existing coverage in
-`reg_and_alphabet_commands.rs`). Phase 3b's golden-corpus harness can take `lsd_k` `eval`/`def`
-fixtures now, but an `lsd`+`I` or custom-base-`lsd` fixture is still untested ground.
+- **U17** (Morphism.java → `wr-core::morphism`): reviewers found a false doc claim about `range`'s
+  iteration order (fixed: documented as an accepted display-only divergence) and a genuinely
+  missing `Fa::canonized`-flag prerequisite for the *deferred* `toWordAutomaton` (documented, not
+  yet built at the time — U24 later built it for real).
+- **U19** (Search/ProductBFS.java → `wr-core::search`): both reviewers independently found
+  `shortest_accepted_word`/`shortest_witness_word_product` silently gave WRONG answers on
+  nondeterministic input (fixed with a hard `SearchError::NotDeterministic` precondition). Core
+  BFS/pruning algorithm confirmed sound by both reviewers via property-testing.
+- **U22** (HelpMessages.java + text tree → `wr-cli::help_messages`): reviewers found real DATA
+  CORRUPTION in 2 of 34 copied help files (mis-decoded as ISO-8859-1; fixed to match real Walnut's
+  own U+FFFD replacement-char behavior, logged WB-030), wrong newline/CRLF handling, and an
+  unported tokenizer (fixed; surfaced a genuine Walnut quirk, WB-031, that the `Morphisms And Word
+  Automata` group's help is unreachable via real CLI syntax).
+- **U21** (Prover dispatch core + MetaCommands + WalnutException → `wr-cli::prover`): both
+  reviewers independently converged on `currentEvalName` not being threaded from Java's sticky
+  static (fixed). Logged WB-028 (`earlyExistTermination` dead code, traced via git history) and
+  WB-029 (`Strategy.fromString` alias-table bug).
+- **U20** (Transducer.java → `wr-core::transducer`): reviewer found an unlogged genuine Walnut bug
+  (`msd[0]==None` NPEs in real Java, silently permitted by the port; fixed + logged as WB-034) and
+  both reviewers found real test-gaps via mutation testing. Algorithm confirmed sound by extensive
+  differential/mutation testing. (Its own genuine-bug find, the `minOutput` dual-use defect, was
+  renumbered WB-028→WB-035 mid-session to resolve a collision with U21 — see the sed-corruption
+  lesson below.)
+- **U18** (convertNS → `wr-core::logicalops`): reviewer found a **correctness-fatal** bug —
+  `truncated_log_ratio` used Rust's correctly-rounded `f64::ln` where Java's `Math.log` is NOT
+  correctly rounded, causing ~150-340 real `(root,exponent)` pairs to silently diverge from real
+  Java (fixed: ported FDLIBM's `__ieee754_log`, verified bit-for-bit against a real JVM over
+  200,000 values). Both reviewers independently found a new live call site for the already-known
+  WB-001 quirk. WB-032/033 logged.
+- **U25** (Test.java → `wr-cli::test_command`): reviewers found a reachable panic in the now-`pub`
+  `find_accepted` API, a dropped resource-cap contract `search.rs` explicitly handed off to this
+  unit (fixed: added `MAX_NEEDED` cap + made `find_accepted` take `&mut Automaton` matching Java's
+  in-place mutation), and — proven by mutation testing — a length-cap removal that hangs forever
+  (now a dedicated regression test).
+- **U26** (transduce command → `wr-cli::transduce`): reviewer found the original 500-state resource
+  guard was ineffective by ~2 orders of magnitude on the WRONG axis (real cost driver is BFS depth,
+  not state count; fixed with a deterministic step/state/word-length budget inside
+  `wr-core::transducer` itself, with measured caps) and a reachable panic on a well-formed partial
+  transducer file (fixed, following the WB-034 precedent).
+- **U23** (batch A: combine/concat/union/intersect/star/reverse/rightquo/leftquo/describe/minimize/
+  fixleadzero/fixtrailzero/macro): both reviewers converged on `union`/`intersect`/`concat`
+  silently accepting operands on different custom-base number systems (a real fail-open bug; fixed
+  with a proper architectural change — a per-track NS *name* now threaded through `wr-io`'s reader
+  → `Automaton` → `wr-core`, not just a narrower approximation). Also fixed: 3 dispatch arms
+  (`combine`/`rightquo`/`leftquo`) could hit process-killing panics on ordinary mismatched-alphabet
+  input (added `catch_walnut_panic`, a scoped `catch_unwind` boundary in `walnut_exception.rs`);
+  `combine`'s output-value parser silently swallowing an integer overflow.
+- **U24** (batch B: morphism/image/promote/join/convert/inf/export — the first real exercise of
+  `Morphism`/`convertNS`/`Infinite`/the writer through the actual dispatch loop): reviewer found a
+  **correctness-fatal** bug — the newly-built `Morphism::to_word_automaton` dropped Java's
+  `NumberSystem` construction *and its validation*, so `promote` silently succeeded on inputs
+  (e.g. any 1-uniform morphism) where real Java cleanly errors "Number system msd_1 is not
+  defined." (fixed). Also fixed: `canonize()`'s early-return ordering bug (both reviewers
+  independently found it), the `canonized` flag's invalidation semantics not matching Java's
+  `Fa`-object-identity model (audited every reset site), a one-sided WB-036 guard, a new
+  process-killing panic in `join` on mismatched alphabets, and a wrong blanket error-classification
+  rule. Logged WB-036/037.
 
-## Process lessons from this phase, worth carrying into Phase 3b
+## Process lesson from this phase, worth repeating for whoever does U27
 
-- **The implementer → two-reviewer → fixer loop caught a real, material issue in nearly every
-  back-half unit** (U8, U14, U16, U11, U15, and the exit checkpoint itself) — never skip it, and
-  always read both full reports, not just the summary line ("no correctness-fatal" ≠ "nothing to
-  fix"). U9/U10 (the two highest-stakes trust-critical units) came through clean on the first
-  pass — encouraging, but not a reason to relax rigor elsewhere.
-- **WB-number collisions across parallel worktrees are routine** when units land concurrently —
-  resolve by keeping the earlier-merging unit's number(s) and renumbering the later one's (heading
-  + every in-body self-reference + any `.rs` test-name/doc-comment citations, both `WB-NNN` and
-  lowercase `wbNNN` spellings). Always grep `^## WB-` for duplicate/gapped numbers after ANY
-  rebase touching `docs/WALNUT-BUGS.md`, whether or not the rebase itself reported a conflict —
-  git can silently interleave non-overlapping insertions without flagging a real numbering clash.
-- **A background agent hitting a session-limit error mid-task is a pause, not a failure** — its
-  worktree and partial progress survive; resume it via `SendMessage` to its agent ID rather than
-  relaunching fresh, so accumulated context/work isn't thrown away.
-- **Coordinator self-caution**: after `cd`-ing into a worktree for inspection, explicitly `cd`
-  back to the intended target directory before the next stateful git command — a stale shell `cwd`
-  from several tool calls back caused one misdirected (non-destructive) commit attempt this phase.
-  Separately, this session's own attempt to fix a reviewer-flagged test-gap directly (rather than
-  delegating) via careless global `sed` replacements corrupted unrelated lines sharing the same
-  literal text (a predicate string reused in both a test body and its own module-doc capture
-  recipe) — caught by rerunning the full suite and a deliberate falsification check before
-  committing, not by the edit itself. Prefer precise `Edit`-tool replacements with enough
-  surrounding context to be unique over `sed` when a file has repeated literal substrings.
-- **A test that's supposed to prove a normalization step matters should be falsified before being
-  trusted** — temporarily disable the step and confirm the specific test(s) that should fail
-  actually do, and that everything else still passes. This caught (twice this phase — U11's
-  reviewer, then again while fixing the exit checkpoint's own review finding) a normalization
-  call that looked load-bearing in a comment but wasn't exercised by any test that would actually
-  fail without it.
+**A careless whole-file `sed` during WB-number renumbering nearly clobbered an already-merged
+entry.** Mid-phase, U20's and U21's independently-authored bug entries both claimed "WB-028" for
+unrelated bugs. Resolving the collision with `sed 's/WB-028/WB-035/g'` matched every occurrence in
+the file — including U21's *already-merged, unrelated* WB-028 heading, which shares the literal
+substring. Caught immediately by grepping for duplicate `## WB-NNN` headings before committing, not
+by the edit itself. **Always use precise `Edit`-tool replacements with unique surrounding context
+for this kind of renumbering, never a bare find-and-replace across the whole file** — WB-numbers
+recur in the doc heading, in source-code comments, AND in test function names (`wbNNN_...`), and a
+renumbering touches all three, but a *different* pre-existing bug's number is an unrelated but
+textually-identical string. Grep for duplicates immediately after every resolved
+`docs/WALNUT-BUGS.md` conflict, no exceptions — this project's own convention, reinforced here.
+
+Also: rebase conflicts in `docs/WALNUT-BUGS.md` should always be resolved by **concatenating both
+sides' entries**, never picking one over the other — every conflict encountered this phase was two
+sets of new entries added independently, both valid, both worth keeping.

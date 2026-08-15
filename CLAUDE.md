@@ -304,8 +304,28 @@ separate, pre-existing `lsd` coverage in `reg_and_alphabet_commands.rs`. **User 
 `lsd_k` fix above was — the user chose to leave it as a tracked backlog item rather than fix it
 immediately. Revisit when picking up related work or if it starts blocking something, not before.**
 
-Not yet started: the rest of **Phase 3b** (the remaining `wr-core` primitives — `Morphism`, `convertNS`,
-`Search/ProductBFS`, `Transducer` — the real `Prover.java` dispatch/REPL/`MetaCommands` wiring
-real values into Phase 3a's U0c no-op hook, all remaining `Commands/*`, and the Tier-1
-golden-corpus harness) — needs the user's explicit go-ahead per
-`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating, same as Phase 3 itself needed before Phase 3a began.
+**Phase 3b, U17–U26 complete** (11 of 12 units; plan re-verified against current code before
+starting per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating — corrected-plan addendum at
+`~/.claude/plans/zany-sauteeing-pudding.md`, outside this repo; execution history and process
+notes in `RESUME-HERE.md`). Landed the remaining `wr-core` primitives (`Morphism`, `convertNS`,
+`Search/ProductBFS`, `Transducer`), the real `Prover.java` dispatch/REPL/`MetaCommands` (wiring
+real values into Phase 3a's U0c hook), and all remaining `Commands/*`
+(combine/concat/union/intersect/star/reverse/quotient/describe/minimize/fixleadzero/fixtrailzero/
+macro/morphism/image/promote/join/convert/inf/export/test/transduce/help). Each unit went through
+the full implementer → two-independent-reviewer → fixer loop; **two correctness-fatal bugs found
+and fixed** (`convertNS`'s exponent computation used Rust's correctly-rounded `f64::ln` where
+Java's `Math.log` is not correctly rounded, silently diverging on ~150-340 ordinary bases; and
+`Morphism::to_word_automaton` dropped Java's `NumberSystem` validation, letting `promote` silently
+succeed on inputs — e.g. any 1-uniform morphism — where real Java cleanly errors), plus several
+correctness-risk bugs (silent fail-open on custom-base number-system mismatches in
+`union`/`concat`/`intersect`, now fixed via real per-track NS-name threading through the
+reader/`Automaton`/writer; multiple process-killing panics on ordinary mismatched-input commands,
+now guarded; an ineffective resource cap on `transduce` replaced with a measured, deterministic
+budget inside the primitive itself). **10 new genuine Walnut (Java) bugs found and logged this
+phase** (WB-028–WB-037), all ported verbatim per the mechanical-port rule. `cargo test --workspace`
+green throughout; `cargo fmt`/`clippy` clean.
+
+Not yet started: **U27**, the Tier-1 golden-corpus harness (the actual DESIGN.md Phase-3 exit
+criterion: "Tier 1 green; eval/def/reg, and now everything else, work") — needs the user's
+explicit go-ahead per `docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating before starting, same as every
+other phase/sub-phase boundary in this project.
