@@ -1,0 +1,22 @@
+[package]
+name = "wr-golden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+wr-cli = { path = "../../crates/wr-cli" }
+wr-core = { path = "../../crates/wr-core" }
+wr-io = { path = "../../crates/wr-io" }
+# Test-harness-only. The Tier-1 corpus is driven by two machine-generated JSON manifests
+# produced by Phase 0 in the sibling `walnut-java` repo
+# (`phase0-artifacts/test-manifest.json`, `phase0-artifacts/subset-filter.json`), and a
+# hand-rolled JSON scanner over 675 fixtures whose `command_script` strings are full of
+# escaped quotes/backslashes is exactly the kind of silent-mis-parse risk this project's
+# correctness discipline exists to avoid. This is a `dev-dependency` of a `publish = false`
+# TEST package only: it is not reachable from any shipped crate (`wr-core`/`wr-logic`/
+# `wr-io`/`wr-cli` all keep their existing dependency sets untouched), so the workspace's
+# "keep the tree lean" rule (root `Cargo.toml`) is not weakened for anything that ships.
+serde_json = "1"

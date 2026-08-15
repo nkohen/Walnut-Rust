@@ -1,0 +1,862 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.).
+
+//! **Tier 1 — the golden-corpus harness** (`docs/DESIGN.md` §5; Phase 3b's U27, the actual
+//! Phase-3 exit criterion "Tier 1 green; eval/def/reg, and now everything else, work").
+//!
+//! This replays Walnut's own recorded integration-test corpus — the 675 command scripts
+//! `walnut-java/src/test/java/Main/IntegrationTest.java` holds in its `L` list, filtered to
+//! the 591 that `phase0-artifacts/subset-filter.json` marks subset-relevant — through this
+//! port's real dispatch loop, and compares each result against the output real Walnut
+//! recorded for it.
+//!
+//! # Tier 1 is not Tier 3
+//!
+//! `tests/differential/` (crate `wr-differential`) is **Tier 3**: queries this project chose,
+//! captured from a live `walnut-java` CLI run, checked in as fixtures. This crate is
+//! **Tier 1**: Walnut's *own* fixtures, its own recorded expectations, replayed wholesale. The
+//! two share a comparison philosophy (semantic equivalence, never bytes) and some scaffolding
+//! shape, but not their inputs, their scale, or their failure meaning — a Tier-1 divergence
+//! says "the port does not reproduce a workload Walnut itself ships a golden answer for."
+//!
+//! # What is compared, and how (a port of `IntegrationTest.runSpecificTest`, `:920-966`)
+//!
+//! Field for field, in Java's own order:
+//!
+//! | field | Java | here |
+//! |---|---|---|
+//! | thrown exception | `assertEquals(expected.getError(), e.getMessage())` | exact string equality on `ProverError`'s `Display`, **no normalization** |
+//! | `getMatrixOutput()` | size + `assertEqualMessages` per entry | same, except the 7 CAS fixtures (below) |
+//! | `getGraphViz()` | `assertEqualMessages`, only when the expected file is non-empty | same |
+//! | `getDetails()` | `assertEqualMessages` | same — see below, this is the strict one |
+//! | `getAutomatonPairs()` | size + `EqualityUtils.faEqual(actual.fa, expected.fa)` | size + [`wr_core::equiv::automaton_language_equivalent`] |
+//!
+//! `assertEqualMessages`' normalization is ported exactly in [`support::normalize_message`]
+//! (strip; one non-overlapping doubled-space pass; drop `\d+ms`; drop `\s*Progress:.*`) and
+//! nothing else. **Every state count survives, including pre-minimization ones** — a
+//! `details` fixture therefore pins intermediate automaton sizes and the cross-product
+//! traversal shape exactly. That strictness is deliberate: a `details` divergence on a
+//! fixture whose command runs `wr_core::product`'s BFS is a correctness signal about that
+//! traversal, not a normalization gap to paper over.
+//!
+//! Automata are compared by **semantic language equivalence only** — `CLAUDE.md`'s prime
+//! directive #1. State numbering, canonicalization order and file bytes are all free to
+//! differ.
+//!
+//! # Session model
+//!
+//! The corpus is **stateful and ordered**: fixture 448 consumes automata fixtures 444-447
+//! built, fixture 534 compares two automata earlier fixtures defined, and so on. Java runs
+//! every fixture against one shared on-disk session (a fresh `Prover` per fixture, but the
+//! same `Session` statics), seeded by `IntegrationTest.initialize()`'s prelude. This harness
+//! does the same:
+//!
+//! * `Global/` is copied to a temp directory and used as the home (read-only seed) library;
+//! * a fresh `Session/` is created with the six library subdirectories and the five word
+//!   automata `Session.cleanPathsAndNamesIntegrationTest` explicitly keeps;
+//! * [`support::PRELUDE`]'s 19 commands run first, on a fresh `Prover` each;
+//! * then all 675 fixtures run **in id order**, each on a fresh `Prover`.
+//!
+//! Fixtures that are excluded from *assertion* are still **executed**, exactly as Java runs
+//! them, so the session state every later fixture depends on is the same one Walnut recorded
+//! against. Excluding a fixture here means "do not compare its result", never "do not run it".
+//!
+//! # Exclusions (each recorded per-id in the report, never silent)
+//!
+//! 1. `subset-filter.json`'s 84 DROP-scope fixtures (negative-base numeration; `split`/
+//!    `rsplit`/`ost`).
+//! 2. The deferred **OTF** determinization strategies `CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`
+//!    (`docs/DESIGN.md` §9/§10 — an already-decided deferral). `SC` and plain `BRZ` are in
+//!    scope and are compared normally.
+//! 3. **Transitive DROP dependency** — a subset-relevant fixture whose command consumes a
+//!    library name that only a DROP-scope fixture could have produced. Computed structurally
+//!    from the manifest ([`support::transitively_dropped`]), not hard-coded.
+//! 4. **`[strategy …]`/`[export …]` metacommands**, which `wr-cli` parses and validates but
+//!    does not yet thread into determinization — a pre-existing, documented deferral
+//!    (`crates/wr-cli/src/prover.rs`'s module docs). See [`Excluded::MetacommandNotWired`];
+//!    comparing these would measure the deferral, not the port.
+//!
+//! Plus one *partial* exclusion: the fixtures whose recorded expectation includes CAS
+//! incidence-matrix files (`.mpl`/`.m`/`.wl`/`.sage`). The CAS matrix writer is confirmed
+//! DROP scope for this port, so those fixtures have their automaton/details/error compared
+//! and **only** their matrix comparison skipped — reported per id as `cas-matrix-skipped`.
+//!
+//! # Resource discipline
+//!
+//! Every fixture is timed. A fixture that exceeds [`MAX_FIXTURE_SECS`] is reported as
+//! `OVER-BUDGET` with its measured time and its cap, and a run whose total exceeds
+//! [`MAX_TOTAL_SECS`] stops early with every remaining fixture reported `not-run`. Neither is
+//! silent. This is a *post-hoc* budget, not a preemptive one: `Prover`/`Session` hold `Rc`
+//! state and are not `Send`, so a fixture cannot be moved onto a watchdog thread and killed —
+//! the honest guarantee is "an over-budget fixture is always visible in the report", not "the
+//! harness can interrupt a runaway fixture". A genuinely non-terminating fixture would hang,
+//! and the fix for that is a real bug fix in the port, not a harness feature.
+//!
+//! # Running it
+//!
+//! The corpus test is `#[ignore]`d — it is `docs/DESIGN.md` §5's **gated slow tier**; see
+//! [`tier1_golden_corpus`]'s own doc and `tests/golden/STATUS.md`.
+//!
+//! ```bash
+//! cargo test -p wr-golden --release -- --ignored --nocapture   # the whole corpus
+//! cargo test -p wr-golden                                      # the cheap checks only
+//! WR_GOLDEN_ONLY=0,1,375,653 cargo test -p wr-golden --release -- --ignored --nocapture
+//! WR_GOLDEN_STOP_AFTER=100  ...   # stop after fixture 100 (triage; disables the gate)
+//! WR_GOLDEN_KEEP_TREE=1     ...   # leave the temp library tree behind for inspection
+//! WALNUT_JAVA_DIR=/path/to/walnut-java cargo test -p wr-golden --release -- --ignored
+//! ```
+//!
+//! The full per-fixture report is also written to `target/golden-corpus-report.txt`, and
+//! `tests/golden/STATUS.md` holds the checked-in summary of the last full run (pass/fail/skip
+//! counts, every remaining divergence and its root cause, and the bugs this unit fixed).
+
+mod support;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use support::{
+    build_session_tree, compare_messages, corpus_root, deferred_otf_strategy, global_library_names,
+    load_expected, load_fixtures, transitively_dropped, unwired_metacommands, walnut_java_dir,
+    Excluded, Expected, Fixture, PathRewrite, PRELUDE,
+};
+use wr_cli::prover::Prover;
+use wr_cli::session::Session;
+use wr_cli::test_case::TestCase;
+use wr_core::equiv::automaton_language_equivalent;
+use wr_core::logging::Logging;
+
+/// Per-fixture wall-time cap (`CLAUDE.md`, test-performance guardrails). Chosen from a
+/// measured full run: see `tests/golden/STATUS.md` for the observed distribution.
+const MAX_FIXTURE_SECS: u64 = 60;
+
+/// Whole-run wall-time cap. The corpus is Walnut's own workload set, so it is inherently
+/// tractable — but a port bug that turns one fixture superexponential must not be able to
+/// wedge `cargo test --workspace` indefinitely.
+const MAX_TOTAL_SECS: u64 = 1800;
+
+// ---------------------------------------------------------------------------
+// Verdicts
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verdict {
+    Pass,
+    Fail(String),
+    Skipped(Excluded),
+    OverBudget(Duration),
+    NotRun,
+}
+
+impl Verdict {
+    fn tag(&self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::Fail(_) => "FAIL",
+            Verdict::Skipped(_) => "SKIP",
+            Verdict::OverBudget(_) => "OVER-BUDGET",
+            Verdict::NotRun => "NOT-RUN",
+        }
+    }
+}
+
+struct Outcome {
+    id: usize,
+    command: String,
+    verdict: Verdict,
+    elapsed: Duration,
+    notes: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Known divergences
+// ---------------------------------------------------------------------------
+
+/// Fixtures that do **not** currently reproduce Walnut's recorded output, each with the reason
+/// it is accepted rather than fixed. The harness asserts the failing set is EXACTLY this set:
+/// a new failure fails the run, and so does a fixture here that starts passing (which means
+/// the entry is stale and must be deleted).
+///
+/// An entry here is only legitimate when it names a `docs/WALNUT-BUGS.md` entry, an already-
+/// signed-off scope decision, or an open follow-up unit — never "this one is hard".
+const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
+    // -- root cause 1: `details` log-text fidelity (see tests/golden/STATUS.md §1) --------
+    //
+    // Every STATE COUNT in these fixtures already matches real Walnut exactly,
+    // pre-minimization ones included. What is missing is log LINES: the `computing X`/
+    // `computed X` pairs that Java emits from inside each token's `act()` body, and every
+    // `wr-core`-level line (`computing cross product:N states`, `Minimizing: N states.`,
+    // `Determinizing [#k, strategy: SC]`, `quantifying:N states`, …).
+    //
+    // Both are pre-existing, explicitly documented deferrals — `wr-logic`'s `eval.rs`
+    // module docs ("DEFERRED GAP: the per-`act()` `Logging` calls are NOT ported", which
+    // itself says the gap "must land before Phase 3b's U27") and `wr-core`'s `product.rs`
+    // ("Progress logging not ported"). Closing them means threading `&mut Logging` through
+    // every `act()` body AND through `wr-core`'s product/determinize/minimize/quantify call
+    // sites: a follow-up unit, not a harness concern.
+    (
+        375,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        376,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        377,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        378,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        379,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        383,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        628,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    // -- root cause 2: `transduce` over a reversed (lsd) custom-base word automaton -------
+    //
+    // `test531 = reverse F` is an `lsd_fib` DFAO, so `transduce test532 RUNSUM2 test531`
+    // takes `Transducer.transduceNonDeterministic`'s reverse-input/reverse-result branch
+    // (`Transducer.java:286-292, 325-327`) — the ONE branch no other transduce fixture
+    // exercises (527/528/529/530/550/551/552/553 all pass, including the same transducer on
+    // the same word automaton in its msd direction). 533 and 534 are downstream of 532.
+    // Open; see tests/golden/STATUS.md §2 for the suggested bisection.
+    (
+        532,
+        "transduce over an lsd custom-base DFAO diverges (open port bug, STATUS.md §2)",
+    ),
+    (533, "downstream of 532 (`reverse test533 test532;`)"),
+    (534, "downstream of 532 (compares test533 against test530)"),
+];
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+/// `#[ignore]` = `docs/DESIGN.md` §5's **gated slow tier**, not a disabled test.
+///
+/// The corpus is Walnut's own workload set, and it is tractable — 12 s of prelude plus 28 s
+/// for all 675 fixtures in a release build. In a debug build the same run is ~7 minutes (a
+/// measured 10× ratio; see `tests/golden/STATUS.md`), which does not belong in the
+/// every-commit fast tier. Everything else in this crate — the `assertEqualMessages`
+/// normalization tests, the classifier tests, and
+/// [`no_later_fixture_depends_on_an_unexecuted_one`] — runs by default in milliseconds.
+///
+/// ```bash
+/// cargo test -p wr-golden --release -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "Tier-1 gated slow tier: run with --release -- --ignored (see tests/golden/STATUS.md)"]
+fn tier1_golden_corpus() {
+    let Some(root) = corpus_root() else {
+        panic!(
+            "Tier-1 golden corpus not found.\n\
+             Looked for `src/test/resources/integrationTests/` under {}.\n\
+             The corpus lives in the sibling `walnut-java` oracle repo and is deliberately not\n\
+             vendored here (see tests/golden/tests/support/mod.rs). Point WALNUT_JAVA_DIR at a\n\
+             walnut-java checkout to run Tier 1.",
+            walnut_java_dir().display()
+        );
+    };
+    let fixtures = load_fixtures().unwrap_or_else(|e| panic!("loading the Phase-0 manifests: {e}"));
+
+    let dest = std::env::temp_dir().join(format!("wr-golden-corpus-{}", std::process::id()));
+    let (home_dir, session_dir) =
+        build_session_tree(&root, &dest).unwrap_or_else(|e| panic!("building session tree: {e}"));
+
+    let seeded = global_library_names(&home_dir);
+    let transitive = transitively_dropped(&fixtures, &seeded);
+    let rewrite = PathRewrite {
+        home_dir: home_dir.clone(),
+        session_dir: session_dir.clone(),
+    };
+
+    // Two triage knobs, both of which disable the pass/fail gate at the end: a run that
+    // deliberately looks at part of the corpus must never be able to report the corpus green.
+    let only: Option<BTreeSet<usize>> = std::env::var("WR_GOLDEN_ONLY").ok().map(|s| {
+        s.split(',')
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| t.trim().parse().expect("WR_GOLDEN_ONLY: not a fixture id"))
+            .collect()
+    });
+    let stop_after: Option<usize> = std::env::var("WR_GOLDEN_STOP_AFTER").ok().map(|s| {
+        s.trim()
+            .parse()
+            .expect("WR_GOLDEN_STOP_AFTER: not a fixture id")
+    });
+    let triage = only.is_some() || stop_after.is_some();
+
+    // -- the prelude (`IntegrationTest.initialize`, `:43-78`) -----------------
+    let prelude_started = Instant::now();
+    let mut prelude_failures = Vec::new();
+    for (i, command) in PRELUDE.iter().enumerate() {
+        let mut prover = fresh_prover(&session_dir, &home_dir);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            prover.dispatch_for_integration_test(command, &format!("prelude:{i}"))
+        }));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => prelude_failures.push(format!("prelude[{i}] `{command}`: {e}")),
+            Err(_) => prelude_failures.push(format!("prelude[{i}] `{command}`: PANICKED")),
+        }
+    }
+
+    // -- the corpus -----------------------------------------------------------
+    let prelude_elapsed = prelude_started.elapsed();
+    eprintln!("prelude finished in {:.1}s", prelude_elapsed.as_secs_f64());
+    let run_started = Instant::now();
+    let mut outcomes: Vec<Outcome> = Vec::with_capacity(fixtures.len());
+    let mut stopped_early = false;
+
+    for fixture in &fixtures {
+        if stop_after.is_some_and(|last| fixture.id > last) {
+            break;
+        }
+        if stopped_early {
+            outcomes.push(Outcome {
+                id: fixture.id,
+                command: fixture.command_script.clone(),
+                verdict: Verdict::NotRun,
+                elapsed: Duration::ZERO,
+                notes: vec!["run stopped early: total budget exceeded".to_string()],
+            });
+            continue;
+        }
+        if only.as_ref().is_some_and(|ids| !ids.contains(&fixture.id)) {
+            // Still EXECUTED (the session is stateful) but not compared, and not reported as
+            // a skip — `WR_GOLDEN_ONLY` is a triage tool, not a scope decision.
+            let mut prover = fresh_prover(&session_dir, &home_dir);
+            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                prover
+                    .dispatch_for_integration_test(&fixture.command_script, &fixture.id.to_string())
+            }));
+            continue;
+        }
+
+        let exclusion = classify(fixture, &transitive);
+        let expected = load_expected(&root, fixture.id)
+            .unwrap_or_else(|e| panic!("fixture {}: reading expectations: {e}", fixture.id));
+
+        // The ONE class of fixture that is not even executed. Everything else runs, because
+        // the session is stateful and later fixtures read what earlier ones wrote — see this
+        // file's module docs. An unwired `[strategy …]` fixture is different in kind: running
+        // it does not reproduce any state Walnut recorded (the strategy is ignored, so the
+        // computation is a different one), and for the corpus's five `[strategy 6 …]` fixtures
+        // it is also ruinously expensive — Walnut answers `test637` in 130 ms via Brzozowski,
+        // where the default `SC` subset-constructs the same 1,790-state NFA and does not
+        // finish. `no_later_fixture_depends_on_an_unexecuted_one` below proves nothing
+        // downstream reads their output, so skipping execution cannot perturb any other
+        // fixture's verdict.
+        let execute = !skips_execution(fixture);
+
+        let started = Instant::now();
+        let mut prover = fresh_prover(&session_dir, &home_dir);
+        let dispatched = execute.then(|| {
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                prover
+                    .dispatch_for_integration_test(&fixture.command_script, &fixture.id.to_string())
+            }))
+        });
+        let elapsed = started.elapsed();
+
+        let mut notes = Vec::new();
+        if !execute {
+            notes.push("not executed (see skip reason)".to_string());
+        }
+        let verdict = match exclusion {
+            Some(reason) => Verdict::Skipped(reason),
+            None if elapsed > Duration::from_secs(MAX_FIXTURE_SECS) => Verdict::OverBudget(elapsed),
+            // `execute` is only ever false for a fixture that `classify` already excluded
+            // (both are driven by `unwired_metacommands`), so this arm is unreachable — but
+            // it is a real `Option`, and a future exclusion class that forgets to keep the two
+            // in step should say so loudly rather than silently compare a result that was
+            // never computed.
+            None if dispatched.is_none() => Verdict::Fail(
+                "harness bug: the fixture was not executed but is not excluded either".to_string(),
+            ),
+            None => match dispatched.expect("checked by the arm above") {
+                Err(payload) => {
+                    Verdict::Fail(format!("PANICKED: {}", panic_message(payload.as_ref())))
+                }
+                Ok(Err(error)) => compare_error(&expected, &rewrite.apply(&error.to_string())),
+                Ok(Ok(None)) => Verdict::Fail(
+                    "dispatch returned no TestCase, but the corpus records an expectation \
+                     (Java's harness fails on a null TestCase too)"
+                        .to_string(),
+                ),
+                Ok(Ok(Some(actual))) => {
+                    compare_test_case(prover.session(), &expected, &actual, &rewrite, &mut notes)
+                }
+            },
+        };
+
+        // Progress, one line per fixture. Captured by libtest unless `--nocapture`, so this
+        // costs nothing in a normal run and makes a long triage run watchable.
+        eprintln!(
+            "[{:>5}] {:>3} {:>7.2}s {}{}",
+            verdict.tag(),
+            fixture.id,
+            elapsed.as_secs_f64(),
+            truncate(&fixture.command_script, 70),
+            match &verdict {
+                Verdict::Fail(why) => format!(
+                    "\n         >> {}",
+                    truncate(why.lines().next().unwrap_or(""), 160)
+                ),
+                _ => String::new(),
+            }
+        );
+        outcomes.push(Outcome {
+            id: fixture.id,
+            command: fixture.command_script.clone(),
+            verdict,
+            elapsed,
+            notes,
+        });
+
+        if run_started.elapsed() > Duration::from_secs(MAX_TOTAL_SECS) {
+            stopped_early = true;
+        }
+    }
+
+    // -- report ---------------------------------------------------------------
+    let report = build_report(
+        &outcomes,
+        &prelude_failures,
+        prelude_elapsed,
+        run_started.elapsed(),
+    );
+    let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join("golden-corpus-report.txt");
+    if let Some(parent) = report_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&report_path, &report);
+    println!("{report}");
+    println!("full report written to {}", report_path.display());
+
+    // `WR_GOLDEN_KEEP_TREE=1` leaves the temp home/session tree in place so a triage run can
+    // inspect exactly what the corpus built (which library files exist, what a `load` wrote).
+    if std::env::var_os("WR_GOLDEN_KEEP_TREE").is_none() {
+        let _ = std::fs::remove_dir_all(&dest);
+    } else {
+        println!("session tree kept at {}", dest.display());
+    }
+
+    // -- gate -----------------------------------------------------------------
+    if triage {
+        // A triage run compares a hand-picked subset; it must not be able to "pass" the gate.
+        println!("WR_GOLDEN_ONLY/WR_GOLDEN_STOP_AFTER set: gate skipped (triage run).");
+        return;
+    }
+
+    let known: BTreeMap<usize, &str> = KNOWN_DIVERGENCES.iter().copied().collect();
+    let failing: BTreeMap<usize, String> = outcomes
+        .iter()
+        .filter_map(|o| match &o.verdict {
+            Verdict::Fail(why) => Some((o.id, why.clone())),
+            Verdict::OverBudget(d) => Some((
+                o.id,
+                format!(
+                    "over budget: {:.1}s > {MAX_FIXTURE_SECS}s cap",
+                    d.as_secs_f64()
+                ),
+            )),
+            Verdict::NotRun => Some((o.id, "not run: total budget exceeded".to_string())),
+            _ => None,
+        })
+        .collect();
+
+    let mut problems = String::new();
+    for (id, why) in &failing {
+        if !known.contains_key(id) {
+            let _ = writeln!(problems, "  NEW FAILURE   fixture {id}: {why}");
+        }
+    }
+    for (id, why) in &known {
+        if !failing.contains_key(id) {
+            let _ = writeln!(
+                problems,
+                "  STALE ENTRY   fixture {id} is listed in KNOWN_DIVERGENCES ({why}) but now passes \
+                 — delete the entry"
+            );
+        }
+    }
+    if !prelude_failures.is_empty() {
+        for f in &prelude_failures {
+            let _ = writeln!(problems, "  PRELUDE       {f}");
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "Tier-1 golden corpus is not green:\n{problems}\nfull report: {}",
+        report_path.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn fresh_prover(session_dir: &str, home_dir: &str) -> Prover {
+    // `Prover.mainProver = new Prover();` (`IntegrationTest.java:926`) — a fresh prover per
+    // fixture, over the same on-disk session.
+    let session = Session::new(Some(session_dir), Some(home_dir), false);
+    Prover::with_output(session, Logging::new(), Box::new(std::io::sink()))
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// The one "do not even run it" rule — see the call site's comment and
+/// [`Excluded::MetacommandNotWired`]. Deliberately keyed on the *command text*, not on which
+/// [`Excluded`] variant `classify` happened to pick: fixtures 638-641 declare BOTH an unwired
+/// `[strategy …]` and a deferred OTF strategy, and get the (more specific) OTF reason, but
+/// they are the same ruinously expensive query as 637 and must not be executed either.
+fn skips_execution(fixture: &Fixture) -> bool {
+    unwired_metacommands(&fixture.command_script).is_some()
+}
+
+/// Nothing later in the corpus may read a library file that a not-executed fixture would have
+/// written — otherwise skipping execution would silently change some *other* fixture's answer,
+/// which is exactly the kind of quiet corruption this harness exists to catch.
+///
+/// Checked at run time rather than assumed, so it stays true if `walnut-java` regenerates the
+/// manifest with new fixtures.
+#[test]
+fn no_later_fixture_depends_on_an_unexecuted_one() {
+    let Ok(fixtures) = load_fixtures() else {
+        // The corpus/manifests are absent; `tier1_golden_corpus` reports that loudly on its
+        // own and this check has nothing to check.
+        return;
+    };
+    let mut produced: Vec<(usize, String)> = Vec::new();
+    for f in &fixtures {
+        if skips_execution(f) {
+            if let Some(name) = support::defined_name(&f.command_script) {
+                produced.push((f.id, name));
+            }
+        }
+    }
+    assert!(
+        !produced.is_empty(),
+        "the rule is supposed to apply to the corpus's `[strategy …]`/`[export …]` fixtures; \
+         finding none means the classifier stopped matching"
+    );
+    for f in &fixtures {
+        for (id, name) in &produced {
+            if f.id > *id {
+                assert!(
+                    !support::references(&f.command_script, name),
+                    "fixture {} references `{name}`, which fixture {id} would have written — \
+                     that fixture is not executed, so skipping it would change fixture {}'s \
+                     result. Either execute it after all, or exclude {} too.",
+                    f.id,
+                    f.id,
+                    f.id
+                );
+            }
+        }
+    }
+}
+
+fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Option<Excluded> {
+    if !fixture.subset_relevant {
+        return Some(Excluded::DropScope(fixture.drop_reason.clone()));
+    }
+    if let Some(strategy) = deferred_otf_strategy(&fixture.command_script) {
+        return Some(Excluded::OtfStrategy(strategy));
+    }
+    if let Some(names) = transitive.get(&fixture.id) {
+        return Some(Excluded::TransitiveDropDependency(names.clone()));
+    }
+    if let Some(meta) = unwired_metacommands(&fixture.command_script) {
+        return Some(Excluded::MetacommandNotWired(meta));
+    }
+    None
+}
+
+/// The `catch(Exception e)` arm of `runSpecificTest` (`:963-965`):
+/// `assertEquals(expected.getError(), e.getMessage())` — an EXACT comparison, with none of
+/// `assertEqualMessages`' normalization.
+fn compare_error(expected: &Expected, actual: &str) -> Verdict {
+    if expected.error == actual {
+        Verdict::Pass
+    } else if expected.error.is_empty() {
+        Verdict::Fail(format!(
+            "command failed, but the corpus records a successful result.\n  actual error: {actual}"
+        ))
+    } else {
+        Verdict::Fail(format!(
+            "error message differs (exact comparison, as in Java)\n  expected: {}\n  actual:   {actual}",
+            expected.error
+        ))
+    }
+}
+
+fn compare_test_case(
+    session: &Session,
+    expected: &Expected,
+    actual: &TestCase,
+    rewrite: &PathRewrite,
+    notes: &mut Vec<String>,
+) -> Verdict {
+    if !expected.error.is_empty() {
+        return Verdict::Fail(format!(
+            "command succeeded, but the corpus records an error: {}",
+            expected.error
+        ));
+    }
+
+    // 1. matrix output (`:933-938`)
+    let actual_matrix = match actual.matrix_output() {
+        Ok(m) => m,
+        Err(e) => return Verdict::Fail(format!("reading actual matrix output: {e}")),
+    };
+    if expected.has_cas_matrices() {
+        // CAS incidence-matrix export is DROP scope for this port; compared automaton/details
+        // still apply. Recorded, not silent.
+        notes.push("cas-matrix-skipped (CAS export is DROP scope)".to_string());
+    } else {
+        if expected.matrix_output.len() != actual_matrix.len() {
+            return Verdict::Fail(format!(
+                "matrix output size differs: expected {}, actual {}",
+                expected.matrix_output.len(),
+                actual_matrix.len()
+            ));
+        }
+        for (i, (e, a)) in expected
+            .matrix_output
+            .iter()
+            .zip(actual_matrix.iter())
+            .enumerate()
+        {
+            if let Err(why) = compare_messages(e.trim(), a.trim(), &format!("matrix output[{i}]")) {
+                return Verdict::Fail(why);
+            }
+        }
+    }
+
+    // 2. graphviz (`:940-945`) — only when the corpus recorded one.
+    if !expected.graph_viz.trim().is_empty() {
+        let actual_gv = match actual.graph_viz() {
+            Ok(gv) => gv,
+            Err(e) => return Verdict::Fail(format!("reading actual graphviz: {e}")),
+        };
+        if let Err(why) = compare_messages(
+            expected.graph_viz.trim(),
+            actual_gv.trim(),
+            "graphviz output",
+        ) {
+            return Verdict::Fail(why);
+        }
+    }
+
+    // 3. details (`:946`). `rewrite` maps this harness's own throwaway library directories
+    // back to the ones `walnut-java` recorded — see [`PathRewrite`] for why that is the one
+    // extra normalization and why it cannot hide a port defect.
+    if let Err(why) = compare_messages(
+        &expected.details,
+        &rewrite.apply(actual.details()),
+        "details",
+    ) {
+        return Verdict::Fail(why);
+    }
+
+    // 4. automaton pairs (`:947-961`). `loadTestCases` always records exactly one pair for a
+    // subset-relevant fixture — the `automaton_repr` second pair only ever appears on the one
+    // Ostrowski fixture (id 625), which is DROP scope and never compared here.
+    let actual_pairs = actual.automaton_pairs().len();
+    if actual_pairs != 1 {
+        return Verdict::Fail(format!(
+            "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
+        ));
+    }
+    let actual_automaton = actual.automaton_pairs()[0].automaton();
+    match (&expected.automaton_path, actual_automaton) {
+        (None, None) => Verdict::Pass,
+        (None, Some(_)) => Verdict::Fail(
+            "the corpus records no automaton for this fixture, but the port produced one"
+                .to_string(),
+        ),
+        (Some(_), None) => Verdict::Fail(
+            "the corpus records an automaton for this fixture, but the port produced none"
+                .to_string(),
+        ),
+        (Some(path), Some(ours)) => {
+            let mut expected_automaton =
+                match wr_io::reader::read_automaton_txt_with_custom_base_resolver(
+                    path,
+                    session.paths(),
+                ) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return Verdict::Fail(format!(
+                            "the recorded automaton {} could not be read: {e:?}",
+                            path.display()
+                        ))
+                    }
+                };
+            // `EqualityUtils.faEqual(actualA.fa, expectedA.fa)` (`:958`). Two normalizations
+            // apply before that call can mean anything, both established by the Tier-3 suite:
+            //   * `sort_label()` on ours — the recorded file was written through Java's
+            //     `AutomatonWriter`, which canonizes (and therefore sorts the label) first, so
+            //     the two must be brought into the same track order before a POSITIONAL
+            //     comparison is meaningful (`wr_core::equiv`'s own documented gap);
+            //   * `totalize(0)` on both — Walnut's `.txt` automata need not be total (a
+            //     missing transition means implicit rejection) and the equivalence oracle
+            //     requires total DFAs.
+            let mut ours = ours.clone();
+            ours.sort_label();
+            ours.fa.totalize(0);
+            expected_automaton.fa.totalize(0);
+            match automaton_language_equivalent(&ours, &expected_automaton) {
+                Ok(true) => Verdict::Pass,
+                Ok(false) => Verdict::Fail(
+                    "automaton language differs from the recorded one (semantic equivalence)"
+                        .to_string(),
+                ),
+                Err(e) => {
+                    Verdict::Fail(format!("equivalence oracle refused the comparison: {e:?}"))
+                }
+            }
+        }
+    }
+}
+
+fn build_report(
+    outcomes: &[Outcome],
+    prelude_failures: &[String],
+    prelude: Duration,
+    total: Duration,
+) -> String {
+    let mut s = String::new();
+    let count = |tag: &str| outcomes.iter().filter(|o| o.verdict.tag() == tag).count();
+    let _ = writeln!(s, "=== Tier-1 golden corpus ===");
+    let _ = writeln!(
+        s,
+        "prelude ({} commands): {:.1}s",
+        PRELUDE.len(),
+        prelude.as_secs_f64()
+    );
+    let _ = writeln!(
+        s,
+        "fixtures: {} | pass {} | fail {} | skip {} | over-budget {} | not-run {} | {:.1}s",
+        outcomes.len(),
+        count("PASS"),
+        count("FAIL"),
+        count("SKIP"),
+        count("OVER-BUDGET"),
+        count("NOT-RUN"),
+        total.as_secs_f64()
+    );
+    if !prelude_failures.is_empty() {
+        let _ = writeln!(s, "\n-- prelude failures --");
+        for f in prelude_failures {
+            let _ = writeln!(s, "  {f}");
+        }
+    }
+
+    let mut skip_reasons: BTreeMap<String, usize> = BTreeMap::new();
+    for o in outcomes {
+        if let Verdict::Skipped(r) = &o.verdict {
+            let key = match r {
+                Excluded::DropScope(reasons) => format!(
+                    "skip-drop-scope[{}]",
+                    reasons
+                        .iter()
+                        .map(|r| r.split(':').next().unwrap_or(r).to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                other => other.to_string(),
+            };
+            *skip_reasons.entry(key).or_default() += 1;
+        }
+    }
+    let _ = writeln!(s, "\n-- skip breakdown --");
+    for (reason, n) in &skip_reasons {
+        let _ = writeln!(s, "  {n:>4}  {reason}");
+    }
+
+    let notes: Vec<&Outcome> = outcomes.iter().filter(|o| !o.notes.is_empty()).collect();
+    if !notes.is_empty() {
+        let _ = writeln!(s, "\n-- partial comparisons (compared, but not in full) --");
+        for o in notes {
+            let _ = writeln!(s, "  fixture {:>3}: {}", o.id, o.notes.join("; "));
+        }
+    }
+
+    let mut slow: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|o| o.elapsed > Duration::from_secs(5))
+        .collect();
+    slow.sort_by_key(|o| std::cmp::Reverse(o.elapsed));
+    if !slow.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n-- slowest fixtures (>5s; per-fixture cap {MAX_FIXTURE_SECS}s) --"
+        );
+        for o in slow.iter().take(25) {
+            let _ = writeln!(
+                s,
+                "  fixture {:>3}: {:>7.1}s  {}",
+                o.id,
+                o.elapsed.as_secs_f64(),
+                truncate(&o.command, 90)
+            );
+        }
+    }
+
+    let failures: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|o| matches!(o.verdict, Verdict::Fail(_) | Verdict::OverBudget(_)))
+        .collect();
+    if !failures.is_empty() {
+        let _ = writeln!(s, "\n-- divergences --");
+        for o in &failures {
+            let why = match &o.verdict {
+                Verdict::Fail(w) => w.clone(),
+                Verdict::OverBudget(d) => format!("OVER BUDGET: {:.1}s", d.as_secs_f64()),
+                _ => unreachable!(),
+            };
+            let _ = writeln!(
+                s,
+                "\n[{}] fixture {}\n  command: {}\n  {}",
+                o.verdict.tag(),
+                o.id,
+                truncate(&o.command, 200),
+                why.replace('\n', "\n  ")
+            );
+        }
+    }
+    s
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
