@@ -259,6 +259,11 @@ pub fn determinize(
         Strategy::Sc => subset_construction(&a.fa, initial),
         Strategy::Brz => brzozowski(&a.fa, initial)?,
     };
+    // In Java this is a brand-new `FA` object, so its `canonized` memo is `false` by
+    // construction; this port's flag lives on the `Automaton` wrapper and survives the
+    // `fa` swap, so it is reset by hand. See `Automaton::canonized`'s doc comment for
+    // the exhaustive list of sites that owe this.
+    a.set_canonized(false);
 
     // Java `:127-130` logs `DETERMINIZED: <Q> states - <ms>ms` here -- unlike the block
     // above, unconditionally (no `shouldPrintDetails` guard; `Logging.logMessage` does

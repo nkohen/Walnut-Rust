@@ -47,7 +47,7 @@
 //! unreachable, matching this crate's convention elsewhere (e.g. `infinite.rs`'s
 //! `find_path().expect(..)`).
 //!
-//! # `determineImageNumberSystemPrefix`: the pre-existing representation-gap note
+//! # `determineImageNumberSystemPrefix`: the representation gap, and its one hard edge
 //!
 //! [`determine_image_number_system_prefix`] ports `Image.determineImageNumberSystemPrefix`
 //! (`:48-57`) using the same canonical-name reconstruction `wr-io`'s `writer.rs` already
@@ -58,6 +58,18 @@
 //! non-arithmetic-numeration word automaton via `image()` even a supported scenario?), not
 //! a confirmed bug; nothing here resolves that question, it only reproduces Java's `ns ==
 //! null -> ""` / `"?" + ns` shape as faithfully as this crate's representation allows.
+//!
+//! **Where that reconstruction is not merely lossy but WRONG: a custom base.** Java uses
+//! `ns.getName()`, the number system's real name — `msd_fib`, `msd_trib`, … Reconstructing
+//! `"?msd_" + alphabet.len()` gives `?msd_2` for an `msd_fib` word automaton, and the
+//! per-value intermediary predicates would then be evaluated over ordinary base-2
+//! arithmetic against a Fibonacci-indexed word: a **silently wrong** answer, with no error
+//! anywhere. `wr-core` cannot currently recover the real name (there is no per-track NS-name
+//! field on `Automaton`), but it CAN detect the situation — `Automaton::all_reps[i]` is
+//! `Some` exactly for a custom base — so [`determine_image_number_system_prefix`] returns
+//! [`ImageError::CustomBaseNotSupported`] instead. A clean, reported refusal is strictly
+//! better than a wrong automaton; when a real NS-name field lands, this arm should become
+//! the faithful `"?" + name`.
 
 use wr_core::automaton::Automaton;
 use wr_core::logging::Logging;
@@ -94,6 +106,12 @@ pub enum ImageError {
     /// `determineImageNumberSystemPrefix`'s inline throw (`Image.java:50`): the old
     /// word automaton is not unary (single-track).
     NotUnaryWordAutomaton { name: String },
+    /// **Port limitation, NOT a Java behavior** (see module docs): the old word automaton
+    /// is over a CUSTOM base (`msd_fib`, …), whose real `NumberSystem` name this crate's
+    /// `Automaton` does not store, so `determineImageNumberSystemPrefix`'s canonical-name
+    /// reconstruction would silently produce a plain `?msd_<k>` prefix and evaluate the
+    /// whole command over the wrong arithmetic. Refused instead.
+    CustomBaseNotSupported { name: String },
     /// A per-value intermediary evaluation (`EvalDef.getImageEval`) failed.
     Eval(EvalError),
 }
@@ -108,6 +126,12 @@ impl std::fmt::Display for ImageError {
             ImageError::NotUnaryWordAutomaton { name } => {
                 write!(f, "{}", msg::image_requires_unary_word_automaton(name))
             }
+            ImageError::CustomBaseNotSupported { name } => write!(
+                f,
+                "image: the word automaton {name} is over a custom base, whose number \
+                 system name walnut-rs does not yet record -- refusing rather than \
+                 silently evaluating the image over the wrong arithmetic"
+            ),
             ImageError::Eval(e) => write!(f, "{e}"),
         }
     }
@@ -233,6 +257,14 @@ fn determine_image_number_system_prefix(
         // `ns == null` -- this crate's `None` stand-in.
         None => Ok(String::new()),
         Some(is_msd) => {
+            // A custom base (`msd_fib`, ...) is exactly `all_reps[0].is_some()`. Its real
+            // `NumberSystem` name is not recoverable here, and the `msd_<alphabet.len()>`
+            // reconstruction below would be actively WRONG for it -- see module docs.
+            if word.all_reps.first().is_some_and(Option::is_some) {
+                return Err(ImageError::CustomBaseNotSupported {
+                    name: word_name.to_string(),
+                });
+            }
             let base = word.alphabet[0].len();
             Ok(format!("?{}_{base}", if is_msd { "msd" } else { "lsd" }))
         }
@@ -388,7 +420,64 @@ mod tests {
         let result = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(!result.fa.is_true_false_automaton());
 
+        // The actual computed CONTENT, not just "a file exists". h(T) = T is the
+        // classical Thue-Morse fixed-point identity, so the image DFAO must output
+        // exactly T[n] = (popcount(n) mod 2) for every n -- checked here against that
+        // independent, hand-computable oracle rather than against the port's own output.
+        let output_of = |n: u32| -> i32 {
+            let mut state = result.fa.q0;
+            let digits: Vec<i32> = if n == 0 {
+                vec![0]
+            } else {
+                let mut d = Vec::new();
+                let mut m = n;
+                while m > 0 {
+                    d.push((m & 1) as i32);
+                    m >>= 1;
+                }
+                d.reverse();
+                d
+            };
+            for digit in digits {
+                let sym = result.encode(&[digit]);
+                state = result.fa.d[state][&sym][0];
+            }
+            result.fa.o[state]
+        };
+        for n in 0u32..32 {
+            assert_eq!(
+                output_of(n),
+                (n.count_ones() % 2) as i32,
+                "h(T)[{n}] must equal T[{n}] (the Thue-Morse fixed-point identity)"
+            );
+        }
+        // ...and it is genuinely the 2-state Thue-Morse DFAO, not some larger automaton
+        // that merely agrees on the sampled prefix.
+        assert_eq!(result.fa.q, 2);
+        assert_eq!(result.alphabet, vec![vec![0, 1]]);
+
+        // The written file is the same automaton (the Result copy and the Word Automata
+        // Library copy are byte-identical, per `write_automata`'s copy-based shape).
+        let written = fs::read_to_string(dir.join("Result").join("FS.txt")).unwrap();
+        let library = fs::read_to_string(dir.join("Word Automata Library").join("FS.txt")).unwrap();
+        assert_eq!(written, library);
+        assert!(
+            written.starts_with("msd_2"),
+            "unexpected header in {written:?}"
+        );
+
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn image_rejects_a_custom_base_word_automaton() {
+        // Port limitation, deliberately surfaced as an error rather than a silently
+        // wrong `?msd_<k>` reconstruction -- see module docs.
+        let mut word = unary_automaton(vec![0, 1], Some(true));
+        // `all_reps[0] = Some(..)` is exactly "this track is on a custom base".
+        word.set_all_reps(vec![Some(std::rc::Rc::new(Automaton::true_false(true)))]);
+        let err = determine_image_number_system_prefix(&word, "fibWord").unwrap_err();
+        assert!(matches!(err, ImageError::CustomBaseNotSupported { name } if name == "fibWord"));
     }
 
     #[test]

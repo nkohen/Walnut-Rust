@@ -95,6 +95,8 @@ use regex_automata::util::captures::Captures;
 use regex_automata::Input;
 
 use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
+use wr_core::logicalops::ConvertNsError;
+use wr_core::morphism::MorphismError;
 use wr_core::util::validate_file;
 use wr_logic::predicate_env::FreshIdentifiers;
 
@@ -695,14 +697,52 @@ impl LoggableError for ProverError {
             | ProverError::Reverse(_)
             | ProverError::Describe(_)
             | ProverError::SimpleTransform(_)
-            | ProverError::Morphism(_)
-            | ProverError::Image(_)
-            | ProverError::Join(_)
-            | ProverError::Convert(_) => true,
+            | ProverError::Image(_) => true,
             // Two exceptions to the paragraph above, both non-`WalnutException` Java
             // throwables faithfully surfaced by U23's review fixes.
             ProverError::AutomatonOps(e) => !matches!(e, AutomatonOpsError::NumberFormat(_)),
             ProverError::Quotient(e) => e.is_walnut_exception(),
+
+            // --- the three wrapped enums that are NOT uniformly `WalnutException` -----
+            //
+            // Same precision `ProverError::NumberFormat` below already applies, and that
+            // `is_io_class_error` applies to these same enums: a Walnut command's failure
+            // renders message-only ONLY when Java would have thrown a `WalnutException`.
+            // The sub-variants below are ports of genuine unchecked JDK exceptions
+            // (`IndexOutOfBoundsException`/`NumberFormatException`/`NullPointerException`/
+            // `IllegalArgumentException`) that Java's `readBuffer` catch reports WITH its
+            // exception kind and stack-trace prefix — which is what `is_handled() == false`
+            // selects. Getting this wrong is a Tier-1 normalized-text divergence.
+
+            // WB-036: real Java's `toWordAutomaton` builds a malformed FA and then throws
+            // `IndexOutOfBoundsException` on the very next write.
+            ProverError::Morphism(MorphismCommandError::Promote(
+                MorphismError::DomainDoesNotCoverImageRange,
+            )) => false,
+            // `UtilityMethods.validateFile` (`:153-159`) throws `IllegalArgumentException`,
+            // exactly like `ProverError::InvalidFile` above.
+            ProverError::Morphism(MorphismCommandError::InvalidFile(_)) => false,
+            // Every other `promote`/`morphism` failure IS a `WalnutException`:
+            // `parseMorphism`'s "Morphism has no valid mappings.",
+            // `WalnutException.morphismNegative()`, `morphismNotUniform()`, and
+            // `NumberSystem`'s "Number system msd_k is not defined."
+            ProverError::Morphism(_) => true,
+
+            // WB-037: `subautomata.remove(0)` on an empty list is
+            // `IndexOutOfBoundsException`.
+            ProverError::Join(JoinError::NoAutomataSpecified) => false,
+            // The label-count throw (`Join.java:53`) and the shared-label alphabet throw
+            // (`ProductStrategies.java:281`) are both real `WalnutException`s.
+            ProverError::Join(_) => true,
+
+            // `Integer.parseInt(m.group(GROUP_CONVERT_BASE))` (`Prover.java:740`) —
+            // `NumberFormatException`, same bucket as `ProverError::NumberFormat`.
+            ProverError::Convert(ConvertError::InvalidBase(_)) => false,
+            // WB-033: `ns.parseBase()` on a `null` NS is a `NullPointerException`.
+            ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)) => false,
+            // The remaining `convertNS` failures, and `convertDFAOIntoFunction`, are
+            // deliberately-thrown `WalnutException`s.
+            ProverError::Convert(_) => true,
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
@@ -1402,7 +1442,13 @@ impl Prover {
         let caps = match_or_fail(&patterns().join, s, JOIN)?;
         let automata = group(&caps, s, GROUP_JOIN_AUTOMATA).unwrap_or("");
         let name = group(&caps, s, GROUP_JOIN_NAME).unwrap_or("");
-        Ok(join_command(&self.session, s, automata, name)?)
+        Ok(join_command(
+            &self.session,
+            &mut self.logging,
+            s,
+            automata,
+            name,
+        )?)
     }
 
     /// `Prover.convertCommand(String)` (`:724-745`).
@@ -2247,6 +2293,84 @@ mod tests {
         );
     }
 
+    /// The OTHER half of the same distinction, on the other classifier: `is_handled`
+    /// decides message-only vs. kind+stack-trace rendering, and must be `false` for
+    /// exactly the sub-variants that port an unchecked JDK exception rather than a
+    /// deliberately-thrown `WalnutException`. Reviewed and corrected after U24's initial
+    /// landing, which had a blanket `true` for all four of these enums.
+    #[test]
+    fn u24_command_errors_classify_by_walnutexception_vs_jdk_exception() {
+        // NOT WalnutException -> kind + stack trace.
+        for (e, why) in [
+            (
+                ProverError::Morphism(MorphismCommandError::Promote(
+                    MorphismError::DomainDoesNotCoverImageRange,
+                )),
+                "WB-036 is an IndexOutOfBoundsException",
+            ),
+            (
+                ProverError::Morphism(MorphismCommandError::InvalidFile("x".to_string())),
+                "validateFile throws IllegalArgumentException",
+            ),
+            (
+                ProverError::Join(JoinError::NoAutomataSpecified),
+                "WB-037 is an IndexOutOfBoundsException",
+            ),
+            (
+                ProverError::Convert(ConvertError::InvalidBase("x".to_string())),
+                "Integer.parseInt throws NumberFormatException",
+            ),
+            (
+                ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)),
+                "WB-033 is a NullPointerException",
+            ),
+        ] {
+            assert!(!e.is_handled(), "{why}");
+        }
+
+        // Genuine WalnutExceptions -> message only.
+        for (e, why) in [
+            (
+                ProverError::Morphism(MorphismCommandError::Promote(
+                    MorphismError::NumberSystemNotDefined(1),
+                )),
+                "\"Number system msd_1 is not defined.\" is a WalnutException",
+            ),
+            (
+                ProverError::Morphism(MorphismCommandError::Promote(MorphismError::NegativeValue)),
+                "WalnutException.morphismNegative",
+            ),
+            (
+                ProverError::Join(JoinError::LabelMismatch {
+                    automaton_name: "A".to_string(),
+                }),
+                "Join.java:53's inline WalnutException",
+            ),
+            (
+                ProverError::Join(JoinError::AlphabetMismatch {
+                    label: "x".to_string(),
+                }),
+                "ProductStrategies.java:281's WalnutException",
+            ),
+            (
+                ProverError::Convert(ConvertError::DfaoIntoFunction),
+                "WalnutException.convertDFAOIntoFunction",
+            ),
+            (
+                ProverError::Convert(ConvertError::Convert(ConvertNsError::NoCommonRoot)),
+                "convertNS's inline WalnutException",
+            ),
+            (
+                ProverError::Image(ImageError::NotUnaryWordAutomaton {
+                    name: "w".to_string(),
+                }),
+                "Image.java:50's inline WalnutException",
+            ),
+        ] {
+            assert!(e.is_handled(), "{why}");
+        }
+    }
+
     // ------------------------------------------------------------- parseSetup
 
     #[test]
@@ -2640,6 +2764,17 @@ mod tests {
         assert!(p.dispatch("image FS h T;").unwrap());
         assert!(dir.join("Word Automata Library").join("FS.txt").is_file());
         assert!(dir.join("Result").join("FS.txt").is_file());
+
+        // ...and it really IS `T` again, not merely "some non-empty automaton": the
+        // written image is byte-identical to the promoted `T` it was computed from.
+        // (Both are the minimal 2-state msd_2 Thue-Morse DFAO, and both go through the
+        // same writer, so byte equality is the right bar here -- if a future change
+        // makes state numbering legitimately differ, weaken this to `wr_core::equiv`,
+        // do NOT drop it back to a file-existence check.)
+        let t_txt = fs::read_to_string(dir.join("Word Automata Library").join("T.txt")).unwrap();
+        let fs_txt = fs::read_to_string(dir.join("Word Automata Library").join("FS.txt")).unwrap();
+        assert_eq!(fs_txt, t_txt, "h(T) must be T (the Thue-Morse identity)");
+        assert!(t_txt.starts_with("msd_2"), "unexpected header: {t_txt:?}");
 
         fs::remove_dir_all(&dir).ok();
     }

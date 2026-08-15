@@ -221,7 +221,45 @@ mod tests {
         assert!(dir.join("Result").join("lt4.txt").is_file());
         assert!(dir.join("Automata Library").join("lt4.txt").is_file());
 
+        // The LANGUAGE, checked against a hand-computed oracle rather than only the
+        // alphabet shape: `even_numbers_msd` accepts exactly the even numbers, so the
+        // msd_4 conversion must accept 0/2/4/6/8/10 and reject 1/3/5/7/9 -- read now in
+        // BASE 4 (e.g. 6 = "12", 7 = "13").
+        for n in 0u32..24 {
+            assert_eq!(
+                accepts_msd(converted, n, 4),
+                n % 2 == 0,
+                "msd_4 acceptance of {n} disagrees with the original msd_2 language"
+            );
+        }
+
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Walk `n`'s `base` representation (most-significant digit first) through `a` and
+    /// report whether the final state accepts. `a` is total after `convertNS`, so every
+    /// digit has a transition.
+    fn accepts_msd(a: &Automaton, n: u32, base: u32) -> bool {
+        let mut digits = Vec::new();
+        let mut m = n;
+        while m > 0 {
+            digits.push((m % base) as i32);
+            m /= base;
+        }
+        if digits.is_empty() {
+            digits.push(0);
+        }
+        digits.reverse();
+
+        let mut state = a.fa.q0;
+        for digit in digits {
+            let sym = a.encode(&[digit]);
+            state = match a.fa.d[state].get(&sym) {
+                Some(dests) => dests[0],
+                None => return false,
+            };
+        }
+        a.fa.o[state] != 0
     }
 
     #[test]

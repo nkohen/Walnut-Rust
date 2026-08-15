@@ -237,6 +237,39 @@ pub struct Automaton {
     /// `Fa`-level (not `Automaton`-wrapped) caller of `canonicalize()`, this guarantee would
     /// need to move or be duplicated — none exists today.
     ///
+    /// **The invariant this placement costs, and where it is paid.** In Java `canonized`
+    /// is a property of the `FA` VALUE, so *any* operation that installs a fresh `FA`
+    /// object gets `canonized == false` for free, by construction. Here the flag rides on
+    /// the `Automaton` WRAPPER, so replacing `automaton.fa` does **not** clear it — the
+    /// invariant is maintained by hand instead, at every site that either (a) Java clears
+    /// it explicitly, or (b) replaces an *existing* automaton's `fa` wholesale. As of
+    /// U24's review fixes those are, exhaustively:
+    ///
+    /// * [`Automaton::clear`] — Java's `FA.clear()` (`FA.java:90-94`) resets it.
+    /// * [`Automaton::bind`] — `Automaton.java:442`'s explicit `fa.setCanonized(false)`.
+    /// * [`Automaton::determinize_and_minimize`] / [`Automaton::determinize_and_minimize_from`]
+    ///   — via `FA.justMinimize`'s own reset (`FA.java:584`).
+    /// * [`crate::determinize::determinize`] — installs a brand-new `Fa`.
+    /// * `logicalops`'s `not` (the other [`crate::logicalops`] `just_minimize` call site),
+    ///   `fix_leading_zeros_problem`, `fix_trailing_zeros_problem`, and
+    ///   `convert_lsd_base_to_root` — the three explicit `A.fa.setCanonized(false)` calls
+    ///   at `AutomatonLogicalOps.java:273`/`:326`/`:647`, plus `justMinimize`'s.
+    ///
+    /// Sites that build a **fresh** [`Automaton`] and only then fill in its `fa`
+    /// (`crate::product::cross_product` via `create_basic_automaton`,
+    /// `crate::quantify`'s `projected`, `wr_io`'s reader) need no reset: their flag is
+    /// already `false` from [`Automaton::new`], exactly as in Java.
+    ///
+    /// And one site deliberately does NOT reset, because Java does not either:
+    /// `crate::word_automaton`'s `reverse_with_output` rebuilds the table through
+    /// `Fa::set_fields`, and Java's `FA.setFields` (`FA.java:547-551`) leaves `canonized`
+    /// alone — a stale `true` genuinely survives that operation upstream, so this port
+    /// keeps the quirk rather than quietly improving on it. **The rule for a future
+    /// operation is therefore "match what Java's `FA`-object identity would give it",
+    /// not "always reset"** — which is exactly why the setter below is `pub(crate)`
+    /// rather than `pub`: the invariant is a per-call-site judgement about Java's
+    /// behavior, and it cannot be maintained from outside this crate.
+    ///
     /// **Narrower than Java's memo, deliberately.** Java's `canonizeInternal` sets
     /// `this.canonized = true` after every successful run, so an ordinary automaton that
     /// has already been canonized skips redundant work on a second `canonize()` call.
@@ -253,7 +286,7 @@ pub struct Automaton {
     /// recomputed) for a performance question this unit was not asked to resolve.
     ///
     /// [`Morphism::to_word_automaton`]: crate::morphism::Morphism::to_word_automaton
-    canonized: bool,
+    pub(crate) canonized: bool,
 }
 
 impl Automaton {
@@ -328,11 +361,14 @@ impl Automaton {
     /// after that path sets the TRUE/FALSE flags.
     ///
     /// Faithful, including the parts that look like oversights: [`Fa::clear`] empties
-    /// `o`/`d` but leaves `fa.q`/`fa.q0`/`fa.alphabet_size` **stale**, and the flags
-    /// themselves are deliberately untouched (Java clears neither). Java sets `NS` and
-    /// `label` to literal `null`; this crate's convention is that an empty `Vec` plays
-    /// the `null` role for both (see [`Automaton::is_bound`]/[`Automaton::unlabel`]), so
-    /// they are emptied instead.
+    /// `o`/`d` but leaves `fa.q`/`fa.q0`/`fa.alphabet_size` **stale**, and the
+    /// TRUE/FALSE flags are deliberately untouched (Java's `FA.clear()` clears neither
+    /// of those two). It does NOT leave everything alone, though: Java's `FA.clear()`
+    /// (`FA.java:90-94`) resets `canonized`, and `Automaton.clear` (`:511`) resets
+    /// `labelSorted` — both are mirrored below. Java sets `NS` and `label` to literal
+    /// `null`; this crate's convention is that an empty `Vec` plays the `null` role for
+    /// both (see [`Automaton::is_bound`]/[`Automaton::unlabel`]), so they are emptied
+    /// instead.
     pub fn clear(&mut self) {
         self.fa.clear();
         self.alphabet.clear();
@@ -343,6 +379,9 @@ impl Automaton {
         self.ns_name.clear();
         self.label.clear();
         self.label_sorted = false;
+        // `FA.clear()`'s own `canonized = false` (`FA.java:93`) -- the flag lives on the
+        // wrapper here, so it has to be cleared explicitly. See `canonized`'s doc.
+        self.canonized = false;
     }
 
     /// Installs the per-track [`Automaton::all_reps`] entries wholesale — the write half
@@ -1049,17 +1088,26 @@ impl Automaton {
         }
     }
 
-    /// `Automaton.canonize` (`Automaton.java:328-331`), now also consulting
+    /// `Automaton.canonize` (`Automaton.java:327-330`), now also consulting
     /// [`Automaton::canonized`] before delegating to [`Fa::canonicalize`] — see that
     /// field's doc comment (added U24) for why this flag lives here rather than on
     /// [`Fa`], and why it is a narrower, opt-in suppression rather than Java's full
     /// auto-memoizing `canonized` flag. Every pre-U24 call site is unaffected: the flag
-    /// starts (and, absent an explicit [`Automaton::set_canonized`] call, stays) `false`.
+    /// starts (and, absent an explicit `set_canonized` call, stays) `false`.
+    ///
+    /// **[`Automaton::sort_label`] runs FIRST and UNCONDITIONALLY**, matching Java
+    /// exactly: `canonize()` is literally `sortLabel(); this.fa.canonizeInternal();`,
+    /// and the memo check lives *inside* `canonizeInternal` (`FA.java:149`), not around
+    /// the pair. Suppressing the label sort as well would be a real divergence for any
+    /// producer that flags a *labeled* automaton — today the sole producer
+    /// ([`crate::morphism::Morphism::to_word_automaton`]) hands back an unlabeled one,
+    /// for which `sort_label` is a no-op either way, but the ordering is not the
+    /// unobservable detail it looks like.
     pub fn canonize(&mut self) {
+        self.sort_label();
         if self.canonized {
             return;
         }
-        self.sort_label();
         self.fa.canonicalize();
     }
 
@@ -1075,11 +1123,17 @@ impl Automaton {
 
     /// `FA.setCanonized(boolean)` (`FA.java:590-592`), moved to this layer — see
     /// [`Automaton::canonized`]'s doc comment. [`crate::morphism::Morphism::to_word_automaton`]
-    /// is this port's one caller (mirroring `Morphism.java:88`'s `promotion.fa.setCanonized(true)`),
-    /// but the setter is `pub` rather than `pub(crate)` since a future unit outside
-    /// `wr-core` (or a test) may need the same "never auto-canonicalize this automaton"
-    /// guarantee for a different producer.
-    pub fn set_canonized(&mut self, canonized: bool) {
+    /// is this port's one caller that sets it `true` (mirroring `Morphism.java:88`'s
+    /// `promotion.fa.setCanonized(true)`); the `false` direction is called from every
+    /// `fa`-replacing operation listed on that field.
+    ///
+    /// **`pub(crate)`, deliberately.** Because the flag lives on the wrapper rather than
+    /// on [`Fa`], its invariant is maintained BY HAND at those call sites — it is not
+    /// correct by construction. Handing the setter to code outside `wr-core` would let a
+    /// caller flag an automaton that a later in-crate `fa` replacement then silently
+    /// un-flags (or, worse, leave a flag set across an operation this crate does not
+    /// know to reset). Reading the flag ([`Automaton::is_canonized`]) stays `pub`.
+    pub(crate) fn set_canonized(&mut self, canonized: bool) {
         self.canonized = canonized;
     }
 
@@ -1110,8 +1164,8 @@ impl Automaton {
     /// existing convention for caller-contract violations (see [`Automaton::encode`]'s
     /// doc comment). Note the trivial half is NOT subsumed by the arity half:
     /// `bind(vec![])` on a trivial automaton passes the `0 == 0` arity check.
-    /// `fa.setCanonized(false)` has no equivalent (see [`Automaton::force_canonize`]'s
-    /// doc comment).
+    /// `fa.setCanonized(false)` (`:442`) IS ported, onto this crate's wrapper-level
+    /// [`Automaton::canonized`] (see that field's doc comment).
     pub fn bind(&mut self, names: Vec<String>) {
         assert!(
             !self.fa.is_true_false_automaton(),
@@ -1124,6 +1178,8 @@ impl Automaton {
         );
         self.label = names;
         self.label_sorted = false;
+        // `fa.setCanonized(false);` (`Automaton.java:442`).
+        self.canonized = false;
         Self::remove_same_inputs(self, 0);
     }
 
@@ -1268,6 +1324,9 @@ impl Automaton {
              already-deterministic branch above skips reachability trimming, so WB-001 \
              (docs/WALNUT-BUGS.md) is reachable, faithfully, not a panic",
         );
+        // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- see
+        // `Automaton::canonized`'s doc comment on why this is manual here.
+        self.canonized = false;
     }
 
     /// `Automaton.determinizeAndMinimize(IntSet qqq)` (`Automaton.java:403-406`) — the
@@ -1281,6 +1340,8 @@ impl Automaton {
             "subset_construction's output is always deterministic and q0-reachable -- \
              minimize's documented preconditions",
         );
+        // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`).
+        self.canonized = false;
     }
 
     /// `Automaton.asDFA` (`Automaton.java:152-158`).
@@ -1760,10 +1821,12 @@ mod tests {
     // --- canonized suppression flag (U24, for `Morphism::to_word_automaton`) ---
 
     #[test]
-    fn set_canonized_true_suppresses_canonize() {
+    fn set_canonized_true_suppresses_only_the_fa_canonicalization_not_the_label_sort() {
         // Same unreachable-state shape as `canonize_sorts_label_and_canonicalizes_fa`,
-        // but flagged `canonized` first -- `canonize()` must be a complete no-op:
-        // neither the label sort nor the state-dropping BFS may run.
+        // but flagged `canonized` first. Java's `canonize()` is `sortLabel();
+        // fa.canonizeInternal();` with the memo check INSIDE `canonizeInternal`
+        // (`FA.java:149`), so the flag suppresses the state-dropping BFS and NOTHING
+        // else -- the label sort still runs.
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![1]);
         let mut d1 = BTreeMap::new();
@@ -1791,8 +1854,9 @@ mod tests {
 
         assert_eq!(
             a.label,
-            vec!["b".to_string(), "a".to_string()],
-            "label must NOT be sorted while canonized is set"
+            vec!["a".to_string(), "b".to_string()],
+            "sortLabel() runs unconditionally in Java -- the flag gates only \
+             canonizeInternal"
         );
         assert_eq!(a.fa.q0, 1, "q0 must be untouched");
         assert_eq!(

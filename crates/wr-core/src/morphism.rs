@@ -68,7 +68,21 @@
 //! (before ever handing back a malformed automaton whose `Fa::d.len() != Fa::q`,
 //! an invariant essentially every other algorithm in this crate assumes) rather than
 //! deferred to wherever Java's crash happens to surface — see WB-036 for the full
-//! empirical repro against real `walnut-java`.
+//! empirical repro against real `walnut-java`. The MIRROR case (a domain *larger* than
+//! the image range needs, e.g. `0->00 1->00`) is not an error in Java and is not one
+//! here either: Java silently ignores the dangling transition rows (every consumer loops
+//! `0..Q`), which this port reproduces by truncating `newD` to `Q`.
+//!
+//! **The `NumberSystem` construction at `Morphism.java:90` is a VALIDATION step, not
+//! just metadata.** `new NumberSystem("msd_" + maxImageLength)` throws
+//! `WalnutException("Number system msd_<k> is not defined.")` for any `k < 2`
+//! (`NumberSystem.java:322-331` — there is no addition automaton to synthesize below
+//! base 2, and no custom-base file to fall back on), so real Walnut cleanly refuses to
+//! `promote` a morphism whose longest image is one letter. This crate's `Automaton`
+//! stores no `NumberSystem`, so [`MorphismError::NumberSystemNotDefined`] carries that
+//! check (and Java's message) explicitly — see [`Morphism::to_word_automaton`]'s doc
+//! comment for the statement-order argument fixing its priority relative to the other
+//! two failure modes.
 //!
 //! # `escapedInt` / `write`
 //!
@@ -139,6 +153,19 @@ pub enum MorphismError {
     /// `AutomatonWriter`'s own per-state loop) touches one of the missing states.
     /// See the module docs and WB-036 for the full derivation and empirical repro.
     DomainDoesNotCoverImageRange,
+    /// `new NumberSystem(NumberSystem.MSD_UNDERSCORE + maxImageLength)`
+    /// (`Morphism.java:90`) — Java's `NumberSystem` constructor is **validating**, not
+    /// just metadata storage: `setAdditionAutomaton` (`NumberSystem.java:322-331`) has
+    /// no `msd_0`/`msd_1` addition automaton to build and no custom-base file to fall
+    /// back on, so it throws `WalnutException("Number system msd_" + maxImageLength +
+    /// " is not defined.")` for every `maxImageLength < 2`.
+    ///
+    /// So real Walnut cleanly REFUSES `promote` on any morphism whose longest image is
+    /// a single letter (e.g. the 1-uniform `0->1 1->0`), writing no file at all. The
+    /// carried value is `maxImageLength`, so the message reproduces Java's exactly.
+    /// Shares [`crate::numsys::NumSysError::NotDefined`]'s message text verbatim —
+    /// the two are literally the same Java throw site.
+    NumberSystemNotDefined(usize),
 }
 
 impl fmt::Display for MorphismError {
@@ -163,6 +190,13 @@ impl fmt::Display for MorphismError {
                  (WB-036: real Walnut throws IndexOutOfBoundsException for this shape \
                  once the promoted automaton is written)"
             ),
+            // Verbatim `NumberSystem.java:330`'s `"Number system " + name + " is not
+            // defined."`, with `name` being the `MSD_UNDERSCORE + maxImageLength` the
+            // constructor at `Morphism.java:90` was handed. Same formatting convention as
+            // `crate::numsys::NumSysError::NotDefined`'s own `Display` arm.
+            MorphismError::NumberSystemNotDefined(max_image_length) => {
+                write!(f, "Number system msd_{max_image_length} is not defined.")
+            }
         }
     }
 }
@@ -273,10 +307,10 @@ impl Morphism {
     /// letter's state without a transition on the higher digit positions (a dead run,
     /// not an error). Ported faithfully — no uniformity check added here.
     ///
-    /// # NS: `msd_<maxImageLength>`, represented as `msd[0] = Some(true)`
+    /// # NS: `msd_<maxImageLength>`, represented as `msd[0] = Some(true)` + a real check
     ///
     /// Java constructs a real `NumberSystem(MSD_UNDERSCORE + maxImageLength)` and adds
-    /// it to `promotion.getNS()` (`:91`). This crate's `Automaton` doesn't carry a
+    /// it to `promotion.getNS()` (`:90`). This crate's `Automaton` doesn't carry a
     /// `NumberSystem` object at all (`automaton.rs`'s own module docs: "deliberately
     /// NOT full Java parity" — see also `wr-io`'s `writer.rs`, which reconstructs the
     /// same canonical name from `msd`+`alphabet.len()` for the identical reason), only
@@ -285,15 +319,44 @@ impl Morphism {
     /// `msd_<k>` `NumberSystem`'s alphabet is exactly `intRangeList(k)`
     /// (`NumberSystem.java`'s standard-base constructor), which is precisely what this
     /// method's own `alphabet` local already is — so `msd = vec![Some(true)]` captures
-    /// every fact this crate's `Automaton` can represent about that `NumberSystem`,
-    /// with nothing lost that any ported caller reads.
+    /// every *stored* fact this crate's `Automaton` can represent about that
+    /// `NumberSystem`.
+    ///
+    /// **But storage is not all that constructor does — it VALIDATES**, and dropping the
+    /// validation was a real divergence (found in adversarial review, verified live
+    /// against the real jar). `NumberSystem(name)` runs `setAdditionAutomaton`
+    /// (`NumberSystem.java:322-331`): with no `msd_<k>_addition.txt` custom-base file on
+    /// disk, it can only synthesize an addition automaton when `Integer.parseInt(base) >
+    /// 1`, and otherwise throws `WalnutException("Number system " + name + " is not
+    /// defined.")`. So a morphism whose longest image is a single letter (`maxImageLength
+    /// == 1`, e.g. the 1-uniform `0->1 1->0`) — or the degenerate all-empty-images case
+    /// (`0`) — makes real Walnut REFUSE `promote`, writing no automaton at all.
+    /// [`MorphismError::NumberSystemNotDefined`] is that check, with Java's message
+    /// verbatim.
+    ///
+    /// **Statement order matters and is ported exactly.** Java runs
+    /// `determineMaxEntry` (which throws on a negative image value) at `:82`, well
+    /// before the `NumberSystem` construction at `:90` — so `NegativeValue` wins over
+    /// `NumberSystemNotDefined` when both apply. Conversely WB-036's
+    /// `IndexOutOfBoundsException` is not thrown inside `toWordAutomaton` at all (it
+    /// surfaces later, at write time), so the `NumberSystem` throw beats it: the check
+    /// below sits between the two, reproducing Java's real priority in both directions.
     pub fn to_word_automaton(&self) -> Result<crate::automaton::Automaton, MorphismError> {
         use crate::automaton::Automaton;
         use crate::fa::Fa;
 
         let max_image_length = determine_max_image_length(&self.mapping);
         let max_entry = determine_max_entry(&self.mapping)?;
-        let new_d = determine_transitions(&self.mapping);
+        let mut new_d = determine_transitions(&self.mapping);
+
+        // `promotion.getNS().add(new NumberSystem(MSD_UNDERSCORE + maxImageLength));`
+        // (`:90`) -- the constructor's own validation, which is the only part of it this
+        // crate's representation cannot store. See the doc comment above for why this
+        // sits AFTER `determine_max_entry` (Java's `:82` throws first) but BEFORE the
+        // WB-036 check (whose Java crash happens later still, outside this method).
+        if max_image_length < 2 {
+            return Err(MorphismError::NumberSystemNotDefined(max_image_length));
+        }
 
         // WB-036: `newD.len() == self.mapping.len()`, indexed by domain-letter SORT
         // POSITION, not value; `Q = max_entry + 1` states are about to be declared.
@@ -307,11 +370,27 @@ impl Morphism {
         if new_d.len() < q {
             return Err(MorphismError::DomainDoesNotCoverImageRange);
         }
+        // The OTHER side of the same `newD.len() != Q` mismatch: a domain LARGER than
+        // the image range needs (e.g. `0->00 1->00`, where no image ever references a
+        // value above `0`, so `Q == 1` but the domain has two letters). Java tolerates
+        // this silently -- `setFields` stores the over-long `newD` as-is, and every
+        // consumer (`AutomatonWriter`'s per-state loop, `canonizeInternal`'s
+        // `for q in 0..Q`) iterates `0..Q` and simply never touches the dangling rows.
+        // Truncating here reproduces that observable behavior exactly while restoring
+        // this crate's `d.len() == q` invariant; REJECTING instead would diverge from
+        // Java on input Java genuinely accepts.
+        new_d.truncate(q);
 
         let mut fa = Fa {
             true_false: None,
             q0: 0,
             q: 0,
+            // Java leaves `alphabetSize` at its `0` default here and lets a later
+            // `setAlphabetSize`/`richAlphabet` pass fill it in; setting it up front is
+            // an intentional, safe divergence -- `max_image_length` is exactly the
+            // product of this automaton's one track's alphabet (`0..max_image_length`),
+            // i.e. what any later recomputation would produce anyway, and the flagless
+            // `0` would make `Automaton::decode`/`encode` misbehave in this crate.
             alphabet_size: max_image_length,
             o: Vec::new(),
             d: Vec::new(),
@@ -551,23 +630,72 @@ mod tests {
         assert!(!p.fa.d[0].contains_key(&1));
     }
 
+    /// `0 -> 01`, `1 -> 10`, `2 -> 22`: `maxImageLength = 2` (so the promoted
+    /// automaton's `msd_2` number system is genuinely constructible -- a 1-uniform
+    /// morphism would be rejected outright, see
+    /// [`MorphismError::NumberSystemNotDefined`]), `maxEntry = 2` and a 3-letter
+    /// domain (so WB-036's guard passes), and state 2 transitions ONLY to itself,
+    /// making it unreachable from `q0 = 0`. Exactly the shape the `canonized` flag
+    /// exists to protect.
+    fn unreachable_state_morphism() -> Morphism {
+        Morphism::from_mapping(map(&[(0, &[0, 1]), (1, &[1, 0]), (2, &[2, 2])]))
+    }
+
+    /// A deterministic `.txt`-shaped rendering of the whole state/output/transition
+    /// table, used instead of asserting `fa.q` alone: the WRITTEN CONTENT is the
+    /// observable property the `canonized` flag protects (without it, `canonize()` runs
+    /// inside the writer and state 2 disappears from the file), and a state count alone
+    /// would not catch a renumbering that silently changed the state<->domain-letter
+    /// correspondence.
+    ///
+    /// Hand-rolled rather than calling `wr-io`'s real writer, which depends on
+    /// `wr-core`, not the reverse (`lib.rs`'s crate-boundary rule); the `wr-cli` sibling
+    /// test `promote_command_keeps_an_unreachable_domain_letter_state` runs the real
+    /// writer end-to-end on this same morphism.
+    fn render_txt(a: &crate::automaton::Automaton) -> String {
+        let mut s = String::new();
+        s.push_str("msd_2\n\n");
+        for q in 0..a.fa.q {
+            s.push_str(&format!("{} {}\n", q, a.fa.o[q]));
+            for (&sym, dests) in &a.fa.d[q] {
+                for &dest in dests {
+                    s.push_str(&format!("{sym} -> {dest}\n"));
+                }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
     #[test]
     fn to_word_automaton_preserves_a_state_unreachable_from_q0_via_the_canonized_flag() {
-        // 0->1, 1->0 (a 2-cycle reachable from q0=0), 2->2 (a state nothing but
-        // ITSELF ever transitions into, so unreachable from q0). This is the whole
-        // reason `Morphism.java:88` sets `setCanonized(true)`: without it, an
-        // ordinary `canonize()` call (which `AutomatonWriter`'s real `.txt`/`.gv`
-        // paths always make) would silently drop state 2 and its domain-letter
-        // correspondence.
-        let h = Morphism::from_mapping(map(&[(0, &[1]), (1, &[0]), (2, &[2])]));
-        let mut p = h.to_word_automaton().unwrap();
+        // This is the whole reason `Morphism.java:88` sets `setCanonized(true)`:
+        // without it, an ordinary `canonize()` call (which `AutomatonWriter`'s real
+        // `.txt`/`.gv` paths always make) would silently drop state 2 and its
+        // domain-letter correspondence.
+        let p = unreachable_state_morphism().to_word_automaton().unwrap();
         assert_eq!(p.fa.q, 3);
         assert!(p.is_canonized());
 
-        p.canonize();
+        let mut canonized = p.clone();
+        canonized.canonize();
         assert_eq!(
-            p.fa.q, 3,
+            canonized.fa.q, 3,
             "the canonized flag must survive an ordinary canonize() call"
+        );
+        // The observable property, not just the state count: all three states, with
+        // state 2's self-loops intact, survive into the written text.
+        assert_eq!(
+            render_txt(&canonized),
+            "msd_2\n\n\
+             0 0\n0 -> 0\n1 -> 1\n\n\
+             1 1\n0 -> 1\n1 -> 0\n\n\
+             2 2\n0 -> 2\n1 -> 2\n\n"
+        );
+        assert_eq!(
+            render_txt(&canonized),
+            render_txt(&p),
+            "canonize() on a flagged automaton must not change the output at all"
         );
     }
 
@@ -576,11 +704,66 @@ mod tests {
         // Sanity companion to the test above -- confirms state 2 really is
         // unreachable (so canonicalize's pruning is legitimate) by explicitly
         // clearing the flag before canonizing.
-        let h = Morphism::from_mapping(map(&[(0, &[1]), (1, &[0]), (2, &[2])]));
-        let mut p = h.to_word_automaton().unwrap();
+        let mut p = unreachable_state_morphism().to_word_automaton().unwrap();
         p.set_canonized(false);
         p.canonize();
         assert_eq!(p.fa.q, 2, "state 2 is genuinely unreachable from q0=0");
+        assert_eq!(
+            render_txt(&p),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 0\n\n",
+            "state 2 is gone from the written text once the flag is cleared"
+        );
+    }
+
+    #[test]
+    fn to_word_automaton_rejects_a_max_image_length_below_two() {
+        // `Morphism.java:90`'s `new NumberSystem("msd_" + maxImageLength)` VALIDATES:
+        // there is no base-1 (or base-0) number system, so real Walnut refuses
+        // `promote` on the simplest possible 1-uniform morphism and writes nothing.
+        let h = Morphism::from_mapping(map(&[(0, &[1]), (1, &[0])]));
+        let err = h.to_word_automaton().unwrap_err();
+        assert_eq!(err, MorphismError::NumberSystemNotDefined(1));
+        assert_eq!(err.to_string(), "Number system msd_1 is not defined.");
+    }
+
+    #[test]
+    fn to_word_automaton_negative_value_beats_the_number_system_check() {
+        // Java's statement order: `determineMaxEntry` (`:82`) throws before the
+        // `NumberSystem` construction (`:90`), so a 1-uniform morphism that ALSO
+        // contains a negative value reports the negative value, not `msd_1`.
+        let h = Morphism::from_mapping(map(&[(0, &[-1]), (1, &[0])]));
+        assert_eq!(
+            h.to_word_automaton().unwrap_err(),
+            MorphismError::NegativeValue
+        );
+    }
+
+    #[test]
+    fn to_word_automaton_number_system_check_beats_wb036() {
+        // The reverse priority: WB-036's Java crash happens at WRITE time, outside
+        // `toWordAutomaton`, whereas the `NumberSystem` throw is inside it. `0->5`
+        // (one domain letter, maxEntry 5, so Q=6 > 1 transition row) is a WB-036 shape,
+        // but its maxImageLength is 1, so real Java reports `msd_1` first.
+        let h = Morphism::from_mapping(map(&[(0, &[5])]));
+        assert_eq!(
+            h.to_word_automaton().unwrap_err(),
+            MorphismError::NumberSystemNotDefined(1)
+        );
+    }
+
+    #[test]
+    fn to_word_automaton_tolerates_a_domain_wider_than_the_image_range() {
+        // The mirror of WB-036, which Java ACCEPTS: `0->00 1->00` references no value
+        // above `0`, so `Q = maxEntry + 1 = 1` while `newD` has two rows. Java stores
+        // the over-long table and every consumer just loops `0..Q`, never touching
+        // row 1; this port truncates instead, which is observably identical and keeps
+        // `d.len() == q`.
+        let h = Morphism::from_mapping(map(&[(0, &[0, 0]), (1, &[0, 0])]));
+        let p = h.to_word_automaton().unwrap();
+        assert_eq!(p.fa.q, 1);
+        assert_eq!(p.fa.d.len(), 1, "d.len() == q invariant restored");
+        assert_eq!(p.fa.o, vec![0]);
+        assert_eq!(p.fa.d[0], BTreeMap::from([(0, vec![0]), (1, vec![0])]));
     }
 
     #[test]
@@ -609,17 +792,19 @@ mod tests {
     }
 
     #[test]
-    fn to_word_automaton_on_an_empty_mapping_is_the_domain_gap_error() {
+    fn to_word_automaton_on_an_empty_mapping_is_the_number_system_error() {
         // Totality edge case beyond what real Java can reach (`parseMorphism` rejects
         // an empty mapping outright, `parse_methods.rs`'s
         // `morphism_no_valid_mappings_errors`) -- `from_mapping` makes the empty map
         // representable (see its own doc comment), so this pins what
-        // `to_word_automaton` does with it rather than leaving it undefined:
-        // `max_entry = 0` (the vacuous case), `Q = 1`, but zero transition-table
-        // entries -- the same WB-036 shape, degenerate case included.
+        // `to_word_automaton` does with it rather than leaving it undefined. Following
+        // Java's statement order: `maxImageLength = 0`, so the `NumberSystem("msd_0")`
+        // construction at `:90` throws before WB-036's later, write-time crash on the
+        // same input (`maxEntry = 0`, `Q = 1`, zero transition rows) could ever happen.
         let h = Morphism::from_mapping(BTreeMap::new());
         let err = h.to_word_automaton().unwrap_err();
-        assert_eq!(err, MorphismError::DomainDoesNotCoverImageRange);
+        assert_eq!(err, MorphismError::NumberSystemNotDefined(0));
+        assert_eq!(err.to_string(), "Number system msd_0 is not defined.");
     }
 
     // -- MorphismTest.testImageLength ---------------------------------------------

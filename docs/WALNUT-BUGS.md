@@ -1814,6 +1814,18 @@ bug costs a silent wrong answer somewhere downstream.
   `to_word_automaton_wb036_domain_gap_is_rejected_up_front` (`wr-core`) and
   `promote_command_wb036_domain_gap_surfaces_as_an_error_not_a_panic` (`wr-cli`, exercising the
   real `promote` command dispatch end-to-end).
+  **The MIRROR shape is not this bug and is not rejected** (adversarial-review correction, U24
+  fix commit): a domain *larger* than the image range needs (e.g. `0->00 1->00`, `maxEntry = 0`
+  so `Q = 1` while `newD` has two rows) is something Java genuinely ACCEPTS — every consumer
+  loops `0..Q` and never touches the dangling rows — so the port truncates `newD` to `Q` rather
+  than erroring, which is observably identical to Java while still restoring `d.len() == q`.
+  Pinned by `to_word_automaton_tolerates_a_domain_wider_than_the_image_range`.
+  **Also note the ordering** (same correction): `Morphism.java:90`'s `new NumberSystem("msd_" +
+  maxImageLength)` is a *validating* constructor that throws for `maxImageLength < 2`, and it
+  throws INSIDE `toWordAutomaton`, whereas this bug's `IndexOutOfBoundsException` only surfaces
+  later, at write time. So a morphism that is both `msd_1`-shaped and WB-036-shaped reports the
+  number-system error in Java — reproduced by `MorphismError::NumberSystemNotDefined`, checked
+  before this guard (`to_word_automaton_number_system_check_beats_wb036`).
 - **Upstream:** not filed. A guard in `toWordAutomaton` (e.g. reject when `newD.size() < maxEntry +
   1`, or better, require the domain be exactly `{0, …, maxEntry}` and say so) would fix it in Java;
   the more useful fix is documenting that `promote`'s morphism must have domain = image-value-range
@@ -1862,6 +1874,15 @@ bug costs a silent wrong answer somewhere downstream.
   no number system attached. Flagged during Phase 0 Item 4 as an open question (is indexing a
   non-arithmetic-numeration word automaton via `image()` an actually-supported scenario?), not a
   confirmed bug — needs a real answer before it earns a `WB-` entry either way.
+  **Related walnut-rs port limitation (not a Java bug):** Java uses the number system's real
+  `getName()` here; `wr_core::automaton::Automaton` records no per-track NS *name*, only
+  `msd: Option<bool>` plus the alphabet, so the port reconstructs `?msd_<alphabet.len()>`. That
+  is exact for a plain base but silently WRONG for a custom base (`msd_fib` would become
+  `?msd_2`, evaluating the whole `image` over the wrong arithmetic). `wr_cli::image`'s
+  `determine_image_number_system_prefix` therefore refuses a custom-base word automaton
+  (`ImageError::CustomBaseNotSupported`, detected via `Automaton::all_reps[0].is_some()`) rather
+  than emitting a wrong prefix. When a real per-track NS-name field lands, replace the refusal
+  with the faithful `"?" + name`.
 
 ---
 

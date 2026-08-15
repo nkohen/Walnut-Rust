@@ -59,7 +59,23 @@
 //! [`JoinError::NoAutomataSpecified`] — a `Result::Err`, not a `panic!`, per the
 //! WB-002/033/034/035/036 precedent for a genuine, unguarded Java `RuntimeException`
 //! that `Prover.dispatch`'s top-level catch recovers from.
+//!
+//! # Mismatched alphabets under a shared label: an `Err`, never a panic
+//!
+//! `join` is precisely the command where independently-authored automata get combined,
+//! so `join J A[x] B[x];` with `A` over `msd_2` and `B` over `msd_3` is an ordinary user
+//! mistake, not an edge case. Java throws a plain `WalnutException` from
+//! `ProductStrategies.computeSameInputs` (`:281-283`) which `Prover.readBuffer`'s
+//! `RuntimeException` catch recovers from — the REPL keeps going. This port's
+//! [`wr_core::product`] reaches the same condition as an `assert_eq!`, i.e. a PANIC,
+//! which would take the whole process down (there is no `catch_unwind` anywhere in
+//! `wr-cli`). [`join`] therefore pre-checks the same condition itself, up front, and
+//! returns [`JoinError::AlphabetMismatch`] carrying Java's message verbatim — the same
+//! shape WB-037 already uses here. The check is a pre-check, not a replacement: the
+//! `wr-core` assertion stays exactly as it is, as a backstop for every other caller.
 
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use regex_automata::meta::Regex;
@@ -67,6 +83,7 @@ use regex_automata::util::captures::Captures;
 use regex_automata::Input;
 
 use wr_core::automaton::Automaton;
+use wr_core::logging::{Logging, COMPUTED, COMPUTING};
 use wr_core::logicalops::totalize;
 use wr_core::numsys::TXT_EXTENSION;
 use wr_core::product::cross_product;
@@ -92,6 +109,15 @@ pub enum JoinError {
     /// WB-037 (`docs/WALNUT-BUGS.md`, see module docs): `join` was given zero
     /// automata.
     NoAutomataSpecified,
+    /// Two of the joined automata give the same variable name two different alphabets
+    /// — `ProductStrategies.computeSameInputs`'s `WalnutException` (`:281-283`), which
+    /// this port would otherwise hit as a process-killing `assert_eq!` inside
+    /// [`wr_core::product`]. See module docs.
+    AlphabetMismatch {
+        /// The shared variable name whose two alphabets disagree, for diagnostics only
+        /// (Java's message text names no variable).
+        label: String,
+    },
     /// A real I/O failure writing the joined result.
     Io(std::io::Error),
 }
@@ -107,6 +133,12 @@ impl std::fmt::Display for JoinError {
                 f,
                 "join requires at least one automaton (WB-037: real Walnut throws \
                  IndexOutOfBoundsException for this shape)"
+            ),
+            // Verbatim `ProductStrategies.java:281-283`.
+            JoinError::AlphabetMismatch { .. } => write!(
+                f,
+                "in computing cross product of two automaton, variables with the same \
+                 label must have the same alphabet"
             ),
             JoinError::Io(e) => write!(f, "{e}"),
         }
@@ -155,6 +187,7 @@ fn re_for_an_automaton_input_in_join_cmd() -> &'static Regex {
 /// `Join.joinCommand(String s, String joinAutomata, String joinName)` (`:27-63`).
 pub fn join_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     join_automata: &str,
     join_name: &str,
@@ -219,7 +252,7 @@ pub fn join_command(
     let rest: Vec<Automaton> = iter.collect();
 
     // `N = join(N, new LinkedList<>(subautomata));` (`:59`).
-    let mut joined = join(&first, rest);
+    let mut joined = join(&first, rest, logging)?;
 
     // `N.writeAutomata(s, ProverHelper.determineOutLibrary(isDFAO), joinName, isDFAO);`
     // (`:61`).
@@ -230,11 +263,28 @@ pub fn join_command(
 }
 
 /// `Join.join(Automaton automaton, Queue<Automaton> subautomata)` (`:72-92`) — see
-/// module docs for why this does NOT relabel its operands (unlike `combine`), and for
-/// the `FIRST_OP`/`totalize` choices.
-pub fn join(automaton: &Automaton, subautomata: Vec<Automaton>) -> Automaton {
+/// module docs for why this does NOT relabel its operands (unlike `combine`), for the
+/// `FIRST_OP`/`totalize` choices, and for the up-front alphabet agreement check (which
+/// Java performs lazily, inside `crossProduct`, as a recoverable `WalnutException`).
+pub fn join(
+    automaton: &Automaton,
+    subautomata: Vec<Automaton>,
+    logging: &mut Logging,
+) -> Result<Automaton, JoinError> {
+    check_shared_labels_agree(automaton, &subautomata)?;
+
     let mut first = automaton.clone();
     for mut next in subautomata {
+        // `Logging.logMessage(COMPUTING + " =>:" + first.fa.getQ() + " states - " +
+        //  next.fa.getQ() + " states"); Logging.indent();` (`:80-81`).
+        let time_before = std::time::Instant::now();
+        let msg = format!(
+            "{COMPUTING} =>:{} states - {} states",
+            first.fa.q, next.fa.q
+        );
+        logging.log_message(&msg);
+        logging.indent();
+
         // `first.fa.totalize(); next.fa.totalize();` (`:82-83`).
         totalize(&mut first.fa);
         totalize(&mut next.fa);
@@ -245,8 +295,51 @@ pub fn join(automaton: &Automaton, subautomata: Vec<Automaton>) -> Automaton {
 
         // `first = WordAutomaton.minimizeWithOutput(first);` (`:85`).
         first = minimize_with_output(&first);
+
+        // `Logging.dedent(); Logging.logMessage(COMPUTED + " =>:" + first.fa.getQ() +
+        //  " states - " + (timeAfter - timeBefore) + "ms");` (`:87-90`).
+        logging.dedent();
+        let msg = format!(
+            "{COMPUTED} =>:{} states - {}ms",
+            first.fa.q,
+            time_before.elapsed().as_millis()
+        );
+        logging.log_message(&msg);
     }
-    first
+    Ok(first)
+}
+
+/// The up-front half of `ProductStrategies.computeSameInputs`'s alphabet guard
+/// (`:279-284`), hoisted out of the per-pair cross product so a mismatch is a clean
+/// [`JoinError::AlphabetMismatch`] rather than [`wr_core::product`]'s process-killing
+/// `assert_eq!` — see this module's docs for why `join` in particular needs it.
+///
+/// Checking every automaton against the FIRST occurrence of each label reproduces the
+/// chained pairwise comparison exactly: `cross_product`'s output keeps the accumulated
+/// (left) operand's alphabet for every shared label, so by induction the alphabet each
+/// later operand is compared against is always the first one seen for that label.
+/// Comparison is by SET (`UtilityMethods.areEqual`), matching both Java's guard and
+/// `compute_same_inputs`' own port of it.
+fn check_shared_labels_agree(first: &Automaton, rest: &[Automaton]) -> Result<(), JoinError> {
+    let mut seen: HashMap<&str, HashSet<i32>> = HashMap::new();
+    for a in std::iter::once(first).chain(rest.iter()) {
+        for (label, alphabet) in a.label.iter().zip(a.alphabet.iter()) {
+            let letters: HashSet<i32> = alphabet.iter().copied().collect();
+            match seen.entry(label.as_str()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(letters);
+                }
+                Entry::Occupied(slot) => {
+                    if *slot.get() != letters {
+                        return Err(JoinError::AlphabetMismatch {
+                            label: label.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -300,6 +393,18 @@ mod tests {
         )
     }
 
+    fn sink_logging() -> Logging {
+        Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()))
+    }
+
+    /// A 1-track `msd_2` DFAO over the given variable, outputting `output0` on words
+    /// whose digits are all `0` and `output1` once a `1` has been read.
+    fn word_automaton_labeled(output0: i32, output1: i32, label: &str) -> Automaton {
+        let mut a = word_automaton(output0, output1);
+        a.label = vec![label.to_string()];
+        a
+    }
+
     // -- join (the primitive) -------------------------------------------------------
 
     #[test]
@@ -312,7 +417,7 @@ mod tests {
         a.label = vec!["x".to_string()];
         b.label = vec!["x".to_string()];
 
-        let joined = join(&a, vec![b]);
+        let joined = join(&a, vec![b], &mut sink_logging()).unwrap();
 
         // Word "" (state q0): a=0, b=3 -> 3.
         assert_eq!(joined.fa.o[joined.fa.q0], 3);
@@ -325,8 +430,80 @@ mod tests {
     #[test]
     fn join_with_no_subautomata_is_a_clone() {
         let a = word_automaton(1, 2);
-        let joined = join(&a, vec![]);
+        let joined = join(&a, vec![], &mut sink_logging()).unwrap();
         assert_eq!(joined.fa.o, a.fa.o);
+    }
+
+    #[test]
+    fn join_over_genuinely_different_variables_builds_a_two_track_automaton() {
+        // THE point of `join` (as opposed to `combine`): the operands need not share a
+        // variable set at all. `T[x]` outputs 0 on `x` with no 1-digit and 7 once `x`
+        // has one; `S[y]` outputs 0 / 4 likewise on `y`. `FIRST_OP` ("first non-zero
+        // output wins") over the cross product therefore gives, on (x, y):
+        //   x has a 1  -> 7  (T wins, regardless of y)
+        //   x all-0s, y has a 1 -> 4  (T is 0, so S's output is taken)
+        //   both all-0s -> 0
+        let t = word_automaton_labeled(0, 7, "x");
+        let s = word_automaton_labeled(0, 4, "y");
+
+        let joined = join(&t, vec![s], &mut sink_logging()).unwrap();
+
+        assert_eq!(joined.label, vec!["x".to_string(), "y".to_string()]);
+        assert_eq!(joined.alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(joined.fa.alphabet_size, 4);
+
+        // Run a two-track word through the joined automaton and read its output.
+        let output_on = |digits: &[(i32, i32)]| -> i32 {
+            let mut state = joined.fa.q0;
+            for &(x, y) in digits {
+                let sym = joined.encode(&[x, y]);
+                state = joined.fa.d[state][&sym][0];
+            }
+            joined.fa.o[state]
+        };
+        assert_eq!(
+            output_on(&[]),
+            0,
+            "empty word: both operands still output 0"
+        );
+        assert_eq!(output_on(&[(0, 0)]), 0);
+        assert_eq!(output_on(&[(1, 0)]), 7, "x's 7 wins");
+        assert_eq!(output_on(&[(0, 1)]), 4, "x is 0, so y's 4 is taken");
+        assert_eq!(output_on(&[(1, 1)]), 7, "x's 7 still wins over y's 4");
+        assert_eq!(output_on(&[(0, 1), (1, 0)]), 7, "x's 1 arrives later");
+    }
+
+    #[test]
+    fn join_rejects_a_shared_label_with_two_different_alphabets() {
+        // `join J A[x] B[x];` where A is over msd_2 and B over msd_3. Java throws a
+        // recoverable `WalnutException` here (`ProductStrategies:281-283`); this port
+        // would otherwise hit `wr_core::product`'s `assert_eq!`, killing the process.
+        let a = word_automaton_labeled(1, 1, "x");
+        let mut b = word_automaton_labeled(1, 1, "x");
+        b.alphabet = vec![vec![0, 1, 2]];
+
+        let err = join(&a, vec![b], &mut sink_logging()).unwrap_err();
+        assert!(matches!(err, JoinError::AlphabetMismatch { ref label } if label == "x"));
+        assert_eq!(
+            err.to_string(),
+            "in computing cross product of two automaton, variables with the same \
+             label must have the same alphabet"
+        );
+    }
+
+    #[test]
+    fn join_allows_different_alphabets_under_different_labels() {
+        // The check is per-LABEL, not global: two operands over different variables may
+        // legitimately be over different bases.
+        let a = word_automaton_labeled(1, 1, "x");
+        let mut b = word_automaton_labeled(1, 1, "y");
+        b.alphabet = vec![vec![0, 1, 2]];
+        b.fa.alphabet_size = 3;
+        b.fa.d[0].insert(2, vec![1]);
+        b.fa.d[1].insert(2, vec![1]);
+
+        let joined = join(&a, vec![b], &mut sink_logging()).unwrap();
+        assert_eq!(joined.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
     }
 
     // -- join_command (end-to-end) ---------------------------------------------------
@@ -352,6 +529,7 @@ mod tests {
 
         let tc = join_command(
             &session,
+            &mut sink_logging(),
             "join test wordAuto[x] plainAuto[x];",
             " wordAuto[x] plainAuto[x]",
             "joined",
@@ -384,6 +562,7 @@ mod tests {
 
         let err = join_command(
             &session,
+            &mut sink_logging(),
             "join test unaryAuto[x][y];",
             " unaryAuto[x][y]",
             "shouldNotBeWritten",
@@ -404,7 +583,7 @@ mod tests {
     #[test]
     fn join_command_wb037_zero_automata_is_rejected_not_a_panic() {
         let (session, dir) = temp_session("empty");
-        let err = join_command(&session, "join J ;", "", "J").unwrap_err();
+        let err = join_command(&session, &mut sink_logging(), "join J ;", "", "J").unwrap_err();
         assert!(matches!(err, JoinError::NoAutomataSpecified));
         fs::remove_dir_all(&dir).ok();
     }

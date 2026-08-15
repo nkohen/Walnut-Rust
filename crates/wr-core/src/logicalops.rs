@@ -556,6 +556,10 @@ pub fn not(a: AutomatonDFA) -> AutomatonDFA {
     totalize(&mut m.fa);
     flip_output(&mut m.fa);
     m.fa = just_minimize(&m.fa);
+    // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- this port's
+    // flag lives on the `Automaton` wrapper, so it is reset by hand at every
+    // `just_minimize` call site. See `Automaton::canonized`'s doc comment.
+    m.set_canonized(false);
     // `A.applyAllRepresentations()` (`:163`). Live as of U5, and the single most
     // load-bearing of its three call sites: complementing a language restricted to a custom
     // base's VALID representations re-admits every invalid one, so without this
@@ -749,6 +753,9 @@ pub fn fix_leading_zeros_problem(a: &mut Automaton) {
     if a.fa.q == 0 {
         return;
     }
+    // `A.fa.setCanonized(false);` (`:273`) -- see `Automaton::canonized`'s doc comment
+    // for why this port has to do it explicitly.
+    a.set_canonized(false);
     let zero = a.determine_zero();
     let initial_state = zero_reachable_states(&mut a.fa, zero);
     a.determinize_and_minimize_from(&initial_state);
@@ -825,6 +832,9 @@ pub fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
 pub fn fix_trailing_zeros_problem(a: &mut Automaton) {
     let zero = a.determine_zero();
     if set_states_reachable_to_final_states_by_zeros(&mut a.fa, zero) {
+        // `A.fa.setCanonized(false);` (`:326`), plus `justMinimize`'s own reset
+        // (`FA.java:584`) -- one assignment covers both.
+        a.set_canonized(false);
         a.fa = just_minimize(&a.fa);
     }
 }
@@ -1766,7 +1776,11 @@ fn convert_lsd_base_to_root(
     }
 
     a.fa.set_fields(new_states.len(), new_o, new_d);
-    // `A.fa.setCanonized(false)` (`:647`) — nothing to clear, see this function's docs.
+    // `A.fa.setCanonized(false)` (`:647`) — ported onto this crate's wrapper-level flag
+    // (`Automaton::canonized`; U24 added it, U24's review fixes wired up every reset
+    // site Java has). An earlier draft of this line claimed there was "nothing to
+    // clear", which was true only until that flag existed.
+    a.set_canonized(false);
 
     // `A.getNS().set(0, new NumberSystem(LSD_UNDERSCORE + root))` (`:650`) +
     // `setAutomatonAlphabet(A, root)` (`:651`).

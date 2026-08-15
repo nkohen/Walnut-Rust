@@ -30,6 +30,14 @@
 //! use `UtilityMethods.validateFile` (unlike `image`'s `UtilityMethods.readFromFile`,
 //! which tolerates a missing file as `""`) — a missing morphism file is a real,
 //! reported error here, not silently treated as an empty morphism.
+//!
+//! There IS one requirement `promote` does impose, easy to mistake for "none at all":
+//! the morphism's LONGEST image must be at least two letters. That is not a check
+//! `promoteCommand` writes — it falls out of `Morphism.java:90` constructing a real
+//! `NumberSystem("msd_" + maxImageLength)`, whose constructor refuses base 0/1. So real
+//! Walnut answers `promote P h;` on `0->1 1->0` with "Number system msd_1 is not
+//! defined." and writes nothing; see
+//! [`wr_core::morphism::MorphismError::NumberSystemNotDefined`].
 
 use std::io::{self, Write};
 
@@ -53,8 +61,11 @@ pub enum MorphismCommandError {
     /// (it defines a NEW morphism, it doesn't read one).
     InvalidFile(String),
     /// `h.toWordAutomaton()` (`Prover.java:646`) — `promoteCommand` only. See
-    /// [`wr_core::morphism::MorphismError`] for the two failure modes (a negative
-    /// image value, or WB-036's domain/image-range mismatch).
+    /// [`wr_core::morphism::MorphismError`] for its three reachable failure modes: a
+    /// negative image value, `Morphism.java:90`'s `NumberSystem` validation
+    /// (`maxImageLength < 2`, i.e. "Number system msd_1 is not defined."), and WB-036's
+    /// domain/image-range mismatch — in that priority order, matching Java's own
+    /// statement order.
     Promote(MorphismError),
     /// A real I/O failure writing the morphism (`morphismCommand`) or the promoted
     /// automaton (`promoteCommand`).
@@ -297,9 +308,102 @@ mod tests {
 
         let tc = promote_command(&session, "promote P h;", "h", "P").unwrap();
         let p = tc.automaton_pairs()[0].automaton().unwrap();
+
+        // The whole transition table, not just the state count: the promoted automaton
+        // is the Thue-Morse DFAO itself -- one state per domain letter (state q's output
+        // IS q), one transition per image POSITION (`d[q][i] = h(q)[i]`). So from state 0
+        // (image "01"): position 0 -> 0, position 1 -> 1; from state 1 (image "10"):
+        // position 0 -> 1, position 1 -> 0.
         assert_eq!(p.fa.q, 2);
+        assert_eq!(p.fa.q0, 0);
+        assert_eq!(p.fa.o, vec![0, 1]);
+        assert_eq!(p.alphabet, vec![vec![0, 1]]);
+        assert_eq!(p.msd, vec![Some(true)]);
+        assert_eq!(
+            p.fa.d[0],
+            std::collections::BTreeMap::from([(0, vec![0]), (1, vec![1])])
+        );
+        assert_eq!(
+            p.fa.d[1],
+            std::collections::BTreeMap::from([(0, vec![1]), (1, vec![0])])
+        );
+
         assert!(dir.join("Result").join("P.txt").is_file());
         assert!(dir.join("Word Automata Library").join("P.txt").is_file());
+        let written = fs::read_to_string(dir.join("Result").join("P.txt")).unwrap();
+        assert!(
+            written.starts_with("msd_2"),
+            "the promoted automaton is read in base maxImageLength = 2: {written:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn promote_command_keeps_an_unreachable_domain_letter_state() {
+        // The end-to-end counterpart of `wr_core::morphism`'s two `canonized`-flag
+        // tests: `0->01 1->10 2->22` has a state (2) that nothing but itself transitions
+        // into, so an ordinary `canonize()` inside the writer would drop it. Java sets
+        // `setCanonized(true)` precisely to stop that, and the observable consequence is
+        // the WRITTEN FILE -- which must still describe all three states.
+        let (session, dir) = temp_session("promote-unreachable");
+        fs::write(
+            dir.join("Morphism Library").join("h.txt"),
+            "0 -> 01\n1 -> 10\n2 -> 22\n",
+        )
+        .unwrap();
+
+        let tc = promote_command(&session, "promote P h;", "h", "P").unwrap();
+        let p = tc.automaton_pairs()[0].automaton().unwrap();
+        assert_eq!(p.fa.q, 3);
+        assert_eq!(p.fa.o, vec![0, 1, 2]);
+
+        let written = fs::read_to_string(dir.join("Result").join("P.txt")).unwrap();
+        // State 2 (output 2, self-looping on both digit positions) survived the write.
+        assert!(
+            written.contains("2 2"),
+            "state 2 was pruned by canonicalization: {written:?}"
+        );
+        // And it really is a 3-state automaton on disk: three "<state> <output>" lines.
+        let state_lines = written
+            .lines()
+            .filter(|l| {
+                let mut parts = l.split_whitespace();
+                matches!(
+                    (parts.next(), parts.next(), parts.next()),
+                    (Some(a), Some(b), None)
+                        if a.parse::<i32>().is_ok() && b.parse::<i32>().is_ok()
+                )
+            })
+            .count();
+        assert_eq!(state_lines, 3, "expected 3 state lines in {written:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn promote_command_rejects_a_morphism_with_max_image_length_one() {
+        // Real Walnut refuses this outright: `Morphism.java:90` builds a
+        // `NumberSystem("msd_1")`, whose constructor throws "Number system msd_1 is not
+        // defined." -- and, crucially, writes NO file.
+        let (session, dir) = temp_session("promote-msd1");
+        fs::write(
+            dir.join("Morphism Library").join("h.txt"),
+            "0 -> 1\n1 -> 0\n",
+        )
+        .unwrap();
+
+        let err = promote_command(&session, "promote P h;", "h", "P").unwrap_err();
+        assert!(matches!(
+            err,
+            MorphismCommandError::Promote(MorphismError::NumberSystemNotDefined(1))
+        ));
+        assert_eq!(err.to_string(), "Number system msd_1 is not defined.");
+        assert!(
+            !dir.join("Result").join("P.txt").exists(),
+            "nothing may be written when promote is refused"
+        );
+        assert!(!dir.join("Word Automata Library").join("P.txt").exists());
 
         fs::remove_dir_all(&dir).ok();
     }
