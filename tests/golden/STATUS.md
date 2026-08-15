@@ -30,7 +30,7 @@ rather than passing silently.
 | **pass** | **573** (98.3% of compared) |
 | **fail** | **10** (all in `KNOWN_DIVERGENCES`, two root causes — below) |
 | skipped (excluded, each with a recorded reason) | **92** |
-| over-budget / not-run | **0** |
+| timed out / not-run | **0** |
 
 Skip breakdown:
 
@@ -51,7 +51,7 @@ Partial comparisons (compared, but not in full — recorded per id in the run re
 * fixtures **637-641, 659, 660** — `not executed`. See `Excluded::MetacommandNotWired`;
   `no_later_fixture_depends_on_an_unexecuted_one` proves nothing downstream reads their output.
 
-## The 11 remaining divergences — two root causes
+## The 10 remaining divergences — two root causes
 
 ### 1. `details` log-text fidelity (7 fixtures: 375, 376, 377, 378, 379, 383, 628)
 
@@ -149,9 +149,19 @@ defect in the *port*, not in Walnut. (The highest existing entry remains WB-037.
 | 675 fixtures | 35 s | ~6 min (extrapolated at the measured 10× ratio) |
 
 Slowest single fixture, release: well under the `MAX_FIXTURE_SECS` = 60 s cap; nothing was
-recorded `OVER-BUDGET` or `not-run`. The 10× debug/release ratio is why the corpus test is
+recorded `TIMEOUT` or `not-run`. The 10× debug/release ratio is why the corpus test is
 `#[ignore]`d: at ~7 minutes it does not belong in the every-commit fast tier
 (`docs/DESIGN.md` §5, "Two test tiers").
+
+That cap is **enforced, not merely measured**: each fixture (and each prelude command) runs on
+a worker thread that the harness waits on with a timeout, so a port regression that turns one
+fixture superexponential is recorded `TIMEOUT` and the run continues, instead of wedging
+`cargo test` indefinitely (`CLAUDE.md`, "per-test resource caps, never hangs"). The known
+tradeoff is that a timed-out worker is *abandoned* rather than killed — Rust has no
+thread-kill primitive — so it may keep writing into the shared session tree and every later
+fixture's verdict becomes suspect; the `TIMEOUT` outcome's own note says so.
+`the_per_fixture_cap_is_enforced_rather_than_measured_afterwards` (fast tier) pins the
+enforcement itself.
 
 The one fixture that genuinely would not finish, 637, is excluded for an unrelated and
 independently correct reason (`[strategy 6 BRZ]` is not wired into determinization yet), and

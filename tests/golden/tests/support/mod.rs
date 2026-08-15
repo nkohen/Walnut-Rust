@@ -310,9 +310,72 @@ pub fn unwired_metacommands(command_script: &str) -> Option<String> {
     (!unwired.is_empty()).then(|| unwired.join("]["))
 }
 
+/// The commands whose SECOND token is the name of a library entry the command **creates**
+/// (Walnut's `<cmd> <newname> <args…>` shape). Every one of them writes
+/// `<library>/<newname>.txt` (or `.mpl`/`.m`, for a morphism/macro) on success.
+///
+/// Split out of [`NON_DEFINING_COMMANDS`] deliberately — see that constant.
+pub const DEFINING_COMMANDS: [&str; 25] = [
+    "alphabet",
+    "combine",
+    "concat",
+    "convert",
+    "def",
+    "eval",
+    "fixleadzero",
+    "fixtrailzero",
+    "image",
+    "intersect",
+    "join",
+    "leftquo",
+    "macro",
+    "minimize",
+    "morphism",
+    "ost",
+    "promote",
+    "reg",
+    "reverse",
+    "rightquo",
+    "rsplit",
+    "split",
+    "star",
+    "transduce",
+    "union",
+];
+
+/// The rest of Walnut's dispatch table: commands whose second token is **not** a library
+/// entry they produce — either because they only READ the named entry (`describe`/`inf`/
+/// `test`/`export`), because the token is a file name (`load`) or a command name
+/// (`help`), or because there is no second token at all (`exit`/`quit`/`cls`/`clear`).
+///
+/// # Why this split exists at all
+///
+/// [`defined_name`]'s answer feeds [`transitively_dropped`] twice: it builds the
+/// "name → produced by a DROP fixture / by a kept fixture" tables, and it tells the scan
+/// which identifier in a command to *skip* (a fixture may reference the name it is itself
+/// defining). Take the second token of every command unconditionally and `describe GG;`
+/// reports that it defines `GG` — so a hypothetical `describe X;` whose `X` only a DROP-scope
+/// fixture produced would have its one offending identifier skipped, be classified "not a
+/// transitive drop dependency", and get executed and compared against an automaton that was
+/// never built. That is precisely the class of silent mis-verdict [`transitively_dropped`]
+/// exists to prevent, so the read-only commands are excluded by name rather than by luck.
+///
+/// (No fixture in the *current* corpus is affected — `describe`'s two live targets, `GG` and
+/// `$diffbyone`, are both `Global`-seeded rather than corpus-produced. The rule is a
+/// classifier invariant, not a bug fix for today's manifest, and
+/// `every_dispatchable_command_is_classified` keeps it honest if `walnut-java` regenerates
+/// the corpus with new fixtures.)
+pub const NON_DEFINING_COMMANDS: [&str; 10] = [
+    "clear", "cls", "describe", "exit", "export", "help", "inf", "load", "quit", "test",
+];
+
 /// The library name a fixture *defines* — the second whitespace-delimited token of the
-/// command, after any leading metacommand block. `None` for a command with no name (there are
-/// none in this corpus, but the parse is defensive).
+/// command, after any leading metacommand block, **when the command is one that creates a
+/// library entry** ([`DEFINING_COMMANDS`]).
+///
+/// `None` for a read-only command ([`NON_DEFINING_COMMANDS`]), for a command with no second
+/// token, and for anything outside Walnut's dispatch table (`invalidcommand;`, fixture 616) —
+/// none of which produce a name.
 pub fn defined_name(command_script: &str) -> Option<String> {
     let mut rest = command_script.trim_start();
     if rest.starts_with('[') {
@@ -323,7 +386,14 @@ pub fn defined_name(command_script: &str) -> Option<String> {
         }
     }
     let mut tokens = rest.split_whitespace();
-    let _command = tokens.next()?;
+    let command = tokens.next()?;
+    // `eval test0 "a=4";` splits cleanly, but `describe GG;`'s command token is glued to
+    // nothing while `exit;` carries its terminator — strip the terminators Java's
+    // `parseSetup` would have removed before comparing.
+    let command = command.trim_end_matches([';', ':']);
+    if !DEFINING_COMMANDS.contains(&command) {
+        return None;
+    }
     let name = tokens.next()?;
     // `test450[+][]` / `test444[a][b]`: the bare identifier is the library file name.
     let ident: String = name
@@ -550,6 +620,10 @@ fn strip_progress_lines(s: &str) -> String {
 /// passed into `Session::new`* — values the port never computes — for the exact strings Java
 /// was given. Every other byte, including the rest of the path, is compared unchanged; a port
 /// that printed the wrong file NAME, or the wrong directory within the session, still fails.
+///
+/// `Clone` because each fixture's worker thread (`golden_corpus.rs`'s `FixtureJob`) owns its
+/// own copy — nothing borrowed may cross that boundary.
+#[derive(Clone)]
 pub struct PathRewrite {
     pub home_dir: String,
     pub session_dir: String,
@@ -897,6 +971,102 @@ mod tests {
             Some("test444")
         );
         assert_eq!(defined_name("exit;"), None);
+        // A writer whose shape is not `<cmd> <newname> "<predicate>"`.
+        assert_eq!(
+            defined_name("minimize test657 GG;").as_deref(),
+            Some("test657")
+        );
+        assert_eq!(
+            defined_name("rightquo test590 test588 test589;").as_deref(),
+            Some("test590")
+        );
+    }
+
+    /// A **read-only** command's second token is a name the fixture CONSUMES, never one it
+    /// produces — see [`NON_DEFINING_COMMANDS`]. Treating `describe GG;` as "defines GG" makes
+    /// [`transitively_dropped`] skip the one identifier it needs to inspect.
+    #[test]
+    fn a_read_only_command_defines_no_name() {
+        assert_eq!(defined_name("describe GG;"), None);
+        assert_eq!(defined_name("describe $diffbyone;"), None);
+        assert_eq!(defined_name("inf test123;"), None);
+        assert_eq!(defined_name("test test123 5;"), None);
+        assert_eq!(defined_name("export test1 BA;"), None);
+        assert_eq!(defined_name("load thue_tests.txt;"), None);
+        assert_eq!(defined_name("help eval;"), None);
+        // Not a command at all (`invalidcommand;`, fixture 616).
+        assert_eq!(defined_name("invalidcommand;"), None);
+    }
+
+    /// The regression the rule above exists for: a kept, read-only fixture that consumes a
+    /// name only a DROP-scope fixture ever produced MUST be flagged. Before `defined_name`
+    /// was gated on [`DEFINING_COMMANDS`], `describe dropped;` was read as *defining*
+    /// `dropped`, the identifier scan skipped it as the fixture's own name, and the fixture
+    /// was executed and compared against an automaton that was never built.
+    #[test]
+    fn a_read_only_fixture_consuming_a_drop_produced_name_is_flagged() {
+        let fixture = |id: usize, cmd: &str, relevant: bool| Fixture {
+            id,
+            command_script: cmd.to_string(),
+            expected_kind: vec!["automaton".to_string()],
+            subset_relevant: relevant,
+            drop_reason: if relevant {
+                vec![]
+            } else {
+                vec!["drop_command:rsplit".to_string()]
+            },
+        };
+        let fixtures = vec![
+            fixture(0, "rsplit dropped[+][+] source;", false),
+            fixture(1, "describe dropped;", true),
+            // A kept fixture that consumes a kept name is untouched by the rule.
+            fixture(2, "eval kept \"x=x\";", true),
+            fixture(3, "describe kept;", true),
+        ];
+        let flagged = transitively_dropped(&fixtures, &BTreeSet::new());
+        assert_eq!(
+            flagged.get(&1).map(Vec::as_slice),
+            Some(&["dropped".to_string()][..]),
+            "the `describe` of a DROP-produced name must be a transitive drop dependency"
+        );
+        assert!(!flagged.contains_key(&3), "flagged: {flagged:?}");
+        assert!(
+            !flagged.contains_key(&0),
+            "DROP fixtures are not classified here"
+        );
+    }
+
+    /// Both classification lists together must cover Walnut's whole dispatch table, and
+    /// nothing else — otherwise a command this corpus grows later is classified by accident.
+    /// Checked against `Prover.RE_FOR_THE_LIST_OF_CMDS` itself, not a transcription of it.
+    #[test]
+    fn every_dispatchable_command_is_classified() {
+        let table = wr_cli::prover::RE_FOR_THE_LIST_OF_CMDS
+            .trim_start_matches('(')
+            .trim_end_matches(')');
+        let dispatchable: BTreeSet<&str> = table.split('|').collect();
+        assert!(
+            dispatchable.len() > 30,
+            "the dispatch table did not parse: {dispatchable:?}"
+        );
+        let classified: BTreeSet<&str> = DEFINING_COMMANDS
+            .iter()
+            .chain(NON_DEFINING_COMMANDS.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            classified.len(),
+            DEFINING_COMMANDS.len() + NON_DEFINING_COMMANDS.len(),
+            "a command is listed as BOTH defining and non-defining"
+        );
+        assert_eq!(
+            dispatchable,
+            classified,
+            "every dispatchable command must be classified exactly once: \
+             unclassified {:?}, stale {:?}",
+            dispatchable.difference(&classified).collect::<Vec<_>>(),
+            classified.difference(&dispatchable).collect::<Vec<_>>()
+        );
     }
 
     // -- PathRewrite ----------------------------------------------------------

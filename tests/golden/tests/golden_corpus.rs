@@ -81,16 +81,29 @@
 //! DROP scope for this port, so those fixtures have their automaton/details/error compared
 //! and **only** their matrix comparison skipped — reported per id as `cas-matrix-skipped`.
 //!
-//! # Resource discipline
+//! # Resource discipline — an ENFORCED per-fixture cap
 //!
-//! Every fixture is timed. A fixture that exceeds [`MAX_FIXTURE_SECS`] is reported as
-//! `OVER-BUDGET` with its measured time and its cap, and a run whose total exceeds
-//! [`MAX_TOTAL_SECS`] stops early with every remaining fixture reported `not-run`. Neither is
-//! silent. This is a *post-hoc* budget, not a preemptive one: `Prover`/`Session` hold `Rc`
-//! state and are not `Send`, so a fixture cannot be moved onto a watchdog thread and killed —
-//! the honest guarantee is "an over-budget fixture is always visible in the report", not "the
-//! harness can interrupt a runaway fixture". A genuinely non-terminating fixture would hang,
-//! and the fix for that is a real bug fix in the port, not a harness feature.
+//! `CLAUDE.md`'s test-performance guardrail is "per-test resource caps, **never hangs**", so
+//! [`MAX_FIXTURE_SECS`] is enforced, not merely measured afterwards: every fixture's whole
+//! body — build the `Prover`, dispatch, compare — runs on a worker thread
+//! ([`run_with_timeout`]), and the harness thread waits on a channel with a timeout rather
+//! than joining. A fixture that does not answer inside the cap is recorded `TIMEOUT` and the
+//! run moves on to the next one. A run whose *total* exceeds [`MAX_TOTAL_SECS`] then stops
+//! early with every remaining fixture reported `not-run`; because each fixture is now
+//! individually bounded, that total check runs at a real boundary and cannot be blown past by
+//! more than one fixture's cap.
+//!
+//! `Prover`/`Session` hold `Rc` state and are **not** `Send`, which is why nothing but plain
+//! data crosses the thread boundary: the worker is handed `String` paths + the fixture's
+//! recorded [`Expected`], constructs its own `Prover` inside the thread, and sends back only
+//! the [`Verdict`] and its notes.
+//!
+//! **The known tradeoff:** Rust has no thread-kill primitive, so a timed-out worker is
+//! *abandoned*, not stopped. It keeps running (and may keep writing into the shared session
+//! tree) while the corpus continues, so a `TIMEOUT` also makes every later fixture's verdict
+//! suspect — the outcome says so in its notes. That is strictly better than the alternative
+//! it replaces, which was for the whole harness to hang forever; and a timeout at all is a
+//! port regression to fix, not a state to run in.
 //!
 //! # Running it
 //!
@@ -116,6 +129,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use support::{
@@ -129,14 +143,21 @@ use wr_cli::test_case::TestCase;
 use wr_core::equiv::automaton_language_equivalent;
 use wr_core::logging::Logging;
 
-/// Per-fixture wall-time cap (`CLAUDE.md`, test-performance guardrails). Chosen from a
-/// measured full run: see `tests/golden/STATUS.md` for the observed distribution.
+/// Per-fixture wall-time cap (`CLAUDE.md`, test-performance guardrails), **enforced** by
+/// [`run_with_timeout`] rather than measured afterwards. Chosen from a measured full run: see
+/// `tests/golden/STATUS.md` for the observed distribution.
 const MAX_FIXTURE_SECS: u64 = 60;
 
 /// Whole-run wall-time cap. The corpus is Walnut's own workload set, so it is inherently
 /// tractable — but a port bug that turns one fixture superexponential must not be able to
 /// wedge `cargo test --workspace` indefinitely.
 const MAX_TOTAL_SECS: u64 = 1800;
+
+/// Stack for a fixture's worker thread. Deliberately generous: `libtest` gives its own test
+/// threads 8 MiB while `thread::spawn`'s default is 2 MiB, and this port's regex/automaton
+/// code recurses, so a plain `spawn` would trade a hang for a stack overflow on exactly the
+/// deep fixtures the cap exists for. (Virtual reservation — it costs nothing untouched.)
+const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Verdicts
@@ -147,7 +168,10 @@ enum Verdict {
     Pass,
     Fail(String),
     Skipped(Excluded),
-    OverBudget(Duration),
+    /// The fixture did not answer within [`MAX_FIXTURE_SECS`] and its worker thread was
+    /// abandoned (carries the cap, not a measured time — there is no measured time, that is
+    /// the point). Counts as a failure at the gate.
+    Timeout(Duration),
     NotRun,
 }
 
@@ -157,9 +181,67 @@ impl Verdict {
             Verdict::Pass => "PASS",
             Verdict::Fail(_) => "FAIL",
             Verdict::Skipped(_) => "SKIP",
-            Verdict::OverBudget(_) => "OVER-BUDGET",
+            Verdict::Timeout(_) => "TIMEOUT",
             Verdict::NotRun => "NOT-RUN",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The enforced cap
+// ---------------------------------------------------------------------------
+
+/// What became of a body handed to [`run_with_timeout`].
+#[derive(Debug)]
+enum Worker<T> {
+    /// The body finished inside the cap; here is its value.
+    Done(T),
+    /// The body did not finish inside the cap. Its thread is still running — see this file's
+    /// "Resource discipline" section for why that is the accepted tradeoff.
+    TimedOut,
+    /// The body panicked *outside* its own `catch_unwind` (i.e. the harness itself broke, not
+    /// the port under test). Carries the panic message.
+    Panicked(String),
+}
+
+/// Runs `body` on a worker thread and gives up on it after `cap`.
+///
+/// This is the mechanism behind `CLAUDE.md`'s "per-test resource caps, **never hangs**": the
+/// calling thread blocks on `recv_timeout`, never on `join`, so it always regains control at
+/// `cap` whatever the body is doing. `body` must own everything it needs — nothing that is
+/// not `Send` may cross the boundary, which is why callers pass path `String`s and build the
+/// (`Rc`-holding, `!Send`) `Prover` *inside* the closure.
+///
+/// A timed-out thread is abandoned, not killed; Rust has no primitive for the latter.
+fn run_with_timeout<T: Send + 'static>(
+    what: &str,
+    cap: Duration,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> Worker<T> {
+    let (tx, rx) = sync_channel::<T>(1);
+    let handle = std::thread::Builder::new()
+        .name(what.to_string())
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            // The receiver is gone only when the harness already gave up on this worker.
+            let _ = tx.send(body());
+        })
+        .unwrap_or_else(|e| panic!("spawning a worker thread for {what}: {e}"));
+
+    match rx.recv_timeout(cap) {
+        Ok(value) => {
+            // The value arrived, so the closure has run to completion; this join is a
+            // formality that cannot block for meaningful time.
+            let _ = handle.join();
+            Worker::Done(value)
+        }
+        Err(RecvTimeoutError::Timeout) => Worker::TimedOut,
+        // The sender was dropped without sending: the body unwound past its own
+        // `catch_unwind` (or there was none). The thread is finished, so `join` is safe.
+        Err(RecvTimeoutError::Disconnected) => Worker::Panicked(match handle.join() {
+            Err(payload) => panic_message(payload.as_ref()),
+            Ok(()) => "<worker exited without sending a result>".to_string(),
+        }),
     }
 }
 
@@ -302,14 +384,35 @@ fn tier1_golden_corpus() {
     let prelude_started = Instant::now();
     let mut prelude_failures = Vec::new();
     for (i, command) in PRELUDE.iter().enumerate() {
-        let mut prover = fresh_prover(&session_dir, &home_dir);
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            prover.dispatch_for_integration_test(command, &format!("prelude:{i}"))
-        }));
-        match result {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => prelude_failures.push(format!("prelude[{i}] `{command}`: {e}")),
-            Err(_) => prelude_failures.push(format!("prelude[{i}] `{command}`: PANICKED")),
+        // Same enforced cap as a fixture: a prelude command that hangs would wedge the run
+        // before a single fixture had reported anything.
+        let what = format!("prelude:{i}");
+        let (sd, hd, cmd, msg) = (
+            session_dir.clone(),
+            home_dir.clone(),
+            command.to_string(),
+            what.clone(),
+        );
+        let outcome = run_with_timeout(&what, Duration::from_secs(MAX_FIXTURE_SECS), move || {
+            let mut prover = fresh_prover(&sd, &hd);
+            // `ProverError` is not `Send`; only its rendered message crosses back.
+            match panic::catch_unwind(AssertUnwindSafe(|| {
+                prover.dispatch_for_integration_test(&cmd, &msg)
+            })) {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(payload) => Err(format!("PANICKED: {}", panic_message(payload.as_ref()))),
+            }
+        });
+        match outcome {
+            Worker::Done(Ok(())) => {}
+            Worker::Done(Err(e)) => prelude_failures.push(format!("prelude[{i}] `{command}`: {e}")),
+            Worker::Panicked(m) => {
+                prelude_failures.push(format!("prelude[{i}] `{command}`: PANICKED: {m}"))
+            }
+            Worker::TimedOut => prelude_failures.push(format!(
+                "prelude[{i}] `{command}`: TIMED OUT after {MAX_FIXTURE_SECS}s (thread abandoned)"
+            )),
         }
     }
 
@@ -336,12 +439,31 @@ fn tier1_golden_corpus() {
         }
         if only.as_ref().is_some_and(|ids| !ids.contains(&fixture.id)) {
             // Still EXECUTED (the session is stateful) but not compared, and not reported as
-            // a skip — `WR_GOLDEN_ONLY` is a triage tool, not a scope decision.
-            let mut prover = fresh_prover(&session_dir, &home_dir);
-            let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                prover
-                    .dispatch_for_integration_test(&fixture.command_script, &fixture.id.to_string())
-            }));
+            // a skip — `WR_GOLDEN_ONLY` is a triage tool, not a scope decision. Capped like
+            // every other execution, so a triage run cannot hang on a fixture it is not even
+            // looking at.
+            let (sd, hd, cmd, id) = (
+                session_dir.clone(),
+                home_dir.clone(),
+                fixture.command_script.clone(),
+                fixture.id,
+            );
+            let outcome = run_with_timeout(
+                &format!("fixture {id} (WR_GOLDEN_ONLY: state only)"),
+                Duration::from_secs(MAX_FIXTURE_SECS),
+                move || {
+                    let mut prover = fresh_prover(&sd, &hd);
+                    let _ = panic::catch_unwind(AssertUnwindSafe(|| {
+                        prover.dispatch_for_integration_test(&cmd, &id.to_string())
+                    }));
+                },
+            );
+            if let Worker::TimedOut = outcome {
+                eprintln!(
+                    "[TIMEOUT] {id:>3} (run for its session state only) exceeded the \
+                     {MAX_FIXTURE_SECS}s cap; later fixtures' state may be incomplete"
+                );
+            }
             continue;
         }
 
@@ -361,45 +483,41 @@ fn tier1_golden_corpus() {
         // fixture's verdict.
         let execute = !skips_execution(fixture);
 
+        let job = FixtureJob {
+            id: fixture.id,
+            command: fixture.command_script.clone(),
+            session_dir: session_dir.clone(),
+            home_dir: home_dir.clone(),
+            execute,
+            exclusion,
+            expected,
+            rewrite: rewrite.clone(),
+        };
         let started = Instant::now();
-        let mut prover = fresh_prover(&session_dir, &home_dir);
-        let dispatched = execute.then(|| {
-            panic::catch_unwind(AssertUnwindSafe(|| {
-                prover
-                    .dispatch_for_integration_test(&fixture.command_script, &fixture.id.to_string())
-            }))
-        });
+        let outcome = run_with_timeout(
+            &format!("fixture {}", fixture.id),
+            Duration::from_secs(MAX_FIXTURE_SECS),
+            move || job.run(),
+        );
         let elapsed = started.elapsed();
 
-        let mut notes = Vec::new();
-        if !execute {
-            notes.push("not executed (see skip reason)".to_string());
-        }
-        let verdict = match exclusion {
-            Some(reason) => Verdict::Skipped(reason),
-            None if elapsed > Duration::from_secs(MAX_FIXTURE_SECS) => Verdict::OverBudget(elapsed),
-            // `execute` is only ever false for a fixture that `classify` already excluded
-            // (both are driven by `unwired_metacommands`), so this arm is unreachable — but
-            // it is a real `Option`, and a future exclusion class that forgets to keep the two
-            // in step should say so loudly rather than silently compare a result that was
-            // never computed.
-            None if dispatched.is_none() => Verdict::Fail(
-                "harness bug: the fixture was not executed but is not excluded either".to_string(),
+        let (verdict, notes) = match outcome {
+            Worker::Done(done) => (done.verdict, done.notes),
+            Worker::Panicked(message) => (
+                // The job catches the port's own panics itself, so reaching here means the
+                // HARNESS unwound (a comparison helper, or `fresh_prover`). Reported against
+                // the fixture rather than aborting the run.
+                Verdict::Fail(format!("harness thread panicked: {message}")),
+                Vec::new(),
             ),
-            None => match dispatched.expect("checked by the arm above") {
-                Err(payload) => {
-                    Verdict::Fail(format!("PANICKED: {}", panic_message(payload.as_ref())))
-                }
-                Ok(Err(error)) => compare_error(&expected, &rewrite.apply(&error.to_string())),
-                Ok(Ok(None)) => Verdict::Fail(
-                    "dispatch returned no TestCase, but the corpus records an expectation \
-                     (Java's harness fails on a null TestCase too)"
-                        .to_string(),
-                ),
-                Ok(Ok(Some(actual))) => {
-                    compare_test_case(prover.session(), &expected, &actual, &rewrite, &mut notes)
-                }
-            },
+            Worker::TimedOut => (
+                Verdict::Timeout(Duration::from_secs(MAX_FIXTURE_SECS)),
+                vec![format!(
+                    "TIMED OUT after {MAX_FIXTURE_SECS}s; the worker thread is abandoned, not \
+                     stopped (Rust cannot kill a thread), so it may still be writing into the \
+                     shared session tree — every later fixture's verdict is suspect"
+                )],
+            ),
         };
 
         // Progress, one line per fixture. Captured by libtest unless `--nocapture`, so this
@@ -468,11 +586,11 @@ fn tier1_golden_corpus() {
         .iter()
         .filter_map(|o| match &o.verdict {
             Verdict::Fail(why) => Some((o.id, why.clone())),
-            Verdict::OverBudget(d) => Some((
+            Verdict::Timeout(cap) => Some((
                 o.id,
                 format!(
-                    "over budget: {:.1}s > {MAX_FIXTURE_SECS}s cap",
-                    d.as_secs_f64()
+                    "timed out: no answer within the {:.0}s per-fixture cap",
+                    cap.as_secs_f64()
                 ),
             )),
             Verdict::NotRun => Some((o.id, "not run: total budget exceeded".to_string())),
@@ -510,6 +628,80 @@ fn tier1_golden_corpus() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Everything one fixture's worker thread needs, as owned `Send` data.
+///
+/// The `Prover`/`Session`/`TestCase` themselves never cross the thread boundary — they hold
+/// `Rc` state and are not `Send`, so the worker builds and consumes them entirely inside
+/// itself and sends back only a [`Completed`]. This is what makes [`run_with_timeout`]'s
+/// enforced cap possible at all; see this file's "Resource discipline" section.
+struct FixtureJob {
+    id: usize,
+    command: String,
+    session_dir: String,
+    home_dir: String,
+    execute: bool,
+    exclusion: Option<Excluded>,
+    expected: Expected,
+    rewrite: PathRewrite,
+}
+
+/// A worker's answer for one fixture: exactly the two fields the harness thread records.
+struct Completed {
+    verdict: Verdict,
+    notes: Vec<String>,
+}
+
+impl FixtureJob {
+    /// The body that used to run inline in the corpus loop, unchanged in substance: build a
+    /// fresh `Prover`, dispatch (unless the fixture is one of the never-executed ones), and
+    /// compare against the recorded expectation.
+    fn run(self) -> Completed {
+        let mut prover = fresh_prover(&self.session_dir, &self.home_dir);
+        let dispatched = self.execute.then(|| {
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                prover.dispatch_for_integration_test(&self.command, &self.id.to_string())
+            }))
+        });
+
+        let mut notes = Vec::new();
+        if !self.execute {
+            notes.push("not executed (see skip reason)".to_string());
+        }
+        let verdict = match self.exclusion {
+            Some(reason) => Verdict::Skipped(reason),
+            // `execute` is only ever false for a fixture that `classify` already excluded
+            // (both are driven by `unwired_metacommands`), so this arm is unreachable — but
+            // it is a real `Option`, and a future exclusion class that forgets to keep the two
+            // in step should say so loudly rather than silently compare a result that was
+            // never computed.
+            None if dispatched.is_none() => Verdict::Fail(
+                "harness bug: the fixture was not executed but is not excluded either".to_string(),
+            ),
+            None => match dispatched.expect("checked by the arm above") {
+                Err(payload) => {
+                    Verdict::Fail(format!("PANICKED: {}", panic_message(payload.as_ref())))
+                }
+                Ok(Err(error)) => {
+                    compare_error(&self.expected, &self.rewrite.apply(&error.to_string()))
+                }
+                Ok(Ok(None)) => Verdict::Fail(
+                    "dispatch returned no TestCase, but the corpus records an expectation \
+                     (Java's harness fails on a null TestCase too)"
+                        .to_string(),
+                ),
+                Ok(Ok(Some(actual))) => compare_test_case(
+                    prover.session(),
+                    &self.expected,
+                    &actual,
+                    &self.rewrite,
+                    &mut notes,
+                ),
+            },
+        };
+        Completed { verdict, notes }
+    }
+}
 
 fn fresh_prover(session_dir: &str, home_dir: &str) -> Prover {
     // `Prover.mainProver = new Prover();` (`IntegrationTest.java:926`) — a fresh prover per
@@ -577,6 +769,57 @@ fn no_later_fixture_depends_on_an_unexecuted_one() {
                 );
             }
         }
+    }
+}
+
+/// The per-fixture cap must be **enforced**, not measured after the fact — `CLAUDE.md`'s
+/// "per-test resource caps, never hangs". Proved here on a stand-in body rather than on a real
+/// runaway fixture: the corpus deliberately contains none (the one query that would not finish,
+/// 637, is excluded for an unrelated reason and is not executed), and a harness that could only
+/// demonstrate its cap by shipping a superexponential fixture would be a worse harness.
+///
+/// The first case's thread outlives the assertion by design; that is the documented tradeoff
+/// (Rust cannot kill a thread) and it is why the assertion is that *the harness* moved on.
+#[test]
+fn the_per_fixture_cap_is_enforced_rather_than_measured_afterwards() {
+    let started = Instant::now();
+    let outcome = run_with_timeout(
+        "stand-in for a runaway fixture",
+        Duration::from_millis(200),
+        || {
+            std::thread::sleep(Duration::from_secs(120));
+            "the body ran to completion, which this test's cap must have prevented".to_string()
+        },
+    );
+    let waited = started.elapsed();
+    assert!(
+        matches!(outcome, Worker::TimedOut),
+        "a body that outruns its cap must be reported TimedOut, got {outcome:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "the harness blocked for {waited:?} on a 200ms cap — the cap is being measured, not \
+         enforced, which is the exact defect this test exists for"
+    );
+
+    // A body that finishes inside its cap still returns its value, unchanged.
+    assert!(matches!(
+        run_with_timeout("fast body", Duration::from_secs(60), || 7u32),
+        Worker::Done(7)
+    ));
+
+    // A body that unwinds is reported as a harness panic, NOT as a timeout — the two mean
+    // different things at the gate and must not be conflated.
+    let panicked = run_with_timeout("panicking body", Duration::from_secs(60), || -> () {
+        // The worker's own panic message goes to stderr; libtest captures it.
+        panic!("deliberate: worker died");
+    });
+    match panicked {
+        Worker::Panicked(message) => assert!(
+            message.contains("deliberate: worker died"),
+            "the panic payload must survive: {message}"
+        ),
+        other => panic!("expected Worker::Panicked, got {other:?}"),
     }
 }
 
@@ -761,12 +1004,12 @@ fn build_report(
     );
     let _ = writeln!(
         s,
-        "fixtures: {} | pass {} | fail {} | skip {} | over-budget {} | not-run {} | {:.1}s",
+        "fixtures: {} | pass {} | fail {} | skip {} | timeout {} | not-run {} | {:.1}s",
         outcomes.len(),
         count("PASS"),
         count("FAIL"),
         count("SKIP"),
-        count("OVER-BUDGET"),
+        count("TIMEOUT"),
         count("NOT-RUN"),
         total.as_secs_f64()
     );
@@ -830,14 +1073,17 @@ fn build_report(
 
     let failures: Vec<&Outcome> = outcomes
         .iter()
-        .filter(|o| matches!(o.verdict, Verdict::Fail(_) | Verdict::OverBudget(_)))
+        .filter(|o| matches!(o.verdict, Verdict::Fail(_) | Verdict::Timeout(_)))
         .collect();
     if !failures.is_empty() {
         let _ = writeln!(s, "\n-- divergences --");
         for o in &failures {
             let why = match &o.verdict {
                 Verdict::Fail(w) => w.clone(),
-                Verdict::OverBudget(d) => format!("OVER BUDGET: {:.1}s", d.as_secs_f64()),
+                Verdict::Timeout(cap) => format!(
+                    "TIMED OUT: no answer within the {:.0}s cap (worker thread abandoned)",
+                    cap.as_secs_f64()
+                ),
                 _ => unreachable!(),
             };
             let _ = writeln!(

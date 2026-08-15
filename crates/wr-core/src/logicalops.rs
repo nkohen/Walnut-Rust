@@ -1208,6 +1208,30 @@ pub enum ConvertNsError {
         /// The offending substring, e.g. `"fib"`.
         found: String,
     },
+    /// **Not a `WalnutException`** — the all-digit-but-too-big case, kept distinguishable
+    /// from [`ConvertNsError::BaseNotAPositiveInt`] on purpose.
+    ///
+    /// Java's guard is `if (!isNumber(baseStr) || Integer.parseInt(baseStr) <= 1) throw new
+    /// WalnutException(...)` (`NumberSystem.java:237-243`), and `||` short-circuits: for a
+    /// `baseStr` that *does* match `^\d+$` but overflows a 32-bit int (`msd_99999999999999`),
+    /// `isNumber` is true, so `Integer.parseInt` runs and throws an **uncaught**
+    /// `java.lang.NumberFormatException` — a different failure, with a different message,
+    /// from the "base must be > 1 and int" one. Folding the two together here would be
+    /// silently *improving* on Java, which `CLAUDE.md`'s prime directive #2 (faithful
+    /// behavior, including quirks) forbids; so this variant reproduces
+    /// `NumberFormatException.forInputString`'s own message instead.
+    ///
+    /// No `docs/WALNUT-BUGS.md` entry: this is unreachable from any real input path. Every
+    /// name that reaches [`parse_base`] comes from
+    /// [`crate::automaton::Automaton::track_ns_names`], i.e. either a recorded
+    /// `NumberSystem.getName()` (always `<msd|lsd>_<base>` for a base that already parsed as
+    /// an `int`) or an `msd_<k>`/`lsd_<k>` this crate built from an `i32` — neither can carry
+    /// a 14-digit base. It is guarded rather than left to `unwrap` because "unreachable" is a
+    /// claim about today's call graph, not about the function.
+    BaseOverflowsInt {
+        /// The offending all-digit substring, e.g. `"99999999999999"`.
+        found: String,
+    },
     /// `"New and old number systems are identical: <name>"` (`:467`). Carries the
     /// reconstructed `msd_k`/`lsd_k` name Java prints via `ns.getName()`.
     IdenticalNumberSystems {
@@ -1250,6 +1274,11 @@ impl fmt::Display for ConvertNsError {
                 f,
                 "Base of automaton's number system must be > 1 and int, found: {found}"
             ),
+            // `NumberFormatException.forInputString` (`java.lang.NumberFormatException:67`),
+            // for radix 10 — Java appends ` under radix <r>` only when the radix is not 10.
+            ConvertNsError::BaseOverflowsInt { found } => {
+                write!(f, "For input string: \"{found}\"")
+            }
             ConvertNsError::IdenticalNumberSystems { name } => {
                 write!(f, "New and old number systems are identical: {name}")
             }
@@ -1486,18 +1515,42 @@ fn truncated_log_ratio(x: i32, root: i32) -> i32 {
 /// `name.substring(name.indexOf("_") + 1)` on an underscore-free string would return the
 /// whole string (`indexOf` = -1), which then fails the `isNumber` check for anything
 /// non-numeric — reproduced here by treating "no `_`" as "the whole name is the base".
+///
+/// # The `||` short-circuit is load-bearing
+///
+/// Java's condition is `!isNumber(baseStr) || Integer.parseInt(baseStr) <= 1`, so
+/// `Integer.parseInt` runs **only** on a string that already matched `^\d+$` — and on such a
+/// string it can still fail, by overflowing a 32-bit `int`. That failure is an uncaught
+/// `NumberFormatException` thrown *instead of* the "must be > 1 and int" `WalnutException`,
+/// so the two stay distinguishable here as well: see [`ConvertNsError::BaseOverflowsInt`].
+/// Evaluating `parse::<i32>()` up front and folding its failure into `BaseNotAPositiveInt` —
+/// which is what this function used to do — would silently normalize a behavior real Walnut
+/// does not have.
 fn parse_base(name: &str) -> Result<i32, ConvertNsError> {
     let base_str = match name.split_once('_') {
         Some((_, rest)) => rest,
         None => name,
     };
+    let not_a_positive_int = || ConvertNsError::BaseNotAPositiveInt {
+        found: base_str.to_string(),
+    };
+    // `UtilityMethods.isNumber` — `PATTERN_NUMBER.matcher(s).matches()`, i.e. `^\d+$`.
     let is_number = !base_str.is_empty() && base_str.bytes().all(|b| b.is_ascii_digit());
-    match base_str.parse::<i32>() {
-        Ok(base) if is_number && base > 1 => Ok(base),
-        _ => Err(ConvertNsError::BaseNotAPositiveInt {
-            found: base_str.to_string(),
-        }),
+    if !is_number {
+        return Err(not_a_positive_int());
     }
+    // Reached only when `isNumber` held, exactly as in Java. An all-ASCII-digit string can
+    // fail `parse::<i32>` for one reason only — it is too big — and that is
+    // `Integer.parseInt`'s `NumberFormatException`, not `parseBase`'s own guard.
+    let base = base_str
+        .parse::<i32>()
+        .map_err(|_| ConvertNsError::BaseOverflowsInt {
+            found: base_str.to_string(),
+        })?;
+    if base <= 1 {
+        return Err(not_a_positive_int());
+    }
+    Ok(base)
 }
 
 /// The `msd_k`/`lsd_k` name Java would have built for a track, used only to fill in
@@ -4141,6 +4194,31 @@ mod tests {
             parse_base("msd_neg_2"),
             Err(ConvertNsError::BaseNotAPositiveInt { ref found }) if found == "neg_2"
         ));
+    }
+
+    /// The `||` short-circuit: an all-digit base that overflows a 32-bit `int` passes
+    /// `isNumber`, so Java runs `Integer.parseInt` and throws an uncaught
+    /// `NumberFormatException` — NOT the `WalnutException` the guard would have thrown. The
+    /// two must stay distinguishable; see [`ConvertNsError::BaseOverflowsInt`] for why this
+    /// is unreachable from any real input path and is guarded anyway.
+    #[test]
+    fn an_all_digit_base_that_overflows_an_int_is_not_the_guards_walnut_exception() {
+        let err = parse_base("msd_99999999999999").expect_err("2^31 is not an int base");
+        assert!(
+            matches!(err, ConvertNsError::BaseOverflowsInt { ref found } if found == "99999999999999"),
+            "expected the NumberFormatException path, got {err:?}"
+        );
+        assert_eq!(err.to_string(), "For input string: \"99999999999999\"");
+
+        // The boundary itself: `2^31 - 1` still parses, `2^31` does not.
+        assert_eq!(parse_base("msd_2147483647"), Ok(2_147_483_647));
+        assert!(matches!(
+            parse_base("msd_2147483648"),
+            Err(ConvertNsError::BaseOverflowsInt { ref found }) if found == "2147483648"
+        ));
+
+        // A digit run with leading zeros is still `^\d+$` and still parses, as in Java.
+        assert_eq!(parse_base("msd_007"), Ok(7));
     }
 
     /// Tier 2: `AutomatonLogicalOpsTest.testConvertNSSameBaseFlipsMsdLsd` (`:236-255`).
