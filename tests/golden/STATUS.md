@@ -155,13 +155,23 @@ recorded `TIMEOUT` or `not-run`. The 10× debug/release ratio is why the corpus 
 
 That cap is **enforced, not merely measured**: each fixture (and each prelude command) runs on
 a worker thread that the harness waits on with a timeout, so a port regression that turns one
-fixture superexponential is recorded `TIMEOUT` and the run continues, instead of wedging
-`cargo test` indefinitely (`CLAUDE.md`, "per-test resource caps, never hangs"). The known
-tradeoff is that a timed-out worker is *abandoned* rather than killed — Rust has no
-thread-kill primitive — so it may keep writing into the shared session tree and every later
-fixture's verdict becomes suspect; the `TIMEOUT` outcome's own note says so.
+fixture superexponential is recorded `TIMEOUT` instead of wedging `cargo test` indefinitely
+(`CLAUDE.md`, "per-test resource caps, never hangs").
 `the_per_fixture_cap_is_enforced_rather_than_measured_afterwards` (fast tier) pins the
 enforcement itself.
+
+**A timeout halts the run.** The known tradeoff of the cap is that a timed-out worker is
+*abandoned* rather than killed — Rust has no thread-kill primitive — so it holds a `Prover`
+over the same on-disk session tree that every later fixture builds a fresh `Prover` against,
+and may keep writing into it for the rest of the run. A `PASS`/`FAIL` computed while that is
+happening is not evidence about the port and is indistinguishable, in the report, from one
+computed cleanly. So the harness stops attempting fixtures at the first timeout — a prelude
+command's, a fixture's, or one run only for its session state — and records every remaining
+fixture `NOT-RUN` with the reason, naming the fixture that poisoned the tree. The
+`MAX_TOTAL_SECS` budget uses the same mechanism. Both `TIMEOUT` and `NOT-RUN` fail the gate,
+so this can never make a broken run look green; what it buys is that the report says "one
+timeout, N never attempted" instead of "one timeout, N verdicts of unknown worth".
+`a_timeout_halts_the_run_and_later_fixtures_are_not_run` (fast tier) pins the policy.
 
 The one fixture that genuinely would not finish, 637, is excluded for an unrelated and
 independently correct reason (`[strategy 6 BRZ]` is not wired into determinization yet), and

@@ -87,23 +87,27 @@
 //! [`MAX_FIXTURE_SECS`] is enforced, not merely measured afterwards: every fixture's whole
 //! body — build the `Prover`, dispatch, compare — runs on a worker thread
 //! ([`run_with_timeout`]), and the harness thread waits on a channel with a timeout rather
-//! than joining. A fixture that does not answer inside the cap is recorded `TIMEOUT` and the
-//! run moves on to the next one. A run whose *total* exceeds [`MAX_TOTAL_SECS`] then stops
-//! early with every remaining fixture reported `not-run`; because each fixture is now
-//! individually bounded, that total check runs at a real boundary and cannot be blown past by
-//! more than one fixture's cap.
+//! than joining. A fixture that does not answer inside the cap is recorded `TIMEOUT`.
 //!
 //! `Prover`/`Session` hold `Rc` state and are **not** `Send`, which is why nothing but plain
 //! data crosses the thread boundary: the worker is handed `String` paths + the fixture's
 //! recorded [`Expected`], constructs its own `Prover` inside the thread, and sends back only
 //! the [`Verdict`] and its notes.
 //!
-//! **The known tradeoff:** Rust has no thread-kill primitive, so a timed-out worker is
-//! *abandoned*, not stopped. It keeps running (and may keep writing into the shared session
-//! tree) while the corpus continues, so a `TIMEOUT` also makes every later fixture's verdict
-//! suspect — the outcome says so in its notes. That is strictly better than the alternative
-//! it replaces, which was for the whole harness to hang forever; and a timeout at all is a
-//! port regression to fix, not a state to run in.
+//! **The known tradeoff, and what the harness does about it:** Rust has no thread-kill
+//! primitive, so a timed-out worker is *abandoned*, not stopped. It keeps running — and may
+//! keep writing into the shared on-disk session tree that every later fixture builds its own
+//! `Prover` against. A verdict computed while an unbounded, unkillable writer is mutating that
+//! tree is not evidence about the port: at best it is a `PASS`/`FAIL` nobody can trust, at
+//! worst it is a false `PASS` off a torn write. So the run **halts** on the first timeout: the
+//! remaining fixtures are neither dispatched nor compared, and each is recorded [`Verdict::NotRun`]
+//! naming the fixture that poisoned the tree ([`Halt`]). The same halt covers a prelude command
+//! that times out, and a run whose *total* exceeds [`MAX_TOTAL_SECS`].
+//!
+//! That is still strictly better than the alternative it replaces (the whole harness hanging
+//! forever), and it keeps the report honest: one `TIMEOUT` plus N explicit `NOT-RUN`s, rather
+//! than one `TIMEOUT` plus N unmarked verdicts that raced an abandoned writer. Both verdicts
+//! fail the gate — a timeout at all is a port regression to fix, not a state to run in.
 //!
 //! # Running it
 //!
@@ -170,8 +174,10 @@ enum Verdict {
     Skipped(Excluded),
     /// The fixture did not answer within [`MAX_FIXTURE_SECS`] and its worker thread was
     /// abandoned (carries the cap, not a measured time — there is no measured time, that is
-    /// the point). Counts as a failure at the gate.
+    /// the point). Counts as a failure at the gate, and [`Halt`]s the rest of the run.
     Timeout(Duration),
+    /// The fixture was never attempted: the run had already halted (see [`Halt`]). Counts as a
+    /// failure at the gate — a corpus run that did not finish is not a green corpus run.
     NotRun,
 }
 
@@ -251,6 +257,65 @@ struct Outcome {
     verdict: Verdict,
     elapsed: Duration,
     notes: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Halting the run
+// ---------------------------------------------------------------------------
+
+/// Why the corpus run stopped attempting fixtures — and the *only* thing that decides it.
+///
+/// Two events halt a run, and both mean the same thing operationally: from here on, this
+/// harness can no longer produce a verdict that says anything about the port.
+///
+/// * **A timeout** (a fixture's or a prelude command's). The worker is abandoned, not killed
+///   (see this file's "Resource discipline" section), so an unbounded thread may still be
+///   writing into the shared on-disk session tree that every later fixture's `Prover` reads.
+///   Continuing would emit `PASS`/`FAIL` verdicts that raced a live writer — indistinguishable
+///   in the report from cleanly computed ones, which is precisely the diagnostic trap this
+///   type exists to close.
+/// * **The total budget** ([`MAX_TOTAL_SECS`]). Nothing is corrupt here; the run is simply out
+///   of time.
+///
+/// Once halted, every remaining fixture is recorded [`Verdict::NotRun`] carrying the reason,
+/// and is neither dispatched nor compared. The first reason wins — a later event must not
+/// overwrite the explanation of why the run actually stopped.
+#[derive(Debug, Default)]
+struct Halt(Option<String>);
+
+impl Halt {
+    fn reason(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Records `reason` unless the run has already halted for an earlier one.
+    fn halt(&mut self, reason: String) {
+        if self.0.is_none() {
+            self.0 = Some(reason);
+        }
+    }
+
+    /// The timeout rule, in one place so the prelude, the `WR_GOLDEN_ONLY` state-only path and
+    /// the main loop cannot drift apart.
+    fn halt_on_abandoned_worker(&mut self, what: &str) {
+        self.halt(format!(
+            "not run: {what} timed out after {MAX_FIXTURE_SECS}s and its worker thread was \
+             abandoned (Rust cannot kill a thread), so it may still be writing into the shared \
+             session tree — no later fixture's verdict would mean anything"
+        ));
+    }
+}
+
+/// The `NotRun` entry a halted run records for a fixture it will not attempt, or `None` while
+/// the run is still live. Called once per fixture, at the top of the corpus loop.
+fn halted_outcome(halt: &Halt, id: usize, command: &str) -> Option<Outcome> {
+    halt.reason().map(|reason| Outcome {
+        id,
+        command: command.to_string(),
+        verdict: Verdict::NotRun,
+        elapsed: Duration::ZERO,
+        notes: vec![reason.to_string()],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +448,15 @@ fn tier1_golden_corpus() {
     // -- the prelude (`IntegrationTest.initialize`, `:43-78`) -----------------
     let prelude_started = Instant::now();
     let mut prelude_failures = Vec::new();
+    let mut halt = Halt::default();
     for (i, command) in PRELUDE.iter().enumerate() {
+        // Once an earlier prelude command's worker has been abandoned, the rest of the prelude
+        // would build its state on a tree that thread may still be writing to — the same
+        // reasoning that halts the corpus loop below.
+        if let Some(reason) = halt.reason() {
+            prelude_failures.push(format!("prelude[{i}] `{command}`: {reason}"));
+            continue;
+        }
         // Same enforced cap as a fixture: a prelude command that hangs would wedge the run
         // before a single fixture had reported anything.
         let what = format!("prelude:{i}");
@@ -410,9 +483,15 @@ fn tier1_golden_corpus() {
             Worker::Panicked(m) => {
                 prelude_failures.push(format!("prelude[{i}] `{command}`: PANICKED: {m}"))
             }
-            Worker::TimedOut => prelude_failures.push(format!(
-                "prelude[{i}] `{command}`: TIMED OUT after {MAX_FIXTURE_SECS}s (thread abandoned)"
-            )),
+            Worker::TimedOut => {
+                prelude_failures.push(format!(
+                    "prelude[{i}] `{command}`: TIMED OUT after {MAX_FIXTURE_SECS}s (thread abandoned)"
+                ));
+                // Same reasoning as a fixture timeout, one step earlier: the abandoned worker
+                // owns a `Prover` over the shared session tree, so the seed state the whole
+                // corpus is replayed against is no longer trustworthy.
+                halt.halt_on_abandoned_worker(&format!("prelude command {i} (`{command}`)"));
+            }
         }
     }
 
@@ -421,20 +500,15 @@ fn tier1_golden_corpus() {
     eprintln!("prelude finished in {:.1}s", prelude_elapsed.as_secs_f64());
     let run_started = Instant::now();
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(fixtures.len());
-    let mut stopped_early = false;
 
     for fixture in &fixtures {
         if stop_after.is_some_and(|last| fixture.id > last) {
             break;
         }
-        if stopped_early {
-            outcomes.push(Outcome {
-                id: fixture.id,
-                command: fixture.command_script.clone(),
-                verdict: Verdict::NotRun,
-                elapsed: Duration::ZERO,
-                notes: vec!["run stopped early: total budget exceeded".to_string()],
-            });
+        // The run has halted (a timeout, or the total budget): record the fixture as `NotRun`
+        // and attempt nothing — see [`Halt`].
+        if let Some(outcome) = halted_outcome(&halt, fixture.id, &fixture.command_script) {
+            outcomes.push(outcome);
             continue;
         }
         if only.as_ref().is_some_and(|ids| !ids.contains(&fixture.id)) {
@@ -461,8 +535,11 @@ fn tier1_golden_corpus() {
             if let Worker::TimedOut = outcome {
                 eprintln!(
                     "[TIMEOUT] {id:>3} (run for its session state only) exceeded the \
-                     {MAX_FIXTURE_SECS}s cap; later fixtures' state may be incomplete"
+                     {MAX_FIXTURE_SECS}s cap; the run halts here"
                 );
+                halt.halt_on_abandoned_worker(&format!(
+                    "fixture {id} (run for its session state only)"
+                ));
             }
             continue;
         }
@@ -510,14 +587,19 @@ fn tier1_golden_corpus() {
                 Verdict::Fail(format!("harness thread panicked: {message}")),
                 Vec::new(),
             ),
-            Worker::TimedOut => (
-                Verdict::Timeout(Duration::from_secs(MAX_FIXTURE_SECS)),
-                vec![format!(
-                    "TIMED OUT after {MAX_FIXTURE_SECS}s; the worker thread is abandoned, not \
-                     stopped (Rust cannot kill a thread), so it may still be writing into the \
-                     shared session tree — every later fixture's verdict is suspect"
-                )],
-            ),
+            Worker::TimedOut => {
+                halt.halt_on_abandoned_worker(&format!("fixture {}", fixture.id));
+                (
+                    Verdict::Timeout(Duration::from_secs(MAX_FIXTURE_SECS)),
+                    vec![format!(
+                        "TIMED OUT after {MAX_FIXTURE_SECS}s; the worker thread is abandoned, \
+                         not stopped (Rust cannot kill a thread), so it may still be writing \
+                         into the shared session tree — the run halts here and every later \
+                         fixture is reported NOT-RUN rather than compared against a tree a \
+                         live writer may still be mutating"
+                    )],
+                )
+            }
         };
 
         // Progress, one line per fixture. Captured by libtest unless `--nocapture`, so this
@@ -545,7 +627,9 @@ fn tier1_golden_corpus() {
         });
 
         if run_started.elapsed() > Duration::from_secs(MAX_TOTAL_SECS) {
-            stopped_early = true;
+            halt.halt(format!(
+                "not run: the run stopped early after exceeding the {MAX_TOTAL_SECS}s total budget"
+            ));
         }
     }
 
@@ -593,16 +677,40 @@ fn tier1_golden_corpus() {
                     cap.as_secs_f64()
                 ),
             )),
-            Verdict::NotRun => Some((o.id, "not run: total budget exceeded".to_string())),
+            Verdict::NotRun => Some((
+                o.id,
+                if o.notes.is_empty() {
+                    "not run".to_string()
+                } else {
+                    o.notes.join("; ")
+                },
+            )),
             _ => None,
         })
         .collect();
 
+    // A halted run turns hundreds of fixtures into `NotRun` at once; listing them one per line
+    // would bury the ONE entry that explains why the run stopped. They still block the gate.
+    let not_run: BTreeSet<usize> = outcomes
+        .iter()
+        .filter(|o| o.verdict == Verdict::NotRun)
+        .map(|o| o.id)
+        .collect();
+
     let mut problems = String::new();
     for (id, why) in &failing {
-        if !known.contains_key(id) {
+        if !known.contains_key(id) && !not_run.contains(id) {
             let _ = writeln!(problems, "  NEW FAILURE   fixture {id}: {why}");
         }
+    }
+    if !not_run.is_empty() {
+        let first = not_run.iter().next().copied().unwrap_or_default();
+        let _ = writeln!(
+            problems,
+            "  NOT RUN       {} fixtures were never attempted (from fixture {first} on): {}",
+            not_run.len(),
+            failing.get(&first).map(String::as_str).unwrap_or("not run")
+        );
     }
     for (id, why) in &known {
         if !failing.contains_key(id) {
@@ -821,6 +929,76 @@ fn the_per_fixture_cap_is_enforced_rather_than_measured_afterwards() {
         ),
         other => panic!("expected Worker::Panicked, got {other:?}"),
     }
+}
+
+/// A timeout must **taint the rest of the run**, not just its own fixture.
+///
+/// The timed-out worker is abandoned rather than killed, and it holds a `Prover` over the same
+/// on-disk session tree every later fixture builds a fresh `Prover` against — so a verdict
+/// computed after a timeout raced a live, unbounded writer and cannot be told apart, in the
+/// report, from one computed cleanly. This drives the corpus loop's exact halt policy
+/// ([`Halt`] + [`halted_outcome`], the only two things the loop consults) over a stand-in
+/// sequence of verdicts, for the same reason the cap test above uses a stand-in body: the
+/// corpus deliberately contains no fixture that would time out.
+#[test]
+fn a_timeout_halts_the_run_and_later_fixtures_are_not_run() {
+    let ids = [10usize, 11, 12, 13];
+    let mut halt = Halt::default();
+    let mut attempted: Vec<usize> = Vec::new();
+    let mut recorded: Vec<(usize, Verdict)> = Vec::new();
+
+    for (i, id) in ids.iter().copied().enumerate() {
+        if let Some(outcome) = halted_outcome(&halt, id, "eval t \"x=x\";") {
+            assert!(
+                !outcome.notes.is_empty(),
+                "a NotRun outcome must carry the reason the run halted"
+            );
+            recorded.push((id, outcome.verdict));
+            continue;
+        }
+        // The fixture is attempted for real; fixture 11 is the one that does not answer.
+        attempted.push(id);
+        let verdict = if i == 1 {
+            Verdict::Timeout(Duration::from_secs(MAX_FIXTURE_SECS))
+        } else {
+            Verdict::Pass
+        };
+        if matches!(verdict, Verdict::Timeout(_)) {
+            halt.halt_on_abandoned_worker(&format!("fixture {id}"));
+        }
+        recorded.push((id, verdict));
+    }
+
+    assert_eq!(
+        attempted,
+        vec![10, 11],
+        "nothing after the timed-out fixture may be dispatched or compared"
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|(id, v)| (*id, v.tag()))
+            .collect::<Vec<_>>(),
+        vec![
+            (10, "PASS"),
+            (11, "TIMEOUT"),
+            (12, "NOT-RUN"),
+            (13, "NOT-RUN")
+        ]
+    );
+    let reason = halt.reason().expect("the run must be halted");
+    assert!(
+        reason.contains("fixture 11") && reason.contains("abandoned"),
+        "the halt reason must name the fixture that poisoned the session tree: {reason}"
+    );
+
+    // The first reason wins: a later event must not rewrite why the run actually stopped.
+    halt.halt("not run: the run stopped early after exceeding the total budget".to_string());
+    assert!(halt.reason().is_some_and(|r| r.contains("fixture 11")));
+
+    // And a live run halts nothing.
+    assert!(Halt::default().reason().is_none());
+    assert!(halted_outcome(&Halt::default(), 1, "eval t \"x=x\";").is_none());
 }
 
 fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Option<Excluded> {

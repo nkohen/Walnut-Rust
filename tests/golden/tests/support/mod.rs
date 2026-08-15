@@ -376,6 +376,18 @@ pub const NON_DEFINING_COMMANDS: [&str; 10] = [
 /// `None` for a read-only command ([`NON_DEFINING_COMMANDS`]), for a command with no second
 /// token, and for anything outside Walnut's dispatch table (`invalidcommand;`, fixture 616) —
 /// none of which produce a name.
+///
+/// # The leading `$`
+///
+/// One [`DEFINING_COMMANDS`] entry — `convert` — may have its created name written with a bare
+/// `$` glued straight onto the identifier: `convert $aut msd_2 AUT;` (fixture 667). Java parses
+/// the two with *adjacent* capture groups, `GROUP_CONVERT_NEW_DOLLAR_SIGN` then
+/// `GROUP_CONVERT_NEW_NAME` (`Prover.java:180-181`), and writes the library entry under the
+/// name alone; the `$` only selects the Macro/Automata library. So the sigil is stripped here
+/// before the identifier is read — without that, `take_while` stops on the `$` immediately,
+/// yields an empty string, and the fixture is reported as defining *nothing*. That would keep
+/// its own created name out of `kept_names` and out of [`transitively_dropped`]'s
+/// self-reference skip, which is exactly the misclassification that scan exists to prevent.
 pub fn defined_name(command_script: &str) -> Option<String> {
     let mut rest = command_script.trim_start();
     if rest.starts_with('[') {
@@ -395,6 +407,8 @@ pub fn defined_name(command_script: &str) -> Option<String> {
         return None;
     }
     let name = tokens.next()?;
+    // `convert $blah msd_2 foo;`: Java's DOLLAR_SIGN group is separate from the NAME group.
+    let name = name.strip_prefix('$').unwrap_or(name);
     // `test450[+][]` / `test444[a][b]`: the bare identifier is the library file name.
     let ident: String = name
         .chars()
@@ -979,6 +993,84 @@ mod tests {
         assert_eq!(
             defined_name("rightquo test590 test588 test589;").as_deref(),
             Some("test590")
+        );
+    }
+
+    /// `convert`'s created name may carry a bare `$` (fixture 667, `convert $blah msd_2 foo;`).
+    /// Java splits the sigil into its own capture group and names the library entry `blah`; a
+    /// `take_while` that starts on the `$` returns the empty string instead, which reads as
+    /// "this fixture defines nothing" — see [`defined_name`]'s "The leading `$`" section.
+    #[test]
+    fn a_dollar_prefixed_created_name_keeps_its_identifier() {
+        assert_eq!(
+            defined_name("convert $blah msd_2 foo;").as_deref(),
+            Some("blah")
+        );
+        assert_eq!(
+            defined_name("convert $test_1 lsd_2 $src;").as_deref(),
+            Some("test_1")
+        );
+        // The un-sigiled form is unchanged, and a lone `$` still defines nothing.
+        assert_eq!(
+            defined_name("convert test540 msd_4 T;").as_deref(),
+            Some("test540")
+        );
+        assert_eq!(defined_name("convert $ msd_2 foo;"), None);
+    }
+
+    /// The consequence of the rule above, at the level that matters: a `$`-prefixed *defining*
+    /// fixture must be recognised as the producer of its own name — both so the name lands in
+    /// `kept_names` (making it available to later fixtures) and so
+    /// [`transitively_dropped`]'s self-reference skip fires for the fixture itself. With the
+    /// `$` mis-parsed, `converted` looked DROP-produced and fixture 2 was flagged as a
+    /// transitive drop dependency even though it consumes a name a KEPT fixture defines.
+    #[test]
+    fn a_dollar_prefixed_defining_fixture_produces_its_own_name() {
+        let fixture = |id: usize, cmd: &str, relevant: bool| Fixture {
+            id,
+            command_script: cmd.to_string(),
+            expected_kind: vec!["automaton".to_string()],
+            subset_relevant: relevant,
+            drop_reason: if relevant {
+                vec![]
+            } else {
+                vec!["drop_command:rsplit".to_string()]
+            },
+        };
+        let fixtures = vec![
+            // A DROP fixture defines `converted` too, so the name is "DROP-produced" unless
+            // fixture 1 is correctly credited with defining it as well.
+            fixture(0, "rsplit converted[+][+] source;", false),
+            fixture(1, "convert $converted msd_2 src;", true),
+            fixture(2, "eval later \"$converted(x)\";", true),
+        ];
+        let flagged = transitively_dropped(&fixtures, &BTreeSet::new());
+        assert!(
+            !flagged.contains_key(&1),
+            "the `convert $converted` fixture DEFINES `converted`; it must never be flagged as \
+             consuming a DROP-produced name: {flagged:?}"
+        );
+        assert!(
+            !flagged.contains_key(&2),
+            "`converted` is produced by a KEPT fixture, so its consumer is not a transitive \
+             drop dependency either: {flagged:?}"
+        );
+        assert!(
+            flagged.is_empty(),
+            "nothing else should be flagged: {flagged:?}"
+        );
+
+        // Control: with the SAME shape but no kept producer, the consumer IS flagged — so the
+        // assertions above are proving the `$` is parsed, not that the rule stopped firing.
+        let no_kept_producer = vec![
+            fixture(0, "rsplit converted[+][+] source;", false),
+            fixture(2, "eval later \"$converted(x)\";", true),
+        ];
+        let flagged = transitively_dropped(&no_kept_producer, &BTreeSet::new());
+        assert_eq!(
+            flagged.get(&2).map(Vec::as_slice),
+            Some(&["converted".to_string()][..]),
+            "without the `convert $converted` producer the rule must still fire"
         );
     }
 
