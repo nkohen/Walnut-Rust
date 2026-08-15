@@ -85,21 +85,46 @@
 //! `Automaton::encode` here would panic on the exact `RUNSUM`-on-a-partial-automaton
 //! shape Walnut supports.
 //!
-//! # Cost: the BFS is uncapped and genuinely can be exponential
+//! # Cost, and the deterministic work budget (a port-specific divergence)
 //!
-//! Neither loop below is bounded. The first runs until the iterate-vector sequence
-//! repeats, and its lag-plus-period `p + q` is capped only by the number of distinct
-//! vectors of maps `S_T -> S_T` over `M`'s states, i.e. `Q_T^(Q_T · Q_M)`; a BFS state is
-//! then a pair `(M-state, [phi_i]_{i<p+q})`, so the state count is capped only by
-//! `Q_M · Q_T^(Q_T · (p+q))`. On top of that, `create_iterates`' `dests` word grows by a
-//! factor of `alphabet_size` per iterate. Ordinary library inputs are tiny (RUNSUM2 on
-//! Thue-Morse is 8 BFS states, sub-millisecond), but hand-built transducers with a few
-//! states and a rich transition monoid measurably run for seconds or more even in release
-//! mode. This is **faithful** — Java pays the same cost through the same unbounded loops,
-//! so it is not a port regression and is deliberately not "fixed" here. It does mean the
-//! cap belongs at the *caller's* layer: whoever wires `transduce` into `wr-cli` (U26)
-//! needs `CLAUDE.md`'s "per-test resource caps, never hangs" wall-time/peak-state guard
-//! around this call, not inside it.
+//! Neither of Java's two loops is bounded. The first runs until the iterate-vector
+//! sequence repeats, and its lag-plus-period `p + q` is capped only by the number of
+//! distinct vectors of maps `S_T -> S_T` over `M`'s states, i.e. `Q_T^(Q_T · Q_M)`; a BFS
+//! state is then a pair `(M-state, [phi_i]_{i<p+q})`, so the state count is capped only by
+//! `Q_M · Q_T^(Q_T · (p+q))`. On top of that — and this is the term that actually bites —
+//! the words these loops carry (`create_iterates`' `dests`, and a `StateTuple`'s `i_list`)
+//! grow by a factor of `M`'s out-degree per level, and *every letter of the word costs a
+//! `create_map` call*. So the real driver is exponential in BFS **depth**, not in `Q_M` or
+//! `Q_T`: the shipped two-state `RUNSUM2` against an eight-state input DFAO already runs
+//! for tens of seconds, and a four-state input over a three-letter alphabet through a
+//! four-state transducer runs for minutes and hundreds of megabytes. A guard keyed on
+//! either automaton's *state count* — the only two numbers a caller has cheaply in hand
+//! before the call — therefore does not bound this at all; it is off by orders of
+//! magnitude, on the wrong axis.
+//!
+//! Nor can a caller wrap this in a wall-clock watchdog: [`Automaton`] is unconditionally
+//! `!Send` (it carries `Rc`s in `all_reps`), so the computation cannot be moved to a
+//! thread that the caller could abandon on a deadline.
+//!
+//! So the cap lives **here**, inside the primitive's own loops, as a deterministic
+//! [`TransduceBudget`]: a ceiling on `create_map` calls (the innermost unit of work, and
+//! the quantity every other cost is proportional to), on the BFS state count actually
+//! explored, and on the length of the words carried around (which bounds peak memory,
+//! since word storage is what the megabytes above are). Exceeding any of the three is
+//! [`TransduceError::Exploded`] — `CLAUDE.md`'s "per-test resource caps, never hangs …
+//! `EXPLODED` verdict" — never a hang and never an OOM.
+//!
+//! **This is a deliberate, documented divergence from Java**, and the only one in this
+//! file that is not a ported quirk: real Walnut, given long enough and enough heap, would
+//! eventually answer where this returns `Exploded`. It is *not* logged in
+//! `docs/WALNUT-BUGS.md`, because it is not a Java defect — Walnut's unbounded loops are
+//! the faithful behavior and are still exactly what runs inside the budget. The budget's
+//! defaults ([`TransduceBudget::default`]) are set two-plus orders of magnitude above
+//! every fixture in this repo and every transducer/word-automaton pair in Walnut's own
+//! libraries, so nothing Walnut is realistically used for is rejected; see that impl for
+//! the arithmetic behind each number. A caller that genuinely wants Java's unbounded
+//! behavior can pass its own budget to
+//! [`Transducer::transduce_non_deterministic_with_budget`].
 //!
 //! # WB-035: `minOutput` is used both as an encoded INPUT symbol and as an OUTPUT marker
 //!
@@ -186,6 +211,166 @@ pub enum TransduceError {
     /// [`TransduceError::NotSingleInput`] (a trivial automaton has no tracks at all,
     /// so its track count is `0 != 1`).
     TrivialAutomaton,
+    /// **WB-035**, half one, as a *rejection* rather than a panic.
+    /// `Transducer.createMap` (`:400`) does
+    /// `getNfaStateDests(mapSoFar.get(j), encoded).getInt(0)` with no null check, so a
+    /// transducer that has no transition on the encoded symbol it is asked for throws
+    ///
+    /// ```text
+    /// java.lang.NullPointerException: Cannot invoke
+    ///   "it.unimi.dsi.fastutil.ints.IntList.getInt(int)" because the return value of
+    ///   "Automata.FA.Transitions.getNfaStateDests(int, int)" is null
+    /// ```
+    ///
+    /// which `Prover.dispatch`'s top-level `catch (RuntimeException)` prints and
+    /// recovers from — the REPL keeps going. Two inputs reach it, both from ordinary
+    /// hand-authored library files: WB-035's shifted-alphabet dead-state path, and a
+    /// **partial** (well-formed but non-total) `Transducer Library/*.txt` — a state
+    /// missing a transition on one letter of its own declared alphabet. Since `transduce`
+    /// is now reachable from user-supplied files (U26), a Rust `panic!` here would unwind
+    /// out of a REPL that has no `catch_unwind` and kill the whole session, which is a
+    /// strictly worse divergence than Java's. Same treatment and the same reasoning as
+    /// [`TransduceError::NoNumberSystem`] (WB-034) and WB-033/WB-013.
+    ///
+    /// One sub-case is knowingly approximated: an *empty* destination list (rather than a
+    /// missing one) is `getInt(0)` on an empty `IntList`, i.e. Java's
+    /// `IndexOutOfBoundsException` with different message text, not this NPE. No `.txt`
+    /// this crate can read produces an empty destination list, so the two are folded into
+    /// one variant rather than splitting a message no input can observe.
+    NoTransducerTransition,
+    /// The same defect class one line earlier in the algorithm: the BFS's per-state
+    /// output (`Transducer.java:187`) is `(int) sigma.get(s).get(encoded)`, an
+    /// `Integer`-to-`int` unboxing cast that throws
+    ///
+    /// ```text
+    /// java.lang.NullPointerException: Cannot invoke "java.lang.Integer.intValue()"
+    ///   because the return value of "java.util.Map.get(Object)" is null
+    /// ```
+    ///
+    /// when `sigma` has no output for that (state, symbol) pair — the `sigma` twin of
+    /// [`TransduceError::NoTransducerTransition`]'s transition-table hole, reachable from
+    /// the same partial-transducer files. Rejected rather than panicked for the same
+    /// reason.
+    NoTransducerOutput,
+    /// **Port-specific; no Java counterpart.** The [`TransduceBudget`] ran out — see this
+    /// module's "Cost" docs for why the cap has to live inside these loops and why this
+    /// is a deliberate divergence rather than a logged Walnut bug.
+    Exploded(TransduceLimit),
+}
+
+/// Which ceiling of a [`TransduceBudget`] was hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransduceLimit {
+    /// [`TransduceBudget::max_map_steps`].
+    MapSteps,
+    /// [`TransduceBudget::max_bfs_states`].
+    BfsStates,
+    /// [`TransduceBudget::max_word_len`].
+    WordLength,
+}
+
+impl fmt::Display for TransduceLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransduceLimit::MapSteps => write!(f, "transducer-map composition steps"),
+            TransduceLimit::BfsStates => write!(f, "states explored"),
+            TransduceLimit::WordLength => write!(f, "intermediate word length"),
+        }
+    }
+}
+
+/// The deterministic work budget [`Transducer::transduce_msd_deterministic`] spends.
+///
+/// See this module's "Cost" docs for why this exists and why it is checked inside the
+/// loops rather than by the caller. All three ceilings are *deterministic* — the same
+/// input always spends exactly the same budget, on any machine — so a budget-exhaustion
+/// verdict is reproducible and testable, unlike a wall-clock timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransduceBudget {
+    /// Total `createMap` compositions allowed across the whole transduction. This is the
+    /// innermost unit of work and every other cost in the algorithm is proportional to
+    /// it: the periodicity search spends one per letter of each iterate word per `M`
+    /// state, and each BFS state spends one per letter of each of its `p + q` iterates.
+    /// Bounding it therefore bounds *time* (each step is `Q_T` transition lookups) and,
+    /// transitively, the words that were charged for (peak *memory*).
+    pub max_map_steps: u64,
+    /// Ceiling on the number of BFS states actually explored — `states.len()`, the size of
+    /// the automaton being built, **not** the input's or the transducer's state count.
+    pub max_bfs_states: usize,
+    /// Ceiling on the length of any single intermediate word of `M`-states (`iList`,
+    /// `createIterates`' `dests`). Caps a single allocation, so peak memory cannot
+    /// overshoot between two budget checks.
+    pub max_word_len: usize,
+}
+
+impl Default for TransduceBudget {
+    /// Generous enough that no realistic Walnut input is rejected, tight enough that the
+    /// worst case is seconds rather than unbounded.
+    ///
+    /// * `max_map_steps = 10_000_000`. Measured on this crate's own fixtures (release,
+    ///   2026-08-15): ~19.5 million steps/second, so the ceiling is **~0.5 s** of release
+    ///   CPU (~7 s in an unoptimized debug build), and — since a word can only be as long
+    ///   as the steps already charged for it — at most ~80 MB of live word storage. For
+    ///   scale, the two end-to-end pairs this repo ships (`RUNSUM2` over Thue-Morse,
+    ///   `RUNSUM2` over the `lsd_2` paperfolding word — the same pairs
+    ///   `IntegrationTest.java` uses) spend under `2^10` and `2^12` steps respectively,
+    ///   so this is ~2400x above the larger of them, and Walnut's own `Transducer
+    ///   Library`/`Word Automata Library` contain nothing structurally larger.
+    ///   `the_default_budget_has_orders_of_magnitude_of_headroom_on_the_shipped_fixtures`
+    ///   re-measures that margin on every test run rather than trusting this comment.
+    /// * `max_bfs_states = 100_000`. The result is minimized afterwards, and a *useful*
+    ///   transduction result is tens of states (the shipped fixtures are 7 and 8); four
+    ///   orders of magnitude of headroom. Mostly redundant with the step budget (a BFS
+    ///   state's word is never shorter than its predecessor's, so states cost steps), but
+    ///   cheap, and it bounds the one quantity a reader expects to see bounded.
+    /// * `max_word_len = 1_000_000`. 8 MB for one word of `usize`, so a single
+    ///   allocation can never overshoot between two step charges by more than that.
+    fn default() -> Self {
+        TransduceBudget {
+            max_map_steps: 10_000_000,
+            max_bfs_states: 100_000,
+            max_word_len: 1_000_000,
+        }
+    }
+}
+
+/// Mutable budget state: a [`TransduceBudget`] plus what has been spent so far.
+#[derive(Debug)]
+struct BudgetState {
+    limits: TransduceBudget,
+    map_steps: u64,
+}
+
+impl BudgetState {
+    fn new(limits: TransduceBudget) -> Self {
+        BudgetState {
+            limits,
+            map_steps: 0,
+        }
+    }
+
+    /// Charges one `createMap` composition.
+    fn charge_map_step(&mut self) -> Result<(), TransduceError> {
+        self.map_steps += 1;
+        if self.map_steps > self.limits.max_map_steps {
+            return Err(TransduceError::Exploded(TransduceLimit::MapSteps));
+        }
+        Ok(())
+    }
+
+    fn check_word_len(&self, len: usize) -> Result<(), TransduceError> {
+        if len > self.limits.max_word_len {
+            return Err(TransduceError::Exploded(TransduceLimit::WordLength));
+        }
+        Ok(())
+    }
+
+    fn check_bfs_states(&self, count: usize) -> Result<(), TransduceError> {
+        if count > self.limits.max_bfs_states {
+            return Err(TransduceError::Exploded(TransduceLimit::BfsStates));
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for TransduceError {
@@ -214,6 +399,24 @@ impl fmt::Display for TransduceError {
             TransduceError::TrivialAutomaton => write!(
                 f,
                 "a TRUE/FALSE automaton has no states or tracks and cannot be transduced"
+            ),
+            // Java's own NPE text, reproduced verbatim (`Transducer.java:400`; the
+            // message is transcribed in WB-035's entry from a real CLI run, 2026-08-13).
+            TransduceError::NoTransducerTransition => write!(
+                f,
+                "Cannot invoke \"it.unimi.dsi.fastutil.ints.IntList.getInt(int)\" because the \
+                 return value of \"Automata.FA.Transitions.getNfaStateDests(int, int)\" is null"
+            ),
+            // Java's own NPE text for the unboxing cast at `Transducer.java:187`.
+            TransduceError::NoTransducerOutput => write!(
+                f,
+                "Cannot invoke \"java.lang.Integer.intValue()\" because the return value of \
+                 \"java.util.Map.get(Object)\" is null"
+            ),
+            TransduceError::Exploded(limit) => write!(
+                f,
+                "transduce exceeded walnut-rs's resource budget ({limit}); \
+                 the input is too large for this port to transduce"
             ),
         }
     }
@@ -314,28 +517,33 @@ impl Transducer {
     /// `map_so_far` by one letter, namely `M`'s output at state `i`: the result maps
     /// each transducer state `j` to `delta_T(map_so_far[j], encode(M.O(i)))`.
     ///
-    /// # Panics
+    /// Charges one [`BudgetState`] map step.
     ///
-    /// If the transducer has no transition on that encoded symbol from some state, or
-    /// has an empty destination list there. Java's `getNfaStateDests(...).getInt(0)`
-    /// throws `NullPointerException`/`IndexOutOfBoundsException` in exactly those two
-    /// cases, uncaught, and `transduceNonDeterministic`'s only guard against it
-    /// (`:276-281`) checks the transducer's state `0` alone — this is one of WB-035's
-    /// two confirmed manifestations.
-    fn create_map(&self, m_fa: &Fa, i: usize, map_so_far: &[usize]) -> Vec<usize> {
+    /// # Errors
+    ///
+    /// [`TransduceError::NoTransducerTransition`] if the transducer has no transition on
+    /// that encoded symbol from some state, or has an empty destination list there.
+    /// Java's `getNfaStateDests(...).getInt(0)` throws
+    /// `NullPointerException`/`IndexOutOfBoundsException` in exactly those two cases,
+    /// uncaught, and `transduceNonDeterministic`'s only guard against it (`:276-281`)
+    /// checks the transducer's state `0` alone — this is one of WB-035's two confirmed
+    /// manifestations, and is also what a partial transducer `.txt` hits. See that
+    /// variant's doc for why this is a `Result::Err` and not a `panic!`.
+    fn create_map(
+        &self,
+        m_fa: &Fa,
+        i: usize,
+        map_so_far: &[usize],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<usize>, TransduceError> {
+        budget.charge_map_step()?;
         let encoded = self.encode_input(m_fa.o[i]);
         (0..self.automaton.fa.q)
             .map(|j| {
                 self.automaton.fa.d[map_so_far[j]]
                     .get(&encoded)
                     .and_then(|dests| dests.first().copied())
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "Transducer::create_map: transducer state {} has no destination on \
-                             encoded input {encoded} (see WB-035)",
-                            map_so_far[j]
-                        )
-                    })
+                    .ok_or(TransduceError::NoTransducerTransition)
             })
             .collect()
     }
@@ -343,31 +551,47 @@ impl Transducer {
     /// `Transducer.createMapSoFar(FA M, Map identity, List iString)` (`:388-394`) —
     /// `phi_{M.O(iString)}`, i.e. [`Transducer::create_map`] folded left-to-right over
     /// the word, starting from the identity.
-    fn create_map_so_far(&self, m_fa: &Fa, identity: &[usize], i_string: &[usize]) -> Vec<usize> {
+    fn create_map_so_far(
+        &self,
+        m_fa: &Fa,
+        identity: &[usize],
+        i_string: &[usize],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<usize>, TransduceError> {
         let mut map_so_far = identity.to_vec();
         for &i in i_string {
-            map_so_far = self.create_map(m_fa, i, &map_so_far);
+            map_so_far = self.create_map(m_fa, i, &map_so_far, budget)?;
         }
-        map_so_far
+        Ok(map_so_far)
     }
 
     /// `Transducer.createIterates(Automaton M, List string, int size)` (`:359-378`) —
     /// `[phi_{M.O(string)}, phi_{M.O(h(string))}, ..., phi_{M.O(h^{size-1}(string))}]`.
-    fn create_iterates(&self, m: &Automaton, string: &[usize], size: usize) -> Vec<Vec<usize>> {
+    ///
+    /// This is where the algorithm's real cost lives: `dests` grows by a factor of `M`'s
+    /// out-degree per iterate and every letter of it costs a [`Transducer::create_map`],
+    /// so `budget` is what stops it. See this module's "Cost" docs.
+    fn create_iterates(
+        &self,
+        m: &Automaton,
+        string: &[usize],
+        size: usize,
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Vec<usize>>, TransduceError> {
         let mut iterates = Vec::with_capacity(size);
         let identity = self.identity_map();
         let mut dests: Vec<usize> = string.to_vec();
 
         for i in 0..size {
-            iterates.push(self.create_map_so_far(&m.fa, &identity, &dests));
+            iterates.push(self.create_map_so_far(&m.fa, &identity, &dests, budget)?);
             // Java: `if (i != size - 1)`. Written as `i + 1 != size` so the guard is
             // also correct (rather than underflowing) at `size == 0`, which Java's
             // loop simply never enters.
             if i + 1 != size {
-                dests = Self::get_destination_for_dfa(m, &dests);
+                dests = Self::get_destination_for_dfa(m, &dests, budget)?;
             }
         }
-        iterates
+        Ok(iterates)
     }
 
     /// `Transducer.addFirstEntries(Automaton M, Integer integer, List iString)`
@@ -382,12 +606,22 @@ impl Transducer {
 
     /// `Transducer.getDestinationForDFA(Automaton M, List prevString)` (`:242-249`) —
     /// `h` applied to a whole word.
-    fn get_destination_for_dfa(m: &Automaton, prev_string: &[usize]) -> Vec<usize> {
+    ///
+    /// The length check is inside the loop, not after it, so the vector cannot overshoot
+    /// `budget.limits.max_word_len` by more than one state's out-degree — that is what
+    /// makes the word-length ceiling a real bound on peak memory rather than a
+    /// post-hoc complaint about an allocation already made.
+    fn get_destination_for_dfa(
+        m: &Automaton,
+        prev_string: &[usize],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<usize>, TransduceError> {
         let mut i_string = Vec::new();
         for &state in prev_string {
             Self::add_first_entries(m, state, &mut i_string);
+            budget.check_word_len(i_string.len())?;
         }
-        i_string
+        Ok(i_string)
     }
 
     /// `Transducer.transduceMsdDeterministic(Automaton M)` (`:99-240`) — transduce an
@@ -405,17 +639,29 @@ impl Transducer {
     /// the wrong destination or throws `IndexOutOfBoundsException`, and this port
     /// takes the same wrong destination or panics on the same slice index.
     ///
-    /// # Panics
+    /// # Errors
     ///
     /// Where Java throws an unchecked `NullPointerException`/`IndexOutOfBoundsException`
-    /// from an ill-formed transducer — see [`Transducer::create_map`], and the `sigma`
-    /// lookup below, whose Java form is an `Integer`-to-`int` unboxing cast (`:187`)
-    /// that NPEs on a missing entry.
+    /// from an ill-formed (partial) transducer — see
+    /// [`TransduceError::NoTransducerTransition`] and [`TransduceError::NoTransducerOutput`]
+    /// — and [`TransduceError::Exploded`] when the default [`TransduceBudget`] runs out.
+    /// Use [`Transducer::transduce_msd_deterministic_with_budget`] to choose the budget.
     pub fn transduce_msd_deterministic(
         &self,
         m: &Automaton,
         logging: &mut Logging,
     ) -> Result<Automaton, TransduceError> {
+        self.transduce_msd_deterministic_with_budget(m, logging, TransduceBudget::default())
+    }
+
+    /// As [`Transducer::transduce_msd_deterministic`], with an explicit work budget.
+    pub fn transduce_msd_deterministic_with_budget(
+        &self,
+        m: &Automaton,
+        logging: &mut Logging,
+        budget: TransduceBudget,
+    ) -> Result<Automaton, TransduceError> {
+        let budget = &mut BudgetState::new(budget);
         // Not a Java guard — see `TransduceError::TrivialAutomaton`. Placed before the
         // timer/logging so the indent stays balanced on this path.
         if m.is_true_false_automaton() {
@@ -473,7 +719,7 @@ impl Transducer {
         let mut init_maps: Vec<Vec<usize>> = Vec::with_capacity(m.fa.q);
         let mut init_strings: Vec<Vec<usize>> = Vec::with_capacity(m.fa.q);
         for i in 0..m.fa.q {
-            init_maps.push(self.create_map(&m.fa, i, &identity));
+            init_maps.push(self.create_map(&m.fa, i, &identity, budget)?);
             init_strings.push(vec![i]);
         }
 
@@ -496,9 +742,9 @@ impl Transducer {
 
             for prev in &prev_strings {
                 // will be h^m(i)
-                let i_string = Self::get_destination_for_dfa(m, prev);
+                let i_string = Self::get_destination_for_dfa(m, prev, budget)?;
                 // start off with the identity.
-                new_maps.push(self.create_map_so_far(&m.fa, &identity, &i_string));
+                new_maps.push(self.create_map_so_far(&m.fa, &identity, &i_string, budget)?);
                 new_strings.push(i_string);
             }
 
@@ -528,7 +774,7 @@ impl Transducer {
         let init_state = StateTuple {
             state: m.fa.q0,
             i_list: Vec::new(),
-            iterates: self.create_iterates(m, &[], p + q),
+            iterates: self.create_iterates(m, &[], p + q, budget)?,
         };
         let mut states: Vec<StateTuple> = vec![init_state.clone()];
         let mut states_hash: HashMap<StateTuple, usize> = HashMap::new();
@@ -540,19 +786,16 @@ impl Transducer {
             // set up the output of this state.
             let transducer_state = curr_state.iterates[0][self.automaton.fa.q0];
             let encoded = self.encode_input(m.fa.o[curr_state.state]);
+            // `(int) sigma.get(...).get(...)` (`:187`) — an unboxing NPE on a hole in
+            // `sigma`, ported as a rejection; see `TransduceError::NoTransducerOutput`.
             let output = *self.sigma[transducer_state]
                 .get(&encoded)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Transducer::transduce_msd_deterministic: sigma has no output for \
-                         transducer state {transducer_state} on encoded input {encoded}"
-                    )
-                });
+                .ok_or(TransduceError::NoTransducerOutput)?;
             n.fa.o.push(output);
             n.fa.d.push(BTreeMap::new());
 
             // get h(w) where w = currState.iList.
-            let new_string = Self::get_destination_for_dfa(m, &curr_state.i_list);
+            let new_string = Self::get_destination_for_dfa(m, &curr_state.i_list, budget)?;
 
             // relying on the di's to be sorted here...
             let mut state_morphed: Vec<usize> = Vec::new();
@@ -577,7 +820,7 @@ impl Transducer {
                 // new state
                 let new_state = StateTuple {
                     state: state_morphed[di_index],
-                    iterates: self.create_iterates(m, &new_state_string, p + q),
+                    iterates: self.create_iterates(m, &new_state_string, p + q, budget)?,
                     i_list: new_state_string,
                 };
 
@@ -589,6 +832,11 @@ impl Transducer {
                         states_queue.push_back(new_state.clone());
                         let index = states.len() - 1;
                         states_hash.insert(new_state, index);
+                        // Not a Java check — the BFS state ceiling. Counted on
+                        // `states.len()`, i.e. the automaton actually being built, not on
+                        // either input's state count (see this module's "Cost" docs for
+                        // why the latter is not a bound at all).
+                        budget.check_bfs_states(states.len())?;
                         index
                     }
                 };
@@ -663,6 +911,21 @@ impl Transducer {
         m: &mut Automaton,
         logging: &mut Logging,
     ) -> Result<Automaton, TransduceError> {
+        self.transduce_non_deterministic_with_budget(m, logging, TransduceBudget::default())
+    }
+
+    /// As [`Transducer::transduce_non_deterministic`], with an explicit work budget for
+    /// the [`Transducer::transduce_msd_deterministic`] call(s) it makes. See this
+    /// module's "Cost" docs.
+    ///
+    /// Note the budget is *per inner call*, matching where the exponential work happens;
+    /// this path makes exactly one such call either way.
+    pub fn transduce_non_deterministic_with_budget(
+        &self,
+        m: &mut Automaton,
+        logging: &mut Logging,
+        budget: TransduceBudget,
+    ) -> Result<Automaton, TransduceError> {
         // check that the input automaton only has one input!
         if m.msd.len() != 1 {
             return Err(TransduceError::NotSingleInput);
@@ -706,7 +969,7 @@ impl Transducer {
         let mut n;
         if totalized {
             // transduce normally
-            n = self.transduce_msd_deterministic(m, logging)?;
+            n = self.transduce_msd_deterministic_with_budget(m, logging, budget)?;
         } else {
             let mut m_new = m.clone();
             m_new.fa.add_distinguished_dead_state();
@@ -724,7 +987,7 @@ impl Transducer {
                 t_new.sigma[q].insert(min_output, min_output);
             }
 
-            n = t_new.transduce_msd_deterministic(&m_new, logging)?;
+            n = t_new.transduce_msd_deterministic_with_budget(&m_new, logging, budget)?;
 
             // WB-035, half two: and here as a marker in the RESULT's output alphabet,
             // which is the transducer's, not `M`'s — so a transducer that can
@@ -1304,14 +1567,245 @@ mod tests {
     /// encoded symbol (`0`, i.e. the letter `1`, clobbering a real transition), while
     /// `create_map` looks the dead state's output up via `encode([0]) == -1`. Real
     /// Walnut throws `NullPointerException` at `Transducer.java:400` (empirically
-    /// confirmed, 2026-08-13); this port panics at the same point.
+    /// confirmed, 2026-08-13).
+    ///
+    /// This port answers with [`TransduceError::NoTransducerTransition`] at the same
+    /// point, carrying Java's own NPE text — not a `panic!`, because Java's NPE is a
+    /// `RuntimeException` its REPL catches and continues past, whereas a Rust panic would
+    /// unwind out of a `wr-cli` session that has no `catch_unwind` and kill the process.
     #[test]
-    #[should_panic(expected = "no destination on encoded input -1")]
-    fn wb035_shifted_alphabet_panics_where_java_npes() {
+    fn wb035_shifted_alphabet_errors_where_java_npes() {
         let mut logging = Logging::new();
         let t = transducer(&[1, 2], &[&[(1, 0, 7), (2, 0, 8)]]);
         let mut m = word_automaton(&[1, 2], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
-        let _ = t.transduce_non_deterministic(&mut m, &mut logging);
+        assert_eq!(
+            t.transduce_non_deterministic(&mut m, &mut logging)
+                .unwrap_err(),
+            TransduceError::NoTransducerTransition
+        );
+        assert_eq!(
+            TransduceError::NoTransducerTransition.to_string(),
+            "Cannot invoke \"it.unimi.dsi.fastutil.ints.IntList.getInt(int)\" because the return \
+             value of \"Automata.FA.Transitions.getNfaStateDests(int, int)\" is null"
+        );
+    }
+
+    /// A **partial transducer**: `{0, 1}` declared, but state `1` has no transition on
+    /// letter `1`. Nothing about the file is malformed — `read_transducer_txt` accepts
+    /// it, and `transduce_non_deterministic`'s only compatibility guard checks the
+    /// transducer's state `0` (WB-035), which is total here. So `create_map` reaches the
+    /// hole in state `1` and Java NPEs at `Transducer.java:400`; this port returns the
+    /// same [`TransduceError::NoTransducerTransition`] rather than panicking. This is the
+    /// shape U26's `transduce` command makes reachable from an ordinary user-supplied
+    /// `.txt` — see `wr_cli::transduce`'s end-to-end twin of this test.
+    #[test]
+    fn a_partial_transducer_is_a_clean_error_not_a_panic() {
+        let mut logging = Logging::new();
+        // State 0: total. State 1: only letter 0.
+        let t = transducer(&[0, 1], &[&[(0, 0, 0), (1, 1, 1)], &[(0, 1, 1)]]);
+        let mut m = thue_morse();
+        assert_eq!(
+            t.transduce_non_deterministic(&mut m, &mut logging)
+                .unwrap_err(),
+            TransduceError::NoTransducerTransition
+        );
+    }
+
+    /// The `sigma` twin of the test above: the transition table is total but `sigma` has
+    /// a hole, which is Java's unboxing NPE at `Transducer.java:187`. Not reachable from
+    /// a `.txt` (`readTransducer` fills both tables from the same lines) but reachable
+    /// from any programmatic `Transducer::new`, which is a public constructor.
+    #[test]
+    fn a_transducer_with_a_hole_in_sigma_is_a_clean_error_not_a_panic() {
+        let mut logging = Logging::new();
+        let mut t = transducer(&[0, 1], &[&[(0, 0, 0), (1, 0, 1)]]);
+        t.sigma[0].remove(&1);
+        let mut m = thue_morse();
+        assert_eq!(
+            t.transduce_non_deterministic(&mut m, &mut logging)
+                .unwrap_err(),
+            TransduceError::NoTransducerOutput
+        );
+        assert_eq!(
+            TransduceError::NoTransducerOutput.to_string(),
+            "Cannot invoke \"java.lang.Integer.intValue()\" because the return value of \
+             \"java.util.Map.get(Object)\" is null"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The deterministic work budget (port-specific; see the module docs)
+    // -------------------------------------------------------------------
+
+    /// The two end-to-end pairs this repo ships — the same ones `IntegrationTest.java`
+    /// uses — must be orders of magnitude inside the default budget, or the guard would
+    /// be rejecting ordinary Walnut usage. Asserted by *measuring* the spend rather than
+    /// by restating a constant, so the margin is visible and cannot silently erode.
+    #[test]
+    fn the_default_budget_has_orders_of_magnitude_of_headroom_on_the_shipped_fixtures() {
+        for (name, m) in [
+            ("thue-morse", thue_morse()),
+            ("paperfolding", paperfolding_lsd()),
+        ] {
+            // Binary-search the smallest map-step budget that still succeeds: that is
+            // exactly what the transduction spends.
+            let spend = (1..)
+                .map(|k| 1usize << k)
+                .find(|&cap| {
+                    let budget = TransduceBudget {
+                        max_map_steps: cap as u64,
+                        ..TransduceBudget::default()
+                    };
+                    runsum2()
+                        .transduce_non_deterministic_with_budget(
+                            &mut m.clone(),
+                            &mut Logging::new(),
+                            budget,
+                        )
+                        .is_ok()
+                })
+                .expect("the shipped fixtures transduce within some finite budget");
+            assert!(
+                (spend as u64) * 1000 < TransduceBudget::default().max_map_steps,
+                "{name}: spends ~{spend} map steps, which is not >=1000x inside the default \
+                 budget of {} -- either the fixture or the default has drifted",
+                TransduceBudget::default().max_map_steps
+            );
+        }
+    }
+
+    /// Each of the three ceilings is separately reachable, and each reports itself.
+    #[test]
+    fn each_budget_ceiling_trips_with_its_own_limit_and_never_hangs() {
+        // Map steps: RUNSUM2 over Thue-Morse spends more than one.
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic_with_budget(
+                    &mut thue_morse(),
+                    &mut Logging::new(),
+                    TransduceBudget {
+                        max_map_steps: 1,
+                        ..TransduceBudget::default()
+                    },
+                )
+                .unwrap_err(),
+            TransduceError::Exploded(TransduceLimit::MapSteps)
+        );
+
+        // Word length: `h` of a one-letter word is already two letters.
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic_with_budget(
+                    &mut thue_morse(),
+                    &mut Logging::new(),
+                    TransduceBudget {
+                        max_word_len: 1,
+                        ..TransduceBudget::default()
+                    },
+                )
+                .unwrap_err(),
+            TransduceError::Exploded(TransduceLimit::WordLength)
+        );
+
+        // BFS states: the Thue-Morse result has 8 of them before minimization.
+        assert_eq!(
+            runsum2()
+                .transduce_non_deterministic_with_budget(
+                    &mut thue_morse(),
+                    &mut Logging::new(),
+                    TransduceBudget {
+                        max_bfs_states: 1,
+                        ..TransduceBudget::default()
+                    },
+                )
+                .unwrap_err(),
+            TransduceError::Exploded(TransduceLimit::BfsStates)
+        );
+    }
+
+    /// A three-letter, single-track word automaton — the shared [`word_automaton`]
+    /// helper hardcodes a two-letter alphabet.
+    fn word_automaton3(outputs: &[i32], d: &[&[(i32, usize)]]) -> Automaton {
+        assert_eq!(outputs.len(), d.len());
+        let table: Vec<BTreeMap<i32, Vec<usize>>> = d
+            .iter()
+            .map(|row| row.iter().map(|&(sym, dest)| (sym, vec![dest])).collect())
+            .collect();
+        let fa = Fa {
+            q0: 0,
+            q: outputs.len(),
+            alphabet_size: 3,
+            o: outputs.to_vec(),
+            d: table,
+            true_false: None,
+        };
+        Automaton::new(
+            fa,
+            vec![vec![0, 1, 2]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        )
+    }
+
+    /// The case a state-count guard cannot see, and the whole reason the budget had to
+    /// move inside this file: a **four**-state input over a three-letter alphabet through
+    /// a **four**-state transducer — numbers any `Q <= 500`-style precheck waves straight
+    /// through, and numbers barely larger than the shipped `RUNSUM2`/Thue-Morse pair,
+    /// which finishes in under `2^10` map steps.
+    ///
+    /// This pair was found by search and *measured* (release, 2026-08-15) to spend more
+    /// than **100,000,000** map steps — 5+ seconds of release CPU, still climbing, past
+    /// 10x the default budget — i.e. five orders of magnitude more than the shipped
+    /// fixtures at the same state counts. The assertion below uses a small explicit
+    /// budget so the test itself stays in the milliseconds; the 100M figure is recorded
+    /// as prose because asserting it would cost seconds per run.
+    ///
+    /// The contrast is the point: at one and the same `100_000`-step budget, the shipped
+    /// pair succeeds and this one does not. No function of the two state counts can tell
+    /// them apart.
+    #[test]
+    fn a_tiny_but_exponential_input_is_rejected_where_a_state_count_guard_sees_nothing() {
+        let budget = TransduceBudget {
+            max_map_steps: 100_000,
+            ..TransduceBudget::default()
+        };
+
+        let t = transducer(
+            &[0, 1, 2],
+            &[
+                &[(0, 1, 2), (1, 2, 0), (2, 2, 0)],
+                &[(0, 1, 1), (1, 1, 1), (2, 2, 1)],
+                &[(0, 3, 2), (1, 2, 2), (2, 3, 1)],
+                &[(0, 2, 0), (1, 2, 0), (2, 3, 0)],
+            ],
+        );
+        let mut m = word_automaton3(
+            &[0, 1, 1, 0],
+            &[
+                &[(0, 3), (1, 1), (2, 3)],
+                &[(0, 0), (1, 0), (2, 2)],
+                &[(0, 0), (1, 0), (2, 0)],
+                &[(0, 2), (1, 2), (2, 1)],
+            ],
+        );
+        assert_eq!(
+            m.fa.q, 4,
+            "four input states -- under any state-count guard"
+        );
+        assert_eq!(
+            t.automaton.fa.q, 4,
+            "four transducer states -- likewise under any state-count guard"
+        );
+        assert_eq!(
+            t.transduce_non_deterministic_with_budget(&mut m, &mut Logging::new(), budget)
+                .unwrap_err(),
+            TransduceError::Exploded(TransduceLimit::MapSteps)
+        );
+
+        // Same budget, the shipped two-state pair: comfortably fine.
+        assert!(runsum2()
+            .transduce_non_deterministic_with_budget(&mut thue_morse(), &mut Logging::new(), budget)
+            .is_ok());
     }
 
     // -------------------------------------------------------------------
@@ -1526,31 +2020,42 @@ mod tests {
         let identity = t.identity_map();
         assert_eq!(identity, vec![0, 1]);
 
+        let b = &mut BudgetState::new(TransduceBudget::default());
         // M state 0 has output 0; RUNSUM2 on letter 0 is the identity on states.
-        assert_eq!(t.create_map(&m.fa, 0, &identity), vec![0, 1]);
+        assert_eq!(t.create_map(&m.fa, 0, &identity, b), Ok(vec![0, 1]));
         // M state 1 has output 1; RUNSUM2 on letter 1 swaps the two states.
-        assert_eq!(t.create_map(&m.fa, 1, &identity), vec![1, 0]);
+        assert_eq!(t.create_map(&m.fa, 1, &identity, b), Ok(vec![1, 0]));
         // Composing letter 1 twice is the identity again.
-        assert_eq!(t.create_map_so_far(&m.fa, &identity, &[1, 1]), vec![0, 1]);
         assert_eq!(
-            t.create_map_so_far(&m.fa, &identity, &[1, 0, 1]),
-            vec![0, 1]
+            t.create_map_so_far(&m.fa, &identity, &[1, 1], b),
+            Ok(vec![0, 1])
+        );
+        assert_eq!(
+            t.create_map_so_far(&m.fa, &identity, &[1, 0, 1], b),
+            Ok(vec![0, 1])
         );
     }
 
     #[test]
     fn get_destination_for_dfa_applies_the_morphism_in_symbol_order() {
         let m = thue_morse();
+        let b = &mut BudgetState::new(TransduceBudget::default());
         // h(0) = 0 1, h(1) = 1 0.
-        assert_eq!(Transducer::get_destination_for_dfa(&m, &[0]), vec![0, 1]);
-        assert_eq!(Transducer::get_destination_for_dfa(&m, &[1]), vec![1, 0]);
         assert_eq!(
-            Transducer::get_destination_for_dfa(&m, &[0, 1]),
-            vec![0, 1, 1, 0]
+            Transducer::get_destination_for_dfa(&m, &[0], b),
+            Ok(vec![0, 1])
         );
         assert_eq!(
-            Transducer::get_destination_for_dfa(&m, &[]),
-            Vec::<usize>::new()
+            Transducer::get_destination_for_dfa(&m, &[1], b),
+            Ok(vec![1, 0])
+        );
+        assert_eq!(
+            Transducer::get_destination_for_dfa(&m, &[0, 1], b),
+            Ok(vec![0, 1, 1, 0])
+        );
+        assert_eq!(
+            Transducer::get_destination_for_dfa(&m, &[], b),
+            Ok(Vec::<usize>::new())
         );
     }
 
@@ -1558,7 +2063,8 @@ mod tests {
     fn create_iterates_of_the_empty_word_is_all_identities() {
         let t = runsum2();
         let m = thue_morse();
-        assert_eq!(t.create_iterates(&m, &[], 3), vec![vec![0, 1]; 3]);
+        let b = &mut BudgetState::new(TransduceBudget::default());
+        assert_eq!(t.create_iterates(&m, &[], 3, b), Ok(vec![vec![0, 1]; 3]));
     }
 
     #[test]

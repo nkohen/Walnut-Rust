@@ -28,10 +28,19 @@
 //! conversion has to live on this side, exactly like `wr_core::morphism::Morphism::
 //! from_mapping` already does for `ParseMethods.parseMorphism`.
 //!
-//! # The resource guard
+//! # The resource guard is in `wr-core`, not here
 //!
-//! See [`check_transduce_size_guard`]'s own doc for exactly what it does, and — just as
-//! importantly — does not, cover.
+//! `CLAUDE.md`'s "per-test resource caps, never hangs" guardrail applies to this command:
+//! the transduction is exponential. It is **not** enforced at this layer, because nothing
+//! at this layer can enforce it — the cost is exponential in the BFS *depth* inside
+//! `wr_core::transducer`, not in either automaton's state count, so a precheck on the two
+//! numbers available here (`M.fa.q` and the transducer's `fa.q`) is off by orders of
+//! magnitude on the wrong axis, and a wall-clock watchdog is impossible because
+//! `Automaton` is `!Send`. The cap therefore lives inside the primitive's own loops as
+//! `wr_core::transducer::TransduceBudget`, and reaches this module as an ordinary
+//! `TransduceError::Exploded` through [`TransduceCommandError::Transduce`]. See that
+//! module's "Cost" docs for the numbers and for why the divergence from Java is
+//! deliberate.
 
 use wr_core::automaton::Automaton;
 use wr_core::fa::Fa;
@@ -46,32 +55,27 @@ use crate::session::Session;
 use crate::test_case::TestCase;
 use wr_logic::predicate_env::PredicateEnvError;
 
-/// The largest input-automaton state count [`check_transduce_size_guard`] allows through.
-/// Chosen generously above every shipped library fixture (the largest word automata in
-/// `walnut-java`'s `Word Automata Library/` are tens of states, not hundreds) so it never
-/// fires on ordinary usage, while still rejecting an obviously oversized input outright
-/// rather than letting it reach the uncapped BFS.
-pub const MAX_TRANSDUCE_INPUT_STATES: usize = 500;
-
-/// As [`MAX_TRANSDUCE_INPUT_STATES`], for the transducer's own state count.
-pub const MAX_TRANSDUCE_TRANSDUCER_STATES: usize = 500;
-
 /// Every failure `transduce` can produce.
 #[derive(Debug)]
 pub enum TransduceCommandError {
-    /// Reading `Transducer Library/<name>.txt` failed (`wr_io::reader::read_transducer_txt`).
-    ReadTransducer(ReadError),
+    /// Reading `Transducer Library/<name>.txt` failed
+    /// (`wr_io::reader::read_transducer_txt`).
+    ///
+    /// Carries the address and is rendered exactly the way
+    /// `crate::session::FileLibraries::read_library_automaton` renders the *input*
+    /// automaton's read failures — Java raises the same two `WalnutException`s from the
+    /// same `AutomatonReader` code for both files (`readTransducer` shares
+    /// `readAutomaton`'s `catch (IOException) -> fileDoesNotExist` and its per-line
+    /// parse errors), so the two paths must not print differently. See
+    /// [`fmt::Display`](std::fmt::Display).
+    ReadTransducer { address: String, source: ReadError },
     /// Reading the input automaton failed — the same classification every other
     /// file-reading command in this crate gets (`crate::session::FileLibraries::
     /// read_library_automaton`).
     ReadAutomaton(PredicateEnvError),
-    /// [`check_transduce_size_guard`] tripped before the transduction ever ran.
-    TooBig {
-        input_states: usize,
-        transducer_states: usize,
-    },
     /// `wr_core::transducer::TransduceError`, unchanged — including WB-034/WB-035's
-    /// already-typed variants.
+    /// already-typed variants and the port-specific
+    /// `TransduceError::Exploded` resource verdict (see the module docs).
     Transduce(TransduceError),
     /// See `crate::automaton_output::write_automata`'s docs for why this propagates
     /// rather than being swallowed-and-logged the way Java's `writeAutomata` is.
@@ -81,18 +85,19 @@ pub enum TransduceCommandError {
 impl std::fmt::Display for TransduceCommandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransduceCommandError::ReadTransducer(e) => write!(f, "{e}"),
+            // Deliberately identical in shape to `PredicateEnvError::FileDoesNotExist` /
+            // `MalformedAutomaton`, which is what `read_library_automaton` produces for
+            // the input-automaton half of this very command: an `Io` failure is Java's
+            // `WalnutException.fileDoesNotExist` (`"File does not exist: " + address`),
+            // everything else is a parse failure named by address. Printing the bare
+            // `ReadError` instead would emit a raw Rust `Debug` dump with no filename in
+            // it — worse than a rough Java match, and inconsistent with this crate's own
+            // other file-reading paths.
+            TransduceCommandError::ReadTransducer { address, source } => match source {
+                ReadError::Io(_) => write!(f, "File does not exist: {address}"),
+                other => write!(f, "File does not parse: {address} ({other})"),
+            },
             TransduceCommandError::ReadAutomaton(e) => write!(f, "{e}"),
-            TransduceCommandError::TooBig {
-                input_states,
-                transducer_states,
-            } => write!(
-                f,
-                "transduce: input too large for the resource guard ({input_states} \
-                 automaton states, {transducer_states} transducer states; limits are \
-                 {MAX_TRANSDUCE_INPUT_STATES}/{MAX_TRANSDUCE_TRANSDUCER_STATES}) — \
-                 see wr-core::transducer's module docs on why this is uncapped internally"
-            ),
             TransduceCommandError::Transduce(e) => write!(f, "{e}"),
             TransduceCommandError::Io(e) => write!(f, "{e}"),
         }
@@ -148,58 +153,6 @@ fn build_transducer(data: TransducerData) -> Transducer {
     Transducer::new(automaton, data.sigma)
 }
 
-/// A size PREFLIGHT, not a true mid-execution kill-switch.
-///
-/// `CLAUDE.md`'s "per-test resource caps, never hangs" guardrail, and
-/// `wr_core::transducer`'s own module doc ("Cost"), both ask for a wall-time/peak-state
-/// guard around the call this unit wires up — the BFS itself stays uncapped, faithfully,
-/// inside `wr-core`.
-///
-/// A *true* preemptive guard (kill the computation if it overruns a wall-clock deadline)
-/// would need to run the call on a watchdog thread and abandon it if the deadline passes.
-/// That is not achievable here without either modifying `wr_core::transducer`'s BFS to
-/// accept a cancellation/step-budget hook (explicitly out of this unit's scope — the
-/// primitive "stays uncapped per its own docs") or `unsafe impl Send`: `Automaton` (and
-/// therefore `Transducer`, which wraps one) is unconditionally `!Send` — it carries
-/// `all_reps: Vec<Option<Rc<Automaton>>>` — and `Rc`'s refcount is not atomic, so moving
-/// one across a thread boundary is only sound if no other clone of the same `Rc` can be
-/// touched concurrently from the thread it came from; this crate has no way to prove that
-/// locally (an automaton's `all_reps` entries can, in general, alias a `NumberSystem`
-/// still cached in this very `Session`). Scoped threads (`std::thread::scope`) don't
-/// avoid this either: `SessionPaths` holds a `RefCell` (for the "Overriding global file
-/// with session file" console notice), making it `!Sync`, so not even a *borrowed*
-/// reference to it may cross into a scoped thread — and scoped threads block until the
-/// spawned work finishes regardless, which defeats returning control to the caller on a
-/// timeout anyway. Given all of that, this crate does not introduce `unsafe` code (it has
-/// none today) to chase a guard that the type system this deep would make unsound in the
-/// general case.
-///
-/// So instead: reject up front on the two numbers that are always cheaply available
-/// *before* the BFS runs — `M`'s state count and the transducer's state count — past a
-/// generous threshold (`MAX_TRANSDUCE_INPUT_STATES`/`MAX_TRANSDUCE_TRANSDUCER_STATES`).
-/// This reliably catches "someone fed a genuinely huge automaton/transducer" without ever
-/// touching the exponential search. It does **not** catch the module doc's other named
-/// hazard — a transducer with only a *few* states but a rich enough transition monoid
-/// that the periodicity search's lag/period still blows up — since noticing that requires
-/// actually running the search. Documented honestly rather than overclaimed, matching
-/// this crate's own precedent (`wr_core::equiv`'s U8 doc note on its own coverage gap).
-fn check_transduce_size_guard(
-    m: &Automaton,
-    transducer: &Transducer,
-) -> Result<(), TransduceCommandError> {
-    let input_states = m.fa.q;
-    let transducer_states = transducer.automaton.fa.q;
-    if input_states > MAX_TRANSDUCE_INPUT_STATES
-        || transducer_states > MAX_TRANSDUCE_TRANSDUCER_STATES
-    {
-        return Err(TransduceCommandError::TooBig {
-            input_states,
-            transducer_states,
-        });
-    }
-    Ok(())
-}
-
 /// `Prover.transduceCommand(String)` (`:693-704`).
 ///
 /// `transducer_name`/`in_name`/`new_name` are `PAT_FOR_transduce_CMD`'s
@@ -221,8 +174,12 @@ pub fn transduce_command(
     let transducer_path = session
         .paths()
         .transducer_file(&format!("{transducer_name}{TXT_EXTENSION}"));
-    let data =
-        read_transducer_txt(&transducer_path).map_err(TransduceCommandError::ReadTransducer)?;
+    let data = read_transducer_txt(&transducer_path).map_err(|source| {
+        TransduceCommandError::ReadTransducer {
+            address: transducer_path.clone(),
+            source,
+        }
+    })?;
     let transducer = build_transducer(data);
 
     // `String inFileName = m.group(GROUP_TRANSDUCE_OLD_NAME) + TXT_EXTENSION;
@@ -233,10 +190,8 @@ pub fn transduce_command(
     let in_address = determine_in_library(session.paths(), is_dfao, &in_file_name);
     let mut m = session.libraries().read_library_automaton(&in_address)?;
 
-    // Not a Java line -- the resource guard this unit adds. See its own doc for scope.
-    check_transduce_size_guard(&m, &transducer)?;
-
-    // `Automaton C = T.transduceNonDeterministic(M);` (`:701`).
+    // `Automaton C = T.transduceNonDeterministic(M);` (`:701`). The resource cap is
+    // inside this call (`wr_core::transducer::TransduceBudget`) -- see the module docs.
     let mut c = transducer.transduce_non_deterministic(&mut m, logging)?;
 
     // `C.writeAutomata(s, Session.getWriteAddressForWordsLibrary(),
@@ -259,9 +214,7 @@ pub fn transduce_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use std::fs;
-    use wr_core::fa::Fa;
 
     fn temp_session(tag: &str) -> (Session, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -399,8 +352,19 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// `transduce test529 RUNSUM2 PR;` (`IntegrationTest.java:674`) end-to-end — an
+    /// `lsd_2` input, exercising `transduce_non_deterministic`'s "Automaton number system
+    /// is lsd, reversing" branch through the real dispatch path.
+    ///
+    /// The assertion is the actual transduction semantics, derived from the fixture
+    /// itself rather than from any hardcoded golden constant: RUNSUM2 is the running sum
+    /// mod 2, so the result's output at `n` must equal `sum_{k<=n} PR(k) mod 2`, where
+    /// `PR` is the very automaton this test wrote into the library. Both automata are
+    /// read lsd-first (the reversal is undone on the way out, so the result is `lsd_2`
+    /// again). This is the same shape the msd-side test above uses for its own semantic
+    /// assertion.
     #[test]
-    fn transduce_runsum2_over_lsd_paperfolding_reverses_and_back_through_the_real_command() {
+    fn transduce_runsum2_over_lsd_paperfolding_computes_the_running_sum_of_the_fixture() {
         let (session, dir) = temp_session("runsum2-paperfolding-lsd");
         write_fixture(&dir, "Transducer Library", "RUNSUM2.txt", RUNSUM2_TXT);
         write_fixture(
@@ -410,10 +374,18 @@ mod tests {
             PAPERFOLDING_LSD_TXT,
         );
 
-        // `transduce test529 RUNSUM2 PR;` -- an lsd_2 input, exercising
-        // `transduce_non_deterministic`'s "Automaton number system is lsd, reversing"
-        // branch through the real dispatch path (not calling `wr_core::transducer`
-        // directly).
+        // The oracle: the input automaton itself, read back the same way the command
+        // reads it (so `word_output` walks a comparable, minimized copy).
+        let pr = session
+            .libraries()
+            .read_library_automaton(
+                dir.join("Word Automata Library")
+                    .join("PR.txt")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+
         let tc = transduce_command(
             &session,
             "transduce test529 RUNSUM2 PR",
@@ -428,92 +400,157 @@ mod tests {
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         // Still an lsd_2 result (the reversal is undone on the way out).
         assert_eq!(c.msd, vec![Some(false)]);
-        // Sanity: the result is a genuine (non-trivial) automaton, not empty/degenerate.
-        assert!(c.fa.q > 0);
+
+        let mut running = 0i32;
+        for n in 0u32..40 {
+            // lsd representation: binary, least-significant digit first.
+            let lsd_rep: Vec<i32> = format!("{n:b}")
+                .bytes()
+                .rev()
+                .map(|b| (b - b'0') as i32)
+                .collect();
+            running = (running + word_output(&pr, &lsd_rep).expect("PR is total")) % 2;
+            assert_eq!(
+                word_output(c, &lsd_rep),
+                Some(running),
+                "running sum mod 2 of the paperfolding word at n = {n}"
+            );
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// The `$` sigil — the one branching decision this command layer makes. Java:
+    /// `boolean isDFAO = !(m.group(GROUP_TRANSDUCE_DOLLAR_SIGN).equals("$"))` (`:698`),
+    /// feeding `ProverHelper.determineInLibrary`, so `transduce N T $M;` reads `M` from
+    /// the **`Automata Library/`** (a plain predicate automaton) rather than the
+    /// `Word Automata Library/`.
+    ///
+    /// The asymmetry Java hardcodes is pinned here too: whatever the *input*'s `$` flag
+    /// was, the *output* is written with `isDFAO = true` (`writeAutomata(..., true)`,
+    /// `:702`), i.e. into the Word Automata Library — so this test's result lands beside
+    /// word automata even though its input did not.
     #[test]
-    fn the_size_guard_does_not_fire_on_the_ordinary_runsum2_thue_morse_case() {
-        let (session, dir) = temp_session("guard-normal");
+    fn the_dollar_sigil_reads_a_plain_automaton_but_the_result_is_still_written_as_a_dfao() {
+        let (session, dir) = temp_session("dollar");
         write_fixture(&dir, "Transducer Library", "RUNSUM2.txt", RUNSUM2_TXT);
-        write_fixture(&dir, "Word Automata Library", "T.txt", THUE_MORSE_MSD_TXT);
+        // A plain (non-DFAO) automaton, in `Automata Library/`: msd_2, accepting the
+        // words with an even number of 1s. Its `.txt` shape is identical to a DFAO's --
+        // Walnut's format does not distinguish them; only the *directory* does, which is
+        // exactly what `$` selects.
+        write_fixture(
+            &dir,
+            "Automata Library",
+            "EVEN.txt",
+            "msd_2\n\n0 1\n0 -> 0\n1 -> 1\n\n1 0\n0 -> 1\n1 -> 0\n",
+        );
+        // A same-named decoy in the Word Automata Library, so a test that accidentally
+        // read the DFAO path would produce a different answer rather than silently pass.
+        write_fixture(
+            &dir,
+            "Word Automata Library",
+            "EVEN.txt",
+            THUE_MORSE_MSD_TXT,
+        );
 
-        assert!(transduce_command(
+        let tc = transduce_command(
             &session,
-            "transduce out RUNSUM2 T",
+            "transduce outd RUNSUM2 $EVEN",
             &mut Logging::new(),
             "RUNSUM2",
+            false, // `is_dfao == false` <=> the `$` was present
+            "EVEN",
+            "outd",
+        )
+        .unwrap();
+
+        // Read from `Automata Library/EVEN.txt`, not the decoy: the running sum mod 2 of
+        // [n has an even number of 1s], not of Thue-Morse (which is its complement).
+        let c = tc.automaton_pairs()[0].automaton().unwrap();
+        let mut running = 0i32;
+        for n in 0u32..32 {
+            running = (running + i32::from(n.count_ones() % 2 == 0)) % 2;
+            let word: Vec<i32> = format!("{n:b}")
+                .bytes()
+                .map(|b| (b - b'0') as i32)
+                .collect();
+            assert_eq!(word_output(c, &word), Some(running), "at n = {n}");
+        }
+
+        // ... and the OUTPUT went to the Word Automata Library regardless.
+        assert!(dir.join("Word Automata Library").join("outd.txt").is_file());
+        assert!(
+            !dir.join("Automata Library").join("outd.txt").is_file(),
+            "Java writes the transduction result as a DFAO even for a `$` input"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A **partial transducer**: `Transducer Library/PARTIAL.txt` declares `{0, 1}` but
+    /// state `1` has no transition on letter `1`. The file is perfectly well-formed --
+    /// `read_transducer_txt` accepts it, and `transduce_non_deterministic`'s only
+    /// compatibility guard looks at the transducer's state `0` (WB-035), which is total
+    /// here -- so nothing rejects it before the BFS reaches the hole.
+    ///
+    /// Real Walnut throws `NullPointerException` there (`Transducer.java:400`), which
+    /// `Prover.dispatch`'s `catch (RuntimeException)` prints before returning to the
+    /// prompt. This is the shape U26 makes reachable from an ordinary user-supplied
+    /// `.txt`, and `wr-cli` has no `catch_unwind` anywhere in `read_buffer`/`dispatch`, so
+    /// a Rust `panic!` would kill the whole session: it must be a clean error.
+    #[test]
+    fn a_partial_transducer_file_is_a_clean_error_not_a_process_killing_panic() {
+        let (session, dir) = temp_session("partial-transducer");
+        write_fixture(
+            &dir,
+            "Transducer Library",
+            "PARTIAL.txt",
+            // State 0 total; state 1 missing its `1` transition.
+            "{0, 1}\n\n0\n0 -> 0 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 1\n",
+        );
+        write_fixture(&dir, "Word Automata Library", "T.txt", THUE_MORSE_MSD_TXT);
+
+        let err = transduce_command(
+            &session,
+            "transduce out PARTIAL T",
+            &mut Logging::new(),
+            "PARTIAL",
             true,
             "T",
             "out",
         )
-        .is_ok());
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TransduceCommandError::Transduce(TransduceError::NoTransducerTransition)
+            ),
+            "expected a clean NoTransducerTransition, got {err:?}"
+        );
+        // Java's own NPE text, so REPL output still matches.
+        assert!(err.to_string().contains("getNfaStateDests"), "{err}");
 
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A hand-built, deliberately oversized (but otherwise trivial -- no exponential cost
-    /// to even construct) input automaton, well past [`MAX_TRANSDUCE_INPUT_STATES`],
-    /// confirms the guard trips with [`TransduceCommandError::TooBig`] rather than
-    /// letting an enormous automaton reach the uncapped BFS.
+    /// The `wr-core` resource budget surfaces through this command as an ordinary error,
+    /// with a user-facing message that does not point at Rust internals.
+    ///
+    /// The *triggering* of the budget is covered where it lives
+    /// (`wr_core::transducer`'s `a_tiny_but_exponential_input_is_rejected_...`); running
+    /// a genuinely exponential input through the default budget here would cost seconds
+    /// per test run for no extra signal, since this layer only propagates with `?`.
     #[test]
-    fn the_size_guard_rejects_an_oversized_input_automaton_before_transducing() {
-        let (session, dir) = temp_session("guard-toobig");
-        write_fixture(&dir, "Transducer Library", "RUNSUM2.txt", RUNSUM2_TXT);
-
-        // A chain 0 -> 1 -> ... -> n-1 (capped) on symbol 1, self-looping on symbol 0,
-        // with every state given a DISTINCT output. `read_library_automaton` (like
-        // Java's `readAutomaton`) auto-determinizes + minimizes on load
-        // (`AutomatonReader.readAutomaton`), so a construction whose states are all
-        // Myhill-Nerode equivalent (e.g. all self-loops, all output 0) would collapse to
-        // one state before this guard ever saw it -- distinct per-state outputs make
-        // every state trivially distinguishable (differing on the empty suffix), so all
-        // `n` states must survive minimization intact.
-        let n = MAX_TRANSDUCE_INPUT_STATES + 1;
-        let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::with_capacity(n);
-        for q in 0..n {
-            let mut row = BTreeMap::new();
-            row.insert(0, vec![q]);
-            row.insert(1, vec![(q + 1).min(n - 1)]);
-            d.push(row);
-        }
-        let fa = Fa {
-            q0: 0,
-            q: n,
-            alphabet_size: 2,
-            o: (0..n as i32).collect(),
-            d,
-            true_false: None,
-        };
-        let mut big = Automaton::new(
-            fa,
-            vec![vec![0, 1]],
-            vec!["x".to_string()],
-            vec![Some(true)],
-        );
-        wr_io::writer::write_automaton_txt(
-            &mut big,
-            dir.join("Word Automata Library").join("BIG.txt"),
-        )
-        .unwrap();
-
-        let err = transduce_command(
-            &session,
-            "transduce out RUNSUM2 BIG",
-            &mut Logging::new(),
-            "RUNSUM2",
-            true,
-            "BIG",
-            "out",
-        )
-        .unwrap_err();
+    fn a_budget_exhaustion_verdict_propagates_with_a_user_facing_message() {
+        let err = TransduceCommandError::Transduce(TransduceError::Exploded(
+            wr_core::transducer::TransduceLimit::MapSteps,
+        ));
+        let text = err.to_string();
+        assert!(text.contains("resource budget"), "{text}");
         assert!(
-            matches!(err, TransduceCommandError::TooBig { input_states, .. } if input_states == n)
+            !text.contains("::") && !text.contains("docs"),
+            "user-facing text must not cite Rust modules or doc comments: {text}"
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -547,8 +584,14 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// A missing transducer file must print Java's `WalnutException.fileDoesNotExist`
+    /// text (`"File does not exist: " + address`), naming the file — the same message
+    /// `Session::read_library_automaton` already produces for the *input* automaton half
+    /// of this same command. Asserting the message STRING, not just the variant: the
+    /// variant matched fine while the rendering was a raw Rust `Debug` dump
+    /// (`Io(Os { code: 2, ... })`) with no filename in it at all.
     #[test]
-    fn a_missing_transducer_file_is_reported_not_a_panic() {
+    fn a_missing_transducer_file_names_the_file_the_way_every_other_read_path_does() {
         let (session, dir) = temp_session("missing-transducer");
         write_fixture(&dir, "Word Automata Library", "T.txt", THUE_MORSE_MSD_TXT);
 
@@ -562,7 +605,59 @@ mod tests {
             "out",
         )
         .unwrap_err();
-        assert!(matches!(err, TransduceCommandError::ReadTransducer(_)));
+        assert!(matches!(
+            err,
+            TransduceCommandError::ReadTransducer {
+                source: ReadError::Io(_),
+                ..
+            }
+        ));
+        let expected = format!(
+            "File does not exist: {}",
+            dir.join("Transducer Library").join("NOPE.txt").display()
+        );
+        assert_eq!(err.to_string(), expected);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The malformed half of the same convention: the file exists but does not parse, so
+    /// the message is the `MalformedAutomaton`-shaped one, again naming the file. (This
+    /// crate's `ReadError` detail text is still its `Debug` form — that gap is
+    /// `PredicateEnvError::MalformedAutomaton`'s own documented, pre-existing one, shared
+    /// verbatim by both read paths; what this test pins is that the *transducer* path is
+    /// no longer worse than the automaton path.)
+    #[test]
+    fn a_malformed_transducer_file_names_the_file_the_way_every_other_read_path_does() {
+        let (session, dir) = temp_session("malformed-transducer");
+        write_fixture(&dir, "Word Automata Library", "T.txt", THUE_MORSE_MSD_TXT);
+        write_fixture(
+            &dir,
+            "Transducer Library",
+            "EMPTY.txt",
+            "# only a comment\n",
+        );
+
+        let err = transduce_command(
+            &session,
+            "transduce out EMPTY T",
+            &mut Logging::new(),
+            "EMPTY",
+            true,
+            "T",
+            "out",
+        )
+        .unwrap_err();
+        let address = dir.join("Transducer Library").join("EMPTY.txt");
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!("File does not parse: {}", address.display())),
+            "{text}"
+        );
+        assert!(
+            !text.starts_with("Io(") && !text.starts_with("EmptyFile"),
+            "must not be a bare Debug dump of the reader error: {text}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

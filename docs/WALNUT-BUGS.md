@@ -1543,7 +1543,20 @@ bug costs a silent wrong answer somewhere downstream.
   `wb035_partial_automaton_loses_states_whose_output_collides_with_the_marker` (asserts the WRONG
   two-transition result), `partial_automaton_transduces_through_the_dead_state_path` (the
   one-value-different control, asserting the correct three-transition result), and
-  `wb035_shifted_alphabet_panics_where_java_npes` (a `#[should_panic]` at the same point Java NPEs).
+  `wb035_shifted_alphabet_errors_where_java_npes` (the same point Java NPEs).
+
+  **Updated Phase 3b, U26 review (2026-08-15).** The crash half is now a
+  `TransduceError::NoTransducerTransition` carrying Java's own NPE text, not a Rust `panic!` — the
+  `#[should_panic]` test above was flipped to an error assertion (not deleted). Reason: U26's
+  `transduce` command makes this reachable from an ordinary user-supplied `Transducer Library/*.txt`
+  — a **partial** transducer (a state missing a transition on one letter of its own declared
+  alphabet) hits the same `createMap` hole with no shifted alphabet involved at all, and passes the
+  `:276-281` state-`0`-only guard on the way in. Java's NPE is a `RuntimeException` that
+  `Prover.dispatch` catches, prints, and returns to the prompt from; `wr-cli` has no `catch_unwind`
+  anywhere in `read_buffer`/`dispatch`, so a panic would unwind out and kill the session, which is a
+  strictly worse divergence than the error. Same reasoning and same treatment as WB-034/WB-033/WB-013
+  in this very file. The `sigma` twin one line earlier (`Transducer.java:187`'s unboxing NPE) got the
+  same treatment as `TransduceError::NoTransducerOutput`.
 - **Upstream:** not filed. The fix is not one line, which is part of why this is logged rather than
   resolved here. Half (1) is mechanical — encode before use (`richAlphabet.encode(List.of(minOutput))`
   at `:315-316`, matching `:397`) — but that alone is not enough, because the encoded symbol may
