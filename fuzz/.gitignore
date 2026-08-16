@@ -1,0 +1,10 @@
+# cargo-fuzz build output, crash artifacts, and libFuzzer's *working* corpus.
+#
+# The curated seeds live in `seeds/<target>/` and ARE committed, so a clean checkout
+# always starts from the same inputs (see `README.md`). `corpus/<target>/` is where
+# libFuzzer accumulates the thousands of mutated inputs a run discovers — run output,
+# not source, and not reproducible across runs.
+/target
+/artifacts
+/corpus
+/coverage

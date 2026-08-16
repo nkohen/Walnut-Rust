@@ -1,0 +1,43 @@
+[package]
+name = "wr-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Own workspace root: `fuzz/` is deliberately NOT a member of the repo's root workspace
+# (it is in that workspace's `exclude` list) so it neither has to satisfy the root's
+# stable toolchain pin -- `cargo-fuzz` needs nightly, see `rust-toolchain.toml` -- nor
+# gets swept into `cargo test --workspace` / `cargo clippy --workspace`. It therefore
+# needs its own `fmt`/`clippy` gate; see `README.md`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wr-core = { path = "../crates/wr-core" }
+wr-io = { path = "../crates/wr-io" }
+wr-logic = { path = "../crates/wr-logic" }
+
+[[bin]]
+name = "wr_io_reader"
+path = "fuzz_targets/wr_io_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wr_logic_parser"
+path = "fuzz_targets/wr_logic_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wr_core_regex"
+path = "fuzz_targets/wr_core_regex.rs"
+test = false
+doc = false
+bench = false

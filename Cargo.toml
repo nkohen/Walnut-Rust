@@ -15,6 +15,11 @@ members = [
     "tests/golden",       # Tier 1: replay of Walnut's own recorded integration-test corpus (U27)
     "tests/differential-gen", # Tier 3 at scale: generated queries vs a long-lived walnut-java JVM oracle (U29)
 ]
+# Tier 5 (U30). `fuzz/` is its own workspace with its own NIGHTLY toolchain pin
+# (`fuzz/rust-toolchain.toml`) -- `cargo-fuzz` needs `-Z sanitizer` -- so it must stay out
+# of this stable-pinned workspace, and out of `cargo test --workspace` / `cargo clippy
+# --workspace`. It gets its own fmt/clippy/build gate; see `fuzz/README.md`.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.0"

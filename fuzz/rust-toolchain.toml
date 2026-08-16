@@ -1,0 +1,8 @@
+# `cargo-fuzz` needs nightly (`-Z sanitizer`, `-C passes=sanitizer-coverage-*`), but the
+# repo root pins stable (`../rust-toolchain.toml`) and toolchain files resolve by walking
+# UP from cwd — so this directory needs its own pin, or every `cargo fuzz` invocation
+# inside it would pick up the stable pin and fail. Dated, not bare `nightly`, for the same
+# reproducibility reason the root pin is dated. Bump deliberately.
+[toolchain]
+channel = "nightly-2026-05-01"
+components = ["rustfmt", "clippy", "rust-src"]
