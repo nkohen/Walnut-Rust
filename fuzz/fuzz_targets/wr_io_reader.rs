@@ -14,6 +14,30 @@
 //! Both entry points are driven from the same input, since the two grammars share
 //! `parse_header` and differ only in the body (`0 -> 1` vs `0 -> 1 / 0`), so one corpus
 //! genuinely exercises both.
+//!
+//! # Why the target does not stop at the read (review round 2)
+//!
+//! It used to. That is why 6M+ clean executions missed both of the defects the adversarial
+//! review of the first fix round found: a successfully-read automaton can carry a
+//! transition under the bogus key `-1` (Java's `List.indexOf` semantics, WB-038,
+//! faithfully reproduced by `Automaton::encode_index_of`), and **nothing the reader itself
+//! does ever touches that key again** — the panics live one step downstream, in whatever
+//! consumes the automaton. So each successful read is now followed by a small, bounded
+//! set of downstream steps that a real command would perform on a freshly loaded library
+//! automaton:
+//!
+//! * `write_txt`/`write_gv` into a `Vec<u8>` — `AutomatonWriter`'s two `decode` call
+//!   sites, the ones that used to fabricate a digit tuple for the `-1` key and write out
+//!   a wrong automaton (silently — strictly worse than a crash);
+//! * `determinize_and_minimize` — the load-time path for a nondeterministic file, and the
+//!   shared prefix of nearly every command;
+//! * a `sort_label` + self-`cross_product` pair — `product.rs`'s raw `[sym as usize]`
+//!   indexing, which is what `union`/`intersect`/`join` reach.
+//!
+//! Everything here still tests **crash-freedom only**, and every step stays inside the
+//! same "generate SMALL" budget as the read itself (see [`MAX_INPUT_LEN`]) — the state
+//! cap below is what keeps the two superexponential steps from turning a fuzz run into a
+//! cost measurement.
 
 #![no_main]
 
@@ -96,6 +120,105 @@ fuzz_target!(|data: &[u8]| {
     // No custom-base resolver: resolving one means real file I/O, which a fuzz target
     // must not do. A custom-base header still reaches `parse_header` and comes back as
     // `ReadError::UnsupportedNumeration` — the header parse itself is what is under test.
-    let _ = wr_io::reader::read_automaton_from_str(content);
+    let read = wr_io::reader::read_automaton_from_str(content);
     let _ = wr_io::reader::read_transducer_from_str(content);
+
+    if let Ok(automaton) = read {
+        // A file with an out-of-alphabet body digit loads with a transition stored under
+        // an INVALID key (Java's `List.indexOf` -> `-1`, WB-038, faithfully ported). Every
+        // `wr-core` primitive then raises the same unchecked exception real Walnut raises
+        // on it — by design, and reported at `wr_cli::prover`'s `Prover::caught` boundary
+        // exactly as `Prover.readBuffer`'s `catch (RuntimeException)` reports Java's. That
+        // is a *ported behavior*, not a crash-freedom violation, so those inputs run the
+        // downstream steps behind the same boundary the shipped binary has (and would
+        // otherwise re-report the known class within seconds, discovering nothing else).
+        //
+        // A well-formed automaton gets the steps RAW: there, a panic is a real finding.
+        if has_invalid_transition_key(&automaton) {
+            let _ = wr_core::walnut_panic::catch_walnut_panic(|| exercise_downstream(automaton));
+        } else {
+            exercise_downstream(automaton);
+        }
+    }
 });
+
+/// Whether any transition key is outside `0..alphabet_size` — i.e. whether this automaton
+/// carries WB-038's bogus key. See the call site for why that changes how it is exercised.
+fn has_invalid_transition_key(automaton: &wr_core::automaton::Automaton) -> bool {
+    let size = automaton.fa.alphabet_size;
+    automaton
+        .fa
+        .d
+        .iter()
+        .flat_map(|row| row.keys())
+        .any(|&sym| sym < 0 || sym as usize >= size)
+}
+
+/// Peak state count a fuzzed automaton may reach before the downstream steps are skipped.
+///
+/// `determinize_and_minimize` (subset construction) and `cross_product` are both
+/// worst-case exponential *by construction*; a fuzzer that finds a blow-up has found
+/// textbook algorithmic cost, not a defect, and every second spent on it is a second not
+/// spent on reachable panics. The read itself is already bounded by [`MAX_INPUT_LEN`] and
+/// [`MAX_HEADER_LEN`], so this only has to bound the product of the two steps below.
+const MAX_STATES_FOR_DOWNSTREAM: usize = 24;
+
+/// Ceiling on `alphabet_size` before the **cross-product** step is skipped — a budget
+/// filter, exactly like [`MAX_HEADER_LEN`], and needed for the same reason at a different
+/// exponent.
+///
+/// `create_basic_automaton` builds the product alphabet, whose size is the **product** of
+/// the two operands' — so crossing an automaton with itself is quadratic in
+/// `alphabet_size`, and the header budget (which bounds each base below 100 and the track
+/// count around 7) is not tight enough on its own: the committed-seed-sized header
+/// `msd_92 msd_4 msd_55` is `alphabet_size = 20_240`, i.e. a 410-million-entry product
+/// alphabet, which libFuzzer reports as a 33-second timeout. Textbook algorithmic cost,
+/// identical in real Walnut, and it would stall every run at seed-replay time.
+///
+/// 64 keeps the product at <= 4_096 symbols, which comfortably covers every real fixture
+/// (base-2/3/4 automata of 1-4 tracks) while making the step effectively free.
+const MAX_ALPHABET_SIZE_FOR_PRODUCT: usize = 64;
+
+/// The downstream steps described in this module's docs, on a successfully-read automaton.
+///
+/// Deliberately *not* driven through `wr-cli`'s `Prover`: that layer catches panics on
+/// purpose (`Prover::caught`, the port of `Prover.readBuffer`'s `catch (RuntimeException)`),
+/// and a target that ran everything behind it could no longer tell a recovered guard from a
+/// genuine defect. These call the `wr-core`/`wr-io` primitives directly; the caller decides
+/// whether a given input is allowed to reach a ported guard (see `has_invalid_transition_key`).
+fn exercise_downstream(mut automaton: wr_core::automaton::Automaton) {
+    if automaton.fa.q > MAX_STATES_FOR_DOWNSTREAM {
+        return;
+    }
+    // The two `AutomatonWriter` paths, into memory (a fuzz target does no file I/O).
+    let mut txt = Vec::new();
+    let _ = wr_io::writer::write_txt(&mut automaton.clone(), &mut txt);
+    let mut gv = Vec::new();
+    let _ = wr_io::writer::write_gv(&mut automaton.clone(), &mut gv, "fuzz", false);
+
+    // `union`/`intersect`/`join`'s shared prefix: a bound automaton crossed with itself.
+    // `sort_label` is what those commands run first, and is itself an `encode`/`decode`
+    // round trip over the whole alphabet.
+    //
+    // The TRUE/FALSE automaton (a file whose whole body is `true`/`false` — 13% of the
+    // Tier-1 corpus) is excluded from THIS step only, not from the writer/determinize
+    // ones above and below. `cross_product`'s first line is a deliberately-ported Java
+    // guard (`ProductStrategies`' "the automata for this method cannot be true or false
+    // automata", a `WalnutException`), and every real caller checks
+    // `isTRUE_FALSE_AUTOMATON` before reaching it — so calling it here would be the
+    // harness violating a documented precondition, not a finding. (It is also, precisely,
+    // the kind of skip that must be justified rather than quietly added: see this file's
+    // "known-crash bypass" rules in `README.md`. This is not one of those — the guard is
+    // correct and the input is not a bug.)
+    if !automaton.fa.is_true_false_automaton()
+        && automaton.fa.alphabet_size <= MAX_ALPHABET_SIZE_FOR_PRODUCT
+    {
+        let mut crossed = automaton.clone();
+        crossed.sort_label();
+        let op = wr_core::product::BooleanOp::And;
+        let _ = wr_core::product::cross_product(&crossed, &crossed, |a, b| op.combine(a, b));
+    }
+
+    // The load-time determinize path (and nearly every command's closing step).
+    automaton.determinize_and_minimize();
+}

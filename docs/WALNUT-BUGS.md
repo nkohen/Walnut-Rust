@@ -1897,15 +1897,24 @@ bug costs a silent wrong answer somewhere downstream.
   trace, after the truncated REPL trace pointed at the wrong frame.
 - **Rust port:** `ported verbatim (quirk)`. `Automaton::encode_index_of` reproduces the `-1` key,
   used by both the automaton and transducer readers; `Automaton::encode`'s panic is retained for
-  callers whose digits come from an alphabet this crate itself built (not raw file input). One
-  knock-on difference is *not* replicated: `Automaton::decode` uses `rem_euclid`/`div_euclid`
-  where Java uses truncating `%`/`/`, so `decode(-1)` returns a digit here where Java throws —
-  meaning outcome (c) above yields a written-but-wrong automaton on this port rather than Java's
-  exception. This is a **pre-existing, separate** divergence (not introduced by this fix), flagged
-  in `RESUME-HERE.md` as a candidate follow-up unit (closing it either means adding a Java-matching
-  bounds check that turns this port's silent corruption into a clean error — a deliberate
-  improvement over Java, since Java's own behavior here is undesirable even on its own terms — or
-  explicitly deciding to leave it, but either way it needs its own scoped unit, not a fold-in).
+  callers whose digits come from an alphabet this crate itself built (not raw file input). The
+  aliasing sub-case — where the `-1` terms cancel against the other tracks' and land on a *valid*
+  key, so the file silently means a different tuple than it spells (`5 1 -> 0` under `msd_2 msd_2`
+  is read as `1 0 -> 0`; confirmed live) — is reproduced digit-for-digit and pinned by
+  `wr_io::reader`'s `an_out_of_alphabet_digit_can_alias_onto_a_valid_key_exactly_as_java_does`.
+  **Outcome (c) is now ported too, closing what an earlier version of this entry recorded as an
+  open, separately-scoped divergence:** `Automaton::decode` used `rem_euclid`/`div_euclid` where
+  Java uses truncating `%`/`/`, so `decode(-1)` returned *some* digit where Java throws, and this
+  port silently wrote out a fabricated automaton where Java errors and writes nothing — silent
+  wrong math, i.e. worse than the Java bug it was standing in for. As of Phase 4 U30's second
+  review round it is Java's arithmetic exactly: `Automaton::try_decode` returns
+  `DecodeError::IndexOutOfBounds` carrying the JDK's own `Index -1 out of bounds for length 2`
+  text (verified against the real CLI, which prints precisely that for `combine wrcb wrbad=1;`),
+  and the panicking `Automaton::decode` wrapper is recovered at `wr_cli::prover`'s new
+  dispatch-level boundary (`Prover::caught`) — the port of `Prover.readBuffer`'s
+  `catch (RuntimeException)` — so the command fails and the session lives, as in Java. The one
+  quirk *kept*: Java bounds-checks only the per-track index, never the symbol as a whole, so a
+  symbol `>= alphabetSize` still wraps silently on both engines.
 - **Upstream:** not filed. A per-digit alphabet-membership check in `validateTransition`, alongside
   its existing arity check, would fix it in Java.
 - **Severity:** medium — this is silent wrong output on a plausible input (a hand-edited or

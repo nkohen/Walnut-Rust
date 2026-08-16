@@ -83,13 +83,19 @@
 //!   corresponding Java "nondeterministic DFAO is a hard error" branch does not
 //!   apply — every parsed automaton is a plain predicate automaton.
 //!
-//! # A deliberate grammar simplification
+//! # One grammar, not two (Phase 4, U30 review round 2)
 //!
-//! Java's number regexes (`(\+|\-)?\s*\d+`) tolerate whitespace *between* a sign and
-//! its digits (`"+  5"`). This reader does not — every real Walnut-*emitted* file
-//! (the only files this spike's differential test reads) never inserts such
-//! whitespace, so this is a gap only for hand-written files with unusual spacing, not
-//! for round-tripping real output.
+//! Both readers now tokenize state declarations and transition lines through
+//! [`crate::parse_methods`] — the verbatim ports of `ParseMethods`' own regexes,
+//! including their deferred-`parseInt` discipline. This file used to carry a second,
+//! hand-rolled `split_whitespace` grammar for the *automaton* reader only (the
+//! transducer reader always used `parse_methods`), which was a Phase-1 leftover and
+//! disagreed with Java in both directions: it accepted a `+`-signed state id Java's
+//! `\d+` rejects, rejected the sign/digit spacing (`"0 + 1"`) Java's `(\+|\-)?\s*\d+`
+//! accepts, and — the reason it was found — silently dropped an `i32`-overflowing state
+//! or destination id into the wrong error class instead of Java's
+//! `NumberFormatException`, while typing ids as `usize` so a value too large for Java's
+//! `int` "parsed" fine.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -105,32 +111,92 @@ use wr_core::util::is_number;
 
 use crate::parse_methods::{self, ParseMethodsError};
 
+/// Every way reading a `.txt` automaton/transducer can fail.
+///
+/// # Message fidelity
+///
+/// Tier-1 `error*` fixtures compare rendered text, so [`fmt::Display`] reproduces the
+/// real `WalnutException` message **verbatim** wherever this reader's failure corresponds
+/// to a Java throw site whose inputs it actually has (the whole per-line family below,
+/// plus the delegating [`Self::NumSys`]/[`Self::ParseMethods`]/[`Self::Io`] arms). Until
+/// this round the impl was a blanket `write!(f, "{self:?}")` — a Debug dump — so a user
+/// reading a library file headed `msd_1` was shown `NumSys(NotDefined("msd_1"))` instead
+/// of `Number system msd_1 is not defined.`.
+///
+/// **Still port-specific text, deliberately** (each has no Java counterpart with the
+/// information needed, and closing it means porting more than this file):
+/// [`Self::MalformedHeader`] (Java's `WalnutException.undefinedStatement(lineNumber,
+/// address)`, thrown from `firstParse` — this reader's `parse_header` is handed the
+/// header *text* alone, with neither the line number nor the address in scope),
+/// [`Self::UnsupportedNumeration`] (renders `NumberSystem`'s real "is not defined."
+/// text, which is what Java answers for the `msd_fib`-without-a-resolver case this
+/// variant is normally raised for — but NOT for a name with no `_` at all, e.g. `msd5`,
+/// where Java instead throws `StringIndexOutOfBoundsException` from
+/// `determineMsdOrLsd`), [`Self::NoStates`]/[`Self::NonDenseStateIds`]
+/// (shapes real Walnut has no check for at all — it fails later with a
+/// `NullPointerException`/`IndexOutOfBoundsException`, see this module's docs) and
+/// [`Self::CustomBaseCycle`] (a guard this port added; Java stack-overflows).
+///
+/// One layer above, `wr_cli::session::read_library_automaton` still wraps whatever this
+/// renders in `PredicateEnvError::MalformedAutomaton`'s `"File does not parse: {address}
+/// ({detail})"`, which Java does not do — a separate, already-documented gap on that
+/// type, not this one.
 #[derive(Debug)]
 pub enum ReadError {
     Io(std::io::Error),
-    /// The file contained nothing but comments/whitespace.
-    EmptyFile,
+    /// `WalnutException.fileEmpty` (`WalnutException.java:52-54`), thrown from
+    /// `AutomatonReader.firstParse`'s `if (!sawHeader)` (`:176-178`): the file contained
+    /// nothing but comments/whitespace.
+    EmptyFile {
+        address: String,
+    },
     /// A `true`/`false` trivial file had further non-comment, non-blank content after
     /// the truth-value line. Ports `WalnutException.fileHasConflict`, thrown from
-    /// `AutomatonReader.firstParse` (`:146-151`); the payload is the 1-based line
-    /// number of the offending line, as in Java's message.
-    FileHasConflict(usize),
+    /// `AutomatonReader.firstParse` (`:146-151`); `line` is the 1-based line number of
+    /// the offending line, as in Java's message.
+    FileHasConflict {
+        line: usize,
+        address: String,
+    },
     /// The header line couldn't be tokenized (unbalanced `{`, non-integer set element).
     MalformedHeader,
     /// A header token isn't `msd_<k>` / `lsd_<k>` / bare `msd` / bare `lsd`.
     UnsupportedNumeration(String),
-    /// A line was neither a state declaration, a transition, blank, nor a comment.
-    UnexpectedLine(usize),
-    /// A transition line appeared before any state was declared.
-    TransitionBeforeState(usize),
-    /// A transition's input arity didn't match the header's track count.
+    /// A line was neither a state declaration, a transition, blank, nor a comment —
+    /// `WalnutException.undefinedStatement` (`WalnutException.java:124-126`), thrown from
+    /// `AutomatonReader.readAutomaton` (`:77`)/`readTransducer` (`:259`).
+    UnexpectedLine {
+        line: usize,
+        address: String,
+    },
+    /// A transition line appeared before any state was declared —
+    /// `AutomatonReader.validateTransition`'s first throw (`:116-120`).
+    TransitionBeforeState {
+        line: usize,
+        address: String,
+    },
+    /// A transition's input arity didn't match the header's track count —
+    /// `AutomatonReader.validateTransition`'s second throw (`:123-125`). `got` is kept
+    /// for programmatic inspection but is deliberately NOT printed: Java's message names
+    /// only the required arity.
     ArityMismatch {
         line: usize,
         expected: usize,
         got: usize,
+        address: String,
     },
-    /// A transition named a destination state with no `<id> <output>` block.
-    UndeclaredDestState(usize),
+    /// A transition named a destination state with no `<id> <output>` block —
+    /// `AutomatonReader.validateDeclaredStates` (`:189-193`). `state` is `i32`, matching
+    /// the `int` Java parses it as (see [`parse_methods::parse_transition`]).
+    ///
+    /// **Newly reachable** as of U30's F2 fix on a file real Walnut accepts: an
+    /// out-of-alphabet body digit is encoded to the bogus key `-1` rather than rejected
+    /// (WB-038), so a file whose only offense is that digit now runs the same
+    /// declared-state validation Java runs, and reports through here.
+    UndeclaredDestState {
+        state: i32,
+        address: String,
+    },
     /// A header line was followed by no state declarations at all (a 0-state `Fa` is
     /// a valid, harmless value everywhere else in this crate — `trim`/`minimize`/
     /// `Fa::is_language_empty` all pass it through — but this reader has no `q0` to
@@ -172,7 +238,76 @@ pub enum ReadError {
 
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            // `AutomatonReader`'s own `catch (IOException e)` turns this into
+            // `WalnutException.fileDoesNotExist`, but only at the CALLER's level
+            // (`wr_cli::session::read_library_automaton` ports exactly that mapping), so
+            // this arm renders the underlying I/O message, as everywhere else in this
+            // workspace.
+            ReadError::Io(e) => write!(f, "{e}"),
+            // Verbatim `WalnutException.java:53`.
+            ReadError::EmptyFile { address } => write!(
+                f,
+                "File is empty or contains only comments/whitespace: {address}"
+            ),
+            // Verbatim `WalnutException.java:56-57`.
+            ReadError::FileHasConflict { line, address } => write!(
+                f,
+                "A file that declares 'true'/'false' must not contain other statements: \
+                 line {line} of file {address}"
+            ),
+            // Port-specific (see this type's docs): Java's `undefinedStatement` needs the
+            // line number and address, neither of which `parse_header` is given.
+            ReadError::MalformedHeader => write!(f, "Malformed alphabet declaration."),
+            ReadError::UnsupportedNumeration(name) => {
+                write!(f, "Number system {name} is not defined.")
+            }
+            // Verbatim `WalnutException.java:125`.
+            ReadError::UnexpectedLine { line, address } => {
+                write!(f, "Undefined statement: line at {line} of file {address}")
+            }
+            // Verbatim `AutomatonReader.java:118-120`.
+            ReadError::TransitionBeforeState { line, address } => write!(
+                f,
+                "Must declare a state before declaring a list of transitions: \
+                 line {line} of file {address}"
+            ),
+            // Verbatim `AutomatonReader.java:124-125`.
+            ReadError::ArityMismatch {
+                line,
+                expected,
+                got: _,
+                address,
+            } => write!(
+                f,
+                "This automaton requires a {expected}-tuple as input: line {line} of file {address}"
+            ),
+            // Verbatim `AutomatonReader.java:191`.
+            ReadError::UndeclaredDestState { state, address } => write!(
+                f,
+                "State {state} is used but never declared anywhere in file: {address}"
+            ),
+            // Port-specific (see this type's docs); Java has no check for either shape.
+            ReadError::NoStates => write!(f, "The automaton declares no states."),
+            ReadError::NonDenseStateIds => {
+                write!(f, "The declared state ids must be exactly 0..Q.")
+            }
+            // `MinimizeError` has no `Display` (it is this port's own
+            // internal-invariant surface, not a Java throw site); Debug is what there is
+            // to show, and it is named as such rather than pretending otherwise.
+            ReadError::Minimize(e) => write!(f, "Minimization failed: {e:?}"),
+            // `NumSysError`/`ParseMethodsError` already render Walnut's verbatim text
+            // (`Number system msd_1 is not defined.`, `For input string: "…"`), and Java
+            // does not wrap either — the exception thrown inside `NumberSystem`'s
+            // constructor / `UtilityMethods.parseInt` propagates out of the reader
+            // unchanged — so these are plain pass-throughs.
+            ReadError::NumSys(e) => write!(f, "{e}"),
+            ReadError::ParseMethods(e) => write!(f, "{e}"),
+            // Port-specific: this port's own recursion guard (Java stack-overflows).
+            ReadError::CustomBaseCycle(name) => {
+                write!(f, "Custom base {name} is defined in terms of itself.",)
+            }
+        }
     }
 }
 
@@ -329,16 +464,18 @@ pub fn read_automaton_txt_with_custom_base_resolver<P: AsRef<Path>>(
 /// instead of off disk.
 ///
 /// Byte-for-byte the same parser: [`read_automaton_txt`] is `std::fs::read_to_string` +
-/// this function, nothing else. It exists because a caller that already *has* the text
-/// (a fuzz harness, an in-memory test, anything driving the reader from a buffer) would
-/// otherwise be forced through a temp file per call — pure overhead for no behavioral
+/// this function, and the only observable difference is that a [`ReadError`] message names
+/// [`STRING_ADDRESS`] where the file entry point names the real path. It exists because a
+/// caller that already *has* the text (a fuzz harness, an in-memory test, anything driving
+/// the reader from a buffer) would otherwise be forced through a temp file per call — pure
+/// overhead for no behavioral
 /// difference.
 ///
 /// Custom-base headers (`msd_fib`, …) are [`ReadError::UnsupportedNumeration`] here, the
 /// same as in [`read_automaton_txt`] — resolving them needs a file resolver, so use
 /// [`read_automaton_from_str_with_custom_base_resolver`] for that.
 pub fn read_automaton_from_str(content: &str) -> Result<Automaton, ReadError> {
-    read_automaton_str_impl(content, None, &mut BTreeSet::new())
+    read_automaton_str_impl(content, STRING_ADDRESS, None, &mut BTreeSet::new())
 }
 
 /// [`read_automaton_from_str`] with [`read_automaton_txt_with_custom_base_resolver`]'s
@@ -348,7 +485,12 @@ pub fn read_automaton_from_str_with_custom_base_resolver(
     content: &str,
     resolver: &dyn CustomBaseResolver,
 ) -> Result<Automaton, ReadError> {
-    read_automaton_str_impl(content, Some(resolver), &mut BTreeSet::new())
+    read_automaton_str_impl(
+        content,
+        STRING_ADDRESS,
+        Some(resolver),
+        &mut BTreeSet::new(),
+    )
 }
 
 fn read_automaton_txt_impl(
@@ -357,11 +499,23 @@ fn read_automaton_txt_impl(
     in_progress: &mut BTreeSet<String>,
 ) -> Result<Automaton, ReadError> {
     let content = std::fs::read_to_string(path)?;
-    read_automaton_str_impl(&content, custom_bases, in_progress)
+    read_automaton_str_impl(
+        &content,
+        &path.display().to_string(),
+        custom_bases,
+        in_progress,
+    )
 }
+
+/// The `address` every [`ReadError`] message names when the text came from memory rather
+/// than from a file — the string entry points ([`read_automaton_from_str`],
+/// [`read_transducer_from_str`]) have no Java counterpart at all (Java's reader always
+/// takes a path), so there is no real address to report and no Java text to match.
+const STRING_ADDRESS: &str = "<string>";
 
 fn read_automaton_str_impl(
     content: &str,
+    address: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<Automaton, ReadError> {
@@ -369,7 +523,9 @@ fn read_automaton_str_impl(
     let (_, header_line) = lines
         .by_ref()
         .find(|(_, l)| !should_skip(l))
-        .ok_or(ReadError::EmptyFile)?;
+        .ok_or_else(|| ReadError::EmptyFile {
+            address: address.to_string(),
+        })?;
 
     // `AutomatonReader.firstParse`'s trivial branch (`:141-153`): the `true`/`false`
     // test runs BEFORE the alphabet-declaration parse, and once it matches nothing but
@@ -377,7 +533,10 @@ fn read_automaton_str_impl(
     if let Some(truth) = parse_true_false(header_line) {
         for (i, raw_line) in lines {
             if !should_skip(raw_line) {
-                return Err(ReadError::FileHasConflict(i + 1));
+                return Err(ReadError::FileHasConflict {
+                    line: i + 1,
+                    address: address.to_string(),
+                });
             }
         }
         // Java's result additionally carries `alphabetSize == 1` here, from the
@@ -427,7 +586,9 @@ fn read_automaton_str_impl(
     let mut transitions: BTreeMap<usize, BTreeMap<i32, Vec<usize>>> = BTreeMap::new();
     let mut declaration_order: Vec<usize> = Vec::new();
     let mut current_state: Option<usize> = None;
-    let mut dest_states_used: BTreeSet<usize> = BTreeSet::new();
+    // `i32`, matching the `int` Java parses a destination id as — see the
+    // `parse_methods` delegation below.
+    let mut dest_states_used: BTreeSet<i32> = BTreeSet::new();
 
     for (i, raw_line) in lines {
         let lineno = i + 1;
@@ -435,18 +596,33 @@ fn read_automaton_str_impl(
             continue;
         }
 
-        if let Some((id, out)) = try_parse_state_decl(raw_line) {
+        // `ParseMethods.parseStateDeclaration` / `parseTransition`, i.e. the SAME two
+        // ports the transducer reader already used. Until this round the automaton
+        // reader had its own hand-rolled `split_whitespace` copies instead, which (a)
+        // swallowed an i32-overflowing state/dest id with `.parse().ok()?` and fell
+        // through to the wrong error class (`UnexpectedLine`/`UndeclaredDestState`)
+        // where Java raises `NumberFormatException`, (b) parsed ids as `usize`, so an id
+        // too large for Java's `int` "succeeded" instead of throwing, and (c) diverged on
+        // Java's own grammar in both directions (it accepted a `+`-signed id Java's
+        // `\d+` rejects, and rejected the `0 + 1`/`0 - 1` spacing Java's
+        // `(\+|\-)?\s*\d+` accepts). One shared port, no second grammar.
+        if let Some((id, out)) = parse_methods::parse_state_declaration(raw_line)? {
+            let id = id as usize; // `\d+`: never negative
             output.insert(id, out);
             transitions.entry(id).or_default();
             declaration_order.push(id);
             current_state = Some(id);
-        } else if let Some((input_tokens, dests)) = try_parse_transition(raw_line) {
-            let cur = current_state.ok_or(ReadError::TransitionBeforeState(lineno))?;
+        } else if let Some((input_tokens, dests)) = parse_methods::parse_transition(raw_line)? {
+            let cur = current_state.ok_or_else(|| ReadError::TransitionBeforeState {
+                line: lineno,
+                address: address.to_string(),
+            })?;
             if input_tokens.len() != num_tracks {
                 return Err(ReadError::ArityMismatch {
                     line: lineno,
                     expected: num_tracks,
                     got: input_tokens.len(),
+                    address: address.to_string(),
                 });
             }
             dest_states_used.extend(dests.iter().copied());
@@ -469,16 +645,22 @@ fn read_automaton_str_impl(
                     .expect("current_state always has a transitions entry")
                     .entry(sym)
                     .or_default()
-                    .extend(dests.iter().copied());
+                    .extend(dests.iter().map(|&d| d as usize));
             }
         } else {
-            return Err(ReadError::UnexpectedLine(lineno));
+            return Err(ReadError::UnexpectedLine {
+                line: lineno,
+                address: address.to_string(),
+            });
         }
     }
 
     for &d in &dest_states_used {
-        if !output.contains_key(&d) {
-            return Err(ReadError::UndeclaredDestState(d));
+        if !output.contains_key(&(d as usize)) {
+            return Err(ReadError::UndeclaredDestState {
+                state: d,
+                address: address.to_string(),
+            });
         }
     }
 
@@ -907,46 +1089,6 @@ fn probe_custom_base_candidate(
     Ok(CustomBaseCandidates { main, complement })
 }
 
-/// `<id> <output>`, both integers, output optionally signed, nothing else on the
-/// line — `ParseMethods.PATTERN_FOR_STATE_DECLARATION`.
-fn try_parse_state_decl(line: &str) -> Option<(usize, i32)> {
-    let mut parts = line.split_whitespace();
-    let id_tok = parts.next()?;
-    let out_tok = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    let id: usize = id_tok.parse().ok()?;
-    let out: i32 = out_tok.parse().ok()?;
-    Some((id, out))
-}
-
-/// `<sym-or-*> ... -> <dest> ...` — `ParseMethods.PATTERN_FOR_TRANSITION`.
-fn try_parse_transition(line: &str) -> Option<(Vec<Option<i32>>, Vec<usize>)> {
-    let (lhs, rhs) = line.trim().split_once("->")?;
-    let lhs = lhs.trim();
-    let rhs = rhs.trim();
-    if lhs.is_empty() || rhs.is_empty() {
-        return None;
-    }
-    let mut input = Vec::new();
-    for tok in lhs.split_whitespace() {
-        if tok == "*" {
-            input.push(None);
-        } else {
-            input.push(Some(tok.parse::<i32>().ok()?));
-        }
-    }
-    let mut dest = Vec::new();
-    for tok in rhs.split_whitespace() {
-        dest.push(tok.parse::<usize>().ok()?);
-    }
-    if dest.is_empty() {
-        return None;
-    }
-    Some((input, dest))
-}
-
 /// `RichAlphabet.expandWildcard`: cross-product-expands every `None` (`*`) position
 /// against its own track's alphabet, one wildcard position at a time.
 fn expand_wildcards(input: &[Option<i32>], alphabet: &[Vec<i32>]) -> Vec<Vec<i32>> {
@@ -1018,8 +1160,9 @@ pub struct TransducerData {
 /// custom-base-free default; a future caller that needs one can extend this the same way
 /// [`read_automaton_txt_with_custom_bases`] extends the automaton reader.
 pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, ReadError> {
+    let path = path.as_ref();
     let content = std::fs::read_to_string(path)?;
-    read_transducer_from_str(&content)
+    read_transducer_str_impl(&content, &path.display().to_string())
 }
 
 /// [`read_transducer_txt`]'s parse, reading the transducer grammar out of an in-memory
@@ -1028,11 +1171,20 @@ pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, Re
 /// `std::fs::read_to_string`. Same motivation: a caller that already holds the text
 /// should not have to round-trip it through a temp file.
 pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadError> {
+    read_transducer_str_impl(content, STRING_ADDRESS)
+}
+
+/// [`read_transducer_from_str`]'s body, with the `address` every [`ReadError`] message
+/// names threaded in (a real path from [`read_transducer_txt`], [`STRING_ADDRESS`] from
+/// the in-memory entry point).
+fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerData, ReadError> {
     let mut lines = content.lines().enumerate();
     let (_, header_line) = lines
         .by_ref()
         .find(|(_, l)| !should_skip(l))
-        .ok_or(ReadError::EmptyFile)?;
+        .ok_or_else(|| ReadError::EmptyFile {
+            address: address.to_string(),
+        })?;
 
     let trimmed_header = header_line.trim();
     // The NS names go unused here: a transducer's own header names never reach an
@@ -1065,7 +1217,8 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
     let mut sigma: BTreeMap<usize, BTreeMap<i32, i32>> = BTreeMap::new();
     let mut declaration_order: Vec<usize> = Vec::new();
     let mut current_state: Option<usize> = None;
-    let mut dest_states_used: BTreeSet<usize> = BTreeSet::new();
+    // `i32`, matching the `int` Java parses a destination id as.
+    let mut dest_states_used: BTreeSet<i32> = BTreeSet::new();
 
     for (i, raw_line) in lines {
         let lineno = i + 1;
@@ -1080,12 +1233,16 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
             declaration_order.push(id);
             current_state = Some(id);
         } else if let Some(t) = parse_methods::parse_transducer_transition(raw_line)? {
-            let cur = current_state.ok_or(ReadError::TransitionBeforeState(lineno))?;
+            let cur = current_state.ok_or_else(|| ReadError::TransitionBeforeState {
+                line: lineno,
+                address: address.to_string(),
+            })?;
             if t.input.len() != num_tracks {
                 return Err(ReadError::ArityMismatch {
                     line: lineno,
                     expected: num_tracks,
                     got: t.input.len(),
+                    address: address.to_string(),
                 });
             }
             // `parseTransducerTransition`'s output group always yields exactly one
@@ -1095,7 +1252,7 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
             debug_assert_eq!(t.output.len(), 1);
             let output = t.output[0];
             let dest: Vec<usize> = t.dest.iter().map(|&x| x as usize).collect();
-            dest_states_used.extend(dest.iter().copied());
+            dest_states_used.extend(t.dest.iter().copied());
             for digits in expand_wildcards(&t.input, &alphabet) {
                 // Same untrusted-input reasoning as the automaton reader above;
                 // `readTransducer` (`AutomatonReader.java:245-247`) encodes with the very
@@ -1122,13 +1279,19 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
                     .insert(sym, output);
             }
         } else {
-            return Err(ReadError::UnexpectedLine(lineno));
+            return Err(ReadError::UnexpectedLine {
+                line: lineno,
+                address: address.to_string(),
+            });
         }
     }
 
     for &dst in &dest_states_used {
-        if !d.contains_key(&dst) {
-            return Err(ReadError::UndeclaredDestState(dst));
+        if !d.contains_key(&(dst as usize)) {
+            return Err(ReadError::UndeclaredDestState {
+                state: dst,
+                address: address.to_string(),
+            });
         }
     }
 
@@ -1306,10 +1469,16 @@ mod tests {
     #[test]
     fn an_out_of_alphabet_digit_with_an_undeclared_dest_reports_the_undeclared_state() {
         let e = read_automaton_from_str(" lsd_2\n0 1\n20-> 11").expect_err("undeclared state");
-        assert!(matches!(e, ReadError::UndeclaredDestState(11)), "{e:?}");
+        assert!(
+            matches!(e, ReadError::UndeclaredDestState { state: 11, .. }),
+            "{e:?}"
+        );
         // A negative digit reaches the same place (`-1 1 -> 0` under `msd_2`).
         let e = read_automaton_from_str("msd_2\n0 1\n-1 -> 9").expect_err("undeclared state");
-        assert!(matches!(e, ReadError::UndeclaredDestState(9)), "{e:?}");
+        assert!(
+            matches!(e, ReadError::UndeclaredDestState { state: 9, .. }),
+            "{e:?}"
+        );
     }
 
     /// F2, sub-case B. Same shape but with a DECLARED destination. Real `walnut-java`
@@ -1356,6 +1525,39 @@ mod tests {
         assert_eq!(a.fa.d[1].get(&-1), Some(&vec![1usize]));
     }
 
+    /// F2, sub-case C — the **aliasing** case, and the reason `encode_index_of` is a
+    /// faithfulness point rather than merely a crash-avoidance one.
+    ///
+    /// With more than one track, `RichAlphabet.encode`'s `-1` terms can cancel against
+    /// the other tracks' real terms and land on a **valid** key: under `msd_2 msd_2`
+    /// (`encoder = [1, 2]`), the line `5 1 -> 0` encodes to `1*(-1) + 2*1 == 1`, i.e.
+    /// exactly the key the legitimate input `1 0` would have. Real Walnut therefore reads
+    /// this file as an automaton that accepts `(1, 0)` — silently, with no diagnostic and
+    /// no crash to give it away (WB-038's outcome (b)). This port must agree digit for
+    /// digit, so the test asserts the ALIASED language, not the file's apparent one.
+    ///
+    /// It is pinned precisely because it is intentional and easy to "fix" by accident: an
+    /// out-of-alphabet check anywhere in this path would reject a file Java accepts, and
+    /// clamping the index would change which valid key it aliases onto.
+    ///
+    /// **Confirmed live** against `walnut-java/target/Walnut-all.jar` (2026-08-16): this
+    /// exact file, evaluated as `eval wralias1 "?msd_2 $wralias(x,y)";`, loads with no
+    /// diagnostic and writes a result whose only non-zero-input transition is `1 0 -> 0`
+    /// — the aliased tuple, never the `5 1` the file spells.
+    #[test]
+    fn an_out_of_alphabet_digit_can_alias_onto_a_valid_key_exactly_as_java_does() {
+        let a = read_automaton_from_str("msd_2 msd_2\n0 1\n5 1 -> 0\n").expect("Java loads this");
+        assert_eq!(a.fa.q, 1);
+        // The bogus digit tuple is stored under the VALID key 1, not under a negative
+        // one -- so unlike the single-track case it survives every later pass.
+        assert_eq!(a.fa.d[0].get(&1), Some(&vec![0usize]));
+        assert_eq!(a.encode_index_of(&[5, 1]), 1);
+        assert_eq!(a.encode(&[1, 0]), 1);
+        // Which means the automaton's language is over `(1, 0)`, NOT over the `(5, 1)`
+        // the file appears to declare.
+        assert_eq!(a.decode(1), vec![1, 0]);
+    }
+
     /// F3. Java's `NumberSystem` constructor rejects a base `<= 1` outright
     /// (`:322-332`): a library file headed `msd_1` answers `Number system msd_1 is not
     /// defined.` on the real CLI, and the session continues. This reader used to build
@@ -1367,11 +1569,17 @@ mod tests {
             let e = parse_header(header, None, &mut BTreeSet::new()).expect_err("base <= 1");
             match e {
                 ReadError::NumSys(NumSysError::NotDefined(ref n)) => assert_eq!(n, name),
-                other => panic!("{other:?}"),
+                ref other => panic!("{other:?}"),
             }
+            // The MESSAGE the user actually sees, asserted on the error `parse_header`
+            // really returned. (An earlier version of this assertion built its own
+            // `ReadError` value and compared that to a `Debug`-shaped string it also
+            // constructed — tautological twice over: it could not fail whatever
+            // `parse_header` returned, and it pinned the Debug dump this type's
+            // `Display` used to emit instead of Walnut's real text.)
             assert_eq!(
-                ReadError::NumSys(NumSysError::NotDefined(name.to_string())).to_string(),
-                format!("NumSys(NotDefined({name:?}))")
+                e.to_string(),
+                format!("Number system {name} is not defined.")
             );
         }
         // Reached through the whole-file entry point too, not just `parse_header`.
@@ -1406,9 +1614,134 @@ mod tests {
                 ReadError::ParseMethods(ref p) => {
                     assert_eq!(p.to_string(), "For input string: \"99999999999\"")
                 }
-                other => panic!("{other:?}"),
+                ref other => panic!("{other:?}"),
             }
+            // The wrapper renders the same text: Java does not wrap a
+            // `NumberFormatException` from `parseInt` either.
+            assert_eq!(e.to_string(), "For input string: \"99999999999\"");
         }
+    }
+
+    /// F1's class at the fifth site, the one the first fix round missed: the ORDINARY
+    /// automaton reader's own state-declaration/transition parsing. It used to be a
+    /// second, hand-rolled grammar in this file whose `.parse().ok()?` silently turned an
+    /// `i32`-overflowing digit run into "this line is not a state declaration", so the
+    /// read failed as `UnexpectedLine`/`UndeclaredDestState` where Java throws
+    /// `NumberFormatException` from `UtilityMethods.parseInt`. Both readers now share the
+    /// `parse_methods` port, so all four groups report the same way.
+    #[test]
+    fn an_automaton_integer_that_overflows_i32_reports_a_number_format_error() {
+        for content in [
+            "msd_2\n99999999999 0\n0 -> 0\n",   // state id
+            "msd_2\n0 99999999999\n0 -> 0\n",   // state output
+            "msd_2\n0 0\n99999999999 -> 0\n",   // transition digit
+            "msd_2\n0 0\n0 -> 99999999999\n",   // destination id
+            "msd_2\n0 0\n0 -> 0 99999999999\n", // second destination id
+        ] {
+            let e = read_automaton_from_str(content).expect_err("overflows i32");
+            assert!(
+                matches!(e, ReadError::ParseMethods(_)),
+                "{content:?} -> {e:?}"
+            );
+            assert_eq!(e.to_string(), "For input string: \"99999999999\"");
+        }
+        // And a digit run that is huge but still a valid `i32` is NOT a parse failure --
+        // it is an ordinary undeclared destination, reported with Java's own text.
+        let e = read_automaton_from_str("msd_2\n0 0\n0 -> 2000000000\n").expect_err("undeclared");
+        assert_eq!(
+            e.to_string(),
+            "State 2000000000 is used but never declared anywhere in file: <string>"
+        );
+    }
+
+    /// The grammar the automaton reader inherited by sharing `parse_methods`: Java's
+    /// `(\+|\-)?\s*\d+` tolerates whitespace between a sign and its digits, and its
+    /// `\d+` state/destination ids do NOT tolerate a sign at all. The deleted
+    /// hand-rolled parser had both backwards.
+    #[test]
+    fn state_and_transition_lines_follow_javas_own_regexes() {
+        // `0 - 1`: a state whose OUTPUT is -1, spelled with a space after the sign.
+        let a = read_automaton_from_str("msd_2\n0 - 1\n0 -> 0\n").expect("Java accepts this");
+        assert_eq!(a.fa.o, vec![-1]);
+        // A `+`-signed state id is not `\d+`, so the line is not a state declaration --
+        // and not a transition either, so it is an undefined statement.
+        let e = read_automaton_from_str("msd_2\n+0 1\n0 -> 0\n").expect_err("not `\\d+`");
+        assert!(
+            matches!(e, ReadError::UnexpectedLine { line: 2, .. }),
+            "{e:?}"
+        );
+        // Likewise a `+`-signed destination id.
+        let e = read_automaton_from_str("msd_2\n0 1\n0 -> +0\n").expect_err("not `\\d+`");
+        assert!(
+            matches!(e, ReadError::UnexpectedLine { line: 3, .. }),
+            "{e:?}"
+        );
+    }
+
+    /// `ReadError`'s `Display` renders Walnut's own message text, not the `Debug` dump it
+    /// emitted before this round (`NumSys(NotDefined("msd_1"))`, …) — the text is what
+    /// Tier-1's `error*` fixtures compare and what the user reads. Each expected string
+    /// below is copied from the cited `walnut-java` throw site.
+    #[test]
+    fn read_errors_render_walnuts_own_message_text() {
+        // `WalnutException.fileEmpty` (`WalnutException.java:53`).
+        assert_eq!(
+            read_automaton_from_str("# nothing but a comment\n")
+                .expect_err("empty")
+                .to_string(),
+            "File is empty or contains only comments/whitespace: <string>"
+        );
+        // `WalnutException.fileHasConflict` (`:56-57`).
+        assert_eq!(
+            read_automaton_from_str("true\n{0, 1}\n")
+                .expect_err("conflict")
+                .to_string(),
+            "A file that declares 'true'/'false' must not contain other statements: \
+             line 2 of file <string>"
+        );
+        // `WalnutException.undefinedStatement` (`:125`).
+        assert_eq!(
+            read_automaton_from_str("msd_2\n0 0\nnonsense\n")
+                .expect_err("undefined statement")
+                .to_string(),
+            "Undefined statement: line at 3 of file <string>"
+        );
+        // `AutomatonReader.validateTransition`'s two throws (`:116-125`).
+        assert_eq!(
+            read_automaton_from_str("msd_2\n0 -> 0\n0 0\n")
+                .expect_err("transition first")
+                .to_string(),
+            "Must declare a state before declaring a list of transitions: \
+             line 2 of file <string>"
+        );
+        assert_eq!(
+            read_automaton_from_str("msd_2 msd_2\n0 0\n0 -> 0\n")
+                .expect_err("arity")
+                .to_string(),
+            "This automaton requires a 2-tuple as input: line 3 of file <string>"
+        );
+        // `AutomatonReader.validateDeclaredStates` (`:191`).
+        assert_eq!(
+            read_automaton_from_str("msd_2\n0 0\n0 -> 5\n")
+                .expect_err("undeclared")
+                .to_string(),
+            "State 5 is used but never declared anywhere in file: <string>"
+        );
+        // A real path is named as itself, not as the in-memory placeholder.
+        let dir = std::env::temp_dir().join(format!("wr-io-test-msgaddr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.txt");
+        std::fs::write(&path, "msd_2\n0 0\n0 -> 5\n").unwrap();
+        assert_eq!(
+            read_automaton_txt(&path)
+                .expect_err("undeclared")
+                .to_string(),
+            format!(
+                "State 5 is used but never declared anywhere in file: {}",
+                path.display()
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1509,7 +1842,7 @@ mod tests {
         assert!(matches!(
             read_automaton_txt(&path),
             // Line 2 (1-based) is the first offending line.
-            Err(ReadError::FileHasConflict(2))
+            Err(ReadError::FileHasConflict { line: 2, .. })
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1537,7 +1870,7 @@ mod tests {
         std::fs::write(&path, "{0, 1}\n\n0 0\n0 -> 5\n1 -> 0\n").unwrap();
         assert!(matches!(
             read_automaton_txt(&path),
-            Err(ReadError::UndeclaredDestState(5))
+            Err(ReadError::UndeclaredDestState { state: 5, .. })
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2200,7 +2533,7 @@ mod tests {
         // header is `UnsupportedNumeration` either way (the resolver-free forms).
         assert!(matches!(
             read_automaton_from_str(""),
-            Err(ReadError::EmptyFile)
+            Err(ReadError::EmptyFile { .. })
         ));
         assert!(matches!(
             read_automaton_from_str("msd_fib\n\n0 0\n"),

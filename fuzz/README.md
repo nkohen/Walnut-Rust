@@ -149,7 +149,7 @@ non-finding. These implement `CLAUDE.md`'s "generate SMALL" guardrail:
 
 | Target | Filter | What it bounds |
 | --- | --- | --- |
-| `wr_io_reader` | `MAX_INPUT_LEN`, `MAX_HEADER_LEN`, `MAX_HEADER_DIGIT_RUN` | auto-determinize-on-load blowup; `msd_99999999`'s 400 MB alphabet; `usize` overflow in the mixed-radix `alphabet_size` product |
+| `wr_io_reader` | `MAX_INPUT_LEN`, `MAX_HEADER_LEN`, `MAX_HEADER_DIGIT_RUN`, `MAX_STATES_FOR_DOWNSTREAM`, `MAX_ALPHABET_SIZE_FOR_PRODUCT` | auto-determinize-on-load blowup; `msd_99999999`'s 400 MB alphabet; `usize` overflow in the mixed-radix `alphabet_size` product; and, for the downstream steps added in review round 2, the cross product's **squared** alphabet (`msd_92 msd_4 msd_55` is a 410-million-entry product alphabet — a 33-second libFuzzer timeout, textbook cost) |
 | `wr_logic_parser` | `MAX_INPUT_LEN`, `MAX_BASE` | `NumberSystem::new`'s `O(k³)` construction (WB-032 documents real Walnut doing the same on `msd_1000`) |
 | `wr_core_regex` | `MAX_INPUT_LEN`, `MAX_REPEAT_DIGIT_RUN`, `MAX_REPETITION_OPS`, `MAX_CONSECUTIVE_REPETITION_OPS`, `MAX_COMPLEMENT_OPS`, `MAX_ATOMS` | `e{0,99999999}`; `e++++…` (Brics' `e+` = `concat(e, star(e))`, so each `+` doubles); `Σ*·α₁…αₙ` determinizing to 2ⁿ |
 
@@ -242,13 +242,30 @@ automaton and the transducer reader. The undeclared-state case then reaches this
 existing `ReadError::UndeclaredDestState` exactly as Java reaches
 `validateDeclaredStates`, and the declared case loads the same automaton Java loads.
 
-One residual, *pre-existing* divergence worth knowing about and deliberately not touched
-here: `Automaton::decode` uses `rem_euclid`/`div_euclid` where Java uses truncating
-`%`/`/`, so `decode(-1)` returns a digit in this port where Java throws
-`IndexOutOfBoundsException`. That is the divergence behind the second bullet above —
-this port writes a corrupt automaton back out where Java errors. It is the *graceful*
-direction (no crash), it predates this unit, and closing it would mean introducing a
-panic, so it is reported rather than changed.
+**Follow-up (review round 2) — F2's first fix relocated a panic class instead of removing
+it, and opened a silent-wrong-answer path. Both are now closed:**
+
+* The `-1` key the reader now (faithfully) stores reaches raw `[sym as usize]` indexing in
+  `wr_core::product`, `wr_core::automaton`, `wr_core::quantify` and
+  `wr_core::word_automaton`, so `union`/`intersect`/`join`/`inf`/`test`/`combine`/… still
+  killed the process on a file real Walnut merely errors on. Patched not at those five
+  sites but at the layer Java itself guards: `wr_cli::prover`'s `Prover::caught`, a
+  `catch_walnut_panic` boundary around `dispatch`/`dispatch_for_integration_test`, mirroring
+  `Prover.readBuffer`'s `catch (RuntimeException)` — which wraps *every* command, which is
+  why `eval`/`def` (already covered by `EvalDef.compute`'s own inner catch, ported in
+  `wr_logic::eval`) never showed the problem during manual probing.
+* The residual `decode` divergence this section used to report as untouched — `rem_euclid`/
+  `div_euclid` where Java uses truncating `%`/`/`, so `decode(-1)` returned *a* digit where
+  Java throws — is ported as well. It was not the "graceful direction": it made this port
+  silently **write a fabricated automaton** where Java errors and writes nothing, which is
+  worse than a crash. `Automaton::try_decode` is now bounds-checked and returns
+  `DecodeError::IndexOutOfBounds` with the JDK's own text; `Automaton::decode` panics with
+  exactly that message and the boundary above turns it into an ordinary command error.
+
+This target now also **exercises downstream steps after a successful read** (writer
+round-trip, `determinize_and_minimize`, `sort_label` + `cross_product`). Stopping at the
+read is why 6M clean executions found neither of the two defects above: the reader itself
+never touches the `-1` key it stores.
 
 ### F3 — `wr-io`'s header parser accepted a base below 2 — FIXED
 
@@ -305,6 +322,39 @@ determinization blowup `MAX_ATOMS` already documents, sitting exactly at that li
 Textbook algorithmic cost, identical in real Walnut/Brics; recorded rather than acted on.
 Its much lower rate throughout is expected for the same reason: every iteration runs a
 full Thompson construction → determinize → minimize → dead-transition prune, three times.
+
+## Run results after the review-round-2 fixes (dispatch boundary + bounds-checked `decode`)
+
+`wr_io_reader` now runs the downstream steps described in its module docs, so this is not
+comparable to the numbers above — it does strictly more work per execution:
+
+| Target | Budget | Executions | Result |
+| --- | --- | --- | --- |
+| `wr_io_reader` | 5 min | 1,993,643 | clean |
+| `wr_logic_parser` | 2.5 min | 2,808,192 | clean |
+| `wr_core_regex` | 2.5 min | 53,493 | clean (2 slow units) |
+
+`wr_core_regex`'s two slow units are the same already-documented class as the one recorded at
+landing — `~&0..................` / `~.0..................`, 20 `.` atoms under a complement,
+i.e. the `Σ*`-concatenation determinization blowup `MAX_ATOMS` bounds. Not crashes; the run
+still exited 0.
+
+The extension paid for itself immediately: the first two runs of the new target ended in
+crashes, both of them **harness** defects rather than port defects, and both worth recording
+because they define what this target may and may not call —
+
+* `true` (a trivial TRUE/FALSE automaton) reaching `cross_product`, whose first statement is
+  a deliberately-ported Java guard every real caller checks `isTRUE_FALSE_AUTOMATON` before
+  reaching. Now skipped for that step only.
+* `msd_92 msd_4 msd_55` (a 410-million-entry product alphabet) timing out at seed-replay
+  time — the squared-alphabet cost that `MAX_ALPHABET_SIZE_FOR_PRODUCT` now bounds.
+
+It also re-found the WB-038 `-1`-key panic class in `wr_core::product` on
+`{ 1}\n0 1\n0 -> 0` — the exact class the dispatch boundary was added for. That one is *not*
+a harness defect and *not* a new finding: it is the ported behavior of a Java
+`RuntimeException`, and it is what motivates the guarded/raw split in `exercise_downstream`
+(see its call site). The `wr-cli` regression test
+`a_corrupt_library_file_costs_one_command_not_the_process` pins the user-visible half.
 
 ## Environment notes
 

@@ -125,6 +125,38 @@ const NO_CONTEXT_CANNOT_FAIL: &str =
 pub const ALPHABET_CHANGED_WARNING: &str =
     "WARN: The alphabet of the resulting automaton was changed. Use the alphabet command to change as desired.";
 
+/// Why [`Automaton::try_decode`] could not decode a symbol — the two unchecked JDK
+/// exceptions `RichAlphabet.decode`'s body can raise, surfaced as values.
+///
+/// Both render Java's own message text verbatim, so that a caller that panics with them
+/// (see [`Automaton::decode`]) reports what real Walnut reports once
+/// [`crate::walnut_panic::catch_walnut_panic`] recovers the payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// `ArrayList.get(idx)` with a negative `idx` — `IndexOutOfBoundsException: Index
+    /// {index} out of bounds for length {length}` (the JDK's own wording, as printed by
+    /// the real CLI on the WB-038 reproducer). Reached whenever the encoded symbol is
+    /// negative, which the `.txt` reader really can produce (WB-038).
+    IndexOutOfBounds { index: i32, length: usize },
+    /// `n % 0` — `ArithmeticException: / by zero`. A track with an empty alphabet; no
+    /// alphabet this crate builds is empty, so this is a defensive value, not a live
+    /// failure mode (see [`Automaton::try_decode`]).
+    EmptyTrackAlphabet,
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::IndexOutOfBounds { index, length } => {
+                write!(f, "Index {index} out of bounds for length {length}")
+            }
+            DecodeError::EmptyTrackAlphabet => write!(f, "/ by zero"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
 /// A multi-track automaton: the raw [`Fa`] plus enough track metadata to encode/decode
 /// symbols and (for `wr-logic`) know which tracks are quantifiable and how to fix up
 /// leading/trailing zeros after projection.
@@ -584,17 +616,91 @@ impl Automaton {
         encoding
     }
 
-    /// Decodes a transition symbol back into its per-track digit tuple. Inverse of
-    /// [`Automaton::encode`] (`decode(encode(x)) == x`).
-    pub fn decode(&self, mut sym: i32) -> Vec<i32> {
+    /// `RichAlphabet.decode(List<List<Integer>>, int)` (`RichAlphabet.java:124-131`) —
+    /// decodes a transition symbol back into its per-track digit tuple. Inverse of
+    /// [`Automaton::encode`] (`try_decode(encode(x)) == Ok(x)`) for every symbol in
+    /// `0..alphabet_size`.
+    ///
+    /// # Java's exact arithmetic, and why it matters
+    ///
+    /// Java is `l.add(integers.get(n % integers.size())); n = n / integers.size();` with
+    /// `%`/`/` being **truncating** (C-style), so a negative `n` produces a negative
+    /// index and `ArrayList.get(-1)` throws `IndexOutOfBoundsException` — an unchecked
+    /// exception `Prover.readBuffer`'s `catch (RuntimeException)` recovers from, leaving
+    /// the session alive (verified live: `Automata Library/fy.txt` = ` lsd_2 / 0 1 /
+    /// 20 -> 0`, then `eval f2b "?lsd_2 $fy(x)";` prints `java.lang.IndexOutOfBounds
+    /// Exception: Index -1 out of bounds for length 2` and the next command still runs).
+    ///
+    /// A negative symbol is **reachable from an ordinary `.txt` file**, not a
+    /// hypothetical: [`Automaton::encode_index_of`] faithfully reproduces Java's
+    /// `List.indexOf(-1)` for an out-of-alphabet body digit (WB-038), so the reader
+    /// really does store transitions under key `-1`, and every pass that iterates
+    /// `fa.d`'s KEYS (rather than `0..alphabet_size`) hands one straight to this
+    /// function — `wr_io::writer`'s `write_state`/`write_gv`,
+    /// [`Automaton::rebuild_transitions_for_new_alphabet`],
+    /// `logicalops::right_quotient`, `infinite`'s path decoding,
+    /// `wr_cli::test_command`'s accepted-word formatting.
+    ///
+    /// This port used `rem_euclid`/`div_euclid` instead, which **always** produces some
+    /// in-range index — so where Java threw and wrote nothing, walnut-rs silently
+    /// fabricated a digit tuple and wrote out an automaton whose language matches
+    /// neither the file nor Java's answer. Silent wrong math is strictly worse than a
+    /// reported error, so the check is ported: truncating `%`/`/`, and an out-of-range
+    /// index is [`DecodeError::IndexOutOfBounds`], carrying the JDK's own message text.
+    ///
+    /// Note that Java bounds-checks only the PER-TRACK index, never the symbol as a
+    /// whole: `decode(alphabet_size + k)` silently wraps to `decode(k)`-ish garbage in
+    /// Java, and does here too. That quirk is ported (it is `n / size`'s natural
+    /// behavior once the loop runs out of tracks), not "fixed" — same rule as WB-038.
+    pub fn try_decode(&self, sym: i32) -> Result<Vec<i32>, DecodeError> {
+        let mut n = sym;
         let mut out = Vec::with_capacity(self.alphabet.len());
         for track in &self.alphabet {
             let size = track.len() as i32;
-            let idx = sym.rem_euclid(size);
+            if size == 0 {
+                // `n % 0` is Java's `ArithmeticException: / by zero`. Unreachable for
+                // any alphabet this crate builds (every track has >= 1 digit, and the
+                // reader rejects a base below 2 as of U30's F3), but a division by zero
+                // must never be a Rust panic in a function reachable from file input.
+                return Err(DecodeError::EmptyTrackAlphabet);
+            }
+            // Java's `%` and `/`, i.e. Rust's `%` and `/` — NOT `rem_euclid`/`div_euclid`.
+            let idx = n % size;
+            if idx < 0 {
+                return Err(DecodeError::IndexOutOfBounds {
+                    index: idx,
+                    length: track.len(),
+                });
+            }
             out.push(track[idx as usize]);
-            sym = sym.div_euclid(size);
+            n /= size;
         }
-        out
+        Ok(out)
+    }
+
+    /// [`Automaton::try_decode`] for the callers whose symbol provably comes from
+    /// `0..alphabet_size` (an internal invariant), where a failure would be a port bug
+    /// rather than bad input — and, per this crate's established idiom
+    /// ([`crate::walnut_panic`]), for the untrusted-key callers whose own signature has
+    /// no error channel to propagate through (`wr_io::writer`, `logicalops`,
+    /// `infinite`, …).
+    ///
+    /// # Panics
+    ///
+    /// With the Java exception's message verbatim, so that
+    /// [`crate::walnut_panic::catch_walnut_panic`] at `wr_cli::prover`'s dispatch
+    /// boundary reports it exactly as `Prover.readBuffer`'s `catch (RuntimeException)`
+    /// does, and the session survives — the same treatment `right_quotient`'s subset
+    /// guard and `product`'s alphabet guard already get. **Never** silently returns a
+    /// fabricated tuple.
+    pub fn decode(&self, sym: i32) -> Vec<i32> {
+        match self.try_decode(sym) {
+            Ok(digits) => digits,
+            // One-argument `panic!` with the message alone: the guard-authoring rule in
+            // `crate::walnut_panic`'s docs (an `expect`/`assert_eq!` payload would reach
+            // the user with Rust framing around Walnut's text).
+            Err(e) => panic!("{e}"),
+        }
     }
 
     /// The encoded symbol for the all-digit-value-0 tuple (`RichAlphabet.determineZero`)
@@ -1545,6 +1651,83 @@ mod tests {
         assert_eq!(a.decode(5), vec![2, 1]);
         assert_eq!(a.decode(0), vec![0, 0]);
         assert_eq!(a.decode(8), vec![2, 2]);
+    }
+
+    /// The `-1` key WB-038's faithfully-ported `encode_index_of` really does put into a
+    /// `.txt`-loaded automaton must never decode to *something*: Java's truncating
+    /// `n % size` yields `-1`, and `ArrayList.get(-1)` throws. This port used
+    /// `rem_euclid`, which always lands in range — so `decode(-1)` returned digit `[1]`
+    /// (for a 2-symbol track) and every caller downstream silently wrote out an
+    /// automaton whose language matched neither the file nor Java's answer.
+    #[test]
+    fn decoding_an_out_of_range_symbol_is_an_error_not_a_fabricated_tuple() {
+        let a = Automaton::new(
+            trivial_fa(4),
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["a".into(), "b".into()],
+            vec![Some(true), Some(true)],
+        );
+        assert_eq!(
+            a.try_decode(-1),
+            Err(DecodeError::IndexOutOfBounds {
+                index: -1,
+                length: 2
+            })
+        );
+        // The JDK's own message text, which is what the real CLI prints for this file
+        // (`java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 2`).
+        assert_eq!(
+            a.try_decode(-1).unwrap_err().to_string(),
+            "Index -1 out of bounds for length 2"
+        );
+        // `-2` is the shape that shows truncating-vs-Euclidean really matters: the FIRST
+        // track's index is `-2 % 2 == 0` (fine), and the failure surfaces on the second
+        // track, where `n` has become `-1`.
+        assert_eq!(
+            a.try_decode(-2),
+            Err(DecodeError::IndexOutOfBounds {
+                index: -1,
+                length: 2
+            })
+        );
+        // Every valid symbol still round-trips.
+        for sym in 0..4 {
+            assert_eq!(a.try_decode(sym).map(|d| a.encode(&d)), Ok(sym));
+        }
+    }
+
+    /// The panicking wrapper: the message is the Java exception's text and nothing else,
+    /// so `wr_cli`'s dispatch boundary (`Prover::caught`) reports exactly it — see
+    /// `crate::walnut_panic`'s guard-authoring rule.
+    #[test]
+    fn decode_panics_with_javas_message_rather_than_returning_a_wrong_tuple() {
+        let a = Automaton::new(
+            trivial_fa(4),
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["a".into(), "b".into()],
+            vec![Some(true), Some(true)],
+        );
+        assert_eq!(
+            crate::walnut_panic::catch_walnut_panic(|| a.decode(-1)),
+            Err("Index -1 out of bounds for length 2".to_string())
+        );
+    }
+
+    /// Java bounds-checks only the per-track index, never the symbol as a whole, so a
+    /// symbol at or above `alphabet_size` silently wraps instead of erroring. Ported as
+    /// the quirk it is (same rule as WB-038) — pinned here so a later "obvious"
+    /// tightening is a deliberate, reviewed divergence rather than a silent one.
+    #[test]
+    fn decoding_a_symbol_past_the_alphabet_wraps_exactly_as_java_does() {
+        let a = Automaton::new(
+            trivial_fa(4),
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["a".into(), "b".into()],
+            vec![Some(true), Some(true)],
+        );
+        // 4 == alphabet_size: `4 % 2 == 0`, then `4 / 2 == 2`, `2 % 2 == 0`.
+        assert_eq!(a.try_decode(4), Ok(vec![0, 0]));
+        assert_eq!(a.try_decode(7), Ok(vec![1, 1]));
     }
 
     #[test]

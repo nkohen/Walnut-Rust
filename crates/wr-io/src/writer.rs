@@ -212,6 +212,24 @@ fn write_alphabet<W: Write>(automaton: &Automaton, out: &mut W) -> io::Result<()
 }
 
 /// `AutomatonWriter.writeState` (`:78-92`).
+///
+/// # A transition key this cannot render
+///
+/// `automaton.fa.d`'s keys are not guaranteed to be valid symbols: a `.txt` file with an
+/// out-of-alphabet body digit stores one under `-1` (WB-038, faithfully ported — see
+/// [`Automaton::encode_index_of`]). [`Automaton::decode`] **panics** on such a key rather
+/// than inventing digits for it, and that is deliberate on both counts:
+///
+/// * Java does the same thing here — `RichAlphabet.decode`'s `ArrayList.get(-1)` throws
+///   `IndexOutOfBoundsException`, `writeToTxtFormat`'s try/catch covers only `IOException`,
+///   so the exception escapes to `Prover.readBuffer`'s `catch (RuntimeException)` and the
+///   file is left containing whatever had already been written (the `PrintWriter` is
+///   closed by try-with-resources, not rolled back). This port's boundary is
+///   `wr_cli::prover`'s `Prover::caught`, with the same partially-written-file outcome.
+/// * The alternative — mapping it into this function's `io::Result` — would be actively
+///   wrong: `wr_cli`'s `is_io_class_error` routes an I/O failure to Java's OUTER
+///   `catch (IOException)`, which **ends** the read loop. A `RuntimeException` must not
+///   end the session.
 fn write_state<W: Write>(automaton: &Automaton, out: &mut W, q: usize) -> io::Result<()> {
     write!(out, "\n{} {}\n", q, automaton.fa.o[q])?;
     for (&sym, dests) in &automaton.fa.d[q] {

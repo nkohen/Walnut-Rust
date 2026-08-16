@@ -98,6 +98,7 @@ use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
 use wr_core::logicalops::ConvertNsError;
 use wr_core::morphism::MorphismError;
 use wr_core::util::validate_file;
+use wr_core::walnut_panic::catch_walnut_panic;
 use wr_logic::predicate_env::FreshIdentifiers;
 
 use crate::alphabet::{alphabet_command, AlphabetError};
@@ -623,6 +624,13 @@ pub enum ProverError {
         command: &'static str,
         reason: &'static str,
     },
+    /// **Port-specific in form, faithful in behavior.** A `wr-core`/`wr-io` guard that
+    /// models a Java `RuntimeException` as a `panic!`/`assert!` fired somewhere under
+    /// this command, and [`Prover::caught`] — the port's stand-in for
+    /// `Prover.readBuffer`'s `catch (RuntimeException)` — recovered its message. The
+    /// payload is that message verbatim. See [`Prover::caught`] for why the boundary sits
+    /// at dispatch and what the recovered message can and cannot say.
+    Thrown(String),
     /// **Port-specific.** A command whose dispatch arm exists but whose body belongs to a
     /// later unit.
     NotYetImplemented {
@@ -659,6 +667,10 @@ impl std::fmt::Display for ProverError {
             ProverError::Image(e) => write!(f, "{e}"),
             ProverError::Join(e) => write!(f, "{e}"),
             ProverError::Convert(e) => write!(f, "{e}"),
+            // The recovered guard message, verbatim — the guard-authoring rule in
+            // `wr_core::walnut_panic`'s docs makes it Walnut's own text wherever the
+            // guard ported one.
+            ProverError::Thrown(message) => write!(f, "{message}"),
             ProverError::UnsupportedCommand { command, reason } => write!(
                 f,
                 "The {command} command is out of scope for walnut-rs ({reason})."
@@ -746,6 +758,11 @@ impl LoggableError for ProverError {
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
+            // A recovered guard panic; see `Prover::caught`'s "known, deliberate
+            // limitation" section for why this is `handled` even though the payload can
+            // also stand in for a genuine JDK exception. Same call this port's
+            // `wr_logic::eval::ActError::Thrown` already makes, for the same reason.
+            ProverError::Thrown(_) => true,
             // This port's own scope errors; no Java analogue.
             ProverError::UnsupportedCommand { .. } | ProverError::NotYetImplemented { .. } => true,
         }
@@ -902,6 +919,82 @@ impl Prover {
 
     // -- parseSetup / dispatch ------------------------------------------------
 
+    /// Flattens [`wr_core::walnut_panic::catch_walnut_panic`]'s doubled result at the
+    /// dispatch boundary: a recovered panic becomes [`ProverError::Thrown`].
+    ///
+    /// # Why the boundary lives HERE, and not at each individual index site
+    ///
+    /// This mirrors Java's actual architecture. `Prover.readBuffer` wraps its
+    /// `dispatch(s)` call — and therefore **every** command, not a chosen few — in
+    /// `catch (RuntimeException e) { Logging.printTruncatedStackTrace(e); }`
+    /// (`Prover.java:388-392`), so any unchecked exception thrown anywhere under a
+    /// command costs the user that command and nothing more: the REPL (or the `load`ed
+    /// command file) keeps going, and the NEXT command still runs. Several of this
+    /// port's `wr-core` primitives model a Java `RuntimeException` as a `panic!`
+    /// (see [`wr_core::walnut_panic`]'s module docs for why), and a Rust panic with no
+    /// `catch_unwind` above it kills the **process** — strictly less faithful than
+    /// Java, and a denial-of-service on an ordinary bad input file.
+    ///
+    /// Two narrower boundaries already existed — `wr_logic::eval::compute`'s (Java's own
+    /// inner `EvalDef.compute` catch, which is why `eval`/`def` never showed this
+    /// problem) and the ad-hoc ones in [`crate::quotient`]/[`crate::automaton_ops`] —
+    /// but everything else (`union`, `intersect`, `join`, `inf`, `test`, `reverse`,
+    /// `minimize`, `export`, …) was unprotected, and Tier-5 fuzzing found live
+    /// process-killing paths into `wr_core::product`, `wr_core::automaton`,
+    /// `wr_core::quantify` and `wr_core::word_automaton` reachable from a single
+    /// out-of-alphabet digit in a `.txt` library file (WB-038). Patching those five
+    /// index sites one at a time would have been both more work and structurally
+    /// incomplete against the next one; one boundary at the layer Java itself guards
+    /// covers all of them, present and future.
+    ///
+    /// Verified live against `walnut-java/target/Walnut-all.jar` (2026-08-16) on exactly
+    /// the corrupt file this port's regression test uses
+    /// (`a_corrupt_library_file_costs_one_command_not_the_process`) — a command file of
+    /// `reg wrok …; union wrbad wrok; inf wrbad; combine wrcb wrbad=1; reg wralive …;`
+    /// prints
+    ///
+    /// ```text
+    /// java.lang.ArrayIndexOutOfBoundsException: Index -2 out of bounds for length 4
+    ///     at Automata.FA.ProductStrategies.crossProductInternalDFA(ProductStrategies.java:139)
+    /// … (again for `inf`)
+    /// java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 2
+    ///     at java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:64)
+    /// ```
+    ///
+    /// and then **runs the final `reg` normally**. Three failed commands, one live
+    /// session — which is the behavior this boundary reproduces. (Note the third one:
+    /// that is `RichAlphabet.decode`'s bounds check, i.e. the Java counterpart of
+    /// [`wr_core::automaton::DecodeError::IndexOutOfBounds`], reached through `combine`.)
+    ///
+    /// # Known, deliberate limitation of the recovered message
+    ///
+    /// A panic payload is a bare string, so the Java exception *class* is not
+    /// recoverable. [`ProverError::Thrown`] is therefore classified as `handled`
+    /// (message-only, no invented JVM frames), exactly as `wr_logic`'s
+    /// `ActError::Thrown` already is — right for the `WalnutException`-modeling guards
+    /// that make up most of this surface, but a text-only divergence for the few
+    /// payloads that stand in for a genuine JDK exception (see the transcript above:
+    /// real Walnut prefixes those with `java.lang.…Exception: ` and one stack frame,
+    /// which this port cannot reproduce from a panic payload — and for the cross-product
+    /// site the guard's own wording differs from the JDK's besides). The *behavior* —
+    /// report and continue — matches either way, and no fixture in the Tier-1 corpus
+    /// reaches this path.
+    ///
+    /// # Unwind safety
+    ///
+    /// The guarded closure holds `&mut self`, so a panic can leave the [`Prover`] (and its
+    /// [`Session`]) mid-update — a half-written library file, a `currentEvalName` set for a
+    /// command that then failed. That is not a Rust-specific hazard being papered over: it
+    /// is precisely what Java's caught `RuntimeException` does to the same state, since
+    /// `readBuffer` resumes on the very same `Prover` instance with whatever the aborted
+    /// command had already mutated. Matching it is the point.
+    fn caught<T>(outcome: Result<Result<T, ProverError>, String>) -> Result<T, ProverError> {
+        match outcome {
+            Ok(inner) => inner,
+            Err(message) => Err(ProverError::Thrown(message)),
+        }
+    }
+
     /// `Prover.parseSetup(String)` (`:432-454`): reset per-command state, decode the
     /// `;`/`:`/`::` suffix into `printFlag`/`printDetails`, strip metacommands, and
     /// configure logging.
@@ -949,7 +1042,16 @@ impl Prover {
 
     /// `Prover.dispatch(String)` (`:401-430`) — returns `false` iff the command was
     /// `exit`/`quit` (or a `load` whose file contained one).
+    ///
+    /// **The panic-recovery boundary.** See [`Prover::caught`]: everything below this
+    /// line runs inside [`wr_core::walnut_panic::catch_walnut_panic`], the way
+    /// everything Java's `readBuffer` calls runs inside its `catch (RuntimeException)`.
     pub fn dispatch(&mut self, s: &str) -> Result<bool, ProverError> {
+        Self::caught(catch_walnut_panic(|| self.dispatch_uncaught(s)))
+    }
+
+    /// [`Prover::dispatch`]'s body, minus the panic boundary.
+    fn dispatch_uncaught(&mut self, s: &str) -> Result<bool, ProverError> {
         let original_command = s.to_string();
         let s = self.parse_setup(s)?;
         if s.is_empty() {
@@ -983,7 +1085,25 @@ impl Prover {
     ///
     /// Java's `msg` parameter is never used in the method body; ported as `_msg` rather
     /// than dropped, so a Java call site translates one-for-one.
+    ///
+    /// Java's `dispatchForIntegrationTest` has **no** try/catch of its own — an unchecked
+    /// exception propagates to the calling test, which is exactly what an `Err` return
+    /// models here. So this carries the same [`Prover::caught`] boundary as
+    /// [`Prover::dispatch`]: without it a `panic!`-modeled Java `RuntimeException` would
+    /// take down the whole harness process instead of failing (or being recorded as) one
+    /// fixture.
     pub fn dispatch_for_integration_test(
+        &mut self,
+        s: &str,
+        msg: &str,
+    ) -> Result<Option<TestCase>, ProverError> {
+        Self::caught(catch_walnut_panic(|| {
+            self.dispatch_for_integration_test_uncaught(s, msg)
+        }))
+    }
+
+    /// [`Prover::dispatch_for_integration_test`]'s body, minus the panic boundary.
+    fn dispatch_for_integration_test_uncaught(
         &mut self,
         s: &str,
         _msg: &str,
@@ -1707,6 +1827,11 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::Image(_)
         | ProverError::Join(_)
         | ProverError::Convert(_)
+        // A recovered panic stands in for an unchecked `RuntimeException`, which is by
+        // definition NOT the checked `IOException` Java's outer catch selects — so the
+        // read loop must log it and read the next line, never end. This is the whole
+        // point of the boundary (see `Prover::caught`): the session survives.
+        | ProverError::Thrown(_)
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
     }
@@ -3139,5 +3264,132 @@ mod tests {
             other => panic!("expected InvalidFile, got {other}"),
         }
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------- the panic-recovery boundary
+
+    /// WB-038's blast radius, pinned at the layer that fixes it.
+    ///
+    /// `bad.txt` is Java's own accepted-but-corrupt shape: a body digit outside the
+    /// header's alphabet, which `Automaton::encode_index_of` faithfully stores under the
+    /// key `-1` (real Walnut does exactly this — see that method's docs). That key then
+    /// reaches raw `[sym as usize]` indexing in `wr_core::product`, `wr_core::automaton`,
+    /// `wr_core::quantify` and `wr_core::word_automaton`, and `decode(-1)` in
+    /// `wr_io::writer`/`Automaton::rebuild_transitions_for_new_alphabet`. Every one of
+    /// those was a process-killing panic before [`Prover::caught`]; in real Walnut every
+    /// one is a `RuntimeException` that `Prover.readBuffer` catches, printing it and
+    /// running the NEXT command in the same session (verified live on `Walnut-all.jar`:
+    /// `eval f2b "?lsd_2 $fy(x)";` prints `java.lang.IndexOutOfBoundsException: Index -1
+    /// out of bounds for length 2`, then the following `eval` still evaluates).
+    ///
+    /// So the assertion is deliberately NOT "these commands succeed" (they must not) and
+    /// NOT a specific message (each site's guard has its own): it is *no panic escapes,
+    /// and the session is still usable afterwards*.
+    #[test]
+    fn a_corrupt_library_file_costs_one_command_not_the_process() {
+        let (mut p, dir, _) = prover("panic-boundary");
+        let lib = dir.join("Automata Library");
+        // Out-of-alphabet digit `5` under `msd_2`, with a DECLARED destination -- the
+        // sub-case real Walnut loads without complaint.
+        fs::write(
+            lib.join("bad.txt"),
+            "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n",
+        )
+        .unwrap();
+        // A well-formed partner for the binary commands.
+        assert!(p.dispatch("reg ok msd_2 \"0*1\";").unwrap());
+        // A corrupt WORD automaton for the `reverse $...`/`minimize` (DFAO) paths.
+        fs::write(
+            dir.join("Word Automata Library").join("badw.txt"),
+            "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 2\n0 -> 0\n5 -> 1\n",
+        )
+        .unwrap();
+
+        for command in [
+            "union u bad ok;",
+            "intersect i bad ok;",
+            "join j bad[x] ok[x];",
+            "concat cc bad ok;",
+            "star st bad;",
+            "rightquo rq bad ok;",
+            "leftquo lq bad ok;",
+            "reverse rv $bad;",
+            "reverse rvw badw;",
+            "minimize mw badw;",
+            "fixleadzero fl bad;",
+            "fixtrailzero ft bad;",
+            "combine cb bad=1;",
+            "alphabet al msd_3 $bad;",
+            "inf bad;",
+            "test bad 3;",
+            "describe $bad;",
+            "eval ev \"?msd_2 Ex $bad(x)\";",
+            "def dv x \"?msd_2 $bad(x)\";",
+            "[export * gv] union u2 bad ok::",
+        ] {
+            // The point of the whole fix: whatever this command does, it RETURNS.
+            let outcome = p.dispatch(command);
+            if let Err(e) = &outcome {
+                // Never an I/O-class error -- `readBuffer` must keep reading (see
+                // `is_io_class_error`'s `Thrown` arm).
+                assert!(!is_io_class_error(e), "{command}: {e}");
+            }
+            // ... and the session is still alive: an ordinary command still works.
+            assert!(
+                p.dispatch("reg alive msd_2 \"1*\";").unwrap(),
+                "session died after `{command}`"
+            );
+            assert!(lib.join("alive.txt").is_file(), "after `{command}`");
+            fs::remove_file(lib.join("alive.txt")).unwrap();
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same shape driven through [`Prover::read_buffer`] — i.e. through the exact
+    /// loop `Prover.readBuffer` is, with its `catch (RuntimeException)`. Java's demoed
+    /// behavior is "the command file keeps running"; this pins that the LAST line of the
+    /// file still executes after an earlier line blew up.
+    #[test]
+    fn read_buffer_survives_a_command_that_panics_and_runs_the_next_one() {
+        let (mut p, dir, out) = prover("panic-readbuffer");
+        fs::write(
+            dir.join("Automata Library").join("bad.txt"),
+            " lsd_2\n0 1\n20 -> 0\n",
+        )
+        .unwrap();
+        let script = "reg ok lsd_2 \"0*1\";\nunion u bad ok;\nreg after lsd_2 \"1*\";\n";
+        let mut input = io::Cursor::new(script.as_bytes().to_vec());
+
+        assert!(
+            p.read_buffer(&mut input, false),
+            "the loop must run to end-of-input, not abort"
+        );
+        assert!(
+            dir.join("Automata Library").join("after.txt").is_file(),
+            "the command AFTER the failing one must still have run: {}",
+            out.text()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `Prover::caught` itself: a panic raised under dispatch becomes
+    /// [`ProverError::Thrown`] carrying the guard's message verbatim, and a successful
+    /// command is passed through untouched.
+    #[test]
+    fn caught_maps_a_panic_to_thrown_and_leaves_success_alone() {
+        assert!(matches!(
+            Prover::caught::<bool>(Err("Second A's alphabet must be a subset".to_string())),
+            Err(ProverError::Thrown(m)) if m == "Second A's alphabet must be a subset"
+        ));
+        assert!(matches!(Prover::caught(Ok(Ok(true))), Ok(true)));
+        assert!(matches!(
+            Prover::caught::<bool>(Ok(Err(ProverError::NoSuchCommand))),
+            Err(ProverError::NoSuchCommand)
+        ));
+        // Message-only (a `WalnutException`-shaped report), never IO-class.
+        let thrown = ProverError::Thrown("boom".to_string());
+        assert!(thrown.is_handled());
+        assert!(!is_io_class_error(&thrown));
+        assert_eq!(thrown.to_string(), "boom");
     }
 }
