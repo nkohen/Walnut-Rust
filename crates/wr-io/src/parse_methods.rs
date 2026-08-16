@@ -268,7 +268,14 @@ pub struct AlphabetDeclaration {
     pub number_systems: Vec<Option<NumberSystem>>,
 }
 
-enum AlphabetToken {
+/// One `PATTERN_NEXT_ALPHABET_TOKEN` match: either an explicit `{...}` set or a
+/// numeration token's raw (un-normalized) text.
+///
+/// `pub(crate)` alongside [`match_next_alphabet_token`] so [`crate::reader`]'s header
+/// parser consumes the SAME tokens this module's own
+/// [`parse_alphabet_declaration`] loop consumes — see that function's doc for why the
+/// reader cannot simply call [`parse_alphabet_declaration`] itself.
+pub(crate) enum AlphabetToken {
     Set(Vec<i32>),
     Ns(String),
 }
@@ -299,11 +306,13 @@ fn match_digit_or_word_run(bytes: &[u8]) -> Option<usize> {
 /// Matches group 2 (`ALPHABET_NUMBER_SYSTEM`) of `PATTERN_NEXT_ALPHABET_TOKEN`:
 /// `((msd|lsd)_(\d+|\w+))|((msd|lsd)(\d+|\w+))|(msd|lsd)|(\d+|\w+)`, tried in that
 /// alternation order (Java regex alternation is leftmost-first with backtracking,
-/// not longest-match — order matters here, e.g. for `"msd_"` with nothing usable
-/// after the `_`, which falls all the way through to matching bare `"msd"`). Only
-/// the OVERALL matched text is used downstream (`normalizeNumberSystemToken`
-/// consumes the whole string and re-derives msd/lsd/base itself), so the individual
-/// inner Java subgroups have no Rust counterpart here.
+/// not longest-match — order matters here: e.g. `"msd_"` does NOT fall through to the
+/// bare-`msd` alternative, because Alt 2's `(\d+|\w+)` still matches the `_` itself
+/// (`\w` includes `_`), so the whole `"msd_"` is one token — see the inline comments
+/// in the body, and `alphabet_declaration_dangling_underscore_quirk` for the javac-
+/// verified evidence). Only the OVERALL matched text is used downstream
+/// (`normalizeNumberSystemToken` consumes the whole string and re-derives msd/lsd/base
+/// itself), so the individual inner Java subgroups have no Rust counterpart here.
 ///
 /// `pub(crate)` so [`crate::reader`]'s own header parser — which cannot simply call
 /// [`parse_alphabet_declaration`], because it has to thread a `CustomBaseResolver`
@@ -384,7 +393,19 @@ fn match_alphabet_set_end(s: &str) -> Option<usize> {
 /// iteration in `parseAlphabetDeclaration`, so a non-match here means the WHOLE
 /// alphabet-declaration parse stops there, not just this one token). Returns the
 /// token and the total number of bytes consumed, including surrounding whitespace.
-fn match_next_alphabet_token(s: &str) -> Result<Option<(AlphabetToken, usize)>, ParseMethodsError> {
+///
+/// `pub(crate)` for [`crate::reader::parse_header`]: it drives its own copy of
+/// `parseAlphabetDeclaration`'s loop (it has a `CustomBaseResolver` to thread through
+/// the numeration lookup, which [`parse_alphabet_declaration`] cannot take), but the
+/// per-token GRAMMAR — the `{...}` set, the numeration token, and Java's ASCII-only
+/// `\s` whitespace between them — is exactly this function's, not a second hand-rolled
+/// copy of it. Three separate live-confirmed divergences (a set element's sign
+/// separated from its digits by whitespace; Rust's Unicode-aware `trim` accepting
+/// NBSP-separated tokens Java rejects; no `removeDuplicates`) all came from that
+/// duplication.
+pub(crate) fn match_next_alphabet_token(
+    s: &str,
+) -> Result<Option<(AlphabetToken, usize)>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let i = skip_ws(bytes, 0);
     if i >= bytes.len() {

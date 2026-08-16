@@ -83,19 +83,37 @@
 //!   corresponding Java "nondeterministic DFAO is a hard error" branch does not
 //!   apply — every parsed automaton is a plain predicate automaton.
 //!
-//! # One grammar, not two (Phase 4, U30 review round 2)
+//! # One grammar, not two (Phase 4, U30 review rounds 2 and 4)
 //!
-//! Both readers now tokenize state declarations and transition lines through
-//! [`crate::parse_methods`] — the verbatim ports of `ParseMethods`' own regexes,
-//! including their deferred-`parseInt` discipline. This file used to carry a second,
-//! hand-rolled `split_whitespace` grammar for the *automaton* reader only (the
-//! transducer reader always used `parse_methods`), which was a Phase-1 leftover and
-//! disagreed with Java in both directions: it accepted a `+`-signed state id Java's
-//! `\d+` rejects, rejected the sign/digit spacing (`"0 + 1"`) Java's `(\+|\-)?\s*\d+`
-//! accepts, and — the reason it was found — silently dropped an `i32`-overflowing state
-//! or destination id into the wrong error class instead of Java's
-//! `NumberFormatException`, while typing ids as `usize` so a value too large for Java's
-//! `int` "parsed" fine.
+//! Both readers now tokenize **every** line — the header, state declarations, transition
+//! lines, and the blank/comment/`true`/`false` classification of all of them — through
+//! [`crate::parse_methods`], the verbatim ports of `ParseMethods`' own regexes, including
+//! their deferred-`parseInt` discipline and Java's ASCII-only `\s`
+//! (`wr_core::util::is_java_whitespace`). **No line-grammar logic is hand-rolled in this
+//! file any more.** The one thing [`parse_header`] still owns beyond
+//! [`parse_methods::parse_alphabet_declaration`] is the *numeration lookup* inside the
+//! loop body ([`parse_ns_token`]), which needs a [`CustomBaseResolver`] that function
+//! cannot take — Java's `NumberSystem.getComputeIfAbsent` call, not grammar.
+//!
+//! Getting there took two rounds, because each one left a shared-rule/duplicated-loop
+//! seam behind and the next round found bugs in exactly that seam:
+//!
+//! * Round 2 removed a second, hand-rolled `split_whitespace` grammar for state
+//!   declarations and transitions in the *automaton* reader (the transducer reader always
+//!   used `parse_methods`). It was a Phase-1 leftover that disagreed with Java in both
+//!   directions: it accepted a `+`-signed state id Java's `\d+` rejects, rejected the
+//!   sign/digit spacing (`"0 + 1"`) Java's `(\+|\-)?\s*\d+` accepts, and — the reason it
+//!   was found — silently dropped an `i32`-overflowing state or destination id into the
+//!   wrong error class instead of Java's `NumberFormatException`, while typing ids as
+//!   `usize` so a value too large for Java's `int` "parsed" fine.
+//! * Round 4 removed the last three: the header line's own `{...}`/numeration tokenizer
+//!   (which reused `parse_methods`' NS-token rule but not its loop, so it kept a
+//!   `split(',')` set parser that rejects the `{ - 3 , 0 }` Java accepts), `should_skip`
+//!   and `parse_true_false` (Rust's Unicode-aware `str::trim`, where Java's `\s` is ASCII
+//!   — so NBSP-separated or NBSP-padded lines were accepted that real Walnut rejects),
+//!   and the missing `UtilityMethods.removeDuplicates` on each parsed track
+//!   (`AutomatonReader.java:165`, which sizes `{0,0,1}` at 2, not 3). All four were
+//!   confirmed against `Walnut-all.jar` before and after.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -107,9 +125,9 @@ use wr_core::fa::Fa;
 use wr_core::minimize::{minimize, MinimizeError};
 use wr_core::numsys::{self, CustomBaseCandidates, CustomBaseFiles, NumSysError, NumberSystem};
 use wr_core::trim::trim;
-use wr_core::util::is_number;
+use wr_core::util::{is_number, remove_duplicates};
 
-use crate::parse_methods::{self, ParseMethodsError};
+use crate::parse_methods::{self, parse_true_false, ParseMethodsError};
 
 /// Every way reading a `.txt` automaton/transducer can fail.
 ///
@@ -534,6 +552,18 @@ fn read_automaton_str_impl(
     // `AutomatonReader.firstParse`'s trivial branch (`:141-153`): the `true`/`false`
     // test runs BEFORE the alphabet-declaration parse, and once it matches nothing but
     // comments/whitespace may follow.
+    //
+    // `parse_methods`'s port of `parseTrueFalse`, not the near-copy this module used to
+    // keep beside it. That copy used Rust's Unicode-aware `str::trim`, and the doc
+    // justifying it ("the pattern permits only whitespace there in either reading, so no
+    // input can be classified differently") was simply wrong: `PATTERN_FOR_TRUE_FALSE`'s
+    // `\s` is `[ \t\n\x0B\f\r]`, so `"true\u{00A0}"` is not a truth-value line to
+    // Java at all. Confirmed live against `Walnut-all.jar`, where the two NBSP placements
+    // give two DIFFERENT answers, both now reproduced here:
+    // `"\u{00A0}true"` -> `Undefined statement: line at 1 of file ...`
+    // (`ReadError::MalformedHeader`), and `"true\u{00A0}"` -> `Number system msd_true is
+    // not defined.` (`ReadError::UnsupportedNumeration`), because `true` then tokenizes as
+    // an ordinary bare-`\w+` numeration token.
     if let Some(truth) = parse_true_false(header_line) {
         for (i, raw_line) in lines {
             if !should_skip(raw_line) {
@@ -551,9 +581,31 @@ fn read_automaton_str_impl(
         return Ok(Automaton::true_false(truth));
     }
 
-    let trimmed_header = header_line.trim();
-    let (alphabet, msd, ns_names, all_reps) =
-        parse_header(trimmed_header, custom_bases, in_progress)?;
+    // No `str::trim` here (nor in `read_transducer_str_impl`): Java hands `line` to
+    // `parseAlphabetDeclaration` raw, and that pattern's own `\s*` padding is ASCII-only.
+    // Pre-trimming with Rust's Unicode-aware `trim` would silently strip leading/trailing
+    // NBSP that real Walnut chokes on (`Undefined statement: line at 1 of file …`).
+    let (mut alphabet, msd, ns_names, all_reps) =
+        parse_header(header_line, custom_bases, in_progress)?;
+    // `AutomatonReader.firstParse:165` — `UtilityMethods.removeDuplicates` on every
+    // track, AFTER a successful `parseAlphabetDeclaration` and BEFORE
+    // `determineAlphabetSize`. Without it a header like `{0,0,1}` sizes the alphabet at 3
+    // instead of 2, leaving a phantom symbol no transition can ever name and an
+    // `Automaton::alphabet` that `NumberSystem.isNSDiffering` then reports as
+    // structurally different from an otherwise-identical `{0,1}` automaton (verified
+    // live: real Walnut's `union` of the two succeeds and writes a `{0, 1}` header).
+    //
+    // The OTHER half of that same Java loop (`:157-164`, "the Nth input of type arithmetic
+    // ... requires 0 and 1 in its input alphabet") has deliberately no counterpart here: it
+    // is unreachable in Java. A track only has a non-null `NumberSystem` if that
+    // `NumberSystem`'s own constructor already succeeded, and
+    // `NumberSystem.setAdditionAutomaton` (`:346-354`) itself throws unless
+    // `getAlphabet()` contains BOTH 0 and 1 — for a custom base as much as for a numeric
+    // one (a numeric base `k >= 2` gives `0..k`, which trivially does). So the condition
+    // can never hold by the time `firstParse` re-tests it.
+    for track in &mut alphabet {
+        remove_duplicates(track);
+    }
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -724,66 +776,51 @@ fn read_automaton_str_impl(
     Ok(automaton)
 }
 
+/// `AutomatonReader.shouldSkipLine` (`:184-186`) —
+/// `PATTERN_WHITESPACE.matches() || PATTERN_COMMENT.matches()`, i.e. `^\s*$` or
+/// `^\s*#.*$`, both compiled WITHOUT `UNICODE_CHARACTER_CLASS`, so Java's `\s` here is
+/// exactly `[ \t\n\x0B\f\r]`.
+///
+/// Delegates to [`parse_methods`]'s ports of those two patterns rather than using
+/// Rust's `str::trim_start`, which is Unicode-aware and therefore OVER-permissive: a
+/// line containing only a non-breaking space (`\u{00A0}`) is blank to `trim_start` but
+/// is a real, non-skippable line to Java — which then fails to parse it as an alphabet
+/// declaration and reports `Undefined statement: line at 1 of file …` (verified live
+/// against `Walnut-all.jar`).
 fn should_skip(line: &str) -> bool {
-    let t = line.trim_start();
-    t.is_empty() || t.starts_with('#')
+    parse_methods::is_whitespace_line(line) || parse_methods::is_comment_line(line)
 }
 
-/// `ParseMethods.parseTrueFalse(String, Boolean[])` (`ParseMethods.java:74-81`) against
-/// `PATTERN_FOR_TRUE_FALSE = ^\s*(true|false)\s*$` (`:43`) — returns the parsed truth
-/// value, or `None` when the line isn't a bare `true`/`false`.
-///
-/// Implemented inline here rather than as part of a `ParseMethods` port on purpose:
-/// **`ParseMethods.java` as a whole is a separate, independently-landing unit (U0b),
-/// which will eventually own all of this file's `.txt` grammar.** Keeping this as one
-/// small private helper with the same name/semantics as the Java method means that
-/// refactor is a mechanical "delete this and call `ParseMethods`" step with no merge
-/// conflict against U0's other changes.
-///
-/// Regex-free by design: the pattern is anchored at both ends with only `\s*` padding,
-/// so `str::trim` + equality is *exactly* equivalent — Java's `\s` and Rust's
-/// `char::is_whitespace` differ on a handful of exotic code points, but the pattern
-/// permits only whitespace there in either reading, so no input can be classified
-/// differently. (Java uses `Matcher.find()`, not `matches()`, which is likewise
-/// equivalent here because the pattern is `^...$`-anchored.)
-fn parse_true_false(line: &str) -> Option<bool> {
-    match line.trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-enum HeaderToken {
-    Set(Vec<i32>),
-    /// `alphabet` is the track's full alphabet — `0..base` for a standard `msd_<k>`/
-    /// `lsd_<k>` base, or [`NumberSystem::get_alphabet`]'s value for a custom base (not
-    /// necessarily contiguous-from-zero in general, though every shipped custom base
-    /// declares its alphabet as a `{...}` set counting up from `0` — most are `{0, 1}`,
-    /// but not all: `msd_kim`/`msd_pell` are `{0, 1, 2}`, `msd_ns`/`msd_tib` are
-    /// `{0, 1, 2, 3}` — verified against the real `walnut-java` `Custom Bases/*.txt`
-    /// files, not assumed).
-    Ns {
-        msd: bool,
-        alphabet: Vec<i32>,
-        /// `NumberSystem.getName()` for this track, already normalized the way Java's
-        /// `NumberSystem.normalizeNumberSystemToken` (`:273-295`) would: bare `msd`/`lsd`
-        /// become `msd_2`/`lsd_2`, an `msd_<k>`/`lsd_<k>` token is itself, and a
-        /// custom-base token is the resolved [`NumberSystem`]'s own name. Kept because
-        /// `NumberSystem.isNSDiffering` compares number systems BY NAME, and a custom
-        /// base is otherwise indistinguishable from the plain base with the same alphabet
-        /// cardinality — see [`wr_core::automaton::Automaton::ns_name`].
-        name: String,
-        /// [`NumberSystem::all_representations`] for this track: the "set of all valid
-        /// representations" restriction a custom base declares in its `<name>.txt` file
-        /// (`msd_fib.txt` = "no `11` substring"). `None` for every standard `msd_<k>`/
-        /// `lsd_<k>` base, and for a custom base that ships no `<name>.txt`.
-        ///
-        /// Populating this is what makes `~`/`=>`/`A` behave correctly on an automaton
-        /// loaded from a library file — see [`read_automaton_txt_with_custom_bases`]'s
-        /// "valid representations" note.
-        all_reps: Option<Rc<Automaton>>,
-    },
+/// One resolved NUMERATION track, i.e. what [`parse_ns_token`] makes of a
+/// [`parse_methods::AlphabetToken::Ns`]. The explicit-`{...}`-set half of
+/// `PATTERN_NEXT_ALPHABET_TOKEN` needs no counterpart here: that token already carries its
+/// values, and [`parse_header`] pushes them straight through.
+struct NsTrack {
+    msd: bool,
+    /// The track's full alphabet — `0..base` for a standard `msd_<k>`/`lsd_<k>` base, or
+    /// [`NumberSystem::get_alphabet`]'s value for a custom base (not necessarily
+    /// contiguous-from-zero in general, though every shipped custom base declares its
+    /// alphabet as a `{...}` set counting up from `0` — most are `{0, 1}`, but not all:
+    /// `msd_kim`/`msd_pell` are `{0, 1, 2}`, `msd_ns`/`msd_tib` are `{0, 1, 2, 3}` —
+    /// verified against the real `walnut-java` `Custom Bases/*.txt` files, not assumed).
+    alphabet: Vec<i32>,
+    /// `NumberSystem.getName()` for this track, already normalized the way Java's
+    /// `NumberSystem.normalizeNumberSystemToken` (`:273-295`) would: bare `msd`/`lsd`
+    /// become `msd_2`/`lsd_2`, an `msd_<k>`/`lsd_<k>` token is itself, and a
+    /// custom-base token is the resolved [`NumberSystem`]'s own name. Kept because
+    /// `NumberSystem.isNSDiffering` compares number systems BY NAME, and a custom
+    /// base is otherwise indistinguishable from the plain base with the same alphabet
+    /// cardinality — see [`wr_core::automaton::Automaton::ns_name`].
+    name: String,
+    /// [`NumberSystem::all_representations`] for this track: the "set of all valid
+    /// representations" restriction a custom base declares in its `<name>.txt` file
+    /// (`msd_fib.txt` = "no `11` substring"). `None` for every standard `msd_<k>`/
+    /// `lsd_<k>` base, and for a custom base that ships no `<name>.txt`.
+    ///
+    /// Populating this is what makes `~`/`=>`/`A` behave correctly on an automaton
+    /// loaded from a library file — see [`read_automaton_txt_with_custom_bases`]'s
+    /// "valid representations" note.
+    all_reps: Option<Rc<Automaton>>,
 }
 
 /// Per-track alphabet, per-track msd/lsd (`None` for an explicit-set track), and per-track
@@ -795,6 +832,40 @@ type HeaderSpec = (
     Vec<Option<Rc<Automaton>>>,
 );
 
+/// `ParseMethods.parseAlphabetDeclaration` (`:84-109`) with a [`CustomBaseResolver`]
+/// threaded through the numeration lookup — the one reason this cannot simply *be* a call
+/// to [`parse_methods::parse_alphabet_declaration`] (that function takes a bare `&str` and
+/// has no way to reach the filesystem; see its own doc).
+///
+/// **Everything else is that function's loop, not a second copy of it.** The tokenizer is
+/// [`parse_methods::match_next_alphabet_token`] — the same `PATTERN_NEXT_ALPHABET_TOKEN`
+/// port, covering the `{...}` set grammar, the `(msd|lsd)…` alternation AND Java's
+/// ASCII-only `\s` handling between and around them — and the loop shape (`\G`-anchored
+/// re-match at a moving cursor; stop at the first non-match; require the WHOLE line to
+/// have been consumed) mirrors Java's `while (m.find(index))` / `return index >=
+/// s.length()` exactly. Java's `false` return becomes [`ReadError::MalformedHeader`], the
+/// stand-in for the `WalnutException.undefinedStatement` its caller `firstParse` throws.
+///
+/// This used to be hand-rolled end to end, and every one of the three live-confirmed
+/// divergences that came out of that is closed by the reuse, not by a local patch:
+///
+/// * `{ - 3 , 0 }` / `{+ 1,2}` — group 12's grammar is
+///   `(\+|\-)?\s*\d+\s*(\s*,\s*(\+|\-)?\s*\d+)*`, so whitespace may sit BETWEEN a sign
+///   and its digits. A `split(',')` + `trim().parse::<i32>()` rejects both; real Walnut
+///   accepts them (verified live: `union S1 spacedset spacedset` writes a `{-3, 0}`-headed
+///   result).
+/// * `msd_2\u{00A0}msd_2` — Rust's `str::trim_start` is Unicode-aware, Java's `\s` (no
+///   `UNICODE_CHARACTER_CLASS`) is `[ \t\n\x0B\f\r]`. This reader accepted the NBSP as a
+///   track separator; real Walnut answers `Undefined statement: line at 1 of file …`
+///   (verified live).
+/// * `{0,0,1}` — deduplication is NOT this function's job in Java either; see the
+///   `remove_duplicates` call in [`read_automaton_str_impl`]/[`read_transducer_str_impl`],
+///   which mirrors `firstParse`'s own placement of it (`AutomatonReader.java:165`).
+///
+/// One deliberate residual difference from Java's function, in the port's favor: Java
+/// mutates its two out-parameter lists as it goes and leaves the partial result behind on
+/// a `false` return (harmless there — `firstParse` throws immediately), whereas this
+/// returns `Err` and hands back nothing.
 fn parse_header(
     line: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
@@ -804,65 +875,45 @@ fn parse_header(
     let mut msd = Vec::new();
     let mut ns_names: Vec<Option<String>> = Vec::new();
     let mut all_reps: Vec<Option<Rc<Automaton>>> = Vec::new();
-    let mut rest = line.trim();
-    while !rest.is_empty() {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
-        let token = if let Some(after_brace) = rest.strip_prefix('{') {
-            let end = after_brace.find('}').ok_or(ReadError::MalformedHeader)?;
-            let inner = &after_brace[..end];
-            let mut values = Vec::new();
-            for part in inner.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    return Err(ReadError::MalformedHeader);
-                }
-                values.push(
-                    part.parse::<i32>()
-                        .map_err(|_| ReadError::MalformedHeader)?,
-                );
-            }
-            rest = &after_brace[end + 1..];
-            HeaderToken::Set(values)
-        } else {
-            // `PATTERN_NEXT_ALPHABET_TOKEN`'s number-system half
-            // (`ParseMethods.java:45-46`), via U0b's faithful port of exactly that
-            // alternation. This used to split on whitespace/`{` instead, which is not
-            // what the regex does: `msd_5x` is TWO tokens to Java (`msd_5`, then `x`) and
-            // `msd_-3` is the single token `msd_`, both verified live. A position the
-            // pattern cannot match at all makes Java's `m.find(index)` fail, the
-            // alphabet parse return `false`, and `firstParse` report `undefinedStatement`
-            // — a malformed header, not a numeration complaint (verified: a file headed
-            // `?msd_5` answers `Undefined statement: line at 1 of file …`).
-            let Some((word, consumed)) = crate::parse_methods::match_ns_token(rest) else {
-                return Err(ReadError::MalformedHeader);
-            };
-            rest = &rest[consumed..];
-            parse_ns_token(word, custom_bases, in_progress)?
-        };
+    let mut index = 0usize;
+    while let Some((token, consumed)) = parse_methods::match_next_alphabet_token(&line[index..])? {
         match token {
-            HeaderToken::Set(values) => {
+            parse_methods::AlphabetToken::Set(values) => {
                 alphabet.push(values);
                 msd.push(None);
                 ns_names.push(None);
                 all_reps.push(None);
             }
-            HeaderToken::Ns {
-                msd: is_msd,
-                alphabet: track_alphabet,
-                name,
-                all_reps: track_all_reps,
-            } => {
-                alphabet.push(track_alphabet);
-                msd.push(Some(is_msd));
-                ns_names.push(Some(name));
-                all_reps.push(track_all_reps);
+            // The `NumberSystem.getComputeIfAbsent` half of Java's loop body
+            // (`ParseMethods.java:98-104`), which is where — and only where — this
+            // function diverges from `parse_alphabet_declaration`.
+            parse_methods::AlphabetToken::Ns(word) => {
+                let track = parse_ns_token(&word, custom_bases, in_progress)?;
+                alphabet.push(track.alphabet);
+                msd.push(Some(track.msd));
+                ns_names.push(Some(track.name));
+                all_reps.push(track.all_reps);
             }
         }
+        index += consumed;
+        if consumed == 0 {
+            // Defensive, mirroring `parse_alphabet_declaration`'s identical guard: every
+            // real alternative consumes >= 1 byte, so this never fires on real input.
+            break;
+        }
+    }
+    // Java's `return index >= s.length()`, and `firstParse`'s `else throw
+    // undefinedStatement` on a `false`.
+    if index < line.len() {
+        return Err(ReadError::MalformedHeader);
     }
     if alphabet.is_empty() {
+        // Unreachable through either reader (the header line is the first line
+        // `should_skip` did NOT skip, so it holds at least one non-`\s` byte, and any such
+        // byte either starts a token or fails the `index < line.len()` check above), but a
+        // zero-track `HeaderSpec` is nonsense for every caller, so it is rejected rather
+        // than assumed away. Java has no counterpart check; it would go on to build a
+        // `1`-sized alphabet from an empty product.
         return Err(ReadError::MalformedHeader);
     }
     Ok((alphabet, msd, ns_names, all_reps))
@@ -890,7 +941,7 @@ fn parse_header(
 /// as `msd_5`/`lsd_5`/`msd_5`/`msd_fib`/`msd_fib` respectively. This port rejected every
 /// one of them.
 ///
-/// The normalized name is also what gets recorded ([`HeaderToken::Ns::name`]) and what a
+/// The normalized name is also what gets recorded ([`NsTrack::name`]) and what a
 /// custom-base lookup is keyed on, which is right: Java hands
 /// `NumberSystem.getComputeIfAbsent` the normalized string, so a file headed `fib` and one
 /// headed `msd_fib` resolve to the same `NumberSystem` and compare equal under
@@ -899,7 +950,7 @@ fn parse_ns_token(
     word: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
-) -> Result<HeaderToken, ReadError> {
+) -> Result<NsTrack, ReadError> {
     let name = numsys::normalize_number_system_token(Some(word));
     // Every branch of `normalizeNumberSystemToken` returns an `msd_`/`lsd_`-prefixed
     // string, so the third arm is unreachable; it reports rather than panics because
@@ -912,7 +963,7 @@ fn parse_ns_token(
         return Err(ReadError::UnsupportedNumeration(name));
     };
     match numeric_base(&name, &rest)? {
-        Some(base) => Ok(HeaderToken::Ns {
+        Some(base) => Ok(NsTrack {
             msd,
             alphabet: (0..base).collect(),
             name,
@@ -946,14 +997,12 @@ fn parse_ns_token(
 /// then tripped a panic in `encode`.
 ///
 /// The membership test is [`is_number`] (`^\d+$`), not `str::parse`, precisely as Java's
-/// is: `parse` would accept a leading `+`/`-` that Java's `isNumber` rejects. One
-/// residual, pre-existing message divergence that this deliberately does not chase:
-/// Java's alphabet-token regex (`ParseMethods.PATTERN_NEXT_ALPHABET_TOKEN`) cannot
-/// consume a `-`, so real Walnut reads `msd_-3` as the token `msd_` and reports
-/// `Number system msd_ is not defined.`, whereas this reader's whitespace-delimited
-/// tokenizer keeps the whole word and reports it under `msd_-3`. Both are errors on the
-/// same input; only the name in the text differs, and closing it means porting that
-/// regex, not this function.
+/// is: `parse` would accept a leading `+`/`-` that Java's `isNumber` rejects. (An earlier
+/// draft of this doc recorded a residual message divergence here — that this reader's
+/// then-whitespace-delimited tokenizer reported `msd_-3` where Java reports `msd_`. That
+/// is stale: [`parse_header`] now tokenizes with `PATTERN_NEXT_ALPHABET_TOKEN` itself, so
+/// the name in the message matches Java's; see
+/// `a_header_token_starting_with_a_non_word_character_is_malformed`.)
 ///
 /// # Why the `<= 1` case errors here rather than falling through to the file lookup
 ///
@@ -992,12 +1041,12 @@ fn custom_base_token(
     word: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
-) -> Result<HeaderToken, ReadError> {
+) -> Result<NsTrack, ReadError> {
     let Some(resolver) = custom_bases else {
         return Err(ReadError::UnsupportedNumeration(word.to_string()));
     };
     let ns = load_custom_base(word, resolver, in_progress)?;
-    Ok(HeaderToken::Ns {
+    Ok(NsTrack {
         msd: ns.is_msd(),
         alphabet: ns.get_alphabet().to_vec(),
         name: ns.name().to_string(),
@@ -1205,13 +1254,17 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
             address: address.to_string(),
         })?;
 
-    let trimmed_header = header_line.trim();
     // The NS names go unused here: a transducer's own header names never reach an
     // `Automaton` (`TransducerData` carries only the alphabet/msd it needs), and Java's
     // `readTransducer` likewise keeps the `NumberSystem` list only inside its scratch
     // parse state.
-    let (alphabet, msd, _ns_names, _all_reps) =
-        parse_header(trimmed_header, None, &mut BTreeSet::new())?;
+    let (mut alphabet, msd, _ns_names, _all_reps) =
+        parse_header(header_line, None, &mut BTreeSet::new())?;
+    // `readTransducer` shares `firstParse` with `readAutomaton` (`AutomatonReader.java:203`),
+    // so it gets the same per-track `removeDuplicates` — see `read_automaton_str_impl`.
+    for track in &mut alphabet {
+        remove_duplicates(track);
+    }
     let num_tracks = alphabet.len();
     let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
@@ -1868,8 +1921,10 @@ mod tests {
         }
         // ...and a token is cut exactly where `PATTERN_NEXT_ALPHABET_TOKEN`'s
         // leftmost-first alternation cuts it: real Walnut consumes `msd_` out of
-        // `msd_-3` (falling through to the bare-prefix alternative) and complains about
-        // THAT name — verified live.
+        // `msd_-3` and complains about THAT name — verified live. (The cut is Alt 2,
+        // `(msd|lsd)(\d+|\w+)`, whose `\w+` matches the `_` itself; NOT the bare-prefix
+        // Alt 3, which would have yielded `msd`. The leftover `-3` then fails to match at
+        // all, but the numeration lookup on the first token errors first.)
         assert!(matches!(
             parse_header("msd_-3", None, &mut BTreeSet::new()),
             Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_"
@@ -1901,9 +1956,13 @@ mod tests {
             parse_header("x5", None, &mut BTreeSet::new()),
             Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_x5"
         ));
-        // `msd_` alone falls through to the bare-`msd` alternative and leaves `_` as a
-        // second token — but `normalizeNumberSystemToken("msd")` is `msd_2`, so the
-        // FIRST track resolves and the failure is the second one's `msd__`.
+        // `msd_` alone is ONE token, not `msd` + a leftover `_`: Alt 1 fails (nothing
+        // usable after the literal `_`), but Alt 2's `(\d+|\w+)` matches the `_` itself
+        // (`\w` includes `_`), so the bare-prefix Alt 3 is never reached.
+        // `normalizeNumberSystemToken("msd_")` returns it unchanged, giving the unusable
+        // base name `""` — hence the complaint names `msd_`, exactly as asserted.
+        // (`parse_methods`'s `alphabet_declaration_dangling_underscore_quirk` pins the
+        // same fact at the tokenizer level, against javac'd output.)
         assert!(matches!(
             parse_header("msd_", None, &mut BTreeSet::new()),
             Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_"
@@ -1917,6 +1976,128 @@ mod tests {
             names,
             vec![Some("msd_5".to_string()), Some("msd_3".to_string())]
         );
+    }
+
+    // --- "one grammar, not two": the header line now goes through `parse_methods` too
+    //     (Phase 4, U30 review round 4). Every expectation below was captured from the
+    //     real `Walnut-all.jar` on exactly these inputs, by dropping the file into a
+    //     scratch `Automata Library/` and running `union <out> <file> <file>;` (which
+    //     loads the file and writes the resulting header verbatim) — the whole point being
+    //     that this reader used to answer differently in all three cases.
+
+    /// F1 — `UtilityMethods.removeDuplicates` on every track after a successful
+    /// `parseAlphabetDeclaration` and before `determineAlphabetSize`
+    /// (`AutomatonReader.java:156-166`).
+    ///
+    /// Real jar: a `{0,0,1}`-headed file loads with a **2**-symbol alphabet; `union UU
+    /// dupalpha normalalpha` (against a `{0,1}`-headed automaton) succeeds and writes the
+    /// header `{0, 1}`. Without the dedup this reader sized the alphabet at 3 — a phantom
+    /// symbol no transition can name — and the resulting per-track alphabet mismatch made
+    /// `NumberSystem.isNSDiffering` report the two automata as incompatible, so the same
+    /// `union` was refused with `Automata must have the same number system(s).`
+    #[test]
+    fn a_duplicated_alphabet_symbol_is_removed_before_the_alphabet_is_sized() {
+        let dup = read_automaton_from_str("{0,0,1}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
+        assert_eq!(dup.alphabet, vec![vec![0, 1]]);
+        assert_eq!(dup.fa.alphabet_size, 2);
+        // ...and it is now structurally identical to the un-duplicated spelling, which is
+        // exactly the comparison `isNSDiffering` performs.
+        let plain = read_automaton_from_str("{0,1}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
+        assert_eq!(dup.alphabet, plain.alphabet);
+        assert_eq!(dup.fa.alphabet_size, plain.fa.alphabet_size);
+
+        // Order is first-occurrence, not sorted (`LinkedHashSet`), and duplicates are
+        // removed per track, not globally.
+        let d = read_automaton_from_str("{3,1,3} {1,1}\n0 0\n3 1 -> 0\n1 1 -> 0\n").unwrap();
+        assert_eq!(d.alphabet, vec![vec![3, 1], vec![1]]);
+        assert_eq!(d.fa.alphabet_size, 2);
+
+        // `readTransducer` shares `firstParse`, so it dedups too
+        // (`AutomatonReader.java:203`).
+        let t = read_transducer_from_str("{0,0,1}\n0\n0 -> 0 / 0\n1 -> 0 / 0\n").unwrap();
+        assert_eq!(t.alphabet, vec![vec![0, 1]]);
+        assert_eq!(t.alphabet_size, 2);
+    }
+
+    /// F2 — group 12's set grammar is `(\+|\-)?\s*\d+\s*(\s*,\s*(\+|\-)?\s*\d+)*`, so
+    /// whitespace may sit between a sign and its digits, and a `+` sign is legal.
+    ///
+    /// Real jar: both files load, and their `union` results carry the headers `{-3, 0}`
+    /// and `{1, 2}`. The old `split(',')` + `trim().parse::<i32>()` brace parser rejected
+    /// both with `Malformed alphabet declaration.`
+    #[test]
+    fn an_explicit_set_may_space_a_sign_away_from_its_digits() {
+        let a = read_automaton_from_str("{ - 3 , 0 }\n0 0\n-3 -> 0\n0 -> 0\n").unwrap();
+        assert_eq!(a.alphabet, vec![vec![-3, 0]]);
+        let b = read_automaton_from_str("{+ 1,2}\n0 0\n1 -> 0\n2 -> 0\n").unwrap();
+        assert_eq!(b.alphabet, vec![vec![1, 2]]);
+        // A dangling comma is still a hard failure: the repeated group backtracks to zero
+        // extra repetitions without consuming it, so the `\s*\}` requirement fails on the
+        // leftover `,}` and `parseAlphabetDeclaration` returns false. Real jar:
+        // `Undefined statement: line at 1 of file …`.
+        assert!(matches!(
+            read_automaton_from_str("{0,1,}\n0 0\n0 -> 0\n1 -> 0\n"),
+            Err(ReadError::MalformedHeader)
+        ));
+        // A fourth divergence closed by the same reuse, this one in the error CLASS: an
+        // `i32`-overflowing set element used to be flattened into `MalformedHeader` by the
+        // hand-rolled `parse::<i32>()`. `parse_methods` defers the parse to
+        // `UtilityMethods.parseInt` exactly where Java does, so it now reports what the
+        // real jar reports on this file — `java.lang.NumberFormatException: For input
+        // string: "99999999999"`, verified live.
+        let e = read_automaton_from_str("{0,99999999999}\n0 0\n0 -> 0\n99999999999 -> 0\n")
+            .expect_err("i32-overflowing set element");
+        assert!(matches!(e, ReadError::ParseMethods(_)));
+        assert_eq!(e.to_string(), "For input string: \"99999999999\"");
+    }
+
+    /// F3 — Java's `\s` is compiled without `UNICODE_CHARACTER_CLASS`, so it is exactly
+    /// `[ \t\n\x0B\f\r]`; Rust's `str::trim`/`trim_start` and `char::is_whitespace` are
+    /// Unicode-aware. Every case here is one this reader used to ACCEPT (over-permissively)
+    /// and real Walnut rejects.
+    #[test]
+    fn unicode_whitespace_is_not_java_whitespace_anywhere_in_the_header_path() {
+        // Two `msd_2` tokens separated by NBSP. Real jar:
+        // `Undefined statement: line at 1 of file …`; this reader used to read it as a
+        // 2-track automaton.
+        assert!(matches!(
+            read_automaton_from_str(
+                "msd_2\u{a0}msd_2\n0 0\n0 0 -> 0\n0 1 -> 0\n1 0 -> 0\n1 1 -> 0\n"
+            ),
+            Err(ReadError::MalformedHeader)
+        ));
+        // An NBSP-only line is NOT blank to `shouldSkipLine`, so it becomes the header line
+        // and fails there — the real jar again answers `Undefined statement: line at 1`,
+        // naming line 1 rather than the `msd_2` on line 2. This reader used to skip it.
+        assert!(matches!(
+            read_automaton_from_str("\u{a0}\nmsd_2\n0 0\n0 -> 0\n1 -> 0\n"),
+            Err(ReadError::MalformedHeader)
+        ));
+        // ...nor is it a comment: `PATTERN_COMMENT` is `^\s*#.*$` with the same `\s`.
+        assert!(matches!(
+            read_automaton_from_str("\u{a0}# not a comment\nmsd_2\n0 0\n0 -> 0\n1 -> 0\n"),
+            Err(ReadError::MalformedHeader)
+        ));
+        // `PATTERN_FOR_TRUE_FALSE` (`^\s*(true|false)\s*$`) has the same `\s`, and the two
+        // NBSP placements give two DIFFERENT real-jar answers — both reproduced here.
+        // Leading: nothing can consume the NBSP, so the alphabet declaration fails too.
+        assert!(matches!(
+            read_automaton_from_str("\u{a0}true\n"),
+            Err(ReadError::MalformedHeader)
+        ));
+        // Trailing: `true` is not a truth-value line, but it IS a bare `\w+` numeration
+        // token, so the failure is `Number system msd_true is not defined.` — verified
+        // live.
+        assert!(matches!(
+            read_automaton_from_str("true\u{a0}\n"),
+            Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_true"
+        ));
+        // The ASCII members of Java's `\s` are of course still whitespace, including the
+        // vertical tab and form feed Rust also accepts, and a trailing run of them after
+        // the last token is consumed by the pattern's own `\s*` (real Walnut's writer emits
+        // exactly such a trailing space).
+        let a = read_automaton_from_str("\u{b}\t msd_2 \u{c}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
     }
 
     // --- trivial (TRUE/FALSE) automaton files (U0) ---
@@ -2299,7 +2480,7 @@ mod tests {
         // Not every shipped custom base is `{0, 1}` -- `msd_kim`/`msd_pell` are
         // `{0, 1, 2}`, `msd_ns`/`msd_tib` are `{0, 1, 2, 3}` (verified against the real
         // `walnut-java` `Custom Bases/*.txt` files). This proves
-        // `HeaderToken::Ns::alphabet` (and therefore the resulting `Automaton::alphabet`)
+        // `NsTrack::alphabet` (and therefore the resulting `Automaton::alphabet`)
         // genuinely round-trips a size-3 custom-base alphabet, not just the `{0, 1}`
         // shape every OTHER fixture in this test module happens to use. A hand-authored
         // (not walnut-java-sourced) 3-track adder is enough -- `NumberSystem::

@@ -96,22 +96,65 @@ impl CaughtPanic {
         std::panic::resume_unwind(self.payload)
     }
 
-    /// Whether `message` is one of the JDK exception texts this port raises on purpose,
+    /// Whether this panic is one of the JDK exception texts this port raises on purpose,
     /// i.e. `IndexOutOfBoundsException`/`ArrayIndexOutOfBoundsException`'s
-    /// `Index <i> out of bounds for length <n>`.
+    /// `Index <i> out of bounds for length <n>`, raised **from one of the two sites that
+    /// actually port it**.
     ///
-    /// Deliberately a shape test, not a list of exact strings: the index and the length
-    /// vary with the input, and both `Automaton::decode` and
-    /// `crate::product::cross_product_internal` render the same shape.
+    /// The message half is deliberately a shape test, not a list of exact strings: the
+    /// index and the length vary with the input, and both [`crate::automaton::Automaton`]'s
+    /// `decode` and [`crate::product`]'s `cross_product_internal` render the same shape.
+    ///
+    /// The site half exists because this predicate's one caller (the `wr_io_reader` fuzz
+    /// target) uses it to decide what to SWALLOW. A shape-only test would also absorb a
+    /// third, genuinely-new bug that happened to render a same-shaped message from
+    /// somewhere else entirely — the precise failure mode that target's triage exists to
+    /// prevent. Matching the site as well does not eliminate that (a new bug at one of
+    /// these two files still slips through), but it narrows it from "anywhere in the
+    /// workspace" to "these two files".
+    ///
+    /// A recovered panic with NO location is not accepted: for these two guards a
+    /// location is always recorded (the quiet hook runs on every `panic!`), so its absence
+    /// means something unusual — `resume_unwind` of a foreign payload, say — and the safe
+    /// answer there is to re-raise loudly rather than absorb silently.
     pub fn is_ported_jdk_index_error(&self) -> bool {
-        let Some(rest) = self.message.strip_prefix("Index ") else {
-            return false;
-        };
-        let Some((index, length)) = rest.split_once(" out of bounds for length ") else {
-            return false;
-        };
-        index.parse::<i64>().is_ok() && length.parse::<u64>().is_ok()
+        is_ported_jdk_index_error_at(&self.message, self.location.as_deref())
     }
+}
+
+/// The `Location::file()` values the two ported JDK-index-error guards report, as path
+/// suffixes (the prefix depends on where the workspace is checked out and on which crate
+/// is being compiled).
+///
+/// Keep in step with the guards themselves: `Automaton::decode`'s `panic!("{e}")` on
+/// [`crate::automaton::DecodeError::IndexOutOfBounds`], and `cross_product_internal`'s
+/// `allInputsOfAxB` bounds check.
+const PORTED_JDK_INDEX_ERROR_SITES: &[&str] =
+    &["wr-core/src/automaton.rs", "wr-core/src/product.rs"];
+
+/// [`CaughtPanic::is_ported_jdk_index_error`]'s body, split out so both halves — the
+/// message shape and the raising site — are testable without having to raise the panic
+/// from the guard files themselves.
+fn is_ported_jdk_index_error_at(message: &str, location: Option<&str>) -> bool {
+    let Some(rest) = message.strip_prefix("Index ") else {
+        return false;
+    };
+    let Some((index, length)) = rest.split_once(" out of bounds for length ") else {
+        return false;
+    };
+    if index.parse::<i64>().is_err() || length.parse::<u64>().is_err() {
+        return false;
+    }
+    let Some(location) = location else {
+        return false;
+    };
+    // `Location::file()` uses the host separator; normalize so this is not silently
+    // Unix-only. The trailing `:` is what stops a suffix from matching some longer file
+    // name that merely ends the same way (`.../my_product.rs`).
+    let location = location.replace('\\', "/");
+    PORTED_JDK_INDEX_ERROR_SITES
+        .iter()
+        .any(|site| location.contains(&format!("{site}:")))
 }
 
 impl std::fmt::Debug for CaughtPanic {
@@ -306,14 +349,17 @@ mod tests {
     /// — and reject anything else, however similar.
     #[test]
     fn only_the_jdk_index_error_shape_counts_as_a_ported_guard() {
-        let caught = |m: &'static str| catch_walnut_panic_detailed(|| panic!("{}", m)).unwrap_err();
+        let at_a_guard = Some("crates/wr-core/src/automaton.rs:702:23");
         for message in [
             "Index -1 out of bounds for length 2",
             "Index -2 out of bounds for length 4",
             "Index 4 out of bounds for length 4",
             "Index 0 out of bounds for length 0",
         ] {
-            assert!(caught(message).is_ported_jdk_index_error(), "{message}");
+            assert!(
+                is_ported_jdk_index_error_at(message, at_a_guard),
+                "{message}"
+            );
         }
         for message in [
             "",
@@ -325,7 +371,43 @@ mod tests {
             "begin 0, end -1, length 4",
             "Index -1 out of bounds for length 2 (and then some)",
         ] {
-            assert!(!caught(message).is_ported_jdk_index_error(), "{message:?}");
+            assert!(
+                !is_ported_jdk_index_error_at(message, at_a_guard),
+                "{message:?}"
+            );
         }
+    }
+
+    /// ...and the SITE half: the same message raised anywhere but the two files that
+    /// actually port this guard is a finding, not something to absorb. Without this, a
+    /// third bug that happens to render the same shape is swallowed by the fuzz target's
+    /// triage and never reported.
+    #[test]
+    fn a_same_shaped_message_from_another_site_is_not_a_ported_guard() {
+        let message = "Index -1 out of bounds for length 2";
+        for site in [
+            "crates/wr-core/src/automaton.rs:702:23",
+            "crates/wr-core/src/product.rs:302:21",
+            // Windows separators, and a checkout root above the workspace.
+            r"C:\src\walnut-rs\crates\wr-core\src\product.rs:302:21",
+        ] {
+            assert!(is_ported_jdk_index_error_at(message, Some(site)), "{site}");
+        }
+        for site in [
+            "crates/wr-core/src/logicalops.rs:88:9",
+            "crates/wr-core/src/determinize.rs:120:5",
+            "crates/wr-io/src/reader.rs:640:9",
+            // A file whose name merely ENDS with a guard file's name.
+            "crates/wr-core/src/my_product.rs:12:1",
+            // A guard file named without the `:line:col` that always follows it.
+            "wr-core/src/product.rs",
+        ] {
+            assert!(!is_ported_jdk_index_error_at(message, Some(site)), "{site}");
+        }
+        // No location at all -> re-raise, never absorb (see the predicate's doc).
+        assert!(!is_ported_jdk_index_error_at(message, None));
+        // End to end through a real recovered panic: raised HERE, so it must not count.
+        let caught = catch_walnut_panic_detailed(|| panic!("{message}")).unwrap_err();
+        assert!(!caught.is_ported_jdk_index_error());
     }
 }
