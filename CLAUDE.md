@@ -446,5 +446,36 @@ rushed. Cumulative result across commits
   silently dropped: a lone-`\r` line-splitting divergence (no corpus/fuzz reach), the `details`-
   fixture `Logging`-threading gap (7 known golden divergences, unrelated, pre-existing).
 
-Next: U31 (Tier-4 property-suite completion), U32 (perf vs Java) — see the plan file for full
-scope of each. `cargo test --workspace` green throughout; `cargo fmt`/`clippy` clean.
+**U31 complete** — Tier-4 property-suite completion (`f754a91`→`16a62bc`→`a54e33e`→`76e5ff9`→
+`b740b27`), ~17 new property tests across `wr-core`/`wr-logic`/`wr-cli` covering the confirmed
+gaps: quotients (with WB-010's guard correctly modeled, not asserted away), `convertNS` (a
+JVM-captured sweep widened to `root ≤ 46340`/48,036 pairs, plus one genuine non-circular
+power-of-2 property — a naive property test here would have been actively wrong, per the plan's
+explicit correction, since WB-032 is a deliberately-ported-verbatim quirk), `Morphism` (generator
+constrained away from WB-036's trigger, validation-order checked against real Java source),
+`fixleadzero`/`fixtrailzero`, `NumberSystem::Div` + `msd_fib` custom-base round-trips, the lsd
+trailing-zero fixup (finally property-tested, not just example-tested — the msd/lsd asymmetry
+confirmed real, not a mirror image), and `Transducer` (constrained away from WB-035, oracle
+independently re-derived from real Java source rather than from the port's own logic). **Zero new
+genuine bugs found** — WB-038 remains the highest entry.
+
+This unit's own review chain (two rounds, both with real findings) is worth recording because the
+findings were about **test strength itself**, not production logic — the first round found two
+property tests that passed even when the primitive under test was replaced with a trivially wrong
+implementation (asserting only one-directional closure, never an upper bound — confirmed by
+literally swapping in a broken implementation and watching the tests stay green), a WB-001 skip
+predicate that was sound but silently over-broad with an inaccurate doc claim, and a WB-010 panic
+check that swallowed *any* panic across ~37-39% of its generated cases, not just the documented
+one. Fixed with exact-characterization oracles (independently re-derived, mutation-verified) and a
+correctly-tightened WB-001 precondition (rejection rate dropped from 30% to ~11% with zero cases
+wrongly admitted, verified exhaustively over thousands of cases). The second round caught a small
+irony: the fix for "stop silently skipping cases" itself left one more instance of exactly that
+pattern unconverted (the highest-skip-rate one, ~37%) — fixed, plus a coverage gap where
+`fixtrailzero`'s WB-001 path lost its only test after an unrelated trimming fix, closed with a
+hand-built pin verified live against the real jar. `cargo test --workspace` green throughout
+(1434 tests); `fmt`/`clippy` clean.
+
+Next: **U32** (performance vs JVM Walnut) — the last unit in Phase 4's plan. See the plan file for
+full scope; needs an execution-time decision on benchmark sourcing (the plan's two documented
+options — golden-corpus throughput as the exit proxy, vs. first wiring `[strategy N NAME]` to
+unlock `thm5`-class fixtures; default is the former).

@@ -1,4 +1,4 @@
-# RESUME-HERE — Phase 4 underway; U29+U30 complete, U31/U32 not started
+# RESUME-HERE — Phase 4 underway; U29+U30+U31 complete, U32 not started
 
 **2026-08-16 checkpoint.** Phase 4 (Hardening) is approved and in progress. Plan at
 `~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo — not checked in; if that path
@@ -47,25 +47,38 @@ narrowed:**
    handle through yet; `crates/wr-logic/src/eval.rs` already flags this as owed. Tentatively "U28"
    if picked up — check current numbering is still free before assuming.
 
+## What's done: U31 (Tier-4 property-suite completion)
+
+~17 new property tests across `wr-core`/`wr-logic`/`wr-cli` (quotients incl. WB-010, `convertNS`
+via a widened JVM-captured sweep + one non-circular power-of-2 property, `Morphism` constrained
+away from WB-036, `fixleadzero`/`fixtrailzero`, `NumberSystem::Div` + `msd_fib` round-trips, the
+lsd trailing-zero fixup, `Transducer` constrained away from WB-035). Commits `f754a91`→`16a62bc`→
+`a54e33e`→`76e5ff9`→`b740b27`. **Zero new genuine bugs found** — WB-038 remains the highest entry.
+Full narrative in `CLAUDE.md`'s "Current status" section — its two review rounds are worth reading
+even though they're done, because the findings were about test-strength itself (property tests
+that passed against a deliberately-broken implementation), not production logic, which is a
+distinct and easy-to-miss failure mode worth remembering for any future property-test unit.
+
 ## What's NOT started
 
-- **U31** — Tier-4 property-suite completion (quotients, `convertNS`, `Morphism`,
-  `fixleadzero`/`fixtrailzero`, `NumberSystem::Div`, lsd trailing-zero fixup, `Transducer`). Full
-  gap list + the plan's corrected oracle designs (notably: `convertNS` needs a captured sweep +
-  a powers-of-2-restricted property, NOT a naive property test, because WB-032 is a
-  ported-verbatim quirk a naive oracle would misflag) are in the plan file's U31 section.
-- **U32** — Performance vs JVM Walnut. Wants U29's JVM-batching infra (done, reusable) and
-  ideally U31 complete first. Benchmark-sourcing needs a decision at execution time between the
-  plan's two documented options (golden-corpus throughput as the exit proxy, vs. first wiring
-  `[strategy N NAME]` to unlock `thm5`-class fixtures — default is the former, smaller option).
+- **U32** — Performance vs JVM Walnut. The last unit in Phase 4's plan. Wants U29's JVM-batching
+  infra (done, reusable) and benefits from U31 being complete (it is). Benchmark-sourcing needs a
+  decision at execution time between the plan's two documented options (golden-corpus throughput
+  as the exit proxy, vs. first wiring `[strategy N NAME]` to unlock `thm5`-class fixtures — default
+  is the former, smaller option). Once U32 lands, Phase 4 — and the original DESIGN.md roadmap —
+  is complete; worth a real stop-and-reassess with the user at that point, not an automatic
+  continuation into undefined further work.
 
 ## Process note worth keeping
 
-U30's review chain is the clearest evidence yet for this project's adversarial-loop discipline:
-every one of five rounds found something real, and the findings got progressively narrower each
-round (process-killing panics → an architectural relocation bug → an unrelated correctness-fatal
-bug found as a byproduct → structural grammar-duplication bugs → rare Unicode edge cases), which
-is the expected and healthy shape of convergence, not a reason to have stopped earlier. Two
-reviewers per round, different models, split context, given only the diff — not the author's
-rationale — held up as the right process the whole way through. Worth the same discipline for
-U31/U32 rather than assuming U30's thoroughness was a one-off.
+Both U30 and U31 ran multi-round adversarial review chains that each found real, non-trivial
+issues on every round until they converged — U30 took five rounds (production-logic bugs,
+narrowing to rare Unicode edge cases), U31 took two (test-strength gaps, not production bugs).
+The pattern holding across both: two reviewers per round, different models, split context, given
+only the diff — never the author's rationale — reliably surfaces real problems that a single
+self-review pass did not. Treat this as the standing default for any future trust-critical unit
+in this project, not a one-off born of U30 specifically. Worth noting for U32 too, though
+performance work has a different risk profile (correctness bugs there would more likely show up
+as a differential/golden-corpus regression than something only an adversarial reviewer would spot
+by reading the diff) — use judgment on how many rounds it actually needs rather than assuming the
+same five-round depth applies by default.
