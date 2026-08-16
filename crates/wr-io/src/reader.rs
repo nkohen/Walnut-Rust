@@ -309,13 +309,46 @@ pub fn read_automaton_txt_with_custom_base_resolver<P: AsRef<Path>>(
     read_automaton_txt_impl(path.as_ref(), Some(resolver), &mut BTreeSet::new())
 }
 
+/// [`read_automaton_txt`]'s parse, reading the `.txt` grammar out of an in-memory string
+/// instead of off disk.
+///
+/// Byte-for-byte the same parser: [`read_automaton_txt`] is `std::fs::read_to_string` +
+/// this function, nothing else. It exists because a caller that already *has* the text
+/// (a fuzz harness, an in-memory test, anything driving the reader from a buffer) would
+/// otherwise be forced through a temp file per call — pure overhead for no behavioral
+/// difference.
+///
+/// Custom-base headers (`msd_fib`, …) are [`ReadError::UnsupportedNumeration`] here, the
+/// same as in [`read_automaton_txt`] — resolving them needs a file resolver, so use
+/// [`read_automaton_from_str_with_custom_base_resolver`] for that.
+pub fn read_automaton_from_str(content: &str) -> Result<Automaton, ReadError> {
+    read_automaton_str_impl(content, None, &mut BTreeSet::new())
+}
+
+/// [`read_automaton_from_str`] with [`read_automaton_txt_with_custom_base_resolver`]'s
+/// custom-base support: the top-level text comes from memory, while any custom-base file
+/// its header names is still resolved (and read from disk) through `resolver`.
+pub fn read_automaton_from_str_with_custom_base_resolver(
+    content: &str,
+    resolver: &dyn CustomBaseResolver,
+) -> Result<Automaton, ReadError> {
+    read_automaton_str_impl(content, Some(resolver), &mut BTreeSet::new())
+}
+
 fn read_automaton_txt_impl(
     path: &Path,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<Automaton, ReadError> {
     let content = std::fs::read_to_string(path)?;
+    read_automaton_str_impl(&content, custom_bases, in_progress)
+}
 
+fn read_automaton_str_impl(
+    content: &str,
+    custom_bases: Option<&dyn CustomBaseResolver>,
+    in_progress: &mut BTreeSet<String>,
+) -> Result<Automaton, ReadError> {
     let mut lines = content.lines().enumerate();
     let (_, header_line) = lines
         .by_ref()
@@ -899,6 +932,15 @@ pub struct TransducerData {
 /// [`read_automaton_txt_with_custom_bases`] extends the automaton reader.
 pub fn read_transducer_txt<P: AsRef<Path>>(path: P) -> Result<TransducerData, ReadError> {
     let content = std::fs::read_to_string(path)?;
+    read_transducer_from_str(&content)
+}
+
+/// [`read_transducer_txt`]'s parse, reading the transducer grammar out of an in-memory
+/// string instead of off disk — the transducer counterpart of
+/// [`read_automaton_from_str`], and identical to [`read_transducer_txt`] minus the
+/// `std::fs::read_to_string`. Same motivation: a caller that already holds the text
+/// should not have to round-trip it through a temp file.
+pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadError> {
     let mut lines = content.lines().enumerate();
     let (_, header_line) = lines
         .by_ref()
@@ -1924,5 +1966,44 @@ mod tests {
         let dfa_false = read_automaton_dfa_txt(fixture("automaton214.txt")).unwrap();
         assert!(dfa_false.automaton().is_true_false_automaton());
         assert!(!dfa_false.automaton().is_true_automaton());
+    }
+
+    /// The string-taking entry points added for the Tier-5 fuzz harness must be the
+    /// *same* parse as the path-taking ones, not a second implementation that can drift.
+    /// Checked on the real fixtures, both the ordinary and the trivial-automaton shapes,
+    /// and on an error case (so the error path is confirmed shared too).
+    #[test]
+    fn read_automaton_from_str_matches_the_path_entry_point() {
+        for name in ["automaton2.txt", "automaton189.txt", "automaton214.txt"] {
+            let path = fixture(name);
+            let from_path = read_automaton_txt(&path).unwrap();
+            let from_str =
+                read_automaton_from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            // Compared by `Debug` rather than `PartialEq`: neither `Automaton` (a
+            // `wr-core` type) nor `TransducerData` derives `Eq`, and widening either
+            // type's public trait surface just to write this assertion would be a
+            // gratuitous API change. `Debug` is total over both and is exactly as
+            // discriminating for "same parse result" purposes here.
+            assert_eq!(format!("{from_path:?}"), format!("{from_str:?}"), "{name}");
+        }
+
+        // Error parity: an empty input is `EmptyFile` either way, and a custom-base
+        // header is `UnsupportedNumeration` either way (the resolver-free forms).
+        assert!(matches!(
+            read_automaton_from_str(""),
+            Err(ReadError::EmptyFile)
+        ));
+        assert!(matches!(
+            read_automaton_from_str("msd_fib\n\n0 0\n"),
+            Err(ReadError::UnsupportedNumeration(_))
+        ));
+    }
+
+    #[test]
+    fn read_transducer_from_str_matches_the_path_entry_point() {
+        let path = fixture("RUNSUM2.txt");
+        let from_path = read_transducer_txt(&path).unwrap();
+        let from_str = read_transducer_from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(format!("{from_path:?}"), format!("{from_str:?}"));
     }
 }
