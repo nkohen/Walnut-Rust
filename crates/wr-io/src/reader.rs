@@ -130,9 +130,13 @@ use crate::parse_methods::{self, ParseMethodsError};
 /// header *text* alone, with neither the line number nor the address in scope),
 /// [`Self::UnsupportedNumeration`] (renders `NumberSystem`'s real "is not defined."
 /// text, which is what Java answers for the `msd_fib`-without-a-resolver case this
-/// variant is normally raised for — but NOT for a name with no `_` at all, e.g. `msd5`,
-/// where Java instead throws `StringIndexOutOfBoundsException` from
-/// `determineMsdOrLsd`), [`Self::NoStates`]/[`Self::NonDenseStateIds`]
+/// variant is raised for; an earlier draft of this note claimed a token with no `_` at
+/// all, e.g. `msd5`, instead throws `StringIndexOutOfBoundsException` from
+/// `determineMsdOrLsd` — **that is wrong**, and the code that believed it rejected such
+/// headers outright. `normalizeNumberSystemToken` runs FIRST
+/// (`ParseMethods.java:99`) and rewrites `msd5` to `msd_5`, so `determineMsdOrLsd` never
+/// sees an underscore-less name and real Walnut loads the file; see
+/// [`parse_ns_token`]), [`Self::NoStates`]/[`Self::NonDenseStateIds`]
 /// (shapes real Walnut has no check for at all — it fails later with a
 /// `NullPointerException`/`IndexOutOfBoundsException`, see this module's docs) and
 /// [`Self::CustomBaseCycle`] (a guard this port added; Java stack-overflows).
@@ -823,11 +827,19 @@ fn parse_header(
             rest = &after_brace[end + 1..];
             HeaderToken::Set(values)
         } else {
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '{')
-                .unwrap_or(rest.len());
-            let word = &rest[..end];
-            rest = &rest[end..];
+            // `PATTERN_NEXT_ALPHABET_TOKEN`'s number-system half
+            // (`ParseMethods.java:45-46`), via U0b's faithful port of exactly that
+            // alternation. This used to split on whitespace/`{` instead, which is not
+            // what the regex does: `msd_5x` is TWO tokens to Java (`msd_5`, then `x`) and
+            // `msd_-3` is the single token `msd_`, both verified live. A position the
+            // pattern cannot match at all makes Java's `m.find(index)` fail, the
+            // alphabet parse return `false`, and `firstParse` report `undefinedStatement`
+            // — a malformed header, not a numeration complaint (verified: a file headed
+            // `?msd_5` answers `Undefined statement: line at 1 of file …`).
+            let Some((word, consumed)) = crate::parse_methods::match_ns_token(rest) else {
+                return Err(ReadError::MalformedHeader);
+            };
+            rest = &rest[consumed..];
             parse_ns_token(word, custom_bases, in_progress)?
         };
         match token {
@@ -856,50 +868,57 @@ fn parse_header(
     Ok((alphabet, msd, ns_names, all_reps))
 }
 
+/// One header number-system token → its track, exactly as
+/// `ParseMethods.parseAlphabet` does it (`:98-102`): **normalize the token first**
+/// ([`numsys::normalize_number_system_token`], the port of
+/// `NumberSystem.normalizeNumberSystemToken`, `:273-297`), then build the number system
+/// from the NORMALIZED name.
+///
+/// # The normalization branches this used to be missing
+///
+/// Only the `msd_…`/`lsd_…`/bare-`msd`/bare-`lsd` forms were handled, and everything else
+/// was rejected outright with `Number system <token> is not defined.` Java has two more
+/// branches (`:290-296`), and both are reachable from an ordinary library file, because
+/// the header regex explicitly admits `(msd|lsd)(\d+|\w+)` and a bare `(\d+|\w+)`:
+///
+/// * a token starting with `msd`/`lsd` but with no underscore gets one inserted —
+///   `msd5` → `msd_5`, `lsdfib` → `lsd_fib`;
+/// * anything else is defaulted to msd — `5` → `msd_5`, `fib` → `msd_fib`.
+///
+/// All four shapes were confirmed live against `Walnut-all.jar`: a library file headed
+/// `msd5`, `lsd5`, `5`, `msdfib` or `fib` loads, and `describe` reports its number system
+/// as `msd_5`/`lsd_5`/`msd_5`/`msd_fib`/`msd_fib` respectively. This port rejected every
+/// one of them.
+///
+/// The normalized name is also what gets recorded ([`HeaderToken::Ns::name`]) and what a
+/// custom-base lookup is keyed on, which is right: Java hands
+/// `NumberSystem.getComputeIfAbsent` the normalized string, so a file headed `fib` and one
+/// headed `msd_fib` resolve to the same `NumberSystem` and compare equal under
+/// `isNSDiffering`.
 fn parse_ns_token(
     word: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<HeaderToken, ReadError> {
-    if let Some(rest) = word.strip_prefix("msd_") {
-        return match numeric_base(word, rest)? {
-            Some(base) => Ok(HeaderToken::Ns {
-                msd: true,
-                alphabet: (0..base).collect(),
-                name: word.to_string(),
-                all_reps: None,
-            }),
-            None => custom_base_token(word, custom_bases, in_progress),
-        };
-    }
-    if let Some(rest) = word.strip_prefix("lsd_") {
-        return match numeric_base(word, rest)? {
-            Some(base) => Ok(HeaderToken::Ns {
-                msd: false,
-                alphabet: (0..base).collect(),
-                name: word.to_string(),
-                all_reps: None,
-            }),
-            None => custom_base_token(word, custom_bases, in_progress),
-        };
-    }
-    // `NumberSystem.normalizeNumberSystemToken` (`:284-286`): a bare `msd`/`lsd` token IS
-    // named `msd_2`/`lsd_2`, so that — not the bare word — is what `isNSDiffering` would
-    // compare.
-    match word {
-        "msd" => Ok(HeaderToken::Ns {
-            msd: true,
-            alphabet: vec![0, 1],
-            name: format!("{}2", numsys::MSD_UNDERSCORE),
+    let name = numsys::normalize_number_system_token(Some(word));
+    // Every branch of `normalizeNumberSystemToken` returns an `msd_`/`lsd_`-prefixed
+    // string, so the third arm is unreachable; it reports rather than panics because
+    // nothing in the type system pins that.
+    let (msd, rest) = if let Some(rest) = name.strip_prefix(numsys::MSD_UNDERSCORE) {
+        (true, rest.to_string())
+    } else if let Some(rest) = name.strip_prefix(numsys::LSD_UNDERSCORE) {
+        (false, rest.to_string())
+    } else {
+        return Err(ReadError::UnsupportedNumeration(name));
+    };
+    match numeric_base(&name, &rest)? {
+        Some(base) => Ok(HeaderToken::Ns {
+            msd,
+            alphabet: (0..base).collect(),
+            name,
             all_reps: None,
         }),
-        "lsd" => Ok(HeaderToken::Ns {
-            msd: false,
-            alphabet: vec![0, 1],
-            name: format!("{}2", numsys::LSD_UNDERSCORE),
-            all_reps: None,
-        }),
-        _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
+        None => custom_base_token(&name, custom_bases, in_progress),
     }
 }
 
@@ -1775,10 +1794,129 @@ mod tests {
             parse_header("msd_fib", None, &mut BTreeSet::new()),
             Err(ReadError::UnsupportedNumeration(_))
         ));
+        // The no-underscore form used to be asserted here as `UnsupportedNumeration`
+        // ("deliberately unsupported"). It never was deliberate: `msd5` is a NUMERIC base
+        // in real Walnut (`normalizeNumberSystemToken` inserts the underscore), so the
+        // assertion is flipped rather than deleted — see
+        // `javas_normalization_branches_are_all_accepted` for the full table.
+        let (alphabet, msd, names, _) =
+            parse_header("msd5", None, &mut BTreeSet::new()).expect("msd5 is base 5");
+        assert_eq!(alphabet, vec![vec![0, 1, 2, 3, 4]]);
+        assert_eq!(msd, vec![Some(true)]);
+        assert_eq!(names, vec![Some("msd_5".to_string())]);
+        // ...but `msdfib` is still a CUSTOM base, so with no resolver it is still
+        // `UnsupportedNumeration` — under its normalized name.
         assert!(matches!(
-            parse_header("msd5", None, &mut BTreeSet::new()), // no-underscore form — deliberately unsupported
-            Err(ReadError::UnsupportedNumeration(_))
+            parse_header("msdfib", None, &mut BTreeSet::new()),
+            Err(ReadError::UnsupportedNumeration(n)) if n == "msd_fib"
         ));
+    }
+
+    /// Every branch of `NumberSystem.normalizeNumberSystemToken` (`:273-297`), each
+    /// expectation captured from `Walnut-all.jar` by putting the token in a library
+    /// file's header and reading `describe`'s `Number systems:` line.
+    #[test]
+    fn javas_normalization_branches_are_all_accepted() {
+        for (header, expected_name, expected_msd, expected_size) in [
+            // `startsWith(MSD_UNDERSCORE)` / `startsWith(LSD_UNDERSCORE)` — unchanged.
+            ("msd_5", "msd_5", true, 5),
+            ("lsd_3", "lsd_3", false, 3),
+            // `MSD.equals(token)` / `LSD.equals(token)` -> base 2.
+            ("msd", "msd_2", true, 2),
+            ("lsd", "lsd_2", false, 2),
+            // `startsWith(MSD)` / `startsWith(LSD)` with no underscore: insert one.
+            ("msd5", "msd_5", true, 5),
+            ("lsd5", "lsd_5", false, 5),
+            // Anything else: default to msd.
+            ("5", "msd_5", true, 5),
+            ("11", "msd_11", true, 11),
+        ] {
+            let (alphabet, msd, names, _) = parse_header(header, None, &mut BTreeSet::new())
+                .unwrap_or_else(|e| panic!("header `{header}`: {e}"));
+            assert_eq!(names, vec![Some(expected_name.to_string())], "{header}");
+            assert_eq!(msd, vec![Some(expected_msd)], "{header}");
+            assert_eq!(alphabet[0].len(), expected_size, "{header}");
+        }
+        // The custom-base half of the same two branches: normalized, then handed to the
+        // resolver (absent here, so reported under the NORMALIZED name).
+        for (header, normalized) in [("msdfib", "msd_fib"), ("fib", "msd_fib"), ("lsdx", "lsd_x")] {
+            assert!(
+                matches!(
+                    parse_header(header, None, &mut BTreeSet::new()),
+                    Err(ReadError::UnsupportedNumeration(ref n)) if n == normalized
+                ),
+                "{header}"
+            );
+        }
+    }
+
+    /// A header position that does not start with a word character cannot be consumed by
+    /// `PATTERN_NEXT_ALPHABET_TOKEN` at all, so Java's `parseAlphabet` returns `false` and
+    /// `firstParse` reports `undefinedStatement` — a MALFORMED HEADER, not a
+    /// number-system complaint. Confirmed live: a file headed `?msd_5` answers
+    /// `Undefined statement: line at 1 of file Automata Library/hh.txt`.
+    #[test]
+    fn a_header_token_starting_with_a_non_word_character_is_malformed() {
+        for header in ["?msd_5", "-3", "$fib"] {
+            assert!(
+                matches!(
+                    parse_header(header, None, &mut BTreeSet::new()),
+                    Err(ReadError::MalformedHeader)
+                ),
+                "{header}"
+            );
+        }
+        // ...and a token is cut exactly where `PATTERN_NEXT_ALPHABET_TOKEN`'s
+        // leftmost-first alternation cuts it: real Walnut consumes `msd_` out of
+        // `msd_-3` (falling through to the bare-prefix alternative) and complains about
+        // THAT name — verified live.
+        assert!(matches!(
+            parse_header("msd_-3", None, &mut BTreeSet::new()),
+            Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_"
+        ));
+    }
+
+    /// The alternation is leftmost-first, NOT longest-match, so a token can end in the
+    /// middle of a run of word characters and the remainder becomes the NEXT track.
+    /// Every expectation here is the real jar's answer to a library file with that
+    /// header: `msd_5x`, `msd5x` and `5x` all report `Number system msd_x is not
+    /// defined.` — i.e. Java got past a first token and failed normalizing the SECOND.
+    ///
+    /// A whitespace-splitting tokenizer reports the whole word instead, so this is what
+    /// pins the reuse of `parse_methods::match_ns_token` over an approximation.
+    #[test]
+    fn a_number_system_token_can_end_mid_word_leaving_a_second_track() {
+        for header in ["msd_5x", "msd5x", "5x"] {
+            assert!(
+                matches!(
+                    parse_header(header, None, &mut BTreeSet::new()),
+                    Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_x"
+                ),
+                "{header}"
+            );
+        }
+        // ...whereas a token that really is one word stays one: `x5` is a single
+        // `\w+` match, so the name is `msd_x5`, not `msd_x`.
+        assert!(matches!(
+            parse_header("x5", None, &mut BTreeSet::new()),
+            Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_x5"
+        ));
+        // `msd_` alone falls through to the bare-`msd` alternative and leaves `_` as a
+        // second token — but `normalizeNumberSystemToken("msd")` is `msd_2`, so the
+        // FIRST track resolves and the failure is the second one's `msd__`.
+        assert!(matches!(
+            parse_header("msd_", None, &mut BTreeSet::new()),
+            Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_"
+        ));
+        // Two genuine tracks still parse as two tracks.
+        let (alphabet, msd, names, _) =
+            parse_header("msd_5 3", None, &mut BTreeSet::new()).unwrap();
+        assert_eq!(alphabet.len(), 2);
+        assert_eq!(msd, vec![Some(true), Some(true)]);
+        assert_eq!(
+            names,
+            vec![Some("msd_5".to_string()), Some("msd_3".to_string())]
+        );
     }
 
     // --- trivial (TRUE/FALSE) automaton files (U0) ---

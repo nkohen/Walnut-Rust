@@ -133,9 +133,29 @@ fuzz_target!(|data: &[u8]| {
         // downstream steps behind the same boundary the shipped binary has (and would
         // otherwise re-report the known class within seconds, discovering nothing else).
         //
-        // A well-formed automaton gets the steps RAW: there, a panic is a real finding.
+        // But ONLY that one class. A blanket catch here would absorb any panic reached
+        // through a corrupt-key input, so a genuinely different bug hiding behind one
+        // would be silently discarded and never reported — the exact failure mode this
+        // target exists to prevent. So the recovered panic is triaged, and anything whose
+        // message is not the ported JDK `Index <i> out of bounds for length <n>` shape is
+        // re-raised unchanged (`CaughtPanic::resume`), surfacing as a real finding with
+        // its original payload — preceded by the recovered site, since the boundary
+        // suppressed Rust's own `panicked at file:line` line on the way through.
+        //
+        // A well-formed automaton gets the steps RAW: there, ANY panic is a real finding.
         if has_invalid_transition_key(&automaton) {
-            let _ = wr_core::walnut_panic::catch_walnut_panic(|| exercise_downstream(automaton));
+            if let Err(caught) = wr_core::walnut_panic::catch_walnut_panic_detailed(|| {
+                exercise_downstream(automaton)
+            }) {
+                if !caught.is_ported_jdk_index_error() {
+                    eprintln!(
+                        "unexpected panic behind a corrupt transition key: {:?} at {}",
+                        caught.message,
+                        caught.location.as_deref().unwrap_or("<unknown site>")
+                    );
+                    caught.resume();
+                }
+            }
         } else {
             exercise_downstream(automaton);
         }

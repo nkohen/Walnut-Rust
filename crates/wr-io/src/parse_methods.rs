@@ -304,7 +304,16 @@ fn match_digit_or_word_run(bytes: &[u8]) -> Option<usize> {
 /// the OVERALL matched text is used downstream (`normalizeNumberSystemToken`
 /// consumes the whole string and re-derives msd/lsd/base itself), so the individual
 /// inner Java subgroups have no Rust counterpart here.
-fn match_ns_token(s: &str) -> Option<(&str, usize)> {
+///
+/// `pub(crate)` so [`crate::reader`]'s own header parser — which cannot simply call
+/// [`parse_alphabet_declaration`], because it has to thread a `CustomBaseResolver`
+/// through the numeration lookup that function does not take — still tokenizes by exactly
+/// this rule rather than an approximation of it. It used to split header words on
+/// whitespace, which is NOT what `\G`-anchored, leftmost-first alternation does: real
+/// Walnut reads `msd_5x` as the two tokens `msd_5` and `x` (verified live -- it answers
+/// `Number system msd_x is not defined.`, i.e. it got as far as normalizing the SECOND
+/// token), and `msd_-3` as the single token `msd_`.
+pub(crate) fn match_ns_token(s: &str) -> Option<(&str, usize)> {
     let bytes = s.as_bytes();
     let has_prefix = bytes.starts_with(b"msd") || bytes.starts_with(b"lsd");
     if has_prefix {

@@ -1915,6 +1915,18 @@ bug costs a silent wrong answer somewhere downstream.
   `catch (RuntimeException)` — so the command fails and the session lives, as in Java. The one
   quirk *kept*: Java bounds-checks only the per-track index, never the symbol as a whole, so a
   symbol `>= alphabetSize` still wraps silently on both engines.
+  **A third review round corrected WHERE the cross-product half of the guard fires.**
+  `ProductStrategies.crossProductInternal(DFA)` hoists `inputA * B.getAlphabetSize()` into its
+  outer loop, but that is plain `int` multiplication — it wraps, it cannot throw. The only
+  expression that can throw is the array access `allInputsOfAxB[…]` in the **inner** loop, so
+  when the inner transition set is empty (the ordinary case for the `and` family, which does not
+  totalize) Java completes the command normally. This port had the check hoisted, and so
+  *rejected* files real Walnut processes: `intersect i bad ok;` on the `fw.txt` shape above
+  succeeds and writes `i.txt` on the real jar (verified live 2026-08-16). The check now sits at
+  the access itself and renders the JDK's `Index -2 out of bounds for length 4` — again the
+  verbatim string the real CLI prints, for `union u bad ok;`. All 20 commands of the corrupt-file
+  matrix in `wr_cli::prover`'s `a_corrupt_library_file_costs_one_command_not_the_process` now
+  agree with the jar on error-vs-success and on whether an output file appears.
 - **Upstream:** not filed. A per-digit alphabet-membership check in `validateTransition`, alongside
   its existing arity check, would fix it in Java.
 - **Severity:** medium — this is silent wrong output on a plausible input (a hand-edited or

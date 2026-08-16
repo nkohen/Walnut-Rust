@@ -227,6 +227,27 @@ impl BooleanOp {
 /// `combine_output` replaces Java's `String op` + `determineOutput(aP, mQ, op,
 /// combineOut)` dispatch — see module docs.
 ///
+/// # Where the alphabet bounds check goes, and why it matters
+///
+/// A `.txt` library file whose body carries a digit outside its header's alphabet loads
+/// with a transition stored under the key `-1` (`List.indexOf` → `-1`, WB-038 — real
+/// Walnut does this too), so `a_sym` here can genuinely be negative. Java's two loops
+/// hoist `entryA.getIntKey() * B.getAlphabetSize()` into the OUTER one, but that is
+/// ordinary `int` multiplication: it wraps, it does not throw. The only expression that
+/// can throw is the array access `allInputsOfAxB[AxBalphabet + entryB.getIntKey()]`,
+/// **inside** the inner loop — so when the inner set is empty, Java completes the state
+/// normally and the whole command succeeds.
+///
+/// That is not hypothetical. `and`-family products deliberately do not totalize their
+/// operands ([`crate::logicalops::and`]), so an inner `b.d[q]` really is empty for
+/// ordinary inputs: `intersect i bad ok;` on such a file **succeeds and writes `i.txt`**
+/// on the real `Walnut-all.jar` (verified live). An earlier version of this port hoisted
+/// a `checked_mul(...).expect(...)` into the outer loop, so it rejected that file with an
+/// error — a file real Walnut processes. The check therefore sits exactly where Java's
+/// access is, and reports the JDK's own `ArrayIndexOutOfBoundsException` text (`Index -2
+/// out of bounds for length 4` — again, the verbatim string the real CLI prints for
+/// `union u bad ok;`), recovered at `wr_cli::prover`'s `Prover::caught` boundary.
+///
 /// # Progress logging not ported
 ///
 /// Java logs BFS progress every 100/1000/10000/100000 states
@@ -260,14 +281,30 @@ where
 
         let mut state_transitions: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
         for (&a_sym, a_dests) in &a.d[p] {
-            let axb_alphabet_base = (a_sym as usize)
-                .checked_mul(b.alphabet_size)
-                .expect("cross product alphabet-offset overflow (a_sym * b.alphabet_size)");
+            // `final int AxBalphabet = entryA.getIntKey() * B.getAlphabetSize();`
+            // (`:64`/`:137`). Plain `int` arithmetic in Java: it cannot throw here, it
+            // just wraps — hence `wrapping_mul`/`wrapping_add` rather than a `checked_*`
+            // that would report where Java reports nothing. See this function's "where
+            // the bounds check goes" note.
+            //
+            // (`b.alphabet_size` is a `usize` here and an `int` in Java, so the cast is
+            // lossy only for a value Java could not have represented at all — its
+            // `determineAlphabetSize` would already have thrown `ArithmeticException`.
+            // That `usize`-vs-`int` width difference is this port's long-standing,
+            // separately-scoped one, not something introduced here.)
+            let axb_alphabet_base = a_sym.wrapping_mul(b.alphabet_size as i32);
             for (&b_sym, b_dests) in &b.d[q] {
-                let idx = axb_alphabet_base
-                    .checked_add(b_sym as usize)
-                    .expect("cross product alphabet-offset overflow (+ b_sym)");
-                let z = all_inputs_of_axb[idx];
+                let idx = axb_alphabet_base.wrapping_add(b_sym);
+                // `allInputsOfAxB[AxBalphabet + entryB.getIntKey()]` (`:66`/`:139`) —
+                // the ONLY site in this loop nest that can throw, and only when the
+                // inner loop actually runs.
+                if idx < 0 || idx as usize >= all_inputs_of_axb.len() {
+                    panic!(
+                        "Index {idx} out of bounds for length {}",
+                        all_inputs_of_axb.len()
+                    );
+                }
+                let z = all_inputs_of_axb[idx as usize];
                 if z == NOT_SAME_INPUT_IN_BOTH {
                     continue;
                 }
@@ -744,6 +781,109 @@ mod tests {
         });
         assert_eq!(axb_match.q, 1);
         assert_eq!(axb_match.o[0], 1);
+    }
+
+    // --- the WB-038 `-1` key: where the bounds check may and may not fire ---
+
+    /// Two one-state FAs, `a` with the given transition keys and `b` with `b_keys`, both
+    /// self-looping. `alphabet_size` is 2 on each, so the product table has 4 entries.
+    fn fa_with_keys(keys: &[i32]) -> Fa {
+        let mut d0 = BTreeMap::new();
+        for &k in keys {
+            d0.insert(k, vec![0]);
+        }
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![1],
+            d: vec![d0],
+        }
+    }
+
+    /// **The heart of the fix.** Java hoists `inputA * B.getAlphabetSize()` into the outer
+    /// loop, but that multiplication cannot throw — only the array access inside the INNER
+    /// loop can. So a corrupt `-1` key on `a` is completely harmless when `b`'s state has
+    /// no outgoing transitions, and real Walnut finishes the command.
+    ///
+    /// Confirmed live on `Walnut-all.jar`: `intersect i bad ok;` (with `bad.txt` carrying
+    /// an out-of-alphabet body digit) SUCCEEDS and writes `i.txt`; the `and` family does
+    /// not totalize its operands, so the empty inner set is the ordinary case, not a
+    /// contrived one. A guard hoisted into the outer loop rejected that file.
+    #[test]
+    fn a_corrupt_key_is_harmless_when_the_other_operands_state_has_no_transitions() {
+        let a = fa_with_keys(&[-1]);
+        let b = fa_with_keys(&[]);
+        let table = [0, 1, 2, 3];
+        let axb = cross_product_internal(&a, &b, 4, &table, |x, y| BooleanOp::And.combine(x, y));
+        assert_eq!(axb.q, 1, "one reachable pair, no transitions taken");
+        assert!(axb.d[0].is_empty());
+    }
+
+    /// ...and when the inner loop DOES run, the access happens and throws — with the
+    /// JDK's own `ArrayIndexOutOfBoundsException` text. `-1 * 2 + 0 = -2`, and
+    /// `union u bad ok;` on the real CLI prints exactly `Index -2 out of bounds for
+    /// length 4`.
+    #[test]
+    fn a_corrupt_key_raises_the_jdks_own_message_when_the_access_really_happens() {
+        let a = fa_with_keys(&[-1]);
+        let b = fa_with_keys(&[0, 1]);
+        let table = [0, 1, 2, 3];
+        assert_eq!(
+            crate::walnut_panic::catch_walnut_panic(|| cross_product_internal(
+                &a,
+                &b,
+                4,
+                &table,
+                |x, y| BooleanOp::Or.combine(x, y)
+            ))
+            .err(),
+            Some("Index -2 out of bounds for length 4".to_string())
+        );
+        // When BOTH operands carry the bogus key the offset is `-1 * 2 + -1 = -3`, which
+        // is Java's observed message for `minimize mw badw;` (a DFAO crossed against a
+        // copy of itself, so the corrupt key appears on both sides).
+        let b_also_corrupt = fa_with_keys(&[-1]);
+        assert_eq!(
+            crate::walnut_panic::catch_walnut_panic(|| cross_product_internal(
+                &a,
+                &b_also_corrupt,
+                4,
+                &table,
+                |x, y| BooleanOp::Or.combine(x, y)
+            ))
+            .err(),
+            Some("Index -3 out of bounds for length 4".to_string())
+        );
+    }
+
+    /// A key at or past `alphabet_size` — Java's OTHER, opposite quirk: `2 * 2 + 0 = 4`
+    /// is past the end of a 4-entry table, so this throws too, whereas `1 * 2 + 1 = 3` is
+    /// the last legal entry and does not.
+    #[test]
+    fn an_over_large_key_is_bounds_checked_at_the_same_site() {
+        let table = [0, 1, 2, 3];
+        let b = fa_with_keys(&[0]);
+        assert_eq!(
+            crate::walnut_panic::catch_walnut_panic(|| cross_product_internal(
+                &fa_with_keys(&[2]),
+                &b,
+                4,
+                &table,
+                |x, y| BooleanOp::Or.combine(x, y)
+            ))
+            .err(),
+            Some("Index 4 out of bounds for length 4".to_string())
+        );
+        let ok = cross_product_internal(
+            &fa_with_keys(&[1]),
+            &fa_with_keys(&[1]),
+            4,
+            &table,
+            |x, y| BooleanOp::Or.combine(x, y),
+        );
+        assert_eq!(ok.d[0].get(&3), Some(&vec![0]), "index 3 is in bounds");
     }
 
     // --- joinTwoInputsForCrossProduct (ProductStrategiesTest.testJoinTwoInputsForCrossProduct) ---

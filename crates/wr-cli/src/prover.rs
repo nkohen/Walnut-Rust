@@ -98,7 +98,7 @@ use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
 use wr_core::logicalops::ConvertNsError;
 use wr_core::morphism::MorphismError;
 use wr_core::util::validate_file;
-use wr_core::walnut_panic::catch_walnut_panic;
+use wr_core::walnut_panic::{catch_walnut_panic_detailed, CaughtPanic};
 use wr_logic::predicate_env::FreshIdentifiers;
 
 use crate::alphabet::{alphabet_command, AlphabetError};
@@ -630,7 +630,18 @@ pub enum ProverError {
     /// `Prover.readBuffer`'s `catch (RuntimeException)` — recovered its message. The
     /// payload is that message verbatim. See [`Prover::caught`] for why the boundary sits
     /// at dispatch and what the recovered message can and cannot say.
-    Thrown(String),
+    Thrown {
+        /// The guard's message, verbatim.
+        message: String,
+        /// `file:line:column` of the `panic!` that raised it, from
+        /// [`wr_core::walnut_panic::CaughtPanic::location`]. Never rendered to the user
+        /// (Java has no such text either), but carried so a `{:?}` in a failing test — or
+        /// a future `Logging` hook — can still name the site. Without it, a genuine new
+        /// port bug caught by this boundary would be strictly HARDER to diagnose than it
+        /// was before the boundary existed, since the boundary suppresses Rust's own
+        /// `panicked at file:line` line.
+        location: Option<String>,
+    },
     /// **Port-specific.** A command whose dispatch arm exists but whose body belongs to a
     /// later unit.
     NotYetImplemented {
@@ -670,7 +681,7 @@ impl std::fmt::Display for ProverError {
             // The recovered guard message, verbatim — the guard-authoring rule in
             // `wr_core::walnut_panic`'s docs makes it Walnut's own text wherever the
             // guard ported one.
-            ProverError::Thrown(message) => write!(f, "{message}"),
+            ProverError::Thrown { message, .. } => write!(f, "{message}"),
             ProverError::UnsupportedCommand { command, reason } => write!(
                 f,
                 "The {command} command is out of scope for walnut-rs ({reason})."
@@ -762,7 +773,7 @@ impl LoggableError for ProverError {
             // limitation" section for why this is `handled` even though the payload can
             // also stand in for a genuine JDK exception. Same call this port's
             // `wr_logic::eval::ActError::Thrown` already makes, for the same reason.
-            ProverError::Thrown(_) => true,
+            ProverError::Thrown { .. } => true,
             // This port's own scope errors; no Java analogue.
             ProverError::UnsupportedCommand { .. } | ProverError::NotYetImplemented { .. } => true,
         }
@@ -973,12 +984,22 @@ impl Prover {
     /// (message-only, no invented JVM frames), exactly as `wr_logic`'s
     /// `ActError::Thrown` already is — right for the `WalnutException`-modeling guards
     /// that make up most of this surface, but a text-only divergence for the few
-    /// payloads that stand in for a genuine JDK exception (see the transcript above:
-    /// real Walnut prefixes those with `java.lang.…Exception: ` and one stack frame,
-    /// which this port cannot reproduce from a panic payload — and for the cross-product
-    /// site the guard's own wording differs from the JDK's besides). The *behavior* —
-    /// report and continue — matches either way, and no fixture in the Tier-1 corpus
-    /// reaches this path.
+    /// payloads that stand in for a genuine JDK exception: real Walnut prefixes those
+    /// with `java.lang.…Exception: ` and one stack frame (see the transcript above), and
+    /// this port prints the bare message. Verified live on the whole 20-command corrupt-
+    /// file matrix in
+    /// [`Self::a_corrupt_library_file_costs_one_command_not_the_process`]: every
+    /// command's OUTCOME now matches the real jar exactly, and the residual difference is
+    /// precisely that missing `java.lang.…Exception: ` prefix + frame line. The
+    /// *behavior* — report and continue — matches either way, and no fixture in the
+    /// Tier-1 corpus reaches this path. Closing it needs the guards to carry a class,
+    /// which is a wider change than this boundary.
+    ///
+    /// What the port DOES recover is the panic's own **site**
+    /// ([`ProverError::Thrown::location`]) — not user-facing (Java has no such text) but
+    /// the nearest thing to the one frame `Logging.printTruncatedStackTrace` prints for a
+    /// genuine-bug case, and the reason drawing this boundary does not make a NEW port
+    /// bug harder to diagnose than it was before the boundary existed.
     ///
     /// # Unwind safety
     ///
@@ -988,10 +1009,13 @@ impl Prover {
     /// is precisely what Java's caught `RuntimeException` does to the same state, since
     /// `readBuffer` resumes on the very same `Prover` instance with whatever the aborted
     /// command had already mutated. Matching it is the point.
-    fn caught<T>(outcome: Result<Result<T, ProverError>, String>) -> Result<T, ProverError> {
+    fn caught<T>(outcome: Result<Result<T, ProverError>, CaughtPanic>) -> Result<T, ProverError> {
         match outcome {
             Ok(inner) => inner,
-            Err(message) => Err(ProverError::Thrown(message)),
+            Err(caught) => Err(ProverError::Thrown {
+                message: caught.message,
+                location: caught.location,
+            }),
         }
     }
 
@@ -1047,7 +1071,7 @@ impl Prover {
     /// line runs inside [`wr_core::walnut_panic::catch_walnut_panic`], the way
     /// everything Java's `readBuffer` calls runs inside its `catch (RuntimeException)`.
     pub fn dispatch(&mut self, s: &str) -> Result<bool, ProverError> {
-        Self::caught(catch_walnut_panic(|| self.dispatch_uncaught(s)))
+        Self::caught(catch_walnut_panic_detailed(|| self.dispatch_uncaught(s)))
     }
 
     /// [`Prover::dispatch`]'s body, minus the panic boundary.
@@ -1097,7 +1121,7 @@ impl Prover {
         s: &str,
         msg: &str,
     ) -> Result<Option<TestCase>, ProverError> {
-        Self::caught(catch_walnut_panic(|| {
+        Self::caught(catch_walnut_panic_detailed(|| {
             self.dispatch_for_integration_test_uncaught(s, msg)
         }))
     }
@@ -1831,7 +1855,7 @@ fn is_io_class_error(e: &ProverError) -> bool {
         // definition NOT the checked `IOException` Java's outer catch selects — so the
         // read loop must log it and read the next line, never end. This is the whole
         // point of the boundary (see `Prover::caught`): the session survives.
-        | ProverError::Thrown(_)
+        | ProverError::Thrown { .. }
         | ProverError::UnsupportedCommand { .. }
         | ProverError::NotYetImplemented { .. } => false,
     }
@@ -3339,13 +3363,44 @@ mod tests {
     /// `eval f2b "?lsd_2 $fy(x)";` prints `java.lang.IndexOutOfBoundsException: Index -1
     /// out of bounds for length 2`, then the following `eval` still evaluates).
     ///
-    /// So the assertion is deliberately NOT "these commands succeed" (they must not) and
-    /// NOT a specific message (each site's guard has its own): it is *no panic escapes,
-    /// and the session is still usable afterwards*.
+    /// So one half of the assertion is *no panic escapes, and the session is still usable
+    /// afterwards*.
+    ///
+    /// # The other half: each command's OUTCOME, captured from the real jar
+    ///
+    /// The first version of this test asserted only "a LATER command still works", which
+    /// is not enough: it cannot tell a command that correctly errors from one that
+    /// wrongly errors, nor a correct success from a silent wrong success. Two real
+    /// regressions hid behind exactly that gap (a cross-product bounds check hoisted into
+    /// the wrong loop, which made `intersect` reject a file real Walnut processes; and a
+    /// missing `normalizeNumberSystemToken` branch). So every row below carries the
+    /// outcome the real `Walnut-all.jar` produces on the same corrupt inputs — measured,
+    /// not guessed, both per-command in a fresh session and in one sequential session
+    /// whose surviving `Automata Library`/`Word Automata Library` contents were listed:
+    /// `cc, dv, ev, fl, i, lq, ok, rv, st` and `rvw`, and nothing else.
+    ///
+    /// The `Ok` rows are the load-bearing ones: `intersect`/`concat`/`star`/`leftquo` all
+    /// go through the `and`-family product, which does NOT totalize its operands, so the
+    /// inner transition set is empty and the corrupt key is never used as an index. See
+    /// `wr_core::product::cross_product_internal`'s docs.
     #[test]
     fn a_corrupt_library_file_costs_one_command_not_the_process() {
+        /// Where a command's output lands, when it produces one.
+        enum Out {
+            /// `Automata Library/<name>.txt` must exist afterwards.
+            Automata(&'static str),
+            /// `Word Automata Library/<name>.txt` must exist afterwards.
+            Word(&'static str),
+            /// The command names an output that must NOT have been written.
+            NotWritten(&'static str),
+            /// A read-only command (`inf`/`test`/`describe`) — nothing to check.
+            None,
+        }
+        use Out::*;
+
         let (mut p, dir, _) = prover("panic-boundary");
         let lib = dir.join("Automata Library");
+        let word_lib = dir.join("Word Automata Library");
         // Out-of-alphabet digit `5` under `msd_2`, with a DECLARED destination -- the
         // sub-case real Walnut loads without complaint.
         fs::write(
@@ -3357,39 +3412,73 @@ mod tests {
         assert!(p.dispatch("reg ok msd_2 \"0*1\";").unwrap());
         // A corrupt WORD automaton for the `reverse $...`/`minimize` (DFAO) paths.
         fs::write(
-            dir.join("Word Automata Library").join("badw.txt"),
+            word_lib.join("badw.txt"),
             "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 2\n0 -> 0\n5 -> 1\n",
         )
         .unwrap();
 
-        for command in [
-            "union u bad ok;",
-            "intersect i bad ok;",
-            "join j bad[x] ok[x];",
-            "concat cc bad ok;",
-            "star st bad;",
-            "rightquo rq bad ok;",
-            "leftquo lq bad ok;",
-            "reverse rv $bad;",
-            "reverse rvw badw;",
-            "minimize mw badw;",
-            "fixleadzero fl bad;",
-            "fixtrailzero ft bad;",
-            "combine cb bad=1;",
-            "alphabet al msd_3 $bad;",
-            "inf bad;",
-            "test bad 3;",
-            "describe $bad;",
-            "eval ev \"?msd_2 Ex $bad(x)\";",
-            "def dv x \"?msd_2 $bad(x)\";",
-            "[export * gv] union u2 bad ok::",
-        ] {
-            // The point of the whole fix: whatever this command does, it RETURNS.
+        // (command, does real Walnut succeed?, where its output goes)
+        let expected: &[(&str, bool, Out)] = &[
+            ("union u bad ok;", false, NotWritten("u")),
+            ("intersect i bad ok;", true, Automata("i")),
+            ("join j bad[x] ok[x];", false, NotWritten("j")),
+            ("concat cc bad ok;", true, Automata("cc")),
+            ("star st bad;", true, Automata("st")),
+            ("rightquo rq bad ok;", false, NotWritten("rq")),
+            ("leftquo lq bad ok;", true, Automata("lq")),
+            ("reverse rv $bad;", true, Automata("rv")),
+            ("reverse rvw badw;", true, Word("rvw")),
+            ("minimize mw badw;", false, NotWritten("mw")),
+            ("fixleadzero fl bad;", true, Automata("fl")),
+            ("fixtrailzero ft bad;", false, NotWritten("ft")),
+            ("combine cb bad=1;", false, NotWritten("cb")),
+            ("alphabet al msd_3 $bad;", false, NotWritten("al")),
+            ("inf bad;", false, None),
+            ("test bad 3;", false, None),
+            ("describe $bad;", true, None),
+            ("eval ev \"?msd_2 Ex $bad(x)\";", true, Automata("ev")),
+            ("def dv x \"?msd_2 $bad(x)\";", true, Automata("dv")),
+            ("[export * gv] union u2 bad ok::", false, NotWritten("u2")),
+        ];
+
+        for (command, java_succeeds, out) in expected {
+            // The point of the whole panic fix: whatever this command does, it RETURNS.
             let outcome = p.dispatch(command);
             if let Err(e) = &outcome {
                 // Never an I/O-class error -- `readBuffer` must keep reading (see
                 // `is_io_class_error`'s `Thrown` arm).
                 assert!(!is_io_class_error(e), "{command}: {e}");
+            }
+            // ...and it agrees with the real jar about WHETHER it worked.
+            assert_eq!(
+                outcome.is_ok(),
+                *java_succeeds,
+                "`{command}`: real Walnut {}, this port {} ({:?})",
+                if *java_succeeds { "succeeds" } else { "errors" },
+                if outcome.is_ok() {
+                    "succeeded"
+                } else {
+                    "errored"
+                },
+                outcome.as_ref().err().map(ToString::to_string),
+            );
+            match out {
+                Automata(name) => assert!(
+                    lib.join(format!("{name}.txt")).is_file(),
+                    "`{command}` must write Automata Library/{name}.txt"
+                ),
+                Word(name) => assert!(
+                    word_lib.join(format!("{name}.txt")).is_file(),
+                    "`{command}` must write Word Automata Library/{name}.txt"
+                ),
+                NotWritten(name) => {
+                    let f = format!("{name}.txt");
+                    assert!(
+                        !lib.join(&f).exists() && !word_lib.join(&f).exists(),
+                        "`{command}` failed, so it must have written nothing"
+                    );
+                }
+                None => {}
             }
             // ... and the session is still alive: an ordinary command still works.
             assert!(
@@ -3434,9 +3523,14 @@ mod tests {
     /// command is passed through untouched.
     #[test]
     fn caught_maps_a_panic_to_thrown_and_leaves_success_alone() {
+        let caught = wr_core::walnut_panic::catch_walnut_panic_detailed::<bool>(|| {
+            panic!("Second A's alphabet must be a subset")
+        })
+        .unwrap_err();
         assert!(matches!(
-            Prover::caught::<bool>(Err("Second A's alphabet must be a subset".to_string())),
-            Err(ProverError::Thrown(m)) if m == "Second A's alphabet must be a subset"
+            Prover::caught::<bool>(Err(caught)),
+            Err(ProverError::Thrown { message: m, location: Some(_) })
+                if m == "Second A's alphabet must be a subset"
         ));
         assert!(matches!(Prover::caught(Ok(Ok(true))), Ok(true)));
         assert!(matches!(
@@ -3444,9 +3538,36 @@ mod tests {
             Err(ProverError::NoSuchCommand)
         ));
         // Message-only (a `WalnutException`-shaped report), never IO-class.
-        let thrown = ProverError::Thrown("boom".to_string());
+        let thrown = ProverError::Thrown {
+            message: "boom".to_string(),
+            location: Some("crates/wr-core/src/product.rs:294:21".to_string()),
+        };
         assert!(thrown.is_handled());
         assert!(!is_io_class_error(&thrown));
+        // The location is CARRIED but never rendered -- Java has no such text.
         assert_eq!(thrown.to_string(), "boom");
+        assert!(format!("{thrown:?}").contains("product.rs:294:21"));
+    }
+
+    /// The point of carrying the location at all: a real guard panic recovered through
+    /// the dispatch boundary names the site it came from.
+    #[test]
+    fn a_recovered_panic_records_where_it_was_raised() {
+        let (mut p, dir, _) = prover("thrown-location");
+        fs::write(
+            dir.join("Automata Library").join("bad.txt"),
+            "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n",
+        )
+        .unwrap();
+        assert!(p.dispatch("reg ok msd_2 \"0*1\";").unwrap());
+        match p.dispatch("union u bad ok;") {
+            Err(ProverError::Thrown { message, location }) => {
+                assert_eq!(message, "Index -2 out of bounds for length 4");
+                let location = location.expect("the site must be recorded");
+                assert!(location.contains("product.rs"), "{location}");
+            }
+            other => panic!("expected a recovered guard panic, got {other:?}"),
+        }
+        fs::remove_dir_all(&dir).ok();
     }
 }
