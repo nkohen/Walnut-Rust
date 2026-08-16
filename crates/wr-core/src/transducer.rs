@@ -2257,8 +2257,11 @@ mod tests {
 
             // The expected output is `dekking_oracle`'s — the same independent
             // step-by-step oracle a prior unit already wrote in this module, reused rather
-            // than re-derived inline (an earlier draft of this property duplicated it
-            // verbatim; the two were checked to agree before being merged).
+            // than re-derived inline. (An earlier draft of this property duplicated it
+            // verbatim; the two copies were read against each other ONCE, by hand, at the
+            // moment they were merged into this single call -- there is no preserved
+            // regression check on that agreement, and none is needed now that only one
+            // copy exists.)
             let expected = dekking_oracle(&t, &original, k as u32, &word);
 
             // And read N at the same position.

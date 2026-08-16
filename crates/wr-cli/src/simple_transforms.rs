@@ -188,6 +188,7 @@ mod tests {
     #[test]
     fn minimize_command_shrinks_a_redundant_word_automaton() {
         let (session, dir) = temp_session("minimize");
+        let _guard = TempDirGuard(dir.clone());
         let path = dir.join("Word Automata Library").join("A.txt");
         let mut a = non_minimal_contains_one();
         wr_io::writer::write_automaton_txt(&mut a, &path).unwrap();
@@ -204,6 +205,7 @@ mod tests {
     #[test]
     fn fix_lead_zero_command_closes_under_prepended_zeros() {
         let (session, dir) = temp_session("fixlead");
+        let _guard = TempDirGuard(dir.clone());
         // Accepts exactly "1" -- a leading-zero fixup must additionally accept "01",
         // "001", etc.
         let mut d0 = BTreeMap::new();
@@ -245,6 +247,7 @@ mod tests {
         // "1"+"0" = "10" ∈ L(original)), while leaving "10" itself accepted and adding
         // nothing else.
         let (session, dir) = temp_session("fixtrail");
+        let _guard = TempDirGuard(dir.clone());
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![1]);
         let mut d1 = BTreeMap::new();
@@ -277,6 +280,120 @@ mod tests {
             "the empty word must still be rejected"
         );
         assert!(!c.fa.accepts_word(&[0, 1]), "\"01\" must still be rejected");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `docs/WALNUT-BUGS.md` **WB-001** reached through the real `fixtrailzero` command,
+    /// on the operand shape the command actually meets in practice: an **untrimmed**
+    /// hand-written `.txt`.
+    ///
+    /// # Why this test has to exist separately from the property below
+    ///
+    /// `fix_zero_commands_establish_their_closure_properties_end_to_end` trims its
+    /// generated operand before writing it (see its own doc comment — the equality oracles
+    /// are only valid on the shape where WB-001 provably cannot fire). That is correct for
+    /// a property whose job is the exact-language contract, but it means every operand the
+    /// property ever hands `fixtrailzero` is trimmed, and the quirk path gets no coverage
+    /// at all. Real user files are not trimmed, so this is the plausible-input case, not an
+    /// exotic one — it is pinned here rather than avoided, per `CLAUDE.md`'s mechanical-port
+    /// rule (quirks get a dedicated pin test), the same discipline as
+    /// `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` in `wr-core`.
+    ///
+    /// The `.txt` is written **by hand, not by `wr_io::writer`**: the writer emits only the
+    /// states reachable from `q0`, so a round trip through it silently trims and the quirk
+    /// becomes unreachable. Only a file a user typed can carry the stranded state.
+    ///
+    /// # The fixture and why it fires
+    ///
+    /// Three states over `msd_2`. `q0` is non-accepting and self-loops on both digits, so
+    /// `L(A) = ∅` and the correct `fixtrailzero` answer is `∅` too. States 1 and 2 are
+    /// unreachable from `q0`: `1 --0--> 2`, and 2 is accepting. So the fixup does change
+    /// something (state 1 gains acceptance by reaching 2 on a zero), which is what makes it
+    /// call `justMinimize` at all — and `justMinimize` does not trim. Valmari's
+    /// co-reachability pre-pass then parks `q0` outside every block while leaving its stale
+    /// `S[q0] = 0`, and `replaceFields` reads that stale 0 as the new start state: `q0`
+    /// aliases onto an **accepting** block.
+    ///
+    /// Result: `∅` comes back as `ε + 0Σ*`. Asserted below both as the exact table and as
+    /// the language, against [`trail_zero_oracle`] — which is what the answer *should* have
+    /// been, so the pin records the size of the divergence, not merely its existence.
+    ///
+    /// # Bug-compatible, verified live
+    ///
+    /// Run against the real `walnut-java/target/Walnut-all.jar` (v8.0-alpha, 2026-08-16) on
+    /// this exact fixture, `fixtrailzero u31trailfix u31trail;` writes precisely this
+    /// automaton:
+    ///
+    /// ```text
+    /// msd_2
+    ///
+    /// 0 1
+    /// 0 -> 1
+    ///
+    /// 1 1
+    /// 0 -> 1
+    /// 1 -> 1
+    /// ```
+    ///
+    /// — same state count, same start-state output, same transitions as this port produces.
+    /// If a later refactor "fixes" this (an added `trim`, a different minimizer), this test
+    /// fails loudly and the divergence from Java becomes a deliberate, logged decision.
+    #[test]
+    fn fix_trail_zero_command_reaches_wb_001_on_an_untrimmed_operand() {
+        let (session, dir) = temp_session("fixtrail-wb001");
+        let _guard = TempDirGuard(dir.clone());
+        fs::write(
+            dir.join("Automata Library").join("A.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 0\n\n1 0\n0 -> 2\n\n2 1\n0 -> 2\n1 -> 2\n",
+        )
+        .unwrap();
+
+        // The operand as the command itself reads it -- 3 states, 1 and 2 stranded.
+        let operand = read_from_automata_library(&session, "A").expect("just written");
+        assert_eq!(operand.fa.q, 3, "the read must keep the unreachable states");
+        let zero = operand.determine_zero();
+
+        let tc = fix_trail_zero_command(&session, "fixtrailzero c A;", "A", "c")
+            .expect("fixtrailzero must succeed on this well-formed (if untrimmed) operand");
+        let c = tc.automaton_pairs()[0].automaton().unwrap();
+
+        // The exact quirky table, as real walnut-java writes it.
+        assert_eq!(c.fa.q, 2);
+        assert_eq!(c.fa.q0, 0);
+        assert_eq!(
+            c.fa.o,
+            vec![1, 1],
+            "WB-001: q0 aliased onto an accepting block"
+        );
+        assert_eq!(
+            c.fa.d,
+            vec![
+                BTreeMap::from([(0, vec![1])]),
+                BTreeMap::from([(0, vec![1]), (1, vec![1])]),
+            ]
+        );
+
+        // ... and the same divergence stated as a language, against the oracle that says
+        // what the answer should have been. `L(A) = ∅`, so the right quotient by `0*` is
+        // `∅` as well -- every one of these words should be REJECTED.
+        for w in all_words_up_to_four() {
+            assert!(
+                !trail_zero_oracle(&operand, zero, &w),
+                "the fixture's correct fixtrailzero language is empty, but the oracle \
+                 accepts {w:?} -- the fixture, not the port, is wrong"
+            );
+        }
+        assert!(
+            c.fa.accepts_word(&[]),
+            "WB-001: the empty word is accepted, and the correct answer rejects it"
+        );
+        assert!(c.fa.accepts_word(&[0]), "WB-001: `0` wrongly accepted");
+        assert!(c.fa.accepts_word(&[0, 1]), "WB-001: `01` wrongly accepted");
+        assert!(
+            !c.fa.accepts_word(&[1]),
+            "the corruption is `ε + 0Σ*`, not all of `Σ*` -- `1` is still rejected"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -548,6 +665,7 @@ mod tests {
     #[test]
     fn fix_lead_zero_command_propagates_a_missing_file_read_error() {
         let (session, dir) = temp_session("missing");
+        let _guard = TempDirGuard(dir.clone());
         let err = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c").unwrap_err();
         assert!(matches!(err, SimpleTransformError::Read(_)));
         fs::remove_dir_all(&dir).ok();

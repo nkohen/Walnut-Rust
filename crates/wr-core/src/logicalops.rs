@@ -4567,7 +4567,11 @@ mod tests {
         /// index-out-of-bounds in `reverse`, an arithmetic overflow, a broken invariant
         /// assert) is a real signal, not a documented quirk. The caught payload is
         /// therefore downcast and matched against [`WB_010_PANIC`], the same text the
-        /// hand-built pin above asserts, and anything else FAILS the property.
+        /// hand-built pin above asserts, and anything else FAILS the property. A
+        /// confirmed WB-010 firing then ends the case as a tracked proptest **rejection**
+        /// (see the comment at that site) rather than as a silent pass, so a shape change
+        /// that pushed the rejection rate to 100% would abort the run instead of leaving
+        /// the property vacuously green.
         #[test]
         fn left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure(
             a in arb_partial_automaton_over(3, vec![0, 1]),
@@ -4602,8 +4606,28 @@ mod tests {
                          regression, not the ported quirk"
                     );
                     // WB-010 fired, confirmed by its own message. Ported verbatim;
-                    // nothing more to check.
-                    return Ok(());
+                    // nothing more to check on this input.
+                    //
+                    // This is a tracked REJECTION, not a bare `return Ok(())`: proptest
+                    // counts an early return as an ordinary PASS, so if a future change
+                    // made every generated case take this branch the property would go
+                    // silently vacuous and stay green forever. As a rejection, starving
+                    // it aborts the run instead. Same reasoning, and same remedy, as the
+                    // `prop_assume!` on
+                    // `convert_ns_to_a_power_of_two_base_preserves_the_integer_language`;
+                    // `prop_assume!` itself does not fit here because the skip is
+                    // post-`catch_unwind` control flow, not a boolean guard over the
+                    // inputs.
+                    //
+                    // Mutation-verified: making `left_quotient` panic with this exact
+                    // message on EVERY input turns this property from a silent all-pass
+                    // into `Test aborted: Too many global rejects / successes: 0`.
+                    // ("Global", not "local": proptest counts a rejection raised from the
+                    // test body — `prop_assume!` and this `reject` alike — against
+                    // `max_global_rejects`.)
+                    return Err(proptest::test_runner::TestCaseError::reject(
+                        "WB-010's documented re-encode failure fired",
+                    ));
                 }
             };
             for z in all_digit_words(&[0, 1], 4) {
