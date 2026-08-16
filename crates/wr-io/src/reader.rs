@@ -101,8 +101,9 @@ use wr_core::fa::Fa;
 use wr_core::minimize::{minimize, MinimizeError};
 use wr_core::numsys::{self, CustomBaseCandidates, CustomBaseFiles, NumSysError, NumberSystem};
 use wr_core::trim::trim;
+use wr_core::util::is_number;
 
-use crate::parse_methods;
+use crate::parse_methods::{self, ParseMethodsError};
 
 #[derive(Debug)]
 pub enum ReadError {
@@ -158,6 +159,15 @@ pub enum ReadError {
     /// that function's own doc for why this is a real, distinct-from-WB-014 gap this port
     /// needed to close. The payload is the re-entered name.
     CustomBaseCycle(String),
+    /// Propagated from [`parse_methods`]: a `.txt` line matched its pattern but one of
+    /// its `\d+` groups overflows `i32` (a state id, a transition digit, a destination
+    /// id, an output value). Java's `UtilityMethods.parseInt` throws an unchecked
+    /// `NumberFormatException` there, which `Prover.readBuffer`'s `catch
+    /// (RuntimeException)` (`Prover.java:390-392`) recovers from, so the read has to be
+    /// a recoverable failure rather than the process-fatal panic this port used to
+    /// raise (Phase 4 U30's fuzz finding F1, same root cause, reached here through the
+    /// transducer reader).
+    ParseMethods(ParseMethodsError),
 }
 
 impl fmt::Display for ReadError {
@@ -177,6 +187,12 @@ impl From<std::io::Error> for ReadError {
 impl From<MinimizeError> for ReadError {
     fn from(e: MinimizeError) -> Self {
         ReadError::Minimize(e)
+    }
+}
+
+impl From<ParseMethodsError> for ReadError {
+    fn from(e: ParseMethodsError) -> Self {
+        ReadError::ParseMethods(e)
     }
 }
 
@@ -435,7 +451,19 @@ fn read_automaton_str_impl(
             }
             dest_states_used.extend(dests.iter().copied());
             for digits in expand_wildcards(&input_tokens, &alphabet) {
-                let sym = automaton.encode(&digits);
+                // `Automaton::encode_index_of`, NOT `encode`: these digits come straight
+                // out of an untrusted file, and Java's `AutomatonReader` has no
+                // out-of-alphabet check at all — `RichAlphabet.encode`'s `List.indexOf`
+                // just returns `-1` and the transition is stored under that bogus key
+                // (`AutomatonReader.java:71-72`). Reproducing the key rather than
+                // rejecting the file is what keeps this port's observable behavior equal
+                // to Java's on both shapes: an undeclared destination still reports the
+                // clean `UndeclaredDestState` below (Java's `validateDeclaredStates`,
+                // which runs after this loop), and a declared one still loads. Using
+                // `encode` here was a process-fatal panic on a plausible file, found by
+                // Tier-5 fuzzing (Phase 4, U30, finding F2); see `encode_index_of`'s doc
+                // for the real-`walnut-java` evidence.
+                let sym = automaton.encode_index_of(&digits);
                 transitions
                     .get_mut(&cur)
                     .expect("current_state always has a transitions entry")
@@ -652,25 +680,25 @@ fn parse_ns_token(
     in_progress: &mut BTreeSet<String>,
 ) -> Result<HeaderToken, ReadError> {
     if let Some(rest) = word.strip_prefix("msd_") {
-        return match rest.parse::<i32>() {
-            Ok(base) => Ok(HeaderToken::Ns {
+        return match numeric_base(word, rest)? {
+            Some(base) => Ok(HeaderToken::Ns {
                 msd: true,
                 alphabet: (0..base).collect(),
                 name: word.to_string(),
                 all_reps: None,
             }),
-            Err(_) => custom_base_token(word, custom_bases, in_progress),
+            None => custom_base_token(word, custom_bases, in_progress),
         };
     }
     if let Some(rest) = word.strip_prefix("lsd_") {
-        return match rest.parse::<i32>() {
-            Ok(base) => Ok(HeaderToken::Ns {
+        return match numeric_base(word, rest)? {
+            Some(base) => Ok(HeaderToken::Ns {
                 msd: false,
                 alphabet: (0..base).collect(),
                 name: word.to_string(),
                 all_reps: None,
             }),
-            Err(_) => custom_base_token(word, custom_bases, in_progress),
+            None => custom_base_token(word, custom_bases, in_progress),
         };
     }
     // `NumberSystem.normalizeNumberSystemToken` (`:284-286`): a bare `msd`/`lsd` token IS
@@ -691,6 +719,65 @@ fn parse_ns_token(
         }),
         _ => Err(ReadError::UnsupportedNumeration(word.to_string())),
     }
+}
+
+/// The base-validation half of `NumberSystem`'s constructor
+/// (`NumberSystem.setAdditionAutomaton`, `:322-332`), applied to the `rest` of a
+/// `msd_`/`lsd_`-prefixed header token whose full text is `name`:
+///
+/// * `Ok(Some(k))` — `rest` is `\d+` and `k >= 2`: an ordinary base-*k* track;
+/// * `Ok(None)` — `rest` is not `\d+` at all: Java falls through to the custom-base
+///   file lookup (`loadAutomatonOrNull`), so this port hands it to
+///   [`custom_base_token`];
+/// * `Err(NotDefined)` — `rest` IS `\d+` but `<= 1`: Java throws
+///   `"Number system " + name + " is not defined."` (`:330`), because neither
+///   `isNumber(base) && parseInt(base) > 1` nor `parseNegNumber(base) > 1` holds and
+///   there is no `Custom Bases/msd_1*.txt` to rescue it. Confirmed against
+///   `walnut-java/target/Walnut-all.jar`: a library file headed `msd_1` (or `msd_0`)
+///   answers exactly that, and the session continues;
+/// * `Err(BaseNotAnI32)` — `rest` is `\d+` but overflows `int`, where Java's
+///   `Integer.parseInt` (`:325`) throws an unchecked `NumberFormatException`;
+///   `NumSysError`'s existing stand-in for that.
+///
+/// Before this, the whole check was a bare `rest.parse::<i32>()`, so `msd_1` built the
+/// one-symbol alphabet `{0}` and `msd_0`/`msd_-3` built the *empty* alphabet — a missing
+/// validation found by Tier-5 fuzzing (Phase 4, U30, finding F3), whose first body digit
+/// then tripped a panic in `encode`.
+///
+/// The membership test is [`is_number`] (`^\d+$`), not `str::parse`, precisely as Java's
+/// is: `parse` would accept a leading `+`/`-` that Java's `isNumber` rejects. One
+/// residual, pre-existing message divergence that this deliberately does not chase:
+/// Java's alphabet-token regex (`ParseMethods.PATTERN_NEXT_ALPHABET_TOKEN`) cannot
+/// consume a `-`, so real Walnut reads `msd_-3` as the token `msd_` and reports
+/// `Number system msd_ is not defined.`, whereas this reader's whitespace-delimited
+/// tokenizer keeps the whole word and reports it under `msd_-3`. Both are errors on the
+/// same input; only the name in the text differs, and closing it means porting that
+/// regex, not this function.
+///
+/// # Why the `<= 1` case errors here rather than falling through to the file lookup
+///
+/// Java's order is file-FIRST: `setAdditionAutomaton` calls
+/// `loadAutomatonOrNull(name, "_addition", base)` before it ever looks at the base's
+/// value, so a `Custom Bases/msd_1_addition.txt` would genuinely make `msd_1` legal in
+/// real Walnut. This function reports the error instead — deliberately, and consistently
+/// with a **pre-existing** simplification right above it: [`parse_ns_token`] shortcuts
+/// every numeric base straight to `(0..k)` and never probes for
+/// `Custom Bases/msd_<k>_addition.txt` either, so no numeric base consults files in this
+/// reader. Making only `k <= 1` consult them would be the inconsistent choice. Nothing in
+/// the real `walnut-java` corpus ships a numerically-named custom base (all of them are
+/// `msd_fib`-style names, verified), so neither branch of the simplification is live; if
+/// that ever changes, both belong to the same fix, not this one.
+fn numeric_base(name: &str, rest: &str) -> Result<Option<i32>, ReadError> {
+    if !is_number(rest) {
+        return Ok(None);
+    }
+    let base = rest
+        .parse::<i32>()
+        .map_err(|_| ReadError::NumSys(NumSysError::BaseNotAnI32(rest.to_string())))?;
+    if base <= 1 {
+        return Err(ReadError::NumSys(NumSysError::NotDefined(name.to_string())));
+    }
+    Ok(Some(base))
 }
 
 /// The non-numeric-base fallback shared by both `msd_`/`lsd_`-prefixed branches of
@@ -986,13 +1073,13 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
             continue;
         }
 
-        if let Some(id) = parse_methods::parse_transducer_state_declaration(raw_line) {
+        if let Some(id) = parse_methods::parse_transducer_state_declaration(raw_line)? {
             let id = id as usize;
             d.entry(id).or_default();
             sigma.entry(id).or_default();
             declaration_order.push(id);
             current_state = Some(id);
-        } else if let Some(t) = parse_methods::parse_transducer_transition(raw_line) {
+        } else if let Some(t) = parse_methods::parse_transducer_transition(raw_line)? {
             let cur = current_state.ok_or(ReadError::TransitionBeforeState(lineno))?;
             if t.input.len() != num_tracks {
                 return Err(ReadError::ArityMismatch {
@@ -1010,7 +1097,10 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
             let dest: Vec<usize> = t.dest.iter().map(|&x| x as usize).collect();
             dest_states_used.extend(dest.iter().copied());
             for digits in expand_wildcards(&t.input, &alphabet) {
-                let sym = scratch.encode(&digits);
+                // Same untrusted-input reasoning as the automaton reader above;
+                // `readTransducer` (`AutomatonReader.java:245-247`) encodes with the very
+                // same `richAlphabet.encode`.
+                let sym = scratch.encode_index_of(&digits);
                 // `AutomatonReader.readTransducer` (`:249-250`):
                 // `currentStateTransitions.put(encode(i), dest)` — Java `Map.put`
                 // REPLACES any prior entry for the same encoded symbol, it does not
@@ -1200,6 +1290,125 @@ mod tests {
         // The self-loop on state0 alone never reaches an accepting state.
         let wrong = [a.encode(&[0, 0, 0, 0])];
         assert!(!a.fa.accepts_word(&wrong));
+    }
+
+    // =======================================================================
+    // Phase 4 U30 Tier-5 fuzz regressions (findings F1/F2/F3)
+    // =======================================================================
+
+    /// F2, sub-case A. ` lsd_2\n0 1\n20-> 11` — the body digit `20` is outside the
+    /// header's `{0,1}` alphabet AND state `11` is never declared. Real `walnut-java`
+    /// on this exact file reports `State 11 is used but never declared anywhere in
+    /// file: …` (verified on `target/Walnut-all.jar`), because `RichAlphabet.encode`'s
+    /// `List.indexOf` silently yields `-1` and the undeclared-state validation only
+    /// runs after the whole parse loop. This port used to panic inside `encode` before
+    /// ever reaching that check.
+    #[test]
+    fn an_out_of_alphabet_digit_with_an_undeclared_dest_reports_the_undeclared_state() {
+        let e = read_automaton_from_str(" lsd_2\n0 1\n20-> 11").expect_err("undeclared state");
+        assert!(matches!(e, ReadError::UndeclaredDestState(11)), "{e:?}");
+        // A negative digit reaches the same place (`-1 1 -> 0` under `msd_2`).
+        let e = read_automaton_from_str("msd_2\n0 1\n-1 -> 9").expect_err("undeclared state");
+        assert!(matches!(e, ReadError::UndeclaredDestState(9)), "{e:?}");
+    }
+
+    /// F2, sub-case B. Same shape but with a DECLARED destination. Real `walnut-java`
+    /// **loads this file with no error at all** — `new Automaton(path)` returns a
+    /// 1-state automaton, keeping the transition under the bogus encoded key `-1`
+    /// (verified directly against `Walnut-all.jar`'s classes; the
+    /// `IndexOutOfBoundsException: Index -1 out of bounds for length 2` the fuzz report
+    /// saw comes later, from `AutomatonWriter.writeToGV`'s `decode(-1)`, and
+    /// `Prover.readBuffer`'s `catch (RuntimeException)` recovers from that too).
+    ///
+    /// So the faithful port is to REPRODUCE the key, not to reject the file: rejecting
+    /// it would diverge on every file Java accepts (see the test below). Any later pass
+    /// that iterates `0..alphabet_size` drops the `-1` entry, which is exactly what
+    /// real Walnut's own written-back output shows.
+    #[test]
+    fn an_out_of_alphabet_digit_with_a_declared_dest_loads_with_javas_minus_one_key() {
+        let a = read_automaton_from_str(" lsd_2\n0 1\n20 -> 0\n").expect("Java loads this too");
+        assert_eq!(a.fa.q, 1);
+        assert_eq!(a.fa.d[0].get(&-1), Some(&vec![0usize]));
+        assert!(
+            a.fa.d[0].keys().all(|&k| k < 0),
+            "no valid symbol is stored"
+        );
+        // `encode_index_of` is what produces that key; `encode` would have panicked.
+        assert_eq!(a.encode_index_of(&[20]), -1);
+    }
+
+    /// F2, sub-case B, the case that decides the fix: real `walnut-java` accepts this
+    /// file and writes it back out as exactly itself minus the out-of-alphabet line
+    /// (`5 -> 1`), confirmed by running `eval`/`def` over it on `Walnut-all.jar`. A
+    /// port that rejected out-of-alphabet digits outright would diverge here.
+    #[test]
+    fn an_out_of_alphabet_digit_leaves_every_in_alphabet_transition_intact() {
+        let a = read_automaton_from_str("msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n")
+            .expect("Java accepts this file");
+        assert_eq!(a.fa.q, 2);
+        assert_eq!(a.fa.o, vec![0, 1]);
+        // State 0's two real transitions, unaffected.
+        assert_eq!(a.fa.d[0].get(&0), Some(&vec![0usize]));
+        assert_eq!(a.fa.d[0].get(&1), Some(&vec![1usize]));
+        // State 1 keeps its real `0 -> 0` and parks `5 -> 1` under the bogus key.
+        assert_eq!(a.fa.d[1].get(&0), Some(&vec![0usize]));
+        assert_eq!(a.fa.d[1].get(&1), None);
+        assert_eq!(a.fa.d[1].get(&-1), Some(&vec![1usize]));
+    }
+
+    /// F3. Java's `NumberSystem` constructor rejects a base `<= 1` outright
+    /// (`:322-332`): a library file headed `msd_1` answers `Number system msd_1 is not
+    /// defined.` on the real CLI, and the session continues. This reader used to build
+    /// `(0..base)` for any `i32` it could parse, so `msd_1` produced the one-symbol
+    /// alphabet `{0}` and `msd_0` an EMPTY one.
+    #[test]
+    fn a_header_base_below_two_is_not_a_defined_number_system() {
+        for (header, name) in [("msd_1", "msd_1"), ("msd_0", "msd_0"), ("lsd_1", "lsd_1")] {
+            let e = parse_header(header, None, &mut BTreeSet::new()).expect_err("base <= 1");
+            match e {
+                ReadError::NumSys(NumSysError::NotDefined(ref n)) => assert_eq!(n, name),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                ReadError::NumSys(NumSysError::NotDefined(name.to_string())).to_string(),
+                format!("NumSys(NotDefined({name:?}))")
+            );
+        }
+        // Reached through the whole-file entry point too, not just `parse_header`.
+        let e = read_automaton_from_str("# .\nmsd_1\n\n1 1\n1 -> 0\n").expect_err("base <= 1");
+        assert!(
+            matches!(e, ReadError::NumSys(NumSysError::NotDefined(_))),
+            "{e:?}"
+        );
+        // Base 2 and up is of course still fine, and a signed base is not a number at
+        // all to Java's `isNumber`, so it falls through to the custom-base branch
+        // (which, with no resolver, is `UnsupportedNumeration`) instead of silently
+        // building an empty alphabet.
+        assert!(parse_header("msd_2", None, &mut BTreeSet::new()).is_ok());
+        let e = parse_header("msd_-3", None, &mut BTreeSet::new()).expect_err("not a base");
+        assert!(matches!(e, ReadError::UnsupportedNumeration(_)), "{e:?}");
+    }
+
+    /// F1's class, at the two `parse_methods` call sites the transducer reader uses:
+    /// a `\d+` group that matches syntactically but overflows `i32`. Java's
+    /// `UtilityMethods.parseInt` throws `NumberFormatException` there and
+    /// `Prover.readBuffer` recovers; this port used to panic, which was process-fatal.
+    #[test]
+    fn a_transducer_integer_that_overflows_i32_reports_instead_of_panicking() {
+        for content in [
+            "msd_2\n99999999999\n0 -> 0 / 0\n", // state declaration
+            "msd_2\n0\n99999999999 -> 0 / 0\n", // input digit
+            "msd_2\n0\n0 -> 99999999999 / 0\n", // destination id
+            "msd_2\n0\n0 -> 0 / 99999999999\n", // output value
+        ] {
+            let e = read_transducer_from_str(content).expect_err("overflows i32");
+            match e {
+                ReadError::ParseMethods(ref p) => {
+                    assert_eq!(p.to_string(), "For input string: \"99999999999\"")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

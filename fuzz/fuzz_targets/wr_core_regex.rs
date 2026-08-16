@@ -50,29 +50,6 @@ const MAX_INPUT_LEN: usize = 128;
 /// global digit filter would reject a large share of the real seed corpus.
 const MAX_REPEAT_DIGIT_RUN: usize = 2;
 
-/// Longest digit run allowed inside a `[…]` span — **a known-crash bypass, not a budget
-/// filter**, kept explicit and narrow rather than silent, in the spirit of
-/// `tests/golden`'s `KNOWN_DIVERGENCES` list.
-///
-/// `determine_encoded_regex` reads a `[a,b,…]` alphabet vector with `parse_set_elements`,
-/// which calls `wr_core::util::parse_int` — and that function *panics* on an `i32`
-/// overflow, by design (see its own doc comment, which reasons that every call site is
-/// already behind a regex gate so only an internal-invariant violation could reach it).
-/// That reasoning does not hold for this call site: the digits come straight off the
-/// user's `reg` command line, so `reg r {0,1} "([8888888800])"` reaches it. See
-/// `README.md`'s "Findings" section and
-/// `regressions/wr_core_regex/f1-parse-int-i32-overflow-in-alphabet-vector` for the
-/// minimized input, the confirmed real-`walnut-java` comparison, and why this is a port
-/// defect rather than a `docs/WALNUT-BUGS.md` entry.
-///
-/// Until that is fixed through the project's review loop, every fuzz run would terminate
-/// on this one known input within seconds and discover nothing else. 9 digits is the
-/// largest run that cannot overflow `i32` (`999999999 < 2147483647`), so this excludes
-/// exactly the known-crashing shape and nothing more. **Remove this constant and its
-/// branch once the underlying panic is guarded** — the regression input above is the
-/// check that the fix works.
-const MAX_SET_ELEMENT_DIGIT_RUN: usize = 9;
-
 /// Structural budget on the *construction*-blowing operators, in the same
 /// "cost, not bug" spirit as [`MAX_REPEAT_DIGIT_RUN`].
 ///
@@ -141,9 +118,15 @@ fn structure_is_in_budget(s: &str) -> bool {
     true
 }
 
-/// A conservative bracket-span scanner: it does not have to mirror the parser's own
-/// brace/bracket handling (unbalanced and nested brackets are still fuzzed), only to
-/// never let through an input whose numeric literals exceed the two limits above.
+/// A conservative brace-span scanner: it does not have to mirror the parser's own
+/// brace handling (unbalanced and nested braces are still fuzzed), only to never let
+/// through an input whose `{n,m}` repetition counts exceed the limit above.
+///
+/// It used to bound `[…]` alphabet-vector digit runs as well — that was the
+/// known-crash bypass for Phase 4 U30's finding F1 (`reg r {0,1} "([8888888800])"`
+/// panicking in `wr_core::util::parse_int`), and it is gone now that
+/// `determine_encoded_regex` reports the overflow as `RegexError::NumberFormat`
+/// instead. `[…]` digit runs are therefore fully fuzzed again.
 fn numeric_literals_are_in_budget(s: &str) -> bool {
     let mut limit: Option<usize> = None;
     let mut run = 0usize;
@@ -151,10 +134,6 @@ fn numeric_literals_are_in_budget(s: &str) -> bool {
         match c {
             '{' => {
                 limit = Some(MAX_REPEAT_DIGIT_RUN);
-                run = 0;
-            }
-            '[' => {
-                limit = Some(MAX_SET_ELEMENT_DIGIT_RUN);
                 run = 0;
             }
             '}' | ']' => {

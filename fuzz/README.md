@@ -27,7 +27,6 @@ fuzz/
   fuzz_targets/       the three targets
   seeds/<target>/     curated, COMMITTED seed inputs (read-only corpus)
   corpus/<target>/    libFuzzer's working corpus — gitignored, run output
-  regressions/        minimized crashing inputs from findings not yet fixed
   artifacts/          libFuzzer crash/OOM/timeout artifacts — gitignored
 ```
 
@@ -158,91 +157,121 @@ non-finding. These implement `CLAUDE.md`'s "generate SMALL" guardrail:
 known, already-reported finding within seconds and discover nothing else. They are
 deliberately loud in the source — each is documented on its own constant/function with the
 minimized reproducer and a **"delete this once the underlying defect is fixed"** note, in
-the same spirit as `tests/golden`'s `KNOWN_DIVERGENCES` list. They are never a silent skip.
+the same spirit as `tests/golden`'s `KNOWN_DIVERGENCES` list. They are never a silent skip,
+and they are **removed, not accumulated**: all three that this unit's findings needed are
+gone, deleted along with the defects they masked (see "Findings" below). There are
+currently none.
+
+A fixed finding's minimized input is **not** thrown away: it moves from `regressions/` into
+`seeds/<target>/` under the same name, so every future run replays it, and it is
+additionally pinned as an ordinary `#[test]` in the owning crate (a fuzz-found bug gets a
+normal regression test, not just a corpus entry). `regressions/` therefore does not exist
+right now — recreate it when a new finding lands that cannot be fixed immediately.
 
 ## Findings
 
 Three findings, all from the first 5-minute run of their target, all confirmed against the
-real `walnut-java` CLI (`~/dev/walnut-java/target/Walnut-all.jar`). **None was fixed here**
-— all three live in `crates/wr-core`/`crates/wr-io`, which need the project's
-implementer → two-independent-reviewer → fixer loop. Each minimized input is committed
-under `regressions/`.
+real `walnut-java` CLI (`~/dev/walnut-java/target/Walnut-all.jar`). **All three are now
+fixed**, together with a fourth instance of F1's root cause found while fixing it. Each
+minimized input has moved into `seeds/<target>/` and is additionally pinned by an ordinary
+`#[test]`; the three known-crash bypasses that masked them are deleted.
 
-### F1 — `wr_core::util::parse_int` panics on `i32` overflow, from raw user input, at two call sites
+Every one of them turned out to be a **port defect, not a Walnut defect** — no
+`docs/WALNUT-BUGS.md` entry was needed. The shared reason is `Prover.readBuffer`
+(`Prover.java:387-392`), which wraps each command's `dispatch(s)` in
+`catch (RuntimeException)` and prints a truncated stack trace: Java's *session survives*
+every one of these inputs. Verified, not inferred — each reproducer was run through the
+real jar with an ordinary `eval` after it, and that following command evaluated normally
+in the same session every time. A Rust `panic!` has no equivalent boundary and kills the
+process, so matching Java means returning a `Result`, never panicking.
 
-`parse_int` panics (`"For input string: \"…\""`) when its argument overflows `i32`. Its
-doc comment justifies that: *"every real call site in this port passes text already
-validated by a regex-shaped matcher, so the only realistic failure is `i32` overflow"* —
-and reaches for a panic rather than a `Result` on the reasoning that this is an
-internal-invariant violation, not untrusted input. **That reasoning does not hold at two
-call sites**, both reachable straight from what a user types:
+### F1 — `wr_core::util::parse_int` panicked on `i32` overflow, from raw user input — FIXED
 
-* `regex.rs`'s `parse_set_elements` (the `reg` command's `[a,b,…]` alphabet vectors) —
-  `reg r {0,1} "([8888888800])"`.
-  Reproducer: `regressions/wr_core_regex/f1-parse-int-i32-overflow-in-alphabet-vector`
-* `wr-logic`'s `@N` alphabet-letter token (`Predicate.java:220`) —
-  `?msd_2 T[x] = @8888888888`.
-  Reproducer: `regressions/wr_logic_parser/f1b-parse-int-i32-overflow-in-alphabet-letter`
+`parse_int`'s doc justified its panic on the grounds that *"every real call site in this
+port passes text already validated by a regex-shaped matcher"*. A regex-shaped `\d+`
+gate constrains a token's **shape** and says nothing about its **magnitude**, so that
+reasoning was false at every site whose digits come from the user. Four, in the end:
 
-**Real Walnut on the same inputs**: throws `java.lang.NumberFormatException: For input
-string: "8888888800"` — i.e. the port reproduces Java's *message* byte-for-byte, which is
-what makes this a port defect rather than a `WALNUT-BUGS.md` entry. What diverges is
-**recoverability**: Java's REPL catches the exception and returns to the prompt, while the
-Rust panic is process-fatal. That is exactly the class the U17–U26 review round already
-fixed several instances of ("multiple process-killing panics on ordinary mismatched-input
-commands, now guarded").
+| Call site | Reproducer | Now |
+| --- | --- | --- |
+| `wr_core::regex::parse_set_elements` (`reg`'s `[a,b,…]` vectors) | `reg r {0,1} "([8888888800])"` | `RegexError::NumberFormat` |
+| `wr_logic`'s `@N` alphabet letter (`Predicate.java:220`) | `?msd_2 T[x] = @8888888888` | `LexError::NumberFormat` |
+| `wr_cli::alphabet::parse_set_elements` (`Alphabet.java:56-59`) | `alphabet foo {8888888800} bar` | `AlphabetError::NumberFormat` |
+| `wr_io::parse_methods`' state/transition/dest/output groups | `msd_2\n99999999999\n0 -> 0 / 0` (transducer reader) | `ReadError::ParseMethods(NumberFormat)` |
 
-### F2 — `Automaton::encode` panics on an out-of-alphabet digit read from a `.txt` file
+The last two were found by reading, not by the fuzzer — the third has no fuzz target at
+all, and the fourth is on the `wr_io_reader` target's `read_transducer_from_str` half but
+needs a 10+-digit run the 5-minute run never mutated its way to. All four now go through
+the new `wr_core::util::try_parse_int`, which returns
+`NumberFormatError` rendering `NumberFormatException.getMessage()` byte-for-byte
+(`For input string: "8888888800"` — the exact text the real jar prints). `parse_int`
+itself is unchanged and still panics, for the call sites where an overflow genuinely
+would be an internal-invariant violation.
 
-`read_automaton_str_impl` calls `automaton.encode(&digits)` **inside** its parse loop, on
-digits taken straight from an untrusted file. `encode`'s own doc says it *"Panics if a
-digit isn't present in its track's alphabet (a caller bug, not a data error)"* — again a
-premise that does not hold at this call site.
+### F2 — `Automaton::encode` panicked on an out-of-alphabet digit read from a `.txt` file — FIXED
 
-Reproducer (18 bytes, `regressions/wr_io_reader/f2-encode-panics-on-out-of-alphabet-digit`):
+`read_automaton_str_impl` called `automaton.encode(&digits)` inside its parse loop, on
+digits taken straight from an untrusted file, and `encode` panics on a digit absent from
+its track's alphabet.
 
-```
- lsd_2
-0 1
-20-> 11
-```
+The original report split this into "undeclared destination state (Java = clean error)"
+and "declared destination state (Java = `IndexOutOfBoundsException`)". Running the real
+jar's classes directly showed both halves have the same cause and neither is a reader
+error in Java: **`AutomatonReader` has no out-of-alphabet check at all.**
+`RichAlphabet.encode` uses `List.indexOf`, gets `-1`, and stores the transition under
+that bogus key; `new Automaton(" lsd_2\n0 1\n20 -> 0\n")` loads with no error and
+reports 1 state. What happens next depends only on what the automaton is used for:
 
-**Real Walnut on the same file**: `State 11 is used but never declared anywhere in file:
-Automata Library/fz.txt` — a clean `WalnutException`. Java gets *past* the encode step
-(`RichAlphabet.encode` uses `List.indexOf`, which returns `-1` and silently corrupts the
-encoding rather than throwing) and then hits its undeclared-state validation, which the
-port performs only *after* the loop. Two sub-cases worth separating for whoever fixes it:
+* **undeclared destination** — `validateDeclaredStates`, which runs *after* the whole
+  parse loop, reports `State 11 is used but never declared anywhere in file: …`;
+* **declared destination** — the file loads. The `IndexOutOfBoundsException: Index -1 out
+  of bounds for length 2` the original report saw comes much later and from somewhere
+  else entirely: `AutomatonWriter.writeToGV` → `RichAlphabet.decode(-1)`, reached from
+  `EvalDef.evalDefCommand`'s result write, four frames outside the reader. `readBuffer`
+  catches it and the session continues;
+* **and often nothing at all** — for many shapes the `-1` key is simply dropped by the
+  next pass that iterates `0..alphabetSize`, and real Walnut writes back the input minus
+  the offending line, with no diagnostic whatsoever
+  (`msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n` does exactly this).
 
-* undeclared destination state (above): Java = clean error, Rust = **panic**;
-* declared destination state (` lsd_2\n0 1\n20 -> 0\n`): Java = uncaught
-  `IndexOutOfBoundsException: Index -1 out of bounds for length 2`, REPL recovers; Rust =
-  panic, process-fatal. Java's own unhelpful exception here looks like a genuine Walnut
-  defect and may deserve a `WB-` entry in its own right — flagged, not filed, since
-  filing is the coordinator's call.
+So rejecting out-of-alphabet digits with a clean error would have *diverged* from Java on
+that third bullet — the common case. The fix is instead the verbatim port: a new
+`Automaton::encode_index_of` reproducing `List.indexOf`'s `-1` (the same treatment
+`wr_core::regex`'s `encode_with_index_of` already carries for WB-024), used by both the
+automaton and the transducer reader. The undeclared-state case then reaches this port's
+existing `ReadError::UndeclaredDestState` exactly as Java reaches
+`validateDeclaredStates`, and the declared case loads the same automaton Java loads.
 
-Negative digits (`-1 1 -> 0` under `msd_2`) reach the same panic.
+One residual, *pre-existing* divergence worth knowing about and deliberately not touched
+here: `Automaton::decode` uses `rem_euclid`/`div_euclid` where Java uses truncating
+`%`/`/`, so `decode(-1)` returns a digit in this port where Java throws
+`IndexOutOfBoundsException`. That is the divergence behind the second bullet above —
+this port writes a corrupt automaton back out where Java errors. It is the *graceful*
+direction (no crash), it predates this unit, and closing it would mean introducing a
+panic, so it is reported rather than changed.
 
-### F3 — `wr-io`'s header parser accepts a base below 2
+### F3 — `wr-io`'s header parser accepted a base below 2 — FIXED
 
-`parse_ns_token` (`crates/wr-io/src/reader.rs`) builds `(0..base).collect()` for **any**
-`i32` it can parse out of a `msd_`/`lsd_` token. So `msd_1` yields the one-symbol alphabet
-`{0}`, and `msd_0`/`msd_-3` yield the *empty* alphabet; the first body digit then trips
-F2's panic. Java's `NumberSystem.parseBase` rejects `<= 1` outright
-(`if (!isNumber(baseStr) || Integer.parseInt(baseStr) <= 1) throw`).
+`parse_ns_token` built `(0..base)` for **any** `i32` it could parse out of a
+`msd_`/`lsd_` token, so `msd_1` yielded the one-symbol alphabet `{0}` and `msd_0`/`msd_-3`
+the *empty* alphabet. Java's `NumberSystem` constructor rejects that outright
+(`:322-332`: neither `isNumber(base) && parseInt(base) > 1` nor `parseNegNumber(base) > 1`
+holds, and no `Custom Bases/msd_1*.txt` rescues it), and the real jar answers
+`Number system msd_1 is not defined.` — session intact.
 
-Reproducer (`regressions/wr_io_reader/f3-header-accepts-base-below-2`):
+The new `numeric_base` helper ports that check, including its use of `isNumber`
+(`^\d+$`) rather than `str::parse`, which Java's is and which `parse` is not (it would
+accept a leading `+`/`-`). A base `<= 1` is now `ReadError::NumSys(NumSysError::NotDefined)`,
+a `\d+` base overflowing `int` is `NumSysError::BaseNotAnI32` (Java's unchecked
+`NumberFormatException` at `:325`), and a non-numeric rest still falls through to the
+custom-base file lookup exactly as Java's does.
 
-```
-# .
-msd_1
-
-1 1
-1 -> 0
-```
-
-**Real Walnut on the same file**: `Number system msd_1 is not defined.` This is a distinct
-defect from F2 — a missing *validation*, not a missing *guard* — and fixing it does not
-fix F2 (an out-of-alphabet digit under a legitimate `msd_2` still panics).
+One message-level divergence, from a pre-existing tokenizer simplification rather than
+from this fix: Java's `PATTERN_NEXT_ALPHABET_TOKEN` cannot consume a `-`, so real Walnut
+reads `msd_-3` as the token `msd_` and says `Number system msd_ is not defined.`, whereas
+this reader's whitespace-delimited tokenizer keeps the whole word and reports
+`UnsupportedNumeration("msd_-3")`. Both are errors on the same input; only the name in
+the text differs, and closing it means porting that regex.
 
 ## Run results at landing
 
@@ -254,8 +283,28 @@ Each target, 5 minutes, after its findings above were filtered out:
 | `wr_logic_parser` | 4,984,611 | clean |
 | `wr_core_regex` | 429,672 | clean |
 
-`wr_core_regex`'s much lower rate is expected: every iteration runs a full Thompson
-construction → determinize → minimize → dead-transition prune, three times.
+(`wr_core_regex`'s much lower rate is expected: every iteration runs a full Thompson
+construction → determinize → minimize → dead-transition prune, three times.)
+
+## Run results after the F1/F2/F3 fixes
+
+Same 5-minute budget per target, with the three known-crash bypasses deleted — so each
+target now explores strictly *more* input than it did above (literal-set `.txt` headers
+and arbitrary body digits for `wr_io_reader`, 10+-digit runs for `wr_logic_parser`,
+multi-digit `[…]` vector elements for `wr_core_regex`), which is why the throughput drops:
+
+| Target | Executions | Result |
+| --- | --- | --- |
+| `wr_io_reader` | 6,052,725 | clean |
+| `wr_logic_parser` | 4,789,840 | clean |
+| `wr_core_regex` | 100,681 | clean |
+
+`wr_core_regex` also recorded one **slow unit** (not a crash; the run still exited 0):
+`~.0..................` — 20 `.` atoms under a complement, i.e. the `Σ*`-concatenation
+determinization blowup `MAX_ATOMS` already documents, sitting exactly at that limit.
+Textbook algorithmic cost, identical in real Walnut/Brics; recorded rather than acted on.
+Its much lower rate throughout is expected for the same reason: every iteration runs a
+full Thompson construction → determinize → minimize → dead-transition prune, three times.
 
 ## Environment notes
 

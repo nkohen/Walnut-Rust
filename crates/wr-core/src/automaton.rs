@@ -534,6 +534,56 @@ impl Automaton {
         encoding
     }
 
+    /// `RichAlphabet.encode(List<Integer>)` (`RichAlphabet.java:86-91`) with **Java's
+    /// `List.indexOf` semantics preserved**: a digit that is not in its track's alphabet
+    /// contributes `encoder[i] * -1` rather than raising anything, so the result can be
+    /// negative and is not a valid symbol at all.
+    ///
+    /// This is the same verbatim-`indexOf` port `crate::regex`'s private
+    /// `encode_with_index_of` already carries for WB-024, at the second call site that
+    /// genuinely needs it: `AutomatonReader.readAutomaton`/`readTransducer` encode every
+    /// transition line's digit tuple straight out of an untrusted `.txt` file
+    /// (`AutomatonReader.java:71-72`, `:245-247`), and Java's reader has **no**
+    /// out-of-alphabet check anywhere — verified by running `walnut-java` on a file whose
+    /// body digit is outside the header's alphabet (` lsd_2\n0 1\n20 -> 0`): it loads
+    /// with no error at all, keeping a transition under the bogus key `-1`. Whether that
+    /// then goes on to fail depends entirely on what the automaton is *used* for
+    /// afterwards, and porting that faithfully means reproducing the key, not rejecting
+    /// the file:
+    ///
+    /// * with a state id that was never declared, `validateDeclaredStates` (which runs
+    ///   AFTER the whole parse loop) reports the clean `State N is used but never
+    ///   declared anywhere in file: …` this port already ports as
+    ///   `wr_io::reader::ReadError::UndeclaredDestState`;
+    /// * otherwise the file loads, and the `-1`-keyed transition is silently dropped by
+    ///   any later pass that iterates `0..alphabet_size` — real `walnut-java` writes
+    ///   exactly that reduced automaton back out (confirmed on two such files).
+    ///
+    /// [`Automaton::encode`] — which panics instead — remains correct for every caller
+    /// whose digits come from an alphabet this crate itself built, and is what those
+    /// callers must keep using; a panic is a better error than a corrupt encoding when
+    /// the input really is an internal invariant.
+    pub fn encode_index_of(&self, digits: &[i32]) -> i32 {
+        let mut encoding: i32 = 0;
+        for (i, &d) in digits.iter().enumerate() {
+            let index = self.alphabet[i]
+                .iter()
+                .position(|&v| v == d)
+                .map_or(-1, |p| p as i32);
+            // Same checked arithmetic as `encode_with`, for the same reason (Java's
+            // `Math.multiplyExact`/`addExact`).
+            let encoder_i =
+                i32::try_from(self.encoder[i]).expect("encoder entry exceeds i32 range");
+            let term = encoder_i
+                .checked_mul(index)
+                .expect("encode overflow (Math.multiplyExact equivalent)");
+            encoding = encoding
+                .checked_add(term)
+                .expect("encode overflow (Math.addExact equivalent)");
+        }
+        encoding
+    }
+
     /// Decodes a transition symbol back into its per-track digit tuple. Inverse of
     /// [`Automaton::encode`] (`decode(encode(x)) == x`).
     pub fn decode(&self, mut sym: i32) -> Vec<i32> {

@@ -71,7 +71,7 @@
 use std::collections::BTreeMap;
 
 use wr_core::numsys::{normalize_number_system_token, NumSysError, NumberSystem};
-use wr_core::util::{is_java_whitespace, parse_int};
+use wr_core::util::{is_java_whitespace, try_parse_int, NumberFormatError};
 
 /// Recoverable parse failures. Mirrors this project's established idiom (module-local
 /// error enums for recoverable cases; see e.g. `wr_core::numsys::NumSysError`) rather
@@ -93,6 +93,28 @@ pub enum ParseMethodsError {
     /// `NumSysError::BaseNotAnI32`). The `String` is the exact text Java would have
     /// handed to `Integer.parseInt`.
     IntegerParseFailure(String),
+    /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on an
+    /// `i32`-overflowing digit run in a state declaration, a transition line, or an
+    /// alphabet set — every `\d+` group in this file's patterns constrains shape, not
+    /// magnitude, and the text behind them comes straight out of a `.txt` library file.
+    ///
+    /// Distinct from [`Self::IntegerParseFailure`], which is WB-011's *plain*
+    /// `Integer.parseInt` call in `parseMorphism` (no whitespace stripping, so it also
+    /// fires on `"[+ 5]"`). This one is the whitespace-stripping `UtilityMethods.parseInt`
+    /// used everywhere else, so its payload is the STRIPPED text, exactly as Java's
+    /// message would carry it.
+    ///
+    /// Recoverable rather than a `panic!`, for the reason `wr_core::util::try_parse_int`
+    /// documents: `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`)
+    /// returns to the prompt on Java's `NumberFormatException`, so the whole-process abort
+    /// this port used to do here was a port defect. Reached through
+    /// `read_transducer_from_str` on e.g. `msd_2\n99999999999\n0 -> 0 / 0` — the same
+    /// class as Phase 4 U30's fuzz finding F1, at a third and fourth call site.
+    NumberFormat(NumberFormatError),
+    /// Propagated from `NumberSystem` construction for a named alphabet token — the
+    /// error [`parse_alphabet_declaration`] used to return directly, now wrapped so that
+    /// function can also report [`Self::NumberFormat`].
+    NumSys(NumSysError),
 }
 
 impl std::fmt::Display for ParseMethodsError {
@@ -104,11 +126,26 @@ impl std::fmt::Display for ParseMethodsError {
             ParseMethodsError::IntegerParseFailure(text) => {
                 write!(f, "For input string: \"{text}\"")
             }
+            // `NumberFormatException.getMessage()` verbatim.
+            ParseMethodsError::NumberFormat(e) => write!(f, "{e}"),
+            ParseMethodsError::NumSys(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for ParseMethodsError {}
+
+impl From<NumberFormatError> for ParseMethodsError {
+    fn from(e: NumberFormatError) -> Self {
+        ParseMethodsError::NumberFormat(e)
+    }
+}
+
+impl From<NumSysError> for ParseMethodsError {
+    fn from(e: NumSysError) -> Self {
+        ParseMethodsError::NumSys(e)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Low-level shared matchers (no direct Java counterpart -- internal plumbing
@@ -159,9 +196,17 @@ fn match_signed_int_span(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// [`parse_int`] applied to an already-CONFIRMED [`match_signed_int_span`] capture.
-fn parse_int_span(s: &str, span: (usize, usize)) -> i32 {
-    parse_int(&s[span.0..span.1])
+/// `UtilityMethods.parseInt` applied to an already-CONFIRMED
+/// [`match_signed_int_span`] capture.
+///
+/// # Errors
+///
+/// [`ParseMethodsError::NumberFormat`] when the captured digit run overflows `i32`.
+/// The enclosing pattern having matched says nothing about magnitude, and Java throws
+/// `NumberFormatException` here too — so this is a real, recoverable outcome, not the
+/// internal-invariant violation `wr_core::util::parse_int`'s panic assumes.
+fn parse_int_span(s: &str, span: (usize, usize)) -> Result<i32, ParseMethodsError> {
+    Ok(try_parse_int(&s[span.0..span.1])?)
 }
 
 /// [`match_signed_int_span`] plus immediate parsing — safe ONLY where a successful
@@ -174,10 +219,12 @@ fn parse_int_span(s: &str, span: (usize, usize)) -> i32 {
 /// has real trailing context (an arrow, a mandatory whitespace run, a closing brace,
 /// end-of-string) that a plain digit match doesn't yet guarantee, and must use
 /// [`match_signed_int_span`] instead.
-fn match_signed_int(bytes: &[u8], pos: usize) -> Option<(i32, usize)> {
-    let (start, end) = match_signed_int_span(bytes, pos)?;
+fn match_signed_int(bytes: &[u8], pos: usize) -> Result<Option<(i32, usize)>, ParseMethodsError> {
+    let Some((start, end)) = match_signed_int_span(bytes, pos) else {
+        return Ok(None);
+    };
     let text = std::str::from_utf8(&bytes[start..end]).expect("regex-shaped input is ASCII");
-    Some((parse_int(text), end))
+    Ok(Some((try_parse_int(text)?, end)))
 }
 
 // ---------------------------------------------------------------------------
@@ -328,11 +375,11 @@ fn match_alphabet_set_end(s: &str) -> Option<usize> {
 /// iteration in `parseAlphabetDeclaration`, so a non-match here means the WHOLE
 /// alphabet-declaration parse stops there, not just this one token). Returns the
 /// token and the total number of bytes consumed, including surrounding whitespace.
-fn match_next_alphabet_token(s: &str) -> Option<(AlphabetToken, usize)> {
+fn match_next_alphabet_token(s: &str) -> Result<Option<(AlphabetToken, usize)>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let i = skip_ws(bytes, 0);
     if i >= bytes.len() {
-        return None;
+        return Ok(None);
     }
     if bytes[i] == b'{' {
         // Java's pattern is `\{\s*(...)\s*\}` (`ParseMethods.java:46`) -- there IS a
@@ -341,12 +388,14 @@ fn match_next_alphabet_token(s: &str) -> Option<(AlphabetToken, usize)> {
         // internal whitespace-skip absorbs it; a signed first element (`{ -1, 0, 1}`)
         // was silently rejected without this.
         let inner_start = skip_ws(bytes, i + 1);
-        let list_end = match_alphabet_set_end(&s[inner_start..])?;
+        let Some(list_end) = match_alphabet_set_end(&s[inner_start..]) else {
+            return Ok(None);
+        };
         let list_text = &s[inner_start..inner_start + list_end];
         let mut j = inner_start + list_end;
         j = skip_ws(bytes, j);
         if bytes.get(j) != Some(&b'}') {
-            return None;
+            return Ok(None);
         }
         j += 1;
         j = skip_ws(bytes, j);
@@ -354,17 +403,19 @@ fn match_next_alphabet_token(s: &str) -> Option<(AlphabetToken, usize)> {
         // text, then `parseList` re-tokenizes it with the more permissive
         // PATTERN_ELEMENT grammar (identical result here, since group 12's grammar
         // is a strict subset of PATTERN_ELEMENT's — no `*`, no leading comma).
-        let values: Vec<i32> = parse_list(list_text)
+        let values: Vec<i32> = parse_list(list_text)?
             .into_iter()
             .map(|v| v.expect("group 12's grammar never produces a '*' element"))
             .collect();
-        return Some((AlphabetToken::Set(values), j));
+        return Ok(Some((AlphabetToken::Set(values), j)));
     }
-    let (ns_text, ns_len) = match_ns_token(&s[i..])?;
+    let Some((ns_text, ns_len)) = match_ns_token(&s[i..]) else {
+        return Ok(None);
+    };
     let ns_text = ns_text.to_string();
     let mut j = i + ns_len;
     j = skip_ws(bytes, j);
-    Some((AlphabetToken::Ns(ns_text), j))
+    Ok(Some((AlphabetToken::Ns(ns_text), j)))
 }
 
 /// `ParseMethods.parseAlphabetDeclaration(String, List<List<Integer>>, List<NumberSystem>)`
@@ -382,13 +433,14 @@ fn match_next_alphabet_token(s: &str) -> Option<(AlphabetToken, usize)> {
 /// (Phase 3a U5) can build a custom base, but only from already-loaded automata, and this
 /// function takes a bare `&str` with no way to reach the filesystem. Closing it means
 /// threading a file-supplying resolver through here — U13's job, tracked in the Phase 3a
-/// plan. Until then the failure is a clean [`NumSysError::NotDefined`], never a silent
-/// misparse.
-pub fn parse_alphabet_declaration(s: &str) -> Result<AlphabetDeclaration, NumSysError> {
+/// plan. Until then the failure is a clean [`NumSysError::NotDefined`] (wrapped in
+/// [`ParseMethodsError::NumSys`] since this function can now also report
+/// [`ParseMethodsError::NumberFormat`]), never a silent misparse.
+pub fn parse_alphabet_declaration(s: &str) -> Result<AlphabetDeclaration, ParseMethodsError> {
     let mut alphabet: Vec<Vec<i32>> = Vec::new();
     let mut number_systems: Vec<Option<NumberSystem>> = Vec::new();
     let mut index = 0usize;
-    while let Some((token, consumed)) = match_next_alphabet_token(&s[index..]) {
+    while let Some((token, consumed)) = match_next_alphabet_token(&s[index..])? {
         match token {
             AlphabetToken::Set(values) => {
                 alphabet.push(values);
@@ -433,7 +485,7 @@ pub fn parse_alphabet_declaration(s: &str) -> Result<AlphabetDeclaration, NumSys
 /// following whitespace at all (e.g. `"9999999999"`, one token, no `\s+`) is not a
 /// state declaration in Java — `m.find()` fails outright and `parseStateDeclaration`
 /// returns `false` — so it must return `None` here too, not panic mid-probe.
-pub fn parse_state_declaration(s: &str) -> Option<(i32, i32)> {
+pub fn parse_state_declaration(s: &str) -> Result<Option<(i32, i32)>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let mut i = skip_ws(bytes, 0);
     let name_start = i;
@@ -441,29 +493,35 @@ pub fn parse_state_declaration(s: &str) -> Option<(i32, i32)> {
         i += 1;
     }
     if i == name_start {
-        return None;
+        return Ok(None);
     }
     let name_span = (name_start, i);
     let ws_start = i;
     i = skip_ws(bytes, i);
     if i == ws_start {
-        return None; // \s+ needs at least one
+        return Ok(None); // \s+ needs at least one
     }
-    let output_span = match_signed_int_span(bytes, i)?;
+    let Some(output_span) = match_signed_int_span(bytes, i) else {
+        return Ok(None);
+    };
     i = skip_ws(bytes, output_span.1);
     if i != bytes.len() {
-        return None;
+        return Ok(None);
     }
     // Fully matched -- now, and only now, safe to parse (matching where Java's own
-    // parseInt calls happen).
-    Some((parse_int_span(s, name_span), parse_int_span(s, output_span)))
+    // parseInt calls happen). Either parse can still fail on i32 overflow, exactly as
+    // Java's does.
+    Ok(Some((
+        parse_int_span(s, name_span)?,
+        parse_int_span(s, output_span)?,
+    )))
 }
 
 /// `ParseMethods.parseTransducerStateDeclaration(String, int[])` (`:122-130`) —
 /// `^\s*(\d+)\s*$`. Same deferred-parsing discipline as [`parse_state_declaration`]:
 /// an overflow-sized digit run followed by non-whitespace trailing garbage isn't a
 /// match in Java at all (`\s*$` fails), so it must not panic here either.
-pub fn parse_transducer_state_declaration(s: &str) -> Option<i32> {
+pub fn parse_transducer_state_declaration(s: &str) -> Result<Option<i32>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let mut i = skip_ws(bytes, 0);
     let start = i;
@@ -471,14 +529,14 @@ pub fn parse_transducer_state_declaration(s: &str) -> Option<i32> {
         i += 1;
     }
     if i == start {
-        return None;
+        return Ok(None);
     }
     let val_span = (start, i);
     i = skip_ws(bytes, i);
     if i != bytes.len() {
-        return None;
+        return Ok(None);
     }
-    Some(parse_int_span(s, val_span))
+    Ok(Some(parse_int_span(s, val_span)?))
 }
 
 /// One LHS input-symbol element, as a SPAN (deferred parse) rather than a value —
@@ -533,12 +591,15 @@ fn match_transition_lhs(s: &str, start: usize) -> Option<(Vec<InputElemSpan>, us
 
 /// Parses a confirmed [`InputElemSpan`] list into the public `Vec<Option<i32>>`
 /// shape — only called after the caller's full pattern has matched.
-fn parse_input_spans(s: &str, spans: Vec<InputElemSpan>) -> Vec<Option<i32>> {
+fn parse_input_spans(
+    s: &str,
+    spans: Vec<InputElemSpan>,
+) -> Result<Vec<Option<i32>>, ParseMethodsError> {
     spans
         .into_iter()
         .map(|e| match e {
-            InputElemSpan::Num(start, end) => Some(parse_int_span(s, (start, end))),
-            InputElemSpan::Wildcard => None,
+            InputElemSpan::Num(start, end) => parse_int_span(s, (start, end)).map(Some),
+            InputElemSpan::Wildcard => Ok(None),
         })
         .collect()
 }
@@ -573,7 +634,7 @@ fn match_dest_list(s: &str, start: usize) -> Option<(Vec<(usize, usize)>, usize)
     }
 }
 
-fn parse_dest_spans(s: &str, spans: Vec<(usize, usize)>) -> Vec<i32> {
+fn parse_dest_spans(s: &str, spans: Vec<(usize, usize)>) -> Result<Vec<i32>, ParseMethodsError> {
     spans.into_iter().map(|sp| parse_int_span(s, sp)).collect()
 }
 
@@ -587,19 +648,27 @@ fn parse_dest_spans(s: &str, spans: Vec<(usize, usize)>) -> Vec<i32> {
 /// which only ever runs after `m.find()` already succeeded for the entire line. An
 /// overflow-sized digit run that's part of a line failing to match for some OTHER
 /// reason (missing `->`, trailing garbage, …) must return `None` here, not panic.
-pub fn parse_transition(s: &str) -> Option<(Vec<Option<i32>>, Vec<i32>)> {
+#[allow(clippy::type_complexity)]
+pub fn parse_transition(
+    s: &str,
+) -> Result<Option<(Vec<Option<i32>>, Vec<i32>)>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let start = skip_ws(bytes, 0);
-    let (input_spans, i) = match_transition_lhs(s, start)?;
-    let (dest_spans, i) = match_dest_list(s, i)?;
+    let Some((input_spans, i)) = match_transition_lhs(s, start) else {
+        return Ok(None);
+    };
+    let Some((dest_spans, i)) = match_dest_list(s, i) else {
+        return Ok(None);
+    };
     if i != bytes.len() {
-        return None;
+        return Ok(None);
     }
-    // Fully matched -- now, and only now, safe to parse.
-    Some((
-        parse_input_spans(s, input_spans),
-        parse_dest_spans(s, dest_spans),
-    ))
+    // Fully matched -- now, and only now, safe to parse. The parses themselves can
+    // still fail on i32 overflow, exactly as Java's `parseList` can.
+    Ok(Some((
+        parse_input_spans(s, input_spans)?,
+        parse_dest_spans(s, dest_spans)?,
+    )))
 }
 
 /// One transducer transition line's parsed fields, mirroring
@@ -619,26 +688,34 @@ pub struct TransducerTransition {
 /// List<Integer>)` (`:142-153`) —
 /// `^\s*((((\+|\-)?\s*\d+\s*)|(\s*\*\s*))+)\s*\->\s*((\d+\s*)+)\s*\/\s*((\+|\-)?\s*\d+)\s*$`.
 /// Same deferred-parsing discipline as [`parse_transition`].
-pub fn parse_transducer_transition(s: &str) -> Option<TransducerTransition> {
+pub fn parse_transducer_transition(
+    s: &str,
+) -> Result<Option<TransducerTransition>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let start = skip_ws(bytes, 0);
-    let (input_spans, i) = match_transition_lhs(s, start)?;
-    let (dest_spans, i) = match_dest_list(s, i)?;
+    let Some((input_spans, i)) = match_transition_lhs(s, start) else {
+        return Ok(None);
+    };
+    let Some((dest_spans, i)) = match_dest_list(s, i) else {
+        return Ok(None);
+    };
     if bytes.get(i) != Some(&b'/') {
-        return None;
+        return Ok(None);
     }
     let i = skip_ws(bytes, i + 1);
-    let output_span = match_signed_int_span(bytes, i)?;
+    let Some(output_span) = match_signed_int_span(bytes, i) else {
+        return Ok(None);
+    };
     let i = skip_ws(bytes, output_span.1);
     if i != bytes.len() {
-        return None;
+        return Ok(None);
     }
     // Fully matched -- now, and only now, safe to parse.
-    Some(TransducerTransition {
-        input: parse_input_spans(s, input_spans),
-        dest: parse_dest_spans(s, dest_spans),
-        output: vec![parse_int_span(s, output_span)],
-    })
+    Ok(Some(TransducerTransition {
+        input: parse_input_spans(s, input_spans)?,
+        dest: parse_dest_spans(s, dest_spans)?,
+        output: vec![parse_int_span(s, output_span)?],
+    }))
 }
 
 /// `ParseMethods.parseList(String, List<Integer>)` (`:155-164`) — repeatedly matches
@@ -646,7 +723,7 @@ pub fn parse_transducer_transition(s: &str) -> Option<TransducerTransition> {
 /// appending each matched value (`None` for `*`) until no more match. Unlike
 /// [`parse_alphabet_declaration`], Java's `parseList` has no "fully consumed" check
 /// at all — any trailing non-matching remainder is silently ignored.
-pub fn parse_list(s: &str) -> Vec<Option<i32>> {
+pub fn parse_list(s: &str) -> Result<Vec<Option<i32>>, ParseMethodsError> {
     let bytes = s.as_bytes();
     let mut result = Vec::new();
     let mut index = 0usize;
@@ -661,7 +738,7 @@ pub fn parse_list(s: &str) -> Vec<Option<i32>> {
             index = i + 1;
             continue;
         }
-        match match_signed_int(bytes, i) {
+        match match_signed_int(bytes, i)? {
             Some((v, end)) => {
                 result.push(Some(v));
                 index = end;
@@ -669,7 +746,7 @@ pub fn parse_list(s: &str) -> Vec<Option<i32>> {
             None => break,
         }
     }
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +994,10 @@ mod tests {
         // unusable base name `""` -- this becomes a clean `NotDefined` error here
         // rather than a silent misparse.
         let d = parse_alphabet_declaration("msd_");
-        assert!(matches!(d, Err(NumSysError::NotDefined(_))));
+        assert!(matches!(
+            d,
+            Err(ParseMethodsError::NumSys(NumSysError::NotDefined(_)))
+        ));
     }
 
     #[test]
@@ -931,9 +1011,11 @@ mod tests {
         // previous test and would abort the loop with `NotDefined` before a second
         // token is ever reached -- exactly like real Java's
         // `NumberSystem.getComputeIfAbsent("msd_")` throwing immediately there too.
-        let (tok1, len1) = match_next_alphabet_token("msd_ 10").unwrap();
+        let (tok1, len1) = match_next_alphabet_token("msd_ 10").unwrap().unwrap();
         assert!(matches!(tok1, AlphabetToken::Ns(ref t) if t == "msd_"));
-        let (tok2, len2) = match_next_alphabet_token(&"msd_ 10"[len1..]).unwrap();
+        let (tok2, len2) = match_next_alphabet_token(&"msd_ 10"[len1..])
+            .unwrap()
+            .unwrap();
         assert!(matches!(tok2, AlphabetToken::Ns(ref t) if t == "10"));
         assert_eq!(len1 + len2, "msd_ 10".len());
     }
@@ -972,7 +1054,10 @@ mod tests {
         // doc comment; U13 threads a resolver through). Until then: a clean Err, never a
         // silent misparse.
         let err = parse_alphabet_declaration("msd_fib").unwrap_err();
-        assert!(matches!(err, NumSysError::NotDefined(_)));
+        assert!(matches!(
+            err,
+            ParseMethodsError::NumSys(NumSysError::NotDefined(_))
+        ));
     }
 
     #[test]
@@ -1045,11 +1130,11 @@ mod tests {
 
     #[test]
     fn state_declaration_examples() {
-        assert_eq!(parse_state_declaration("0 1"), Some((0, 1)));
-        assert_eq!(parse_state_declaration("  12   -3  "), Some((12, -3)));
-        assert_eq!(parse_state_declaration("5"), None); // missing output
-        assert_eq!(parse_state_declaration("5-3"), None); // missing mandatory \s+
-        assert_eq!(parse_state_declaration("5 -3 extra"), None);
+        assert_eq!(parse_state_declaration("0 1"), Ok(Some((0, 1))));
+        assert_eq!(parse_state_declaration("  12   -3  "), Ok(Some((12, -3))));
+        assert_eq!(parse_state_declaration("5"), Ok(None)); // missing output
+        assert_eq!(parse_state_declaration("5-3"), Ok(None)); // missing mandatory \s+
+        assert_eq!(parse_state_declaration("5 -3 extra"), Ok(None));
     }
 
     /// Review finding: `"9999999999"` (10 digits, overflows i32) has no mandatory
@@ -1060,42 +1145,42 @@ mod tests {
     /// of returning `None` like Java's clean non-match.
     #[test]
     fn state_declaration_overflow_digit_run_with_no_match_returns_none_not_panic() {
-        assert_eq!(parse_state_declaration("9999999999"), None);
+        assert_eq!(parse_state_declaration("9999999999"), Ok(None));
         // Overflowing OUTPUT field, trailing garbage after it (also not a match).
-        assert_eq!(parse_state_declaration("0 9999999999 x"), None);
+        assert_eq!(parse_state_declaration("0 9999999999 x"), Ok(None));
     }
 
     #[test]
     fn transducer_state_declaration_examples() {
-        assert_eq!(parse_transducer_state_declaration("  7  "), Some(7));
-        assert_eq!(parse_transducer_state_declaration("7 8"), None);
-        assert_eq!(parse_transducer_state_declaration(""), None);
+        assert_eq!(parse_transducer_state_declaration("  7  "), Ok(Some(7)));
+        assert_eq!(parse_transducer_state_declaration("7 8"), Ok(None));
+        assert_eq!(parse_transducer_state_declaration(""), Ok(None));
     }
 
     // -- parseTransition / parseTransducerTransition --------------------------
 
     #[test]
     fn transition_single_symbol() {
-        let (input, dest) = parse_transition("0 -> 1").unwrap();
+        let (input, dest) = parse_transition("0 -> 1").unwrap().unwrap();
         assert_eq!(input, vec![Some(0)]);
         assert_eq!(dest, vec![1]);
     }
 
     #[test]
     fn transition_multi_track_with_wildcard() {
-        let (input, dest) = parse_transition("0 * -1 -> 2 3").unwrap();
+        let (input, dest) = parse_transition("0 * -1 -> 2 3").unwrap().unwrap();
         assert_eq!(input, vec![Some(0), None, Some(-1)]);
         assert_eq!(dest, vec![2, 3]);
     }
 
     #[test]
     fn transition_requires_arrow() {
-        assert_eq!(parse_transition("0 1"), None);
+        assert_eq!(parse_transition("0 1"), Ok(None));
     }
 
     #[test]
     fn transition_rejects_trailing_garbage() {
-        assert_eq!(parse_transition("0 -> 1 x"), None);
+        assert_eq!(parse_transition("0 -> 1 x"), Ok(None));
     }
 
     /// Review finding: neither of these is a match in Java at all (no `->` for the
@@ -1105,14 +1190,14 @@ mod tests {
     /// panicked instead of returning `None`.
     #[test]
     fn transition_overflow_digit_run_with_no_match_returns_none_not_panic() {
-        assert_eq!(parse_transition("9999999999"), None); // no "->" anywhere
-        assert_eq!(parse_transition("2147483648"), None); // ditto, i32::MAX + 1
-        assert_eq!(parse_transition("0 -> 9999999999 x"), None); // dest overflow + trailing garbage
+        assert_eq!(parse_transition("9999999999"), Ok(None)); // no "->" anywhere
+        assert_eq!(parse_transition("2147483648"), Ok(None)); // ditto, i32::MAX + 1
+        assert_eq!(parse_transition("0 -> 9999999999 x"), Ok(None)); // dest overflow + trailing garbage
     }
 
     #[test]
     fn transducer_transition_example() {
-        let t = parse_transducer_transition("0 -> 1 / -2").unwrap();
+        let t = parse_transducer_transition("0 -> 1 / -2").unwrap().unwrap();
         assert_eq!(t.input, vec![Some(0)]);
         assert_eq!(t.dest, vec![1]);
         assert_eq!(t.output, vec![-2]);
@@ -1120,7 +1205,7 @@ mod tests {
 
     #[test]
     fn transducer_transition_requires_slash_output() {
-        assert!(parse_transducer_transition("0 -> 1").is_none());
+        assert!(parse_transducer_transition("0 -> 1").unwrap().is_none());
     }
 
     /// Review finding: no `/`-output present at all, so this isn't a
@@ -1128,23 +1213,25 @@ mod tests {
     /// trailing digit run -- must return `None`, not panic.
     #[test]
     fn transducer_transition_overflow_dest_with_no_slash_returns_none_not_panic() {
-        assert!(parse_transducer_transition("0 -> 1 9999999999").is_none());
+        assert!(parse_transducer_transition("0 -> 1 9999999999")
+            .unwrap()
+            .is_none());
     }
 
     // -- parseList -------------------------------------------------------------
 
     #[test]
     fn parse_list_examples() {
-        assert_eq!(parse_list("0, 1, 2"), vec![Some(0), Some(1), Some(2)]);
-        assert_eq!(parse_list("5 -3 *"), vec![Some(5), Some(-3), None]);
-        assert_eq!(parse_list(""), Vec::<Option<i32>>::new());
+        assert_eq!(parse_list("0, 1, 2"), Ok(vec![Some(0), Some(1), Some(2)]));
+        assert_eq!(parse_list("5 -3 *"), Ok(vec![Some(5), Some(-3), None]));
+        assert_eq!(parse_list(""), Ok(Vec::<Option<i32>>::new()));
     }
 
     #[test]
     fn parse_list_ignores_trailing_unparseable_remainder() {
         // Unlike parse_alphabet_declaration, parse_list has no "fully consumed"
         // check -- trailing junk after the last valid element is silently dropped.
-        assert_eq!(parse_list("0, 1, abc"), vec![Some(0), Some(1)]);
+        assert_eq!(parse_list("0, 1, abc"), Ok(vec![Some(0), Some(1)]));
     }
 
     // -- parseMorphism -----------------------------------------------------------

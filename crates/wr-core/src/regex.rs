@@ -119,6 +119,7 @@ use crate::determinize::subset_construction;
 use crate::fa::Fa;
 use crate::minimize::minimize;
 use crate::product::cross_product_internal;
+use crate::util::NumberFormatError;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +148,16 @@ pub enum RegexError {
     /// module docs for why the construction is unreachable from every `walnut-java`
     /// production call path).
     UnsupportedInterval,
+    /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on an
+    /// `i32`-overflowing element of a `[a,b,…]` alphabet vector (`Reg.java:56-59`) —
+    /// e.g. `reg r {0,1} "([8888888800])"`. Like [`Self::Brics`] this is an UNCHECKED
+    /// Java exception rather than a `WalnutException`, so `Prover` prints it with its
+    /// class name and a stack trace; unlike a `WalnutException` it is still caught by
+    /// `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`), so the
+    /// session survives — verified against `target/Walnut-all.jar`. Found by Tier-5
+    /// fuzzing (Phase 4, U30, finding F1); this port used to `panic!` here, which was
+    /// process-fatal and therefore a port defect, not Walnut behavior.
+    NumberFormat(NumberFormatError),
 }
 
 impl RegexError {
@@ -159,6 +170,8 @@ impl RegexError {
             RegexError::UnsupportedInterval => {
                 "walnut-rs does not implement dk.brics numerical intervals (<n-m>)".to_string()
             }
+            // `NumberFormatException.getMessage()` verbatim.
+            RegexError::NumberFormat(e) => e.to_string(),
         }
     }
 }
@@ -1314,7 +1327,8 @@ fn encode_with_index_of(digits: &[i32], alphabet: &[Vec<i32>], encoder: &[i32]) 
 /// # Errors
 ///
 /// [`RegexError::Walnut`] if a bracketed vector's arity does not match the number of
-/// declared tracks (`Reg.java:60-62`).
+/// declared tracks (`Reg.java:60-62`); [`RegexError::NumberFormat`] if one of that
+/// vector's elements overflows `i32` (see [`parse_set_elements`]).
 pub fn determine_encoded_regex(
     baseexp: &str,
     alphabet: &[Vec<i32>],
@@ -1336,7 +1350,7 @@ pub fn determine_encoded_regex(
         if is(vector[0], '[') {
             vector = &vector[1..vector.len() - 1];
         }
-        let l = parse_set_elements(vector);
+        let l = parse_set_elements(vector)?;
         if l.len() != input_length {
             return Err(RegexError::Walnut(
                 "Mismatch between vector length in regex and specified number of inputs to automaton"
@@ -1435,7 +1449,16 @@ fn match_signed_number(units: &[u16], p: usize) -> Option<usize> {
 /// `Prover.PAT_FOR_A_SINGLE_ELEMENT_OF_A_SET` (`Prover.java:103-104`,
 /// `"(\\+|\\-)?\\s*\\d+"`) applied with `Matcher.find()` in a loop, followed by
 /// `UtilityMethods.parseInt` on each match (`Reg.java:56-59`).
-fn parse_set_elements(units: &[u16]) -> Vec<i32> {
+///
+/// # Errors
+///
+/// [`RegexError::NumberFormat`] if a matched element overflows `i32`. The pattern is a
+/// purely syntactic `\d+`, so it constrains the element's *shape* and not its
+/// magnitude — `reg r {0,1} "([8888888800])"` reaches this from raw user input, and
+/// [`crate::util::try_parse_int`] (not the panicking `parse_int`) is what makes it a
+/// recoverable command failure here, exactly as Java's caught `NumberFormatException`
+/// is one there.
+fn parse_set_elements(units: &[u16]) -> Result<Vec<i32>, RegexError> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < units.len() {
@@ -1461,13 +1484,13 @@ fn parse_set_elements(units: &[u16]) -> Vec<i32> {
         match m {
             Some(end) => {
                 let text = String::from_utf16_lossy(&units[i..end]);
-                out.push(crate::util::parse_int(&text));
+                out.push(crate::util::try_parse_int(&text).map_err(RegexError::NumberFormat)?);
                 i = end;
             }
             None => i += 1,
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

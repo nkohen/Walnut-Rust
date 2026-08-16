@@ -47,36 +47,6 @@ const MAX_INPUT_LEN: usize = 256;
 /// plus a couple beyond, at a worst case of 512 symbols.
 const MAX_BASE: u32 = 8;
 
-/// Longest run of ASCII digits accepted — **a known-crash bypass, not a budget filter**,
-/// kept explicit rather than silent, in the spirit of `tests/golden`'s
-/// `KNOWN_DIVERGENCES` list, and **to be deleted once the underlying panic is guarded**.
-///
-/// The `@N` alphabet-letter token (`Predicate.java:220`) is read with
-/// `wr_core::util::parse_int`, which *panics* on an `i32` overflow by design — its own
-/// doc reasons that every call site is already behind a regex gate, so only an
-/// internal-invariant violation could reach it. That reasoning does not hold here: the
-/// digits come straight out of the user's query, and `?msd_2 T[x] = @8888888888` reaches
-/// it. This is the same root cause as the `wr_core_regex` target's first finding, at a
-/// second, independent call site; see `README.md`'s "Findings" and
-/// `regressions/wr_logic_parser/f1b-parse-int-i32-overflow-in-alphabet-letter`.
-///
-/// 9 digits is the largest run that cannot overflow `i32` (`999999999 < 2147483647`), so
-/// this excludes exactly the known-crashing shape. The cost is that numeric literals of
-/// 10+ digits go unfuzzed — which is narrow, since ordinary constants take the
-/// arbitrary-precision `parse_big_integer` path instead and are unaffected.
-const MAX_DIGIT_RUN: usize = 9;
-
-fn digit_runs_are_in_budget(s: &str) -> bool {
-    let mut run = 0usize;
-    for c in s.chars() {
-        run = if c.is_ascii_digit() { run + 1 } else { 0 };
-        if run > MAX_DIGIT_RUN {
-            return false;
-        }
-    }
-    true
-}
-
 /// A file-I/O-free [`PredicateEnv`] with a bounded numeration base.
 ///
 /// Delegates wholesale to [`InMemoryPredicateEnv`], which already builds plain
@@ -176,10 +146,6 @@ fuzz_target!(|data: &[u8]| {
     let Ok(query) = std::str::from_utf8(data) else {
         return;
     };
-    if !digit_runs_are_in_budget(query) {
-        return;
-    }
-
     ENV.with(|env| {
         let _ = Predicate::new(env, query);
     });

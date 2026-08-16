@@ -59,89 +59,6 @@ fn is_skipped(line: &str) -> bool {
     t.is_empty() || t.starts_with('#')
 }
 
-/// Second known-crash bypass, same status as [`avoids_known_encode_panic`]'s own rules and
-/// likewise **to be deleted once fixed**: `parse_ns_token` accepts *any* `i32` as a base, so `msd_1`
-/// builds the one-symbol alphabet `{0}`, `msd_0`/`msd_-3` build the *empty* alphabet, and
-/// the first body digit then trips the same `encode` panic. Java's `NumberSystem.parseBase`
-/// rejects `<= 1` outright — real `walnut-java` on the minimized reproducer
-/// (`regressions/wr_io_reader/f3-header-accepts-base-below-2`) answers "Number system
-/// msd_1 is not defined." This is a *distinct* defect from the `encode` panic itself
-/// (a missing validation, not a missing guard); see `README.md`'s "Findings".
-fn header_base_is_at_least_two(header: &str) -> bool {
-    header.split_whitespace().all(|tok| {
-        match tok
-            .strip_prefix("msd_")
-            .or_else(|| tok.strip_prefix("lsd_"))
-        {
-            // Not a `msd_`/`lsd_`-prefixed token, or a custom-base *name* rather than a
-            // numeric base — neither reaches the `(0..base)` alphabet construction.
-            None => true,
-            Some(rest) => rest.parse::<i32>().map(|b| b >= 2).unwrap_or(true),
-        }
-    })
-}
-
-/// **A known-crash bypass, not a budget filter** — kept explicit and narrow rather than
-/// silent, in the spirit of `tests/golden`'s `KNOWN_DIVERGENCES` list, and **to be
-/// deleted once the underlying panic is guarded**.
-///
-/// The reader encodes each transition line's digit tuple with `Automaton::encode` *inside*
-/// its parse loop, and `encode` panics ("digit N not in track I's alphabet") when a digit
-/// is absent from the declared alphabet — its own doc calls that "a caller bug, not a data
-/// error", which does not hold for this call site, where the digits come straight out of an
-/// untrusted file. ` lsd_2\n0 1\n20-> 11` (18 bytes) is the minimized reproducer, committed
-/// as `regressions/wr_io_reader/f2-encode-panics-on-out-of-alphabet-digit`; real
-/// `walnut-java` on the same file reports a clean `WalnutException` instead. See
-/// `README.md`'s "Findings".
-///
-/// It is a trivially reachable shape — essentially any disagreement between the header's
-/// base and a body digit — so without this filter the target crashes within seconds every
-/// run and finds nothing else. The filter is deliberately crude and **over**-rejecting
-/// (the safe direction), because a harness must not re-implement the grammar it is
-/// fuzzing:
-///
-/// * the header must not contain `{`, so it is a `msd_k`/`lsd_k`/custom-base *name*, whose
-///   alphabet is always `0..k` with `k >= 2` (`parse_base` rejects `k <= 1`) — rather than
-///   a literal `{5,7}` set whose members are arbitrary;
-/// * every digit run in the **body** must be a single `0` or `1` (and unsigned — see the
-///   `-` branch), which is therefore in every alphabet such a header can declare;
-/// * the base is at least 2, per [`header_base_is_at_least_two`].
-///
-/// The cost is real and worth stating: literal-set headers go unfuzzed, and body state ids
-/// are limited to 0/1. What remains fuzzed is everything else — the whole `msd_k`/`lsd_k`/
-/// custom-name header grammar, and the entire body grammar (arrows, wildcards, multi-track
-/// arity, output values, comments, blank lines, declaration order, malformed lines).
-fn avoids_known_encode_panic(content: &str) -> bool {
-    let mut lines = content.lines().skip_while(|l| is_skipped(l));
-    let Some(header) = lines.next() else {
-        return true;
-    };
-    if header.contains('{') || !header_base_is_at_least_two(header) {
-        return false;
-    }
-    for line in lines {
-        let mut run = 0usize;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c.is_ascii_digit() {
-                run += 1;
-                if run > 1 || (c != '0' && c != '1') {
-                    return false;
-                }
-            } else {
-                // A `-` that does not begin the `->` arrow is a MINUS SIGN on a digit
-                // token, and a negative digit is outside every alphabet such a header can
-                // declare -- the same `encode` panic, reached with `-1` instead of `20`.
-                if c == '-' && chars.peek() != Some(&'>') {
-                    return false;
-                }
-                run = 0;
-            }
-        }
-    }
-    true
-}
-
 fn header_is_in_budget(content: &str) -> bool {
     let Some(header) = content.lines().find(|l| !is_skipped(l)) else {
         // No header at all — `ReadError::EmptyFile`, cheap, and worth exercising.
@@ -172,7 +89,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(content) = std::str::from_utf8(data) else {
         return;
     };
-    if !header_is_in_budget(content) || !avoids_known_encode_panic(content) {
+    if !header_is_in_budget(content) {
         return;
     }
 

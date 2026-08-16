@@ -361,6 +361,29 @@ fn determine_encoded_regex_rejects_a_vector_whose_arity_misses_the_track_count()
     );
 }
 
+/// Phase 4 U30 fuzz finding F1. `reg r {0,1} "([8888888800])"` is a plausible
+/// command line, and the `\d+` behind `PAT_FOR_A_SINGLE_ELEMENT_OF_A_SET` bounds the
+/// element's shape but not its magnitude — so `UtilityMethods.parseInt` overflows.
+/// Real `walnut-java` prints
+/// `java.lang.NumberFormatException: For input string: "8888888800"` and
+/// `Prover.readBuffer`'s `catch (RuntimeException)` returns to the prompt (verified
+/// on `target/Walnut-all.jar`: the next command in the same session still evaluates).
+/// This port used to `panic!` here, which was process-fatal.
+#[test]
+fn determine_encoded_regex_reports_an_i32_overflowing_vector_element_instead_of_panicking() {
+    let err = determine_encoded_regex("([8888888800])", &[vec![0, 1]]).expect_err("overflows i32");
+    assert!(matches!(err, RegexError::NumberFormat(_)));
+    assert_eq!(err.message(), "For input string: \"8888888800\"");
+    // A bare (unbracketed) digit run is NOT this call site: `RE_FOR_AN_ALPHABET_VECTOR`
+    // matches one bare digit at a time, so `8888888800` is ten separate one-element
+    // vectors and nothing overflows -- only the bracketed form can carry a multi-digit
+    // element. Pinned so the two are not conflated.
+    assert!(determine_encoded_regex("8888888800", &[vec![0, 1]]).is_ok());
+    // Still no panic when the value merely does not exist in the alphabet -- that is
+    // WB-024's negative-encoding path, which is a different (ported-verbatim) quirk.
+    assert!(determine_encoded_regex("9", &[vec![0, 1]]).is_ok());
+}
+
 #[test]
 fn determine_encoded_regex_swallows_bracketed_digit_runs_that_look_like_char_classes() {
     // `[01]` matches `RE_FOR_AN_ALPHABET_VECTOR`'s FIRST alternative, so it is the

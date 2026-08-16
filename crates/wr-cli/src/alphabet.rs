@@ -81,7 +81,7 @@ use std::rc::Rc;
 
 use wr_core::automaton::Automaton;
 use wr_core::numsys::{normalize_number_system_token, NumberSystem};
-use wr_core::util::{parse_int, remove_duplicates};
+use wr_core::util::{remove_duplicates, try_parse_int, NumberFormatError};
 use wr_core::word_automaton::minimize_self_with_output;
 use wr_logic::predicate_env::{PredicateEnv, PredicateEnvError};
 
@@ -114,6 +114,16 @@ pub enum AlphabetError {
     /// Propagated from [`write_automata`] — see that function's docs for why this
     /// module does not swallow-and-log the way Java's `writeAutomata` does.
     Io(std::io::Error),
+    /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on an
+    /// `i32`-overflowing element of a `{…}` literal alphabet set (`Alphabet.java:56-59`)
+    /// — e.g. `alphabet foo {8888888800} bar`. Same class as
+    /// `wr_core::regex::RegexError::NumberFormat`: an UNCHECKED Java exception that
+    /// `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`) recovers
+    /// from, so it must be a recoverable command failure here rather than the
+    /// process-fatal `panic!` `wr_core::util::parse_int` would raise. This call site is
+    /// the `reg`-command finding's (Phase 4 U30, F1) twin, found by reading rather than
+    /// by the fuzzer, which has no `wr-cli` target.
+    NumberFormat(NumberFormatError),
 }
 
 impl std::fmt::Display for AlphabetError {
@@ -123,6 +133,8 @@ impl std::fmt::Display for AlphabetError {
             AlphabetError::NumberSystem(e) => write!(f, "{e}"),
             AlphabetError::Read(e) => write!(f, "{e}"),
             AlphabetError::Io(e) => write!(f, "{e}"),
+            // `NumberFormatException.getMessage()` verbatim.
+            AlphabetError::NumberFormat(e) => write!(f, "{e}"),
         }
     }
 }
@@ -189,7 +201,12 @@ fn match_signed_number(units: &[u16], p: usize) -> Option<usize> {
 
 /// `Prover.PAT_FOR_A_SINGLE_ELEMENT_OF_A_SET` (`"(\\+|\\-)?\\s*\\d+"`) applied with
 /// `Matcher.find()` in a loop, as `Alphabet.determineAlphabet` does.
-fn parse_set_elements(units: &[u16]) -> Vec<i32> {
+///
+/// # Errors
+///
+/// [`AlphabetError::NumberFormat`] if a matched element overflows `i32` — the pattern
+/// is a syntactic `\d+`, which bounds shape and not magnitude.
+fn parse_set_elements(units: &[u16]) -> Result<Vec<i32>, AlphabetError> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < units.len() {
@@ -213,28 +230,31 @@ fn parse_set_elements(units: &[u16]) -> Vec<i32> {
         match m {
             Some(end) => {
                 let text = String::from_utf16_lossy(&units[i..end]);
-                out.push(parse_int(&text));
+                out.push(try_parse_int(&text).map_err(AlphabetError::NumberFormat)?);
                 i = end;
             }
             None => i += 1,
         }
     }
-    out
+    Ok(out)
 }
 
 /// Attempts to match `RE_FOR_AN_ALPHABET` starting EXACTLY at `at`. Returns the token
 /// plus the offset just past the mandatory trailing `\s+`, or `None` if nothing matches
 /// starting there (mirroring one failed `Matcher.find()` attempt at this position).
-fn try_match_alphabet_token(units: &[u16], at: usize) -> Option<(AlphabetToken, usize)> {
+fn try_match_alphabet_token(
+    units: &[u16],
+    at: usize,
+) -> Result<Option<(AlphabetToken, usize)>, AlphabetError> {
     if at >= units.len() {
-        return None;
+        return Ok(None);
     }
     if is(units[at], '{') {
         match_set_token(units, at)
     } else if is_word_char(units[at]) {
-        match_number_system_token(units, at)
+        Ok(match_number_system_token(units, at))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -251,8 +271,14 @@ fn match_number_system_token(units: &[u16], at: usize) -> Option<(AlphabetToken,
     Some((AlphabetToken::NumberSystem(text), ws_end))
 }
 
-fn match_set_token(units: &[u16], at: usize) -> Option<(AlphabetToken, usize)> {
-    let mut p = match_signed_number(units, at + 1)?; // past '{', first (mandatory) element
+fn match_set_token(
+    units: &[u16],
+    at: usize,
+) -> Result<Option<(AlphabetToken, usize)>, AlphabetError> {
+    // past '{', first (mandatory) element
+    let Some(mut p) = match_signed_number(units, at + 1) else {
+        return Ok(None);
+    };
     loop {
         let q = skip_spaces(units, p);
         if q < units.len() && is(units[q], ',') {
@@ -268,18 +294,18 @@ fn match_set_token(units: &[u16], at: usize) -> Option<(AlphabetToken, usize)> {
     }
     let close = skip_spaces(units, p);
     if !(close < units.len() && is(units[close], '}')) {
-        return None;
+        return Ok(None);
     }
     let after_close = close + 1;
     let ws_end = skip_spaces(units, after_close);
     if ws_end == after_close {
-        return None; // the mandatory trailing `\s+` did not match
+        return Ok(None); // the mandatory trailing `\s+` did not match
     }
     // `s = s.substring(1, s.length() - 1)` (`Alphabet.java:56`) -- truncate the braces.
-    let mut elems = parse_set_elements(&units[at + 1..close]);
+    let mut elems = parse_set_elements(&units[at + 1..close])?;
     // `UtilityMethods.removeDuplicates(L)` (`Alphabet.java:59`).
     remove_duplicates(&mut elems);
-    Some((AlphabetToken::Set(elems), ws_end))
+    Ok(Some((AlphabetToken::Set(elems), ws_end)))
 }
 
 /// `Alphabet.determineAlphabetsAndNS(String, List<NumberSystem>, List<List<Integer>>)`
@@ -297,7 +323,7 @@ pub fn determine_alphabets_and_ns(
     let mut alphabets = Vec::new();
     let mut i = 0usize;
     while i < units.len() {
-        match try_match_alphabet_token(&units, i) {
+        match try_match_alphabet_token(&units, i)? {
             Some((AlphabetToken::NumberSystem(text), end)) => {
                 let base = normalize_number_system_token(Some(&text));
                 let resolved = env
@@ -496,6 +522,23 @@ mod tests {
         assert!(ns.iter().all(Option::is_none));
         assert_eq!(ns.len(), 1);
         assert_eq!(alphabets, vec![vec![-1, 2, 3]]);
+    }
+
+    /// Phase 4 U30 fuzz finding F1's twin in `wr-cli`, found by reading rather than by
+    /// the fuzzer (which has no `wr-cli` target). `Alphabet.java:56-59` runs
+    /// `UtilityMethods.parseInt` over each `{…}` element, and the `\d+` behind it bounds
+    /// the element's shape but not its magnitude — so `alphabet foo {8888888800} bar`
+    /// throws `NumberFormatException` in real Walnut, which `Prover.readBuffer`'s
+    /// `catch (RuntimeException)` recovers from. This port used to `panic!`.
+    #[test]
+    fn a_set_element_that_overflows_i32_reports_instead_of_panicking() {
+        let env = InMemoryPredicateEnv::new();
+        let err = determine_alphabets_and_ns("{8888888800} ", &env).unwrap_err();
+        assert!(matches!(err, AlphabetError::NumberFormat(_)));
+        assert_eq!(err.to_string(), "For input string: \"8888888800\"");
+        // i32::MAX itself is still an ordinary alphabet element.
+        let (_, alphabets) = determine_alphabets_and_ns("{2147483647} ", &env).unwrap();
+        assert_eq!(alphabets, vec![vec![i32::MAX]]);
     }
 
     #[test]

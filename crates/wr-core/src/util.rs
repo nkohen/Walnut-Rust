@@ -31,7 +31,7 @@
 
 use num_bigint::BigInt;
 use std::collections::HashSet;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::hash::Hash;
 
 /// `UtilityMethods.MISSING_ELT` (`:31`) — "useful for IntMaps especially."
@@ -146,11 +146,74 @@ pub fn remove_indices<T: Clone>(l: &mut Vec<T>, indices: &[usize]) {
 /// path instead because it's genuinely reachable straight from raw user input at the
 /// `NumberSystem` boundary; this one is one layer further removed, already past a
 /// regex gate.)
+///
+/// # That reasoning is only true of the call sites that remain
+///
+/// Tier-5 fuzzing found three call sites where it was false — a regex gate that
+/// matches `\d+` says nothing about magnitude, so any of them could be handed a digit
+/// run that overflows `i32` straight from user input. Those now call
+/// [`try_parse_int`]; see its doc for the reproducers and the real-`walnut-java`
+/// comparison. Do not add a new `parse_int` call on text whose *length* is not itself
+/// bounded by the caller.
 pub fn parse_int(s: &str) -> i32 {
+    match try_parse_int(s) {
+        Ok(v) => v,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// `java.lang.NumberFormatException` as a recoverable value: the failure
+/// [`try_parse_int`] reports instead of panicking.
+///
+/// [`Display`](fmt::Display) renders `NumberFormatException.getMessage()` verbatim —
+/// `For input string: "8888888800"` — because the call sites that surface it
+/// (`wr_core::regex::determine_encoded_regex`'s `[a,b,…]` alphabet vectors,
+/// `wr_logic`'s `@N` alphabet-letter token, `wr_cli::alphabet`'s `{…}` sets, and
+/// `wr_io::parse_methods`' state/transition groups) reproduce that text byte-for-byte
+/// against the real `walnut-java` CLI, and Tier 1's `error*` fixtures compare message
+/// text.
+/// `payload` is the WHITESPACE-STRIPPED input, matching what Java's
+/// `UtilityMethods.parseInt` actually hands `Integer.parseInt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumberFormatError {
+    payload: String,
+}
+
+impl NumberFormatError {
+    /// The whitespace-stripped text that failed to parse.
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+}
+
+impl fmt::Display for NumberFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "For input string: \"{}\"", self.payload)
+    }
+}
+
+impl std::error::Error for NumberFormatError {}
+
+/// [`parse_int`]'s non-panicking form, for the call sites where the argument is **raw
+/// user input** rather than something already past a regex gate.
+///
+/// `parse_int`'s own doc reasons that only an internal-invariant violation can make it
+/// fail. Tier-5 fuzzing (Phase 4, U30) disproved that at four call sites, all reachable
+/// straight from what a user types or from a `.txt` file: `reg r {0,1}
+/// "([8888888800])"`, `?msd_2 T[x] = @8888888888`, `alphabet foo {8888888800} bar`, and
+/// a `.txt` transducer state declaration whose id overflows `i32`. Real `walnut-java`
+/// throws `NumberFormatException` on all of them
+/// and `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`) returns
+/// to the prompt — verified by running `target/Walnut-all.jar` on each: the failing
+/// command reports the exception and the very next command in the same session
+/// evaluates normally. A Rust `panic!` there is process-fatal, i.e. a port defect, not
+/// Walnut behavior; those call sites use this function and propagate the failure as an
+/// ordinary command-level error.
+pub fn try_parse_int(s: &str) -> Result<i32, NumberFormatError> {
     let stripped = strip_whitespace(s);
     stripped
         .parse::<i32>()
-        .unwrap_or_else(|_| panic!("For input string: \"{stripped}\""))
+        .map_err(|_| NumberFormatError { payload: stripped })
 }
 
 /// `UtilityMethods.parseBigInteger(String)` (`:115-117`) — same whitespace-stripping
@@ -373,6 +436,30 @@ mod tests {
     #[should_panic(expected = "For input string")]
     fn parse_int_panics_like_javas_number_format_exception() {
         parse_int("not a number");
+    }
+
+    /// Phase 4 U30 fuzz finding F1. `parse_int`'s panic is only defensible where the
+    /// caller genuinely cannot pass an overflowing digit run; `try_parse_int` is the
+    /// form the raw-user-input call sites use, and its message is
+    /// `NumberFormatException.getMessage()` byte-for-byte (real `walnut-java` on
+    /// `reg r {0,1} "([8888888800])"` prints exactly
+    /// `java.lang.NumberFormatException: For input string: "8888888800"`).
+    #[test]
+    fn try_parse_int_reports_overflow_instead_of_panicking() {
+        assert_eq!(try_parse_int("  -12  "), Ok(-12));
+        let e = try_parse_int("8888888800").unwrap_err();
+        assert_eq!(e.payload(), "8888888800");
+        assert_eq!(e.to_string(), "For input string: \"8888888800\"");
+        // Whitespace is stripped BEFORE parsing, so the reported payload is the
+        // stripped text -- exactly what Java's `UtilityMethods.parseInt` hands
+        // `Integer.parseInt`.
+        assert_eq!(
+            try_parse_int(" 88 888 888 00 ").unwrap_err().payload(),
+            "8888888800"
+        );
+        // `parse_int` still panics with the identical text, for the call sites where
+        // an overflow really would be an internal-invariant violation.
+        assert!(std::panic::catch_unwind(|| parse_int("8888888800")).is_err());
     }
 
     #[test]

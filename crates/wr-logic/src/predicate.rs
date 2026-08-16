@@ -122,7 +122,9 @@ use regex_automata::util::captures::Captures;
 use regex_automata::{Anchored, Input};
 
 use wr_core::numsys::{normalize_number_system_token, MSD_2};
-use wr_core::util::{generic_list_string, is_java_whitespace, parse_big_integer, parse_int};
+use wr_core::util::{
+    generic_list_string, is_java_whitespace, parse_big_integer, try_parse_int, NumberFormatError,
+};
 
 use crate::predicate_env::{PredicateEnv, PredicateEnvError};
 use crate::token::{
@@ -217,6 +219,21 @@ pub enum LexError {
     /// (RuntimeException)` recovers from, not a Rust `panic!` that would abort this
     /// process outright with no equivalent boundary (yet).
     MacroArgumentReplacementError { message: &'static str },
+    /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on the `@N`
+    /// alphabet-letter token (`Predicate.java:220`) when `N` overflows `i32` — e.g.
+    /// `?msd_2 T[x] = @8888888888`. The pattern behind that branch is a syntactic
+    /// `\d+`, which bounds the token's *shape* and not its magnitude, so this is
+    /// reachable straight from the user's query text.
+    ///
+    /// Like [`Self::MacroArgumentReplacementError`] this is an UNCHECKED Java exception
+    /// rather than a `WalnutException`, recovered by `Prover.readBuffer`'s `catch
+    /// (RuntimeException)` (`Prover.java:390-392`) — confirmed by running
+    /// `walnut-java/target/Walnut-all.jar` on the reproducer above: the command reports
+    /// the exception and the next command in the same session still evaluates. Ported
+    /// as a recoverable `Result::Err` for the same reason that variant gives; a Rust
+    /// `panic!` here (which is what Tier-5 fuzzing found, Phase 4 U30 finding F1) would
+    /// abort the process with no equivalent boundary.
+    NumberFormat(NumberFormatError),
 }
 
 impl From<TokenError> for LexError {
@@ -285,6 +302,8 @@ impl std::fmt::Display for LexError {
                 "{message} (uncaught Java exception from Predicate.putMacro's %N \
                  substitution, see docs/WALNUT-BUGS.md WB-019)"
             ),
+            // `NumberFormatException.getMessage()` verbatim.
+            LexError::NumberFormat(e) => write!(f, "{e}"),
         }
     }
 }
@@ -765,7 +784,10 @@ impl Predicate {
                 // between `@`, the sign, and the digits.
                 let t = Token::AlphabetLetter(AlphabetLetter::new(
                     self.position(val_span.start),
-                    parse_int(&text),
+                    // NOT the panicking `parse_int`: `text` is raw query text behind a
+                    // syntactic `\d+` gate that bounds its shape, not its magnitude.
+                    // See `LexError::NumberFormat`.
+                    try_parse_int(&text).map_err(LexError::NumberFormat)?,
                 ));
                 t.push_onto(&mut self.post_order, &mut self.operator_stack)?;
                 index = whole.end;
@@ -1887,6 +1909,32 @@ mod tests {
         assert_eq!(post("x=@+2"), "x:2:=_msd_2");
         // The pattern deliberately allows whitespace around the sign; `parseInt` strips it.
         assert_eq!(post("x=@ - 3"), "x:-3:=_msd_2");
+    }
+
+    /// Phase 4 U30 fuzz finding F1, second call site. `@N` goes through
+    /// `UtilityMethods.parseInt` (`Predicate.java:220`), whose `\d+` gate bounds the
+    /// token's shape and not its magnitude — so `?msd_2 T[x] = @8888888888` overflows
+    /// `i32`. Real `walnut-java` prints `java.lang.NumberFormatException: For input
+    /// string: "8888888888"` and `Prover.readBuffer`'s `catch (RuntimeException)`
+    /// returns to the prompt (verified against `target/Walnut-all.jar`: the next
+    /// command in the same session still evaluates). This port used to `panic!`,
+    /// which was process-fatal.
+    ///
+    /// Contrast [`number_literals_are_arbitrary_precision`] below: a bare numeric
+    /// literal takes `parseBigInteger` and is genuinely unbounded, so only the `@`
+    /// form is affected.
+    #[test]
+    fn alphabet_letter_reports_an_i32_overflow_instead_of_panicking() {
+        assert_eq!(err("x=@8888888888"), "For input string: \"8888888888\"");
+        assert!(matches!(
+            lex("x=@8888888888").expect_err("overflows i32"),
+            LexError::NumberFormat(_)
+        ));
+        // The whitespace the pattern allows is stripped before parsing, so the
+        // reported text is the stripped digits, exactly as Java's would be.
+        assert_eq!(err("x=@ - 8888888888"), "For input string: \"-8888888888\"");
+        // i32::MAX itself still lexes.
+        assert_eq!(post("x=@2147483647"), "x:2147483647:=_msd_2");
     }
 
     /// The literal keeps its full `BigInteger` value (`UtilityMethods.parseBigInteger`),
