@@ -3499,6 +3499,219 @@ mod tests {
         assert_eq!(a.fa.o, vec![0, 1, 1]);
     }
 
+    // --------------------- Tier-4 properties over the two standalone zero fixups (U31)
+    //
+    // Phase 4, U31. `wr_logic::quantify`'s `quantified_language_is_closed_under_leading_
+    // zeros` checks the leading-zero fixup only as the tail of the ∃-projection pipeline,
+    // on a 2-track automaton that has just been projected + determinized + minimized.
+    // These cover the same two primitives as the STANDALONE `fixleadzero`/`fixtrailzero`
+    // commands reach them: on an arbitrary, possibly nondeterministic, possibly partial
+    // automaton read straight off disk (`wr-cli`'s `simple_transforms.rs` carries the
+    // matching property at the command level, through the real file round trip).
+    //
+    // The two fixups are NOT mirror images and their properties are deliberately not
+    // symmetric — see `fix_trailing_zeros_problem`'s own doc comment. The leading-zeros one
+    // re-runs subset construction from the zero-closure of `q0` *after* forcing a
+    // `(q0, zero) -> q0` self-loop into the table, so it CLOSES the language under
+    // prepending zeros. The trailing-zeros one only widens the accepting set, so it is a
+    // right quotient by `zero*`: it closes the language under REMOVING trailing zeros, and
+    // not at all under adding them.
+
+    /// Random single-track NFA over `{0, 1}` with genuinely missing transitions and
+    /// genuinely multi-destination ones — a strictly wilder shape than `arb_partial_dfa`,
+    /// because `fixleadzero`/`fixtrailzero` read their operand from a `.txt` file and so
+    /// really can be handed an NFA.
+    fn arb_partial_nfa(q_max: usize) -> impl Strategy<Value = Automaton> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let o = prop::collection::vec(0i32..=1, q);
+            let table = prop::collection::vec(
+                prop::collection::vec(prop::collection::vec(any::<bool>(), q), 2),
+                q,
+            );
+            (o, table).prop_map(move |(o, table)| {
+                let d: Vec<BTreeMap<i32, Vec<usize>>> = table
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .enumerate()
+                            .filter_map(|(sym, incl)| {
+                                let dests: Vec<usize> = incl
+                                    .into_iter()
+                                    .enumerate()
+                                    .filter_map(|(dest, keep)| keep.then_some(dest))
+                                    .collect();
+                                (!dests.is_empty()).then_some((sym as i32, dests))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                single_track(
+                    Fa {
+                        true_false: None,
+                        q0: 0,
+                        q,
+                        alphabet_size: 2,
+                        o,
+                        d,
+                    },
+                    Some(true),
+                )
+            })
+        })
+    }
+
+    /// Can `fa`, from some state of `from`, reach an accepting state by reading `zero`
+    /// zero-or-more times? A plain BFS over the zero-edges of the ORIGINAL table — the
+    /// independent oracle for the trailing-zero fixup's right-quotient-by-`0*` semantics.
+    fn reaches_accepting_by_zeros(fa: &Fa, from: &BTreeSet<usize>, zero: i32) -> bool {
+        let mut seen = from.clone();
+        let mut queue: VecDeque<usize> = from.iter().copied().collect();
+        while let Some(s) = queue.pop_front() {
+            if fa.is_accepting(s) {
+                return true;
+            }
+            if let Some(dests) = fa.d[s].get(&zero) {
+                for &t in dests {
+                    if seen.insert(t) {
+                        queue.push_back(t);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Tier-4, `fixleadzero`: the closure the fixup exists to establish, plus both
+        /// one-sided containments that pin WHICH language it closes to.
+        ///
+        /// 1. **Closure** — `w` is accepted iff `0w` is. (`Automaton.determinizeAndMinimize
+        ///    (IntSet)` is run from `Z0`, the zero-closure of `q0`, and `zeroReachableStates`'
+        ///    forced `(q0, zero) -> q0` self-loop makes `δ(Z0, zero) = Z0` in BOTH directions
+        ///    — `⊆` from the closure, `⊇` from the self-loop.)
+        /// 2. **Soundness** — nothing is lost: `L(A) ⊆ L(fixed)`.
+        /// 3. **Completeness for the thing the command promises** — every word that the
+        ///    ORIGINAL automaton accepted with some number of leading zeros is accepted
+        ///    without them: `0^k w ∈ L(A) ⟹ w ∈ L(fixed)`.
+        ///
+        /// All three oracles run on the untouched clone of the input with nothing but
+        /// `Fa::accepts_word`. Note (2) and (3) are containments, not an equality: the
+        /// forced self-loop is a real, load-bearing mutation of the transition TABLE (see
+        /// `zero_reachable_states`' doc), so `L(fixed)` can legitimately contain words no
+        /// leading-zero padding of `L(A)` produces — asserting equality here would be
+        /// asserting away ported behaviour.
+        #[test]
+        fn fix_leading_zeros_closes_the_language_under_a_leading_zero(
+            a in arb_partial_nfa(4),
+            probe in prop::collection::vec(0i32..2, 0..4),
+        ) {
+            let original = a.clone();
+            let mut fixed = a;
+            fix_leading_zeros_problem(&mut fixed);
+
+            let zero = 0; // encode([0]) over the alphabet {0, 1}
+            let mut padded = vec![zero];
+            padded.extend_from_slice(&probe);
+            prop_assert_eq!(
+                fixed.fa.accepts_word(&probe),
+                fixed.fa.accepts_word(&padded),
+                "not closed under a leading zero at {:?}", probe
+            );
+
+            if original.fa.accepts_word(&probe) {
+                prop_assert!(fixed.fa.accepts_word(&probe), "the fixup lost a word");
+            }
+            for k in 0..=4usize {
+                let mut with_zeros = vec![zero; k];
+                with_zeros.extend_from_slice(&probe);
+                if original.fa.accepts_word(&with_zeros) {
+                    prop_assert!(
+                        fixed.fa.accepts_word(&probe),
+                        "0^{} {:?} was accepted, so {:?} must be after the fixup",
+                        k, probe, probe
+                    );
+                }
+            }
+        }
+
+        /// Tier-4, `fixtrailzero`: the EXACT characterization, which for this fixup is
+        /// available (unlike its leading-zeros sibling, which mutates the transition table).
+        /// `setStatesReachableToFinalStatesByZeros` only widens the accepting set, so
+        ///
+        /// ```text
+        /// L(fixed) = { w : ∃k ≥ 0, w·0^k ∈ L(A) }
+        /// ```
+        ///
+        /// i.e. a right quotient by `zero*`. The oracle decides that exactly — run `w` on
+        /// the ORIGINAL automaton, then ask a from-scratch zero-edge BFS whether any state
+        /// so reached can reach acceptance on zeros ([`reaches_accepting_by_zeros`]) — with
+        /// no length bound to guess, and with no call to the fixup or to `just_minimize`.
+        ///
+        /// The corollary spelled out separately below is the asymmetry `CLAUDE.md`'s L1
+        /// entry records: the result is closed under REMOVING a trailing zero and NOT under
+        /// adding one. Asserting the mirror of the leading-zeros property here would be
+        /// wrong, not merely unproven.
+        ///
+        /// # Two deliberate generator constraints, both faithful-behaviour driven
+        ///
+        /// * **Deterministic input.** Unlike its leading-zeros sibling (which re-runs
+        ///   subset construction and therefore handles an NFA natively), this fixup ends in
+        ///   `justMinimize`, whose `convertNFAtoDFA()` step throws `"Unexpected NFA instead
+        ///   of DFA."` on genuine nondeterminism — Java and this port alike (see
+        ///   `just_minimize`). So a `partial DFA` generator is the primitive's actual
+        ///   domain; feeding it an NFA would test the ported rejection, not the quotient.
+        /// * **Trimmed input.** `just_minimize` establishes none of `minimize`'s
+        ///   `q0`-reachability precondition (faithfully — Java's `justMinimize` does not
+        ///   trim either), so an unreachable state can legitimately trigger
+        ///   `docs/WALNUT-BUGS.md` WB-001. Same constraint, for the same reason, as
+        ///   `not_matches_the_complement_oracle`'s. Trimming does not change the quotient:
+        ///   a state that cannot reach acceptance contributes to neither side of the
+        ///   equation.
+        #[test]
+        fn fix_trailing_zeros_is_exactly_the_right_quotient_by_zeros(
+            fa in arb_partial_dfa(4, 2),
+            probe in prop::collection::vec(0i32..2, 0..4),
+        ) {
+            let mut original = single_track(fa, Some(true));
+            original.fa = crate::trim::trim(&original.fa);
+            let mut fixed = original.clone();
+            fix_trailing_zeros_problem(&mut fixed);
+
+            let zero = 0;
+            let reached: BTreeSet<usize> = {
+                let mut cur: BTreeSet<usize> = BTreeSet::from([original.fa.q0]);
+                for &sym in &probe {
+                    let mut next = BTreeSet::new();
+                    for &s in &cur {
+                        if let Some(dests) = original.fa.d[s].get(&sym) {
+                            next.extend(dests.iter().copied());
+                        }
+                    }
+                    cur = next;
+                }
+                cur
+            };
+            let expected = reaches_accepting_by_zeros(&original.fa, &reached, zero);
+            prop_assert_eq!(
+                fixed.fa.accepts_word(&probe), expected,
+                "trailing-zero fixup disagrees with the right quotient by 0* at {:?}", probe
+            );
+
+            // The corollary: closed under REMOVING a trailing zero (never under adding —
+            // that direction is genuinely false and is not asserted).
+            let mut with_zero = probe.clone();
+            with_zero.push(zero);
+            if fixed.fa.accepts_word(&with_zero) {
+                prop_assert!(
+                    fixed.fa.accepts_word(&probe),
+                    "{:?}0 accepted but {:?} is not", probe, probe
+                );
+            }
+        }
+    }
+
     // ------------------------------------- removeStatesWithOutputRebuild (Java test)
 
     #[test]

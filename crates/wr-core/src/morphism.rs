@@ -540,6 +540,7 @@ fn determine_uniform_length(mapping: &BTreeMap<i32, Vec<i32>>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn map(pairs: &[(i32, &[i32])]) -> BTreeMap<i32, Vec<i32>> {
         pairs.iter().map(|(k, v)| (*k, v.to_vec())).collect()
@@ -1048,5 +1049,189 @@ mod tests {
             predicate,
             "?msd_2 E q, r (n=2*q+r & r>=0 & r<2 & (L[q]= @-3 => (r=0)) & (L[q]= @12 => (r=1)))"
         );
+    }
+    // ------------------------------------------------------- Tier-4 properties (U31)
+    //
+    // Phase 4, U31. Two properties, both with oracles written from scratch here:
+    // the first re-derives the promoted automaton's meaning by literally iterating the
+    // morphism (string substitution, no automata involved at all); the second recomputes
+    // Java's three validation predicates directly from the `BTreeMap` and checks the
+    // classification AND Java's statement ORDER between them.
+
+    /// `h^m` applied to the single letter `0`, by direct substitution — the definition of
+    /// a morphism's iterate, computed with `Vec` concatenation and nothing else. This is
+    /// the independent ground truth for [`Morphism::to_word_automaton`]: it never builds,
+    /// reads or walks an automaton.
+    ///
+    /// Every letter it ever substitutes is reachable from `0` through the images, and the
+    /// generator below guarantees the domain contains all of those, so the `mapping` lookup
+    /// cannot miss.
+    fn iterate_from_zero(mapping: &BTreeMap<i32, Vec<i32>>, m: usize) -> Vec<i32> {
+        let mut word = vec![0i32];
+        for _ in 0..m {
+            word = word
+                .iter()
+                .flat_map(|c| mapping[c].iter().copied())
+                .collect();
+        }
+        word
+    }
+
+    /// `n` as exactly `m` digits base `l`, most significant first.
+    fn msd_digits(n: usize, l: usize, m: usize) -> Vec<i32> {
+        let mut out = vec![0i32; m];
+        let mut rest = n;
+        for slot in (0..m).rev() {
+            out[slot] = (rest % l) as i32;
+            rest /= l;
+        }
+        assert_eq!(rest, 0);
+        out
+    }
+
+    /// An `l`-UNIFORM morphism whose domain is exactly `{0, ..., d - 1}` and every one of
+    /// whose image values lies in that same set.
+    ///
+    /// Both constraints are mandatory, not cosmetic:
+    /// * `l >= 2`, because `Morphism.java:90`'s `new NumberSystem("msd_" + maxImageLength)`
+    ///   is a *validating* constructor that refuses `msd_0`/`msd_1` — real Walnut cleanly
+    ///   refuses to `promote` a 1-uniform morphism, and so does this port
+    ///   ([`MorphismError::NumberSystemNotDefined`]).
+    /// * images ⊆ domain, because otherwise nearly every generated case would be
+    ///   `docs/WALNUT-BUGS.md` **WB-036** (`toWordAutomaton` declaring more states than its
+    ///   own transition table has rows, which real Java crashes on at write time and this
+    ///   port rejects up front) — rediscovering an already-logged, already-ported quirk on
+    ///   most inputs and drowning the signal this property exists to check. WB-036 is
+    ///   covered deliberately, and as an *expected* outcome, by the second property below.
+    fn arb_uniform_covering_morphism() -> impl Strategy<Value = (Morphism, usize, usize)> {
+        (1usize..=3, 2usize..=3).prop_flat_map(|(d, l)| {
+            prop::collection::vec(prop::collection::vec(0i32..d as i32, l), d).prop_map(
+                move |images| {
+                    let mapping: BTreeMap<i32, Vec<i32>> = images
+                        .into_iter()
+                        .enumerate()
+                        .map(|(k, image)| (k as i32, image))
+                        .collect();
+                    (Morphism::from_mapping(mapping), d, l)
+                },
+            )
+        })
+    }
+
+    /// Arbitrary mappings, deliberately including every shape the three validation guards
+    /// exist to reject: negative image values, empty/short images, and domains that do not
+    /// cover their own image range.
+    ///
+    /// Two sub-strategies, mixed 50/50, because a single unconstrained one is **vacuous on
+    /// the success branch**: with independently drawn keys and values, "no negative value
+    /// AND every image long enough AND the domain covers its own image range" essentially
+    /// never happens together (measured: 0 successes in 64 cases). The second arm keys the
+    /// domain to `0..d` and draws image values from `0..=d`, so it lands on the accepting
+    /// side often while still producing the off-by-one WB-036 gap. Measured branch counts
+    /// are in this unit's commit message.
+    fn arb_any_morphism() -> impl Strategy<Value = Morphism> {
+        let wild =
+            prop::collection::btree_map(0i32..4, prop::collection::vec(-1i32..5, 0..4), 0..4usize);
+        let near_valid = (1usize..=4)
+            .prop_flat_map(|d| (Just(d), 0i32..=(d as i32)))
+            .prop_flat_map(|(d, highest_value)| {
+                prop::collection::vec(prop::collection::vec(0i32..=highest_value, 0..4), d)
+                    .prop_map(move |images| {
+                        images
+                            .into_iter()
+                            .enumerate()
+                            .map(|(k, image)| (k as i32, image))
+                            .collect::<BTreeMap<i32, Vec<i32>>>()
+                    })
+            });
+        prop_oneof![wild, near_valid].prop_map(Morphism::from_mapping)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Tier-4: the automaton `toWordAutomaton` promotes a morphism into really is that
+        /// morphism's DFAO — reading the `m`-digit base-`l` representation of `n` lands in
+        /// the state whose output is the `n`-th letter of `h^m(0)`.
+        ///
+        /// The oracle ([`iterate_from_zero`]) is pure string substitution: it applies the
+        /// `BTreeMap` to a `Vec<i32>` `m` times and indexes the result. It touches no
+        /// automaton, so it cannot re-derive whatever `to_word_automaton` did — in
+        /// particular it is blind to the sort-position-vs-letter-value indexing that
+        /// WB-036 is about, to the `canonized` flag, and to the `newD` truncation.
+        ///
+        /// (This is the classic `S_{m+1}[n*l + j] = h(S_m[n])[j]` induction, which needs no
+        /// prolongability assumption — `h(0)` is not required to start with `0`.)
+        #[test]
+        fn promoted_morphism_is_the_dfao_of_its_own_iterates(
+            (h, _d, l) in arb_uniform_covering_morphism(),
+            m in 1usize..=3,
+            n_raw in 0usize..27,
+        ) {
+            let p = h.to_word_automaton().expect("the generator excludes all three guards");
+            prop_assert_eq!(p.alphabet.len(), 1);
+            prop_assert_eq!(&p.alphabet[0], &(0..l as i32).collect::<Vec<i32>>());
+
+            let word = iterate_from_zero(&h.mapping, m);
+            prop_assert_eq!(word.len(), l.pow(m as u32));
+            let n = n_raw % word.len();
+
+            let mut state = p.fa.q0;
+            for d in msd_digits(n, l, m) {
+                let sym = p.encode(&[d]);
+                state = p.fa.d[state][&sym][0];
+            }
+            prop_assert_eq!(
+                p.fa.o[state], word[n],
+                "h^{}(0)[{}] disagrees with the promoted automaton", m, n
+            );
+        }
+
+        /// Tier-4: `toWordAutomaton`'s validation. For an ARBITRARY mapping the call must
+        /// (a) never panic, (b) succeed exactly when all three of Java's guards pass, and
+        /// (c) report the guards in Java's own statement ORDER when more than one fails —
+        /// `determineMaxEntry`'s negative-value throw (`Morphism.java:82`) first, then the
+        /// `NumberSystem` constructor (`:90`), then WB-036's domain/image mismatch (whose
+        /// Java crash happens later still, at write time).
+        ///
+        /// The three predicates are recomputed here straight off the `BTreeMap` — a fold
+        /// for the max image value, a fold for the longest image, a length comparison —
+        /// rather than by calling `determine_max_entry`/`determine_max_image_length`, so
+        /// this is a check of the contract rather than of the helpers against themselves.
+        ///
+        /// On success it also pins the `Fa` invariant WB-036 exists to protect: `d.len()`
+        /// equals `q` equals `max_entry + 1`, including on the MIRROR shape (a domain wider
+        /// than the image range needs), which Java genuinely accepts and this port
+        /// reproduces by truncating rather than rejecting.
+        #[test]
+        fn to_word_automaton_validation_follows_javas_own_statement_order(h in arb_any_morphism()) {
+            let negative = h.mapping.values().flatten().any(|&y| y < 0);
+            let max_entry = h.mapping.values().flatten().copied().max().unwrap_or(0).max(0);
+            let max_image_length = h.mapping.values().map(Vec::len).max().unwrap_or(0);
+
+            let result = h.to_word_automaton();
+            if negative {
+                prop_assert_eq!(result.unwrap_err(), MorphismError::NegativeValue);
+            } else if max_image_length < 2 {
+                prop_assert_eq!(
+                    result.unwrap_err(),
+                    MorphismError::NumberSystemNotDefined(max_image_length)
+                );
+            } else if h.mapping.len() < max_entry as usize + 1 {
+                prop_assert_eq!(
+                    result.unwrap_err(),
+                    MorphismError::DomainDoesNotCoverImageRange
+                );
+            } else {
+                let p = result.expect("all three guards pass");
+                prop_assert_eq!(p.fa.q, max_entry as usize + 1);
+                prop_assert_eq!(p.fa.d.len(), p.fa.q);
+                prop_assert_eq!(p.fa.o.len(), p.fa.q);
+                prop_assert_eq!(&p.fa.o, &(0..=max_entry).collect::<Vec<i32>>());
+                prop_assert_eq!(&p.alphabet[0], &(0..max_image_length as i32).collect::<Vec<i32>>());
+                prop_assert_eq!(&p.msd, &vec![Some(true)]);
+                prop_assert!(p.is_canonized());
+            }
+        }
     }
 }

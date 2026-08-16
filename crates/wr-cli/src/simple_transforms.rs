@@ -131,6 +131,7 @@ pub fn fix_trail_zero_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
     use std::fs;
     use wr_core::automaton::Automaton;
@@ -276,6 +277,117 @@ mod tests {
             "the empty word must still be rejected"
         );
         assert!(!c.fa.accepts_word(&[0, 1]), "\"01\" must still be rejected");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------- Tier-4 property (Phase 4, U31)
+
+    /// Random single-track partial DFAs over `{0,1}` — the shape a `.txt` in
+    /// `Automata Library/` can hold, including genuinely MISSING transitions (the case
+    /// that makes both fixups' behaviour observable at all).
+    ///
+    /// Deterministic on purpose: `fixtrailzero` bottoms out in `FA.justMinimize`, whose
+    /// `convertNFAtoDFA()` step rejects genuine nondeterminism with `"Unexpected NFA
+    /// instead of DFA."` in Java and in this port alike, so an NFA operand would exercise
+    /// that ported rejection rather than the closure property under test.
+    fn arb_partial_dfa(q_max: usize) -> impl Strategy<Value = Automaton> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let o = prop::collection::vec(0i32..=1, q);
+            let trans =
+                prop::collection::vec(prop::collection::vec(prop::option::of(0usize..q), 2), q);
+            (o, trans).prop_map(move |(o, trans)| {
+                let d = trans
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .enumerate()
+                            .filter_map(|(sym, dest)| dest.map(|t| (sym as i32, vec![t])))
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect();
+                Automaton::new(
+                    Fa {
+                        true_false: None,
+                        q0: 0,
+                        q,
+                        alphabet_size: 2,
+                        o,
+                        d,
+                    },
+                    vec![vec![0, 1]],
+                    vec!["x".to_string()],
+                    vec![Some(true)],
+                )
+            })
+        })
+    }
+
+    /// Tier-4 (`CLAUDE.md`'s correctness ladder, `docs/DESIGN.md` §5) at the COMMAND
+    /// level: the two standalone zero-fixup commands establish their closure properties
+    /// end to end — through the real `Automata Library/` read, the primitive, and the
+    /// write-back — not just when the primitive is called in isolation.
+    ///
+    /// The invariants are the same two `wr_core::logicalops`'s own properties check, and
+    /// the same two `wr_logic::quantify`'s `quantified_language_is_closed_under_leading_
+    /// zeros` checks for the ∃-pipeline's internal use of the leading-zeros fixup — and
+    /// they are deliberately NOT mirror images of each other, because the fixups are not
+    /// (see `fix_trailing_zeros_problem`'s doc comment):
+    ///
+    /// * `fixleadzero` CLOSES the language under a leading zero, in both directions, and
+    ///   loses nothing that was already accepted;
+    /// * `fixtrailzero` is a right quotient by `zero*`, so its result is closed under
+    ///   REMOVING a trailing zero and NOT under adding one. Asserting the mirror of the
+    ///   first property here would be wrong, not merely unproven.
+    ///
+    /// Each oracle is a direct statement about the command's OWN output word set, checked
+    /// with `Fa::accepts_word`; nothing re-implements or re-runs either fixup.
+    #[test]
+    fn fix_zero_commands_establish_their_closure_properties_end_to_end() {
+        let (session, dir) = temp_session("zero-closure-props");
+        let path = dir.join("Automata Library").join("A.txt");
+        proptest!(
+            ProptestConfig::with_cases(24),
+            |(a in arb_partial_dfa(3), probe in prop::collection::vec(0i32..2, 0..4))| {
+                let mut original = a;
+                wr_io::writer::write_automaton_txt(&mut original, &path).unwrap();
+
+                let lead = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c")
+                    .expect("fixleadzero must succeed on a well-formed operand");
+                let lead = lead.automaton_pairs()[0].automaton().unwrap().clone();
+                let mut padded = vec![0];
+                padded.extend_from_slice(&probe);
+                prop_assert_eq!(
+                    lead.fa.accepts_word(&probe),
+                    lead.fa.accepts_word(&padded),
+                    "fixleadzero: not closed under a leading zero at {:?}", probe
+                );
+                if original.fa.accepts_word(&probe) {
+                    prop_assert!(
+                        lead.fa.accepts_word(&probe),
+                        "fixleadzero dropped {:?}, which the operand already accepted", probe
+                    );
+                }
+
+                let trail = fix_trail_zero_command(&session, "fixtrailzero d A;", "A", "d")
+                    .expect("fixtrailzero must succeed on a well-formed operand");
+                let trail = trail.automaton_pairs()[0].automaton().unwrap().clone();
+                let mut with_zero = probe.clone();
+                with_zero.push(0);
+                if trail.fa.accepts_word(&with_zero) {
+                    prop_assert!(
+                        trail.fa.accepts_word(&probe),
+                        "fixtrailzero: {:?}0 accepted but {:?} is not", probe, probe
+                    );
+                }
+                if original.fa.accepts_word(&with_zero) {
+                    prop_assert!(
+                        trail.fa.accepts_word(&probe),
+                        "fixtrailzero: {:?}0 was accepted by the operand, so {:?} must be \
+                         accepted by the result", probe, probe
+                    );
+                }
+            }
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

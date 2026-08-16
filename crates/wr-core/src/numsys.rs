@@ -3335,6 +3335,52 @@ mod tests {
                 .collect();
             prop_assert_eq!(accepts_tuples(&times_n, &word), y == n * x, "{}*{}={}", n, x, y);
         }
+
+        /// Tier-4 property (Phase 4, U31): `division(n)` accepts `(x, y)` iff
+        /// `y == x / n` in real INTEGER division — the sibling of the multiplication
+        /// property above, for the one composed construction `numsys` had no property
+        /// test for.
+        ///
+        /// The oracle is Rust's own `x / n` on `u32`, computed from the same two values
+        /// the digit words are built from; it never consults `division`, `arithmetic`, the
+        /// adder or the comparators, so it cannot re-derive
+        /// `a / n = b  <=>  Er,q  a = q + r & q = n*b & 0 <= r < n` (the identity the
+        /// construction is built out of) — which is the point: a wrong remainder range,
+        /// a swapped `q`/`r`, or a `<=`-for-`<` in that identity all show up here as a
+        /// disagreement with plain integer division.
+        ///
+        /// `exact` forces roughly half the cases to be genuine quotients (same reason as
+        /// the adder and multiplication properties), and the non-exact half is what pins
+        /// the *rejecting* side: `x / n` truncates, so `y = x / n` holds for a whole band
+        /// of `x` and a construction that forgot the `r < n` clause would accept
+        /// neighbouring `y` values too.
+        #[test]
+        fn division_automaton_computes_real_division(
+            n in 1u32..8,
+            x in 0u32..40,
+            y_free in 0u32..40,
+            exact in any::<bool>(),
+        ) {
+            let y = if exact { x / n } else { y_free };
+            let base = 2u32;
+            let ns = NumberSystem::new("msd_2").unwrap();
+            let over_n = ns
+                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Div)
+                .unwrap();
+            let width = 7;
+            let (Some(xd), Some(yd)) = (msd_digits(x, base, width), msd_digits(y, base, width))
+                else { return Ok(()); };
+            let word: Vec<Vec<i32>> = (0..width)
+                .map(|i| {
+                    over_n
+                        .label
+                        .iter()
+                        .map(|l| if l == "x" { xd[i] } else { yd[i] })
+                        .collect()
+                })
+                .collect();
+            prop_assert_eq!(accepts_tuples(&over_n, &word), y == x / n, "{}/{}={}", x, n, y);
+        }
     }
 
     /// A non-proptest sanity check that `msd_string` (used by nothing else) and the
@@ -3728,6 +3774,165 @@ mod tests {
         assert!(!accepts_digits(&lt, &[("x", "10"), ("y", "01")]));
         // 011 is not a valid representation, so no comparison involving it holds.
         assert!(!accepts_digits(&lt, &[("x", "011"), ("y", "100")]));
+    }
+
+    // ----------------------------- Tier-4 properties over the file-backed custom base
+    //
+    // Phase 4, U31. Everything above about `msd_fib` is a hand-picked fixture; these two
+    // properties sweep the same real, file-backed base (`walnut-java`'s own
+    // `Custom Bases/msd_fib.txt` + `msd_fib_addition.txt`, see `msd_fib_files`) against an
+    // arithmetic oracle that knows nothing about automata at all.
+    //
+    // Note what "custom base" buys here that `msd_k` cannot: the number system's addition
+    // automaton is READ FROM A FILE rather than synthesized, and every construction is
+    // additionally restricted to the base's valid-representation language. A bug in either
+    // (a mis-wired `all_reps`, a reversed file-loaded adder, a dropped `applyAll
+    // Representations` after a composed construction) is invisible to every base-k
+    // property in this file.
+
+    /// The Zeckendorf value of an msd-first `{0,1}` word: the least significant position
+    /// has weight 1 and the weights going left are `2, 3, 5, 8, 13, …` (`F_2, F_3, F_4,
+    /// …`). Plain integer arithmetic — the independent decoder.
+    fn zeckendorf_value(word: &[i32]) -> u32 {
+        let mut weights = vec![1u32, 2];
+        while weights.len() < word.len().max(2) {
+            let n = weights.len();
+            weights.push(weights[n - 1] + weights[n - 2]);
+        }
+        word.iter()
+            .rev()
+            .enumerate()
+            .map(|(i, &d)| d as u32 * weights[i])
+            .sum()
+    }
+
+    /// A Zeckendorf representation is VALID iff it has no two adjacent `1`s — exactly the
+    /// language `Custom Bases/msd_fib.txt` recognizes (leading zeros allowed). Stated here
+    /// as a predicate on the word rather than read off that automaton.
+    fn is_valid_zeckendorf(word: &[i32]) -> bool {
+        word.windows(2).all(|w| w != [1, 1])
+    }
+
+    /// Every `{0,1}` word of length `0..=max_len`, most significant digit first.
+    fn all_binary_words(max_len: usize) -> Vec<Vec<i32>> {
+        (0..=max_len)
+            .flat_map(|len| {
+                (0..(1u32 << len)).map(move |mask| {
+                    (0..len)
+                        .map(|i| ((mask >> (len - 1 - i)) & 1) as i32)
+                        .collect::<Vec<i32>>()
+                })
+            })
+            .collect()
+    }
+
+    /// Tier-4: over the real file-backed `msd_fib`, `getConstant(n)` accepts EXACTLY the
+    /// valid Zeckendorf representations of `n` — i.e. the value/representation round trip
+    /// closes in both directions, and the base's valid-representation restriction really
+    /// is applied to a composed construction (`constant` recurses through `arithmetic`
+    /// and `quantify` for `n >= 2`).
+    ///
+    /// The oracle is [`zeckendorf_value`] + [`is_valid_zeckendorf`]: integer arithmetic and
+    /// a two-window scan. Neither reads `ns`, the loaded files, or any automaton, so this
+    /// is a genuine cross-check rather than a re-derivation. The sweep covers every
+    /// `{0,1}` word up to 6 digits, so it pins the REJECTING side (every non-representation
+    /// and every `11`-containing word) as strongly as the accepting one — a construction
+    /// that dropped the restriction would accept `11`-words here.
+    #[test]
+    fn msd_fib_constants_are_exactly_the_valid_zeckendorf_representations() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let words = all_binary_words(6);
+        proptest!(ProptestConfig::with_cases(12), |(n in 0u32..13)| {
+            let constant = ns.get_constant(&BigInt::from(n)).unwrap();
+            for word in &words {
+                prop_assert_eq!(
+                    accepts_single_track_word(&constant, word),
+                    is_valid_zeckendorf(word) && zeckendorf_value(word) == n,
+                    "msd_fib constant {} on word {:?}", n, word
+                );
+            }
+        });
+    }
+
+    /// Tier-4: the FILE-LOADED `msd_fib` adder computes real addition on Zeckendorf
+    /// representations, and only on valid ones.
+    ///
+    /// Same oracle, same independence argument. This is the custom-base analogue of
+    /// `addition_automaton_computes_real_addition`, and it is the property that would
+    /// catch the adder file being read reversed, its tracks being permuted, or the
+    /// valid-representation restriction not reaching it — none of which the synthesized
+    /// base-`k` adder can exercise, because it has no file to read.
+    ///
+    /// The two summands are drawn from the VALID 5-digit words only and, on half the
+    /// cases, `r` is the canonical representation of their actual sum — otherwise the
+    /// property degenerates into "this automaton rejects almost everything", which a
+    /// reject-all mutant also satisfies (measured before the constraint: 4 accepting cases
+    /// in 64; after: roughly a third). `r` itself is still drawn from ALL 5-digit words on
+    /// the other half, so `11`-containing right-hand sides genuinely exercise the
+    /// rejecting side. The same mutation-testing lesson the `exact` flags elsewhere in
+    /// this file record.
+    #[test]
+    fn msd_fib_adder_computes_real_zeckendorf_addition() {
+        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let plus = ns.arithmetic("p", "q", "r", ArithmeticOp::Plus).unwrap();
+        let words: Vec<Vec<i32>> = all_binary_words(5)
+            .into_iter()
+            .filter(|w| w.len() == 5)
+            .collect();
+        let valid: Vec<Vec<i32>> = words
+            .iter()
+            .filter(|w| is_valid_zeckendorf(w))
+            .cloned()
+            .collect();
+        // Summands are additionally capped at value 6 so that `v(p) + v(q) <= 12`, which
+        // is the largest value a 5-digit Zeckendorf word can hold (`10101` = 8+3+1) — i.e.
+        // the canonical representation of the sum always EXISTS at this width, so the
+        // `exact` half of the cases really does hit the accepting side. Without the cap
+        // most `exact` draws overflow the width and silently fall back to a random `r`
+        // (measured: 11 accepting cases in 64; with it, roughly half).
+        let summands: Vec<Vec<i32>> = valid
+            .iter()
+            .filter(|w| zeckendorf_value(w) <= 6)
+            .cloned()
+            .collect();
+        // Values 0..=6, one canonical representation each, all of them 5 digits wide.
+        assert_eq!(summands.len(), 7);
+        proptest!(
+            ProptestConfig::with_cases(64),
+            |(i in 0usize..7, j in 0usize..7, k_free in 0usize..32, exact in any::<bool>())| {
+                let (p, q) = (&summands[i], &summands[j]);
+                // Half the cases aim at a genuine sum: find the canonical representation
+                // of `v(p) + v(q)` among the 5-digit words, if it has one.
+                let sum = zeckendorf_value(p) + zeckendorf_value(q);
+                let target = words.iter().position(|w| {
+                    is_valid_zeckendorf(w) && zeckendorf_value(w) == sum
+                });
+                let r = match (exact, target) {
+                    (true, Some(t)) => &words[t],
+                    _ => &words[k_free],
+                };
+                let expected = is_valid_zeckendorf(p)
+                    && is_valid_zeckendorf(q)
+                    && is_valid_zeckendorf(r)
+                    && zeckendorf_value(p) + zeckendorf_value(q) == zeckendorf_value(r);
+                let word: Vec<Vec<i32>> = (0..5)
+                    .map(|pos| {
+                        plus.label
+                            .iter()
+                            .map(|l| match l.as_str() {
+                                "p" => p[pos],
+                                "q" => q[pos],
+                                _ => r[pos],
+                            })
+                            .collect()
+                    })
+                    .collect();
+                prop_assert_eq!(
+                    accepts_tuples(&plus, &word), expected,
+                    "msd_fib adder on {:?} + {:?} = {:?}", p, q, r
+                );
+            }
+        );
     }
 
     // ---------------------------------------------------- the validation error paths
