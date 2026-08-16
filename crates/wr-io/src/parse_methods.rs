@@ -231,10 +231,52 @@ fn match_signed_int(bytes: &[u8], pos: usize) -> Result<Option<(i32, usize)>, Pa
 // parseTrueFalse
 // ---------------------------------------------------------------------------
 
-/// `ParseMethods.parseTrueFalse(String, Boolean[])` (`:74-81`) — `^\s*(true|false)\s*$`.
+/// One of Java's five line terminators that is NOT also in Java's (non-
+/// `UNICODE_CHARACTER_CLASS`) `\s` class. `java.util.regex.Pattern`'s "Line terminators"
+/// section defines the set as `{\n, \r, \r\n,  (NEL),   (LS),   (PS)}`,
+/// a strict SUPERSET of `\s` = `[ \t\n\x0B\f\r]`. The three listed here are exactly the
+/// difference — the ones a `\s*` run cannot consume but `$`'s end-of-input leniency and
+/// `.`'s exclusion set both still care about.
+///
+/// See [`parse_true_false`] (where `$` consumes one of these) and [`is_comment_line`]
+/// (where `.` refuses to consume one) — the two behaviors are NOT symmetric, because
+/// `parseTrueFalse` uses `Matcher.find()` while `shouldSkipLine` uses `Matcher.matches()`.
+fn is_wide_line_terminator(c: char) -> bool {
+    matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+/// `ParseMethods.parseTrueFalse(String, Boolean[])` (`:74-81`) — `^\s*(true|false)\s*$`,
+/// matched with `Matcher.find()` (not `matches()`).
 /// Java's out-parameter becomes a return value: `Some(true/false)` on a match,
 /// `None` on no match (Java's `false` return, singleton left untouched).
+///
+/// # Java's two different whitespace/terminator notions, both live here
+///
+/// * `\s*` is compiled WITHOUT `UNICODE_CHARACTER_CLASS`, so it is exactly ASCII
+///   `[ \t\n\x0B\f\r]` — a leading or trailing NBSP (`\u{00A0}`) is NOT padding and
+///   defeats the match (verified live: a library file `true\u{00A0}` is rejected by real
+///   Walnut with `Number system msd_true is not defined.`).
+/// * `$` (no `MULTILINE`) matches at end of input **or immediately before a single FINAL
+///   line terminator**, and Java's line-terminator set is the strict superset
+///   `{\n, \r, \r\n, ,  ,  }` (see [`is_wide_line_terminator`]). So a
+///   trailing NEL/LS/PS — which `\s*` cannot touch — is nonetheless consumed by `$` and
+///   the pattern still matches. Verified live against `Walnut-all.jar` (2026-08-16):
+///   library files containing `true\u{0085}`, `true\u{2028}`, `true\u{2029}` all load as
+///   the TRUE automaton and `false\u{0085}` as the FALSE one, while `true\u{0085}x` —
+///   where the NEL is no longer final — reports `Number system msd_true is not defined.`
+///
+/// Hence the one-character pre-strip below, applied BEFORE the ASCII-`\s` trim so that
+/// `"true \u{0085}"` (space then NEL) also matches, exactly as Java's `\s*` then `$` do.
+/// `\r`/`\n`/`\r\n` need no special case: they are in `\s` already, and `\s*` eats them.
+/// Note the strip is deliberately of at most ONE character and only when it is the very
+/// last: `$` extends its leniency to a *single* final terminator, so `"true\u{0085}\n"`
+/// (two terminators) does not match in Java, and does not match here either.
 pub fn parse_true_false(s: &str) -> Option<bool> {
+    // `$`'s single-final-line-terminator leniency, for the three terminators `\s` misses.
+    let s = match s.chars().next_back() {
+        Some(c) if is_wide_line_terminator(c) => &s[..s.len() - c.len_utf8()],
+        _ => s,
+    };
     let bytes = s.as_bytes();
     let start = skip_ws(bytes, 0);
     let mut end = bytes.len();
@@ -954,20 +996,40 @@ pub fn is_whitespace_line(s: &str) -> bool {
 
 /// `ParseMethods.PATTERN_COMMENT` (`:71`) — `^\s*#.*$`, matched via `Matcher.matches()`
 /// (the WHOLE string must match, not just a prefix). Java's `.` does NOT match line
-/// terminators (no `DOTALL` flag), so — verified against the real compiled
-/// `Pattern`/`Matcher.matches()` — any `\n`/`\r` anywhere at or after the `#` makes the
-/// whole thing fail to match (`"#x\ny"` and even a bare trailing `"#x\n"` are both
-/// `false`; empirically `matches()` does NOT extend `$`'s usual "before a final line
-/// terminator" leniency here — a trailing terminator is simply never consumed by
-/// `.*`, so it's never `matches()`-clean). Leading whitespace (via `\s*`) DOES still
-/// tolerate embedded newlines before the `#`, since `\s` includes `\n`/`\r`.
+/// terminators (no `DOTALL` flag), and its line-terminator set is the FULL
+/// `{\n, \r, \r\n,  (NEL),   (LS),   (PS)}` — a strict superset of `\s`
+/// (see [`is_wide_line_terminator`]). So any one of those five characters anywhere at or
+/// after the `#` makes the whole thing fail to match: `.*` can never consume it, and
+/// `matches()` requires the ENTIRE input to be consumed, so the leftover character alone
+/// sinks the match.
+///
+/// That last point is why this is **not** symmetric with [`parse_true_false`], which does
+/// tolerate one trailing NEL/LS/PS: `parseTrueFalse` calls `Matcher.find()`, where `$`'s
+/// "before a single final line terminator" leniency leaves the terminator unconsumed and
+/// nobody minds; `shouldSkipLine` calls `Matcher.matches()`, where an unconsumed trailing
+/// character is fatal regardless of what `$` is willing to match before. So a bare
+/// trailing `"#x\n"` is `false` here, and so is `"#x\u{0085}"`.
+///
+/// Verified live against `Walnut-all.jar` (2026-08-16): a library file whose first line is
+/// `#x` followed by NEL, LS, or PS (then a real `msd_2` header on line 2) is rejected with
+/// `Undefined statement: line at 1 of file …` — the "comment" line is not skipped, it is
+/// taken as the header and fails to parse — while the same file with a plain `#x` first
+/// line loads fine.
+///
+/// Leading whitespace (via `\s*`) DOES still tolerate embedded `\n`/`\r` before the `#`,
+/// since `\s` includes those two — but NOT a leading NEL/LS/PS, which `\s` excludes and
+/// which therefore leaves the `#` unmatched.
 pub fn is_comment_line(s: &str) -> bool {
     let bytes = s.as_bytes();
     let i = skip_ws(bytes, 0);
     if bytes.get(i) != Some(&b'#') {
         return false;
     }
-    !bytes[i + 1..].iter().any(|&b| b == b'\n' || b == b'\r')
+    // `i` indexes an ASCII `#`, so `i + 1` is a char boundary; scan the rest as `char`s so
+    // the three multi-byte terminators are seen as characters, not stray bytes.
+    !s[i + 1..]
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || is_wide_line_terminator(c))
 }
 
 #[cfg(test)]
@@ -985,6 +1047,40 @@ mod tests {
         assert_eq!(parse_true_false("True"), None); // case-sensitive
         assert_eq!(parse_true_false(""), None);
         assert_eq!(parse_true_false("msd_2"), None);
+    }
+
+    /// `^\s*(true|false)\s*$` is matched with `find()`, and `$` (no `MULTILINE`) matches
+    /// before a single FINAL line terminator — where Java's terminator set
+    /// (`{\n, \r, \r\n, NEL, LS, PS}`) is a strict superset of `\s` = `[ \t\n\x0B\f\r]`.
+    /// So a trailing NEL/LS/PS matches even though it is not whitespace.
+    ///
+    /// Verified live against `Walnut-all.jar` (2026-08-16): library files containing
+    /// `true\u{0085}` / `true\u{2028}` / `true\u{2029}` load as the TRUE automaton
+    /// (`test <name> 3;` -> `Cannot enumerate accepted inputs of an unmaterialized true
+    /// automaton.`), `false\u{0085}` as the FALSE one (`only accepts 0 inputs`), and
+    /// `true\u{0085}x` -- NEL no longer final -- gives `Number system msd_true is not
+    /// defined.`
+    #[test]
+    fn parse_true_false_tolerates_one_trailing_wide_line_terminator() {
+        for t in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            assert_eq!(parse_true_false(&format!("true{t}")), Some(true), "{t:?}");
+            assert_eq!(parse_true_false(&format!("false{t}")), Some(false), "{t:?}");
+            // Only when it is truly the LAST character.
+            assert_eq!(parse_true_false(&format!("true{t}x")), None, "{t:?} + x");
+            // ...and only ONE of them: `$` forgives a single final terminator, so
+            // `true<NEL><NEL>` leaves an unmatchable one behind, as does `true<NEL>\n`
+            // (the `\n` is `\s`-trimmed, but the NEL is then no longer final-adjacent to
+            // `$` -- it is trailing text `\s*` cannot consume).
+            assert_eq!(parse_true_false(&format!("true{t}{t}")), None, "{t:?} x2");
+            assert_eq!(parse_true_false(&format!("true{t}\n")), None, "{t:?} + LF");
+            // `\s*` runs BEFORE `$`, so whitespace then the terminator still matches...
+            assert_eq!(parse_true_false(&format!("true {t}")), Some(true), "{t:?}");
+            // ...but the terminator then whitespace does not (`\s*` stops at the NEL,
+            // and `$` is not at a single-final-terminator position).
+            assert_eq!(parse_true_false(&format!("true{t} ")), None, "{t:?} + sp");
+            // A LEADING one is not `\s` and not `^`-adjacent leniency: no match.
+            assert_eq!(parse_true_false(&format!("{t}true")), None, "leading {t:?}");
+        }
     }
 
     // -- parseAlphabetDeclaration ---------------------------------------------
@@ -1463,5 +1559,25 @@ mod tests {
         // since \s includes \n/\r.
         assert!(is_comment_line(" \n #x"));
         assert!(!is_comment_line(" \n #x\n"));
+    }
+
+    /// The other three of Java's five line terminators — NEL (`\u{0085}`), LS
+    /// (`\u{2028}`), PS (`\u{2029}`) — are excluded by `.` exactly like `\n`/`\r`, so they
+    /// sink a `matches()` against `^\s*#.*$` just the same. Deliberately NOT symmetric
+    /// with [`parse_true_false_tolerates_one_trailing_wide_line_terminator`]: that one
+    /// uses `find()`, this one `matches()` (see [`is_comment_line`]'s doc).
+    ///
+    /// Verified live against `Walnut-all.jar` (2026-08-16) — a `.txt` whose line 1 is
+    /// `#x` + NEL/LS/PS and whose line 2 is `msd_2` is rejected with `Undefined
+    /// statement: line at 1 of file …`, where the plain `#x` version loads.
+    #[test]
+    fn comment_line_rejects_the_wide_line_terminators_too() {
+        for t in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            assert!(!is_comment_line(&format!("#x{t}")), "trailing {t:?}");
+            assert!(!is_comment_line(&format!("#x{t}y")), "embedded {t:?}");
+            assert!(!is_comment_line(&format!("#{t}")), "bare {t:?}");
+            // Leading: `\s*` cannot consume one either, so the `#` is never reached.
+            assert!(!is_comment_line(&format!("{t}#x")), "leading {t:?}");
+        }
     }
 }

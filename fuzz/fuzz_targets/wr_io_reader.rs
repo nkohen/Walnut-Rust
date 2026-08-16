@@ -60,27 +60,39 @@ const MAX_INPUT_LEN: usize = 512;
 ///
 /// Same "cost, not bug" filter as [`MAX_INPUT_LEN`], aimed at the one place where a few
 /// input bytes buy unbounded work: the alphabet declaration. A `msd_k` track
-/// materializes the full digit set `0..k` (so `msd_99999999` is a 400 MB `Vec` before a
-/// single transition is read), and `alphabet_size` is the **product** over all tracks
-/// (so ~20 tracks of base 99 overflows `usize` — which, under `cargo-fuzz`'s
-/// `-Cdebug-assertions`, is an arithmetic-overflow panic that says nothing about the
-/// port's fidelity to Java, whose `int` silently wraps there instead).
+/// materializes the full digit set `0..k`, so `msd_99999999` is a 400 MB `Vec` before a
+/// single transition is read — pure allocation cost, saying nothing about the port.
 ///
-/// Capping the header at 48 characters with digit runs of at most 2 bounds both: at most
-/// ~7 tracks of base < 100, i.e. `alphabet_size < 100^7`, comfortably inside `usize`,
-/// with every real fixture header (`msd_2`, `lsd_2 lsd_2 lsd_2 lsd_2`, `{0,1} {-1,0,1}`,
-/// `msd_fib`) still accepted. Header *grammar* — malformed tokens, wrong separators,
-/// bogus numeration names, the `{…}` literal-set form — is fully fuzzed; only the
-/// magnitude is bounded.
+/// Capping the header at 48 characters with digit runs of at most 2 bounds it: at most
+/// ~7 tracks of base < 100, with every real fixture header (`msd_2`,
+/// `lsd_2 lsd_2 lsd_2 lsd_2`, `{0,1} {-1,0,1}`, `msd_fib`) still accepted. Header
+/// *grammar* — malformed tokens, wrong separators, bogus numeration names, the `{…}`
+/// literal-set form — is fully fuzzed; only the magnitude is bounded.
+///
+/// This cap used also to be the only thing keeping the reader's `alphabet_size`
+/// **product** out of arithmetic-overflow territory (a 64-track `{0,1}` header, ~380
+/// bytes, overflowed it) — an incidental screen that hid a real defect rather than a
+/// deliberate one. The reader now folds that product at Java `int` width and returns
+/// `ReadError::AlphabetSizeOverflow`, matching `RichAlphabet.determineAlphabetSize`'s
+/// `Math.multiplyExact` throw, so overflow is an ordinary in-scope outcome here and no
+/// longer something this filter has to (or does) prevent.
 const MAX_HEADER_LEN: usize = 48;
 const MAX_HEADER_DIGIT_RUN: usize = 2;
 
-/// `read_automaton_txt_impl`'s own blank/comment skip (`should_skip`), duplicated here
-/// rather than exported from `wr-io`: the harness must decide *before* calling the
-/// reader, and a budget filter is not something the shipped crate should carry.
+/// `read_automaton_txt_impl`'s own blank/comment skip (`should_skip`), needed *before*
+/// calling the reader so this file can size up the header it is about to hand over.
+///
+/// Delegates to the very functions `should_skip` itself delegates to — `wr-io` exports
+/// both — rather than re-deriving the rule. The hand-rolled `trim_start().starts_with('#')`
+/// that used to live here was a second, subtly different grammar: `str::trim_start` is
+/// Unicode-aware where Java's `\s` is ASCII-only, and it had none of the line-terminator
+/// handling that `PATTERN_COMMENT`'s `.`-exclusion set requires. It only ever chose which
+/// line to *measure*, so it could not corrupt a verdict — but "one grammar, not two" is
+/// exactly the invariant this reader's last several review rounds were about, and a
+/// budget filter reading a different header line than the reader does is a way to
+/// silently under-fuzz.
 fn is_skipped(line: &str) -> bool {
-    let t = line.trim_start();
-    t.is_empty() || t.starts_with('#')
+    wr_io::parse_methods::is_whitespace_line(line) || wr_io::parse_methods::is_comment_line(line)
 }
 
 fn header_is_in_budget(content: &str) -> bool {

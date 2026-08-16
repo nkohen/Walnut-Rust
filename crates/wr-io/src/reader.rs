@@ -114,6 +114,25 @@
 //!   and the missing `UtilityMethods.removeDuplicates` on each parsed track
 //!   (`AutomatonReader.java:165`, which sizes `{0,0,1}` at 2, not 3). All four were
 //!   confirmed against `Walnut-all.jar` before and after.
+//!
+//! # Known remaining gap: line SPLITTING (not fixed, deliberately)
+//!
+//! Everything above is about how a line is *classified* once it exists. How the file is
+//! *cut into* lines is a separate rule, and there this port is **not** faithful: both
+//! readers iterate `str::lines()`, which breaks on `\n` only (stripping one trailing
+//! `\r`), whereas `AutomatonReader` reads through `BufferedReader.readLine()`, which
+//! treats `\n`, `\r`, **and** `\r\n` each as a terminator. So a file that separates its
+//! lines with a lone `\r` — classic Mac OS 9 line endings, and nothing this decade
+//! produces — is one giant line to this reader and several lines to Walnut. (That is
+//! `BufferedReader`'s own three-terminator set, which is itself narrower than the *regex*
+//! line-terminator set the NEL/LS/PS handling in [`parse_methods::parse_true_false`] and
+//! [`parse_methods::is_comment_line`] is about; the two notions are independent.)
+//!
+//! Left as-is on purpose: `\r`-only files do not occur in Walnut's corpus, no fixture or
+//! fuzz finding has ever reached it, and closing it means replacing `lines()` with a
+//! hand-rolled splitter in both readers plus every line-number computation that hangs off
+//! them. Recorded here so a future reader does not mistake the line-*classification*
+//! fidelity documented above for full line-*splitting* fidelity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -256,6 +275,13 @@ pub enum ReadError {
     /// raise (Phase 4 U30's fuzz finding F1, same root cause, reached here through the
     /// transducer reader).
     ParseMethods(ParseMethodsError),
+    /// The declared per-track alphabet sizes multiply out past Java's `int` —
+    /// `RichAlphabet.determineAlphabetSize` (`RichAlphabet.java:60-66`) folds them with
+    /// `Math.multiplyExact`, which throws `ArithmeticException: integer overflow` rather
+    /// than wrapping. See [`determine_alphabet_size`] for the live verification and for
+    /// why this is a recoverable `ReadError` rather than the panic the equivalent
+    /// `wr_core::automaton::Automaton::determine_alphabet_size` still raises.
+    AlphabetSizeOverflow,
 }
 
 impl fmt::Display for ReadError {
@@ -329,6 +355,10 @@ impl fmt::Display for ReadError {
             ReadError::CustomBaseCycle(name) => {
                 write!(f, "Custom base {name} is defined in terms of itself.",)
             }
+            // Verbatim `ArithmeticException`'s own message: real Walnut prints the raw
+            // `java.lang.ArithmeticException: integer overflow` + first stack frame, and
+            // `Prover.readBuffer`'s `catch (RuntimeException)` returns to the prompt.
+            ReadError::AlphabetSizeOverflow => write!(f, "integer overflow"),
         }
     }
 }
@@ -607,7 +637,7 @@ fn read_automaton_str_impl(
         remove_duplicates(track);
     }
     let num_tracks = alphabet.len();
-    let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
+    let alphabet_size = determine_alphabet_size(&alphabet)?;
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
 
     // Placeholder `Fa`, replaced once every line is parsed — lets us reuse
@@ -779,7 +809,17 @@ fn read_automaton_str_impl(
 /// `AutomatonReader.shouldSkipLine` (`:184-186`) —
 /// `PATTERN_WHITESPACE.matches() || PATTERN_COMMENT.matches()`, i.e. `^\s*$` or
 /// `^\s*#.*$`, both compiled WITHOUT `UNICODE_CHARACTER_CLASS`, so Java's `\s` here is
-/// exactly `[ \t\n\x0B\f\r]`.
+/// exactly `[ \t\n\x0B\f\r]` — and both matched with `Matcher.matches()`, so the WHOLE
+/// line must be consumed.
+///
+/// Two distinct Java character sets are in play, and they are not the same set:
+///
+/// * `\s`, as above, is ASCII-only — no NBSP, no NEL.
+/// * `.` (no `DOTALL`) excludes Java's full *line-terminator* set,
+///   `{\n, \r, \r\n,  (NEL),   (LS),   (PS)}`, which is a strict
+///   SUPERSET of `\s`. Combined with `matches()`, any one of those five at or after the
+///   `#` makes the comment pattern fail — see [`parse_methods::is_comment_line`], which
+///   carries the live `Walnut-all.jar` verification.
 ///
 /// Delegates to [`parse_methods`]'s ports of those two patterns rather than using
 /// Rust's `str::trim_start`, which is Unicode-aware and therefore OVER-permissive: a
@@ -789,6 +829,52 @@ fn read_automaton_str_impl(
 /// against `Walnut-all.jar`).
 fn should_skip(line: &str) -> bool {
     parse_methods::is_whitespace_line(line) || parse_methods::is_comment_line(line)
+}
+
+/// `RichAlphabet.determineAlphabetSize` (`RichAlphabet.java:60-66`), called from
+/// `AutomatonReader.firstParse:167` on a freshly parsed header — the product of the
+/// per-track alphabet sizes.
+///
+/// Java folds with `Math.multiplyExact` **at `int` width**, which THROWS
+/// `ArithmeticException: integer overflow` rather than wrapping. Verified live against
+/// `Walnut-all.jar` (2026-08-16): a library file whose header is 40 repetitions of `{0,1}`
+/// (`2^40`) fails with
+///
+/// ```text
+/// java.lang.ArithmeticException: integer overflow
+///     at java.base/java.lang.Math.multiplyExact(Math.java:964)
+/// ```
+///
+/// while the same file with 30 tracks (`2^30`, still inside `int`) loads and runs fine.
+/// So the threshold is `i32`, not `usize`, and the outcome is *recoverable* —
+/// `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`) prints it and
+/// returns to the prompt, exactly as it does for the `NumberFormatException` behind
+/// [`ReadError::ParseMethods`].
+///
+/// The plain `alphabet.iter().map(|t| t.len()).product::<usize>()` this replaces was wrong
+/// in three separate ways at once: it panicked (process-fatal for a library consumer) under
+/// `debug_assertions`, silently wrapped at 64-bit width in release — so debug and release
+/// disagreed with each other — and neither behavior matched Java's `int`-width throw. A
+/// 64-track `{0,1}` header, i.e. ~380 bytes of input, reached it.
+///
+/// Note the deliberate divergence from `wr_core::automaton::Automaton::determine_alphabet_size`,
+/// which still `expect()`s at `usize` width: that one is called on alphabets this workspace
+/// *constructs*, where an overflow is an internal-invariant violation; this one is called on
+/// an alphabet a *user file* declares, where it is ordinary malformed input.
+fn determine_alphabet_size(alphabet: &[Vec<i32>]) -> Result<usize, ReadError> {
+    let mut size: i32 = 1;
+    for track in alphabet {
+        // A track longer than `i32::MAX` could not have come from `Math.multiplyExact`'s
+        // `x.size()` either (Java's `List.size()` is an `int`), so it folds into the same
+        // overflow verdict rather than a separate one.
+        let len = i32::try_from(track.len()).map_err(|_| ReadError::AlphabetSizeOverflow)?;
+        size = size
+            .checked_mul(len)
+            .ok_or(ReadError::AlphabetSizeOverflow)?;
+    }
+    // Non-negative by construction (a fold of `List.size()`s starting at 1), so the cast
+    // is value-preserving.
+    Ok(size as usize)
 }
 
 /// One resolved NUMERATION track, i.e. what [`parse_ns_token`] makes of a
@@ -1266,7 +1352,7 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
         remove_duplicates(track);
     }
     let num_tracks = alphabet.len();
-    let alphabet_size: usize = alphabet.iter().map(|t| t.len()).product();
+    let alphabet_size = determine_alphabet_size(&alphabet)?;
     let label: Vec<String> = (0..num_tracks).map(|i| i.to_string()).collect();
 
     // Scratch `Automaton`, used only for its `encode` (mixed-radix, position-in-alphabet)
@@ -2866,5 +2952,92 @@ mod tests {
         let from_path = read_transducer_txt(&path).unwrap();
         let from_str = read_transducer_from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(format!("{from_path:?}"), format!("{from_str:?}"));
+    }
+
+    /// `RichAlphabet.determineAlphabetSize` folds with `Math.multiplyExact` at `int`
+    /// width, so a header whose per-track sizes multiply past `i32::MAX` is a recoverable
+    /// `ArithmeticException` in Java -- NOT a wrap, and not a crash.
+    ///
+    /// This used to be `alphabet.iter().map(|t| t.len()).product::<usize>()`, which
+    /// panicked under `debug_assertions` (process-fatal for every `cargo test` build of
+    /// every consumer) and silently wrapped at 64-bit width in release, so the two build
+    /// profiles disagreed with each other AND both disagreed with Java.
+    ///
+    /// Thresholds verified live against `Walnut-all.jar` (2026-08-16): 40 tracks of
+    /// `{0,1}` (`2^40`) -> `java.lang.ArithmeticException: integer overflow at
+    /// java.base/java.lang.Math.multiplyExact`; 30 tracks (`2^30`) -> loads and runs.
+    #[test]
+    fn many_track_header_overflows_alphabet_size_like_javas_multiply_exact() {
+        // `2^31` is the first product outside `int`; 31 tracks is exactly it.
+        let over = format!("{}\n0 0\n", vec!["{0,1}"; 31].join(" "));
+        assert!(matches!(
+            read_automaton_from_str(&over),
+            Err(ReadError::AlphabetSizeOverflow)
+        ));
+        // The shape that used to panic outright in a debug build.
+        let way_over = format!("{}\n0 0\n", vec!["{0,1}"; 64].join(" "));
+        assert!(matches!(
+            read_automaton_from_str(&way_over),
+            Err(ReadError::AlphabetSizeOverflow)
+        ));
+        // The transducer reader shares `firstParse`, so it shares the throw.
+        assert!(matches!(
+            read_transducer_from_str(&way_over),
+            Err(ReadError::AlphabetSizeOverflow)
+        ));
+        // And the largest product that still FITS is accepted, not rejected -- the
+        // boundary is `i32`, exactly Java's, not something more conservative. (30 tracks
+        // of `{0,1}` = `2^30`; the body declares one state and no transitions.)
+        let under = format!("{}\n0 0\n", vec!["{0,1}"; 30].join(" "));
+        let a = read_automaton_from_str(&under).unwrap();
+        assert_eq!(a.fa.alphabet_size, 1 << 30);
+    }
+
+    /// `parse_true_false`'s `$`-leniency (`ParseMethods.java:74-81`) reaching the reader:
+    /// a library file whose only line is `true` + a NEL/LS/PS is the TRUE automaton, and
+    /// the same with a trailing non-terminator character is not a truth-value line at all
+    /// -- it tokenizes as the bare numeration token `true`.
+    ///
+    /// Verified live against `Walnut-all.jar` (2026-08-16); see
+    /// `parse_methods::parse_true_false`'s doc for the full transcript.
+    #[test]
+    fn truth_value_line_tolerates_a_trailing_wide_line_terminator() {
+        for t in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            let a = read_automaton_from_str(&format!("true{t}\n")).unwrap();
+            assert_eq!(a.fa.true_false, Some(true), "{t:?}");
+            let b = read_automaton_from_str(&format!("false{t}\n")).unwrap();
+            assert_eq!(b.fa.true_false, Some(false), "{t:?}");
+            assert!(
+                matches!(
+                    read_automaton_from_str(&format!("true{t}x\n")),
+                    Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_true"
+                ),
+                "{t:?}"
+            );
+        }
+    }
+
+    /// The mirror-image case, which is deliberately NOT symmetric: `shouldSkipLine` uses
+    /// `Matcher.matches()`, where an unconsumed trailing character is fatal, so a comment
+    /// line ending in NEL/LS/PS is not a comment at all and is taken as the header.
+    ///
+    /// Verified live against `Walnut-all.jar` (2026-08-16): each of these reports
+    /// `Undefined statement: line at 1 of file …`, while the plain `#x` version loads.
+    #[test]
+    fn comment_line_with_a_wide_line_terminator_is_not_skipped() {
+        for t in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            // Java: line 1 fails `PATTERN_COMMENT`, so it IS the header, and
+            // `parseAlphabetDeclaration` rejects it.
+            assert!(
+                matches!(
+                    read_automaton_from_str(&format!("#x{t}\nmsd_2\n0 0\n0 -> 0\n")),
+                    Err(ReadError::MalformedHeader)
+                ),
+                "{t:?}"
+            );
+            // Sanity: the same file with an ordinary comment line loads.
+            let ok = read_automaton_from_str("#x\nmsd_2\n0 0\n0 -> 0\n").unwrap();
+            assert_eq!(ok.alphabet, vec![vec![0, 1]]);
+        }
     }
 }
