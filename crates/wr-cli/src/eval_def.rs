@@ -159,8 +159,9 @@
 //! [`TestCase::gv_address`]: crate::test_case::TestCase
 use std::io::Write;
 
+use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::Logging;
-use wr_logic::eval::{evaluate_with_logging, EvalError};
+use wr_logic::eval::{evaluate_with_logging_and_ctx, EvalError};
 use wr_logic::predicate_env::{FreshIdentifiers, PredicateEnv};
 
 use crate::automaton_output::{write_automata, GV_EXTENSION};
@@ -291,6 +292,51 @@ pub fn eval_def_command_with_stdout(
     free_var_str: Option<&str>,
     stdout: &mut dyn Write,
 ) -> Result<TestCase, EvalDefError> {
+    eval_def_command_with_stdout_and_ctx(
+        session,
+        logging,
+        fresh,
+        print_flag,
+        print_details,
+        predicate_str,
+        eval_name,
+        free_var_str,
+        stdout,
+        None,
+    )
+}
+
+/// As [`eval_def_command_with_stdout`], plus the `[strategy …]`/`[export …]` metacommand
+/// context (`crate::meta_commands::MetaCommands` implements
+/// [`DeterminizeContext`]) — the single point where Walnut's parsed metacommands actually
+/// reach the determinization dispatcher.
+///
+/// # The `shouldPrintDetails()` gate lives at this call's CALLER
+///
+/// Java wraps its whole metacommand block in `if (Logging.shouldPrintDetails())`
+/// (`DeterminizationStrategies.java:95`), so the automata counter must not move for a
+/// command that is not printing details. `MetaCommands.parseMetaCommands` already refuses
+/// any metacommand on a command that does not end in `::`
+/// (`MetaCommands.java:91-93`), which makes `print_details` the exact Rust-side spelling
+/// of that gate — [`crate::prover::Prover::eval_def_commands`] passes `Some(ctx)` only
+/// when `print_details` holds. The `printEnabled` half of Java's flag (flipped off by
+/// `Logging.disablePrint()` around every automaton `NumberSystem` builds for itself) is
+/// modelled structurally instead: `wr_core::numsys` never receives a context at all.
+///
+/// `clippy::too_many_arguments`: see [`eval_def_command`]'s docs.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_def_command_with_stdout_and_ctx(
+    session: &Session,
+    logging: &mut Logging,
+    fresh: &mut FreshIdentifiers,
+    print_flag: bool,
+    print_details: bool,
+    predicate_str: &str,
+    eval_name: Option<&str>,
+    free_var_str: Option<&str>,
+    stdout: &mut dyn Write,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+) -> Result<TestCase, EvalDefError> {
     // `boolean headless = evalName == null || evalName.isBlank();` (`:52`) -- see this
     // module's docs on the `isBlank`/`trim().is_empty()` approximation.
     let headless = eval_name.map(|s| s.trim().is_empty()).unwrap_or(true);
@@ -305,7 +351,7 @@ pub fn eval_def_command_with_stdout(
     let env = session.predicate_env();
 
     if headless {
-        return compute_headless(env, logging, fresh, predicate_str, stdout);
+        return compute_headless(env, logging, fresh, predicate_str, stdout, ctx);
     }
     // `evalName == null || evalName.isBlank()` was false, so a real, non-blank name exists.
     let eval_name =
@@ -319,7 +365,7 @@ pub fn eval_def_command_with_stdout(
     logging.with_eval_logs_to(&result_name, |logging| {
         // `Predicate predicate = new Predicate(predicateStr); c.compute(predicate);
         //  Automaton M = c.result.M;` (`:63-65`).
-        let mut automaton = evaluate_with_logging(env, logging, fresh, predicate_str)?;
+        let mut automaton = evaluate_with_logging_and_ctx(env, logging, fresh, predicate_str, ctx)?;
 
         // `M.writeAutomata(predicateStr, Session.getWriteAddressForAutomataLibrary(),
         //  evalName, false);` (`:67`) -- UNCONDITIONAL, before the TRUE/FALSE check below.
@@ -387,10 +433,11 @@ fn compute_headless(
     fresh: &mut FreshIdentifiers,
     predicate_str: &str,
     stdout: &mut dyn Write,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<TestCase, EvalDefError> {
     // `Predicate predicate = new Predicate(predicateStr); c.compute(predicate);
     //  Automaton M = c.result.M;` (`:80-82`).
-    let automaton = evaluate_with_logging(env, logging, fresh, predicate_str)?;
+    let automaton = evaluate_with_logging_and_ctx(env, logging, fresh, predicate_str, ctx)?;
 
     // `if (M.fa.isTRUE_FALSE_AUTOMATON()) { System.out.println("____\n" +
     //  M.fa.trueFalseString().toUpperCase()); }` (`:84-86`) -- identical to the
@@ -1194,6 +1241,238 @@ mod tests {
              must have the same alphabet\n\t: char at 8"
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------------
+    // `[strategy …]`/`[export …]`: the `DeterminizeContext` threading
+    // ------------------------------------------------------------------------
+
+    /// A [`DeterminizeContext`] that records every interaction, so a test can assert
+    /// WHICH automaton each `[strategy n …]`/`[export n …]` index actually names.
+    ///
+    /// `MetaCommands` itself deliberately records nothing (Java's does not either), so the
+    /// observability lives here in the test rather than as production state.
+    #[derive(Default)]
+    struct RecordingCtx {
+        next_index: usize,
+        /// The strategy to hand back per index; absent entries fall back to `SC`, exactly
+        /// as `MetaCommands.getStrategy`'s `getOrDefault` does.
+        strategies: std::collections::BTreeMap<usize, wr_core::determinize::Strategy>,
+        /// `(index, strategy answered, |Q| of the PRE-determinization automaton)`, in
+        /// order. The state count comes from the export hook, which Java offers `A`
+        /// before any strategy runs — the same value Walnut prints as
+        /// `Determinizing [#n, strategy: S]: <Q> states`.
+        seen: Vec<(usize, wr_core::determinize::Strategy, usize)>,
+    }
+
+    impl DeterminizeContext for RecordingCtx {
+        fn next_automaton_index(&mut self) -> usize {
+            let i = self.next_index;
+            self.next_index += 1;
+            i
+        }
+        fn strategy(&mut self, automaton_index: usize) -> wr_core::determinize::Strategy {
+            self.strategies
+                .get(&automaton_index)
+                .copied()
+                .unwrap_or(wr_core::determinize::Strategy::Sc)
+        }
+        fn export_pre_determinization(&mut self, request: wr_core::determinize::ExportRequest<'_>) {
+            let idx = request.automaton_index;
+            let strategy = self.strategy(idx);
+            self.seen.push((idx, strategy, request.automaton.fa.q));
+        }
+    }
+
+    /// Runs `predicate` headlessly with `print_details = true` and the given context.
+    fn eval_with_ctx(
+        session: &Session,
+        predicate: &str,
+        ctx: &mut dyn DeterminizeContext,
+    ) -> wr_core::automaton::Automaton {
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        let mut fresh = FreshIdentifiers::new();
+        let mut out: Vec<u8> = Vec::new();
+        let tc = eval_def_command_with_stdout_and_ctx(
+            session,
+            &mut logging,
+            &mut fresh,
+            true,
+            true,
+            predicate,
+            None,
+            None,
+            &mut out,
+            Some(ctx),
+        )
+        .unwrap();
+        tc.automaton_pairs()[0].automaton().unwrap().clone()
+    }
+
+    /// **The index-alignment pin, anchored on real `walnut-java` output.**
+    ///
+    /// `[strategy n …]`/`[export n …]` name an automaton by the ORDER of the
+    /// determinizations a command performs, so this port is only correct if it performs
+    /// exactly the same determinizations, in the same order, as Java. Nothing about the
+    /// final language can detect a mistake here (both strategies are correct), so the
+    /// only real check is against Walnut's own `Determinizing [#n, strategy: S]: <Q>
+    /// states` trace.
+    ///
+    /// The expectations below are transcribed from `<name>_detailed_log.txt` files
+    /// produced by the real `Walnut-all.jar` for these exact five queries (captured the
+    /// same way `tests/differential/CAPTURE.md` describes; the same lines are visible in
+    /// the committed corpus fixture `details637.txt`). Each tuple is
+    /// `(index, |Q| before determinizing)`.
+    ///
+    /// Three of these five are load-bearing beyond mere counting:
+    ///
+    /// * `q2`/`q5` — the arithmetic sub-formula's `quantifying:` block gets **no**
+    ///   `Determinizing` line at all in Java, because `Automaton.determinizeAndMinimize()`
+    ///   skips the dispatcher on an already-deterministic table (`Automaton.java:385`).
+    ///   This port used to determinize unconditionally there; every later index would be
+    ///   off by one.
+    /// * `q3` — `A` is `~E~`, and neither `not(asDFA())` consumes an index (the operand is
+    ///   already deterministic), so a `∀` costs the same two indices a `∃` does.
+    /// * `q4` — on `lsd`, `fixTrailingZerosProblem` closes with `justMinimize`, not
+    ///   `determinizeAndMinimize`, so an `lsd` quantification costs ONE index, not two.
+    #[test]
+    fn the_automata_index_sequence_matches_real_walnut_java() {
+        let (session, dir) = temp_session("idxseq");
+        for (predicate, expected) in [
+            ("?msd_2 Ei i < x", vec![(0, 2), (1, 2)]),
+            (
+                "?msd_2 Ex Ey (x + y = z) & (x < y)",
+                vec![(0, 2), (1, 4), (2, 3), (3, 3), (4, 2)],
+            ),
+            ("?msd_2 Ax (x < y) => (x < z)", vec![(0, 4), (1, 2)]),
+            ("?lsd_2 Ei i < x", vec![(0, 2)]),
+            // WB-039: Java has SIX indices here, not five —
+            // `[(0, 2), (1, 2), (2, 5), (3, 6), (4, 6), (5, 3)]`. Its extra `(1, 2)` is
+            // `NumberSystem.constant(2)`'s own internal `quantify`, which
+            // `NumberSystem.java:936` brackets in `Logging.disablePrint()` precisely so it
+            // will NOT be counted — except `disablePrint`/`enablePrint` are plain
+            // assignments, so the nested `getConstant(1)` inside that bracket turns
+            // printing back on and the rest of `constant(2)` runs counted. It also makes
+            // Java's sequence depend on the constant memo: rerun the same command and the
+            // leak vanishes. This port never hands `wr_core::numsys` a context, so its
+            // sequence is stable and matches Java's stated intent rather than Java's
+            // behavior — it is exactly Java's list with the leaked `(1, 2)` entry removed
+            // and the survivors renumbered, which is the whole of the divergence. See WB-039 — this divergence is logged and awaiting an explicit
+            // decision, not silently taken.
+            (
+                "?msd_3 Ei Ej (i + j = x) & (i > 2)",
+                vec![(0, 2), (1, 5), (2, 6), (3, 6), (4, 3)],
+            ),
+        ] {
+            let mut ctx = RecordingCtx::default();
+            eval_with_ctx(&session, predicate, &mut ctx);
+            let actual: Vec<(usize, usize)> = ctx.seen.iter().map(|(i, _, q)| (*i, *q)).collect();
+            assert_eq!(actual, expected, "index sequence for `{predicate}`");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `[strategy n BRZ]` really switches the algorithm for THAT determinization and no
+    /// other, and the answer is unchanged.
+    ///
+    /// The proxy for "Brzozowski actually ran" is not the answer (both strategies compute
+    /// the same language — that is the point of the equivalence assertion below) but the
+    /// recorded strategy the dispatcher asked for and got at each index, plus the fact
+    /// that only the targeted index differs.
+    #[test]
+    fn a_strategy_metacommand_switches_exactly_the_named_determinization() {
+        let (session, dir) = temp_session("stratsel");
+        let predicate = "?msd_2 Ex Ey (x + y = z) & (x < y)";
+
+        let mut sc_ctx = RecordingCtx::default();
+        let sc = eval_with_ctx(&session, predicate, &mut sc_ctx);
+
+        let mut brz_ctx = RecordingCtx {
+            strategies: [(3, wr_core::determinize::Strategy::Brz)]
+                .into_iter()
+                .collect(),
+            ..RecordingCtx::default()
+        };
+        let brz = eval_with_ctx(&session, predicate, &mut brz_ctx);
+
+        use wr_core::determinize::Strategy;
+        assert_eq!(
+            sc_ctx.seen.iter().map(|(_, s, _)| *s).collect::<Vec<_>>(),
+            vec![Strategy::Sc; 5]
+        );
+        assert_eq!(
+            brz_ctx.seen.iter().map(|(_, s, _)| *s).collect::<Vec<_>>(),
+            vec![
+                Strategy::Sc,
+                Strategy::Sc,
+                Strategy::Sc,
+                Strategy::Brz,
+                Strategy::Sc
+            ],
+            "only index 3 may be answered with Brzozowski"
+        );
+        // Same automata offered at every index, i.e. switching the strategy at index 3
+        // did not perturb WHICH automaton later indices name.
+        assert_eq!(
+            sc_ctx
+                .seen
+                .iter()
+                .map(|(i, _, q)| (*i, *q))
+                .collect::<Vec<_>>(),
+            brz_ctx
+                .seen
+                .iter()
+                .map(|(i, _, q)| (*i, *q))
+                .collect::<Vec<_>>()
+        );
+
+        // ... and the answer is the same language (`CLAUDE.md`'s prime directive #1:
+        // semantic equivalence, never structural identity).
+        let mut a = sc.clone();
+        let mut b = brz.clone();
+        a.fa.totalize(0);
+        b.fa.totalize(0);
+        assert_eq!(wr_core::equiv::language_equivalent(&a.fa, &b.fa), Ok(true));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The no-metacommand case must be bit-for-bit what it was before the context existed:
+    /// passing `None` runs plain subset construction everywhere and touches nothing else.
+    #[test]
+    fn no_context_computes_exactly_what_the_default_sc_context_does() {
+        let (session, dir) = temp_session("noctx");
+        for predicate in [
+            "?msd_2 Ei i < x",
+            "?msd_2 Ex Ey (x + y = z) & (x < y)",
+            "?lsd_2 Ei i < x",
+        ] {
+            let mut logging =
+                Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+            let mut fresh = FreshIdentifiers::new();
+            let mut out: Vec<u8> = Vec::new();
+            let plain = eval_def_command_with_stdout(
+                &session,
+                &mut logging,
+                &mut fresh,
+                false,
+                false,
+                predicate,
+                None,
+                None,
+                &mut out,
+            )
+            .unwrap();
+
+            let mut ctx = RecordingCtx::default();
+            let with_ctx = eval_with_ctx(&session, predicate, &mut ctx);
+
+            let plain = plain.automaton_pairs()[0].automaton().unwrap();
+            assert_eq!(plain.fa.q, with_ctx.fa.q, "state count for `{predicate}`");
+            assert_eq!(plain.fa.o, with_ctx.fa.o, "outputs for `{predicate}`");
+            assert_eq!(plain.fa.d, with_ctx.fa.d, "transitions for `{predicate}`");
+        }
         fs::remove_dir_all(&dir).ok();
     }
 }

@@ -185,6 +185,7 @@ use std::fmt;
 use std::time::Instant;
 
 use wr_core::automaton::Automaton;
+use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::{LoggableError, Logging};
 use wr_core::numsys::NumSysError;
 use wr_core::walnut_panic::catch_walnut_panic;
@@ -462,6 +463,22 @@ pub fn compute(
     fresh: &mut FreshIdentifiers,
     post_order: &[Token],
 ) -> Result<Expression, EvalError> {
+    compute_with_ctx(logging, fresh, post_order, None)
+}
+
+/// [`compute`] with an explicit [`DeterminizeContext`] — Walnut's `[strategy …]`/
+/// `[export …]` metacommand state; see [`Token::act_with_ctx`] for the contract and for
+/// why the caller owes the `shouldPrintDetails()` gate.
+///
+/// The context is threaded across the WHOLE postorder loop, not rebuilt per token:
+/// `MetaCommands`' automata counter is per-COMMAND state in Java, which is exactly what
+/// makes `[strategy 6 BRZ]` mean "the seventh determinization this command performs".
+pub fn compute_with_ctx(
+    logging: &mut Logging,
+    fresh: &mut FreshIdentifiers,
+    post_order: &[Token],
+    mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+) -> Result<Expression, EvalError> {
     let mut stack: Vec<Expression> = Vec::new();
     let time_beginning = Instant::now();
 
@@ -474,10 +491,11 @@ pub fn compute(
         // Tier-1 corpus exercises, via `error190.txt`). Without this boundary such a guard
         // would kill the process instead of producing Walnut's positioned error message —
         // strictly less faithful than Java. See `wr_core::walnut_panic`.
-        let outcome = match catch_walnut_panic(|| t.act(fresh, &mut stack)) {
-            Ok(inner) => inner,
-            Err(message) => Err(ActError::Thrown(message)),
-        };
+        let outcome =
+            match catch_walnut_panic(|| t.act_with_ctx(fresh, &mut stack, ctx.as_deref_mut())) {
+                Ok(inner) => inner,
+                Err(message) => Err(ActError::Thrown(message)),
+            };
         if let Err(source) = outcome {
             // `Logging.printTruncatedStackTrace(e)` (`:124`) on the ORIGINAL exception,
             // before the position-appending wrapper below is built.
@@ -561,8 +579,28 @@ pub fn evaluate_with_logging(
     fresh: &mut FreshIdentifiers,
     predicate_str: &str,
 ) -> Result<Automaton, EvalError> {
+    evaluate_with_logging_and_ctx(env, logging, fresh, predicate_str, None)
+}
+
+/// [`evaluate_with_logging`] with an explicit [`DeterminizeContext`] — see
+/// [`compute_with_ctx`].
+///
+/// **Scope note (deliberate, and narrower than Java's):** the context covers the
+/// postorder execution only, not [`Predicate::new`]'s lexing. Java's singleton is global,
+/// so a `.txt` library automaton that happens to be an NFA also advances the counter when
+/// `AutomatonReader` determinizes it (`AutomatonReader.java:92`). Threading a context
+/// through [`PredicateEnv`] to reproduce that is a separate decision; no fixture in
+/// Walnut's own corpus loads a nondeterministic library automaton under a metacommand, so
+/// the gap is recorded here rather than closed blind.
+pub fn evaluate_with_logging_and_ctx(
+    env: &dyn PredicateEnv,
+    logging: &mut Logging,
+    fresh: &mut FreshIdentifiers,
+    predicate_str: &str,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+) -> Result<Automaton, EvalError> {
     let predicate = Predicate::new(env, predicate_str)?;
-    match compute(logging, fresh, predicate.post_order())? {
+    match compute_with_ctx(logging, fresh, predicate.post_order(), ctx)? {
         Expression::Automaton(ae) => Ok(ae.m),
         // `compute` already validated this above (`ResultNotAutomaton` otherwise), so
         // any other variant here is an internal-invariant violation, not a real input.

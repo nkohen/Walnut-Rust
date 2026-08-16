@@ -74,14 +74,17 @@ use std::rc::Rc;
 
 use num_bigint::BigInt;
 use wr_core::automaton::Automaton;
+use wr_core::determinize::DeterminizeContext;
 use wr_core::infinite::{infinite, InfiniteError};
 use wr_core::logicalops::{
-    and, iff, imply, not, or, remove_leading_zeros, reverse, xor, RemoveLeadingZerosError,
+    and, iff, imply, not, or, remove_leading_zeros_with_ctx, reverse_with_ctx, xor,
+    RemoveLeadingZerosError,
 };
 use wr_core::numsys::{ArithmeticOp, NumSysError, NumberSystem, RelationalOp};
-use wr_core::quantify::{quantify, QuantifyError};
+use wr_core::quantify::{quantify_with_ctx, QuantifyError};
 use wr_core::word_automaton::{
-    apply_word_arith_operator, apply_word_operator, compare_word_automata, compare_word_automaton,
+    apply_word_arith_operator_with_ctx, apply_word_operator_with_ctx, compare_word_automata,
+    compare_word_automaton_with_ctx,
 };
 
 use crate::expr::{
@@ -931,10 +934,11 @@ impl Operator {
 pub(crate) fn and_then_quantify_if_arithmetic(
     a: &Expression,
     m: Automaton,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, ActError> {
     if let Expression::Arithmetic(ae) = a {
         let mut m = and(&m, &ae.m).into_automaton();
-        quantify(&mut m, &BTreeSet::from([ae.identifier.clone()]))?;
+        quantify_with_ctx(&mut m, &BTreeSet::from([ae.identifier.clone()]), ctx)?;
         return Ok(m);
     }
     Ok(m)
@@ -1108,9 +1112,19 @@ impl Operator {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
     ) -> Result<(), ActError> {
+        self.act_with_ctx(fresh, stack, None)
+    }
+
+    /// [`Operator::act`] with an explicit [`DeterminizeContext`] — see [`Token::act_with_ctx`].
+    pub fn act_with_ctx(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
         match self.kind {
-            OperatorKind::Relational(opp) => return self.act_relational(opp, stack),
-            OperatorKind::Arithmetic(opp) => return self.act_arithmetic(opp, fresh, stack),
+            OperatorKind::Relational(opp) => return self.act_relational(opp, stack, ctx),
+            OperatorKind::Arithmetic(opp) => return self.act_arithmetic(opp, fresh, stack, ctx),
             OperatorKind::LeftParen | OperatorKind::RightParen => return Ok(()),
             _ => {}
         }
@@ -1120,7 +1134,7 @@ impl Operator {
 
         // `if (this.isNegation(op) || op.equals(Operator.REVERSE))` (`:65-68`).
         if matches!(self.kind, OperatorKind::Negate | OperatorKind::Reverse) {
-            return self.act_negation_or_reverse(stack);
+            return self.act_negation_or_reverse(stack, ctx);
         }
         // `if (op.equals(EXISTS) || op.equals(FORALL) || op.equals(INFINITE))` (`:69-72`).
         if matches!(
@@ -1129,7 +1143,7 @@ impl Operator {
                 | OperatorKind::Forall { .. }
                 | OperatorKind::Infinite { .. }
         ) {
-            return self.act_quantifier(stack);
+            return self.act_quantifier(stack, ctx);
         }
 
         let b = stack.pop().expect("validated arity above");
@@ -1194,7 +1208,11 @@ impl Operator {
     /// [`wr_core::automaton::Automaton::as_dfa`]), so Java's `a.M = not(...)` rebinds
     /// rather than mutating in place — which is exactly the by-value ownership transfer
     /// [`wr_core::logicalops::not`] models.
-    fn act_negation_or_reverse(&self, stack: &mut Vec<Expression>) -> Result<(), ActError> {
+    fn act_negation_or_reverse(
+        &self,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
         let a = stack.pop().expect("validated arity above");
         let op = &self.op_text;
         // `if (a instanceof AutomatonExpression)` (`:104`), else `invalidOperator` (`:116`).
@@ -1215,9 +1233,9 @@ impl Operator {
         match self.kind {
             // `AutomatonLogicalOps.reverse(a.M, true)` (`:107-108`) — mutates in place and
             // returns void.
-            OperatorKind::Reverse => reverse(&mut m, true),
+            OperatorKind::Reverse => reverse_with_ctx(&mut m, true, ctx),
             // `a.M = AutomatonLogicalOps.not(a.M.asDFA())` (`:109-110`).
-            OperatorKind::Negate => m = not(m.as_dfa()).into_automaton(),
+            OperatorKind::Negate => m = not(m.as_dfa_with_ctx(ctx)).into_automaton(),
             _ => unreachable!("only the two unary kinds reach this method"),
         }
         stack.push(Expression::Automaton(AutomatonExpression::new(
@@ -1273,7 +1291,12 @@ impl Operator {
     ///   constructor sets `arity = quantifiedVariableCount + 1 >= 1`. Modeled here as a
     ///   value that is definitely assigned by the `i == arity - 1` iteration, with an
     ///   [`expect`](Option::expect) standing in for Java's would-be NPE.
-    fn act_quantifier(&self, stack: &mut Vec<Expression>) -> Result<(), ActError> {
+    fn act_quantifier(
+        &self,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
+        let mut ctx = ctx;
         let op = &self.op_text;
         let quantified_variable_count = self.arity - 1;
         let mut string_value = format!("({op} ");
@@ -1313,17 +1336,31 @@ impl Operator {
                 let mut automaton = ae.m;
                 match self.kind {
                     OperatorKind::Exists { .. } => {
-                        quantify(&mut automaton, &label_set(&identifiers_to_quantify))?;
+                        quantify_with_ctx(
+                            &mut automaton,
+                            &label_set(&identifiers_to_quantify),
+                            ctx.as_deref_mut(),
+                        )?;
                     }
                     OperatorKind::Forall { .. } => {
                         // `// A == ~ E ~` (`:145-148`).
-                        automaton = not(automaton.as_dfa()).into_automaton();
-                        quantify(&mut automaton, &label_set(&identifiers_to_quantify))?;
-                        automaton = not(automaton.as_dfa()).into_automaton();
+                        automaton =
+                            not(automaton.as_dfa_with_ctx(ctx.as_deref_mut())).into_automaton();
+                        quantify_with_ctx(
+                            &mut automaton,
+                            &label_set(&identifiers_to_quantify),
+                            ctx.as_deref_mut(),
+                        )?;
+                        automaton =
+                            not(automaton.as_dfa_with_ctx(ctx.as_deref_mut())).into_automaton();
                     }
                     OperatorKind::Infinite { .. } => {
                         // `// op == I` (`:150-153`).
-                        automaton = remove_leading_zeros(&automaton, &identifiers_to_quantify)?;
+                        automaton = remove_leading_zeros_with_ctx(
+                            &automaton,
+                            &identifiers_to_quantify,
+                            ctx.as_deref_mut(),
+                        )?;
                         // Java: `String infReg = Infinite.infinite(...); M = new
                         // Automaton(!infReg.isEmpty());` — the `""`-means-finite sentinel
                         // this port already replaced with `Option` (see
@@ -1371,7 +1408,9 @@ impl Operator {
         &self,
         opp: RelationalOp,
         stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<(), ActError> {
+        let mut ctx = ctx;
         // `super.validateArity(S)` (`:88`).
         self.validate_arity(stack.len())?;
         let ns = self.number_system();
@@ -1417,7 +1456,7 @@ impl Operator {
             // the list itself is never mutated here, in either language.
             for o in word.word_automaton.fa.o.clone() {
                 let mut n = word.word_automaton.clone();
-                compare_word_automaton(&mut n, o, RelationalOp::Equal);
+                compare_word_automaton_with_ctx(&mut n, o, RelationalOp::Equal, ctx.as_deref_mut());
                 let mut c = if reverse {
                     ns.comparison_const_b(identifier, &BigInt::from(o), opp)?
                 } else {
@@ -1427,8 +1466,12 @@ impl Operator {
                 m = and(&m, &n).into_automaton();
             }
             m = and(&m, &word.m).into_automaton();
-            quantify(&mut m, &label_set(&word.identifiers_to_quantify))?;
-            m = and_then_quantify_if_arithmetic(arith_expr, m)?;
+            quantify_with_ctx(
+                &mut m,
+                &label_set(&word.identifiers_to_quantify),
+                ctx.as_deref_mut(),
+            )?;
+            m = and_then_quantify_if_arithmetic(arith_expr, m, ctx.as_deref_mut())?;
             // WB-023: `word.toString()`, NOT `a + op + b` like every sibling arm.
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 word_expr.to_string(),
@@ -1440,8 +1483,8 @@ impl Operator {
         // ---- 2: arithmetic/variable vs arithmetic/variable (`:135-140`) -----
         if is_arithmetic_or_variable(&a) && is_arithmetic_or_variable(&b) {
             let mut m = ns.comparison(identifier_of(&a), identifier_of(&b), opp);
-            m = and_then_quantify_if_arithmetic(&a, m)?;
-            m = and_then_quantify_if_arithmetic(&b, m)?;
+            m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut())?;
+            m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut())?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 format!("{a}{op}{b}"),
                 m,
@@ -1458,7 +1501,7 @@ impl Operator {
                 }
                 _ => ns.comparison_const_a(&get_constant_value(&a), identifier, opp)?,
             };
-            let m = and_then_quantify_if_arithmetic(&b, m)?;
+            let m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut())?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 format!("{a}{op}{b}"),
                 m,
@@ -1475,7 +1518,7 @@ impl Operator {
                 }
                 _ => ns.comparison_const_b(identifier, &get_constant_value(&b), opp)?,
             };
-            let m = and_then_quantify_if_arithmetic(&a, m)?;
+            let m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut())?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 format!("{a}{op}{b}"),
                 m,
@@ -1496,8 +1539,16 @@ impl Operator {
             m = and(&m, &bw.m).into_automaton();
             // Two separate `quantify` calls, not one merged set — each one re-runs the
             // leading-zero fixup. Ported as-is (`:157-158`).
-            quantify(&mut m, &label_set(&aw.identifiers_to_quantify))?;
-            quantify(&mut m, &label_set(&bw.identifiers_to_quantify))?;
+            quantify_with_ctx(
+                &mut m,
+                &label_set(&aw.identifiers_to_quantify),
+                ctx.as_deref_mut(),
+            )?;
+            quantify_with_ctx(
+                &mut m,
+                &label_set(&bw.identifiers_to_quantify),
+                ctx.as_deref_mut(),
+            )?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 string_value,
                 m,
@@ -1518,9 +1569,13 @@ impl Operator {
             // Mutates `a.wordAutomaton` IN PLACE (`compareWordAutomaton` returns void);
             // `a` is discarded right after, so the aliasing Java's `Automaton M =
             // a.wordAutomaton` sets up is unobservable.
-            compare_word_automaton(&mut aw.word_automaton, k, opp);
+            compare_word_automaton_with_ctx(&mut aw.word_automaton, k, opp, ctx.as_deref_mut());
             let mut m = and(&aw.word_automaton, &aw.m).into_automaton();
-            quantify(&mut m, &label_set(&aw.identifiers_to_quantify))?;
+            quantify_with_ctx(
+                &mut m,
+                &label_set(&aw.identifiers_to_quantify),
+                ctx.as_deref_mut(),
+            )?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 string_value,
                 m,
@@ -1537,9 +1592,14 @@ impl Operator {
                 _ => unreachable!("matched above"),
             };
             // `k op T[…]` is `T[…] reverse(op) k` — hence `reverseOperator(opp)`.
-            compare_word_automaton(&mut bw.word_automaton, k, opp.reverse_operator());
+            compare_word_automaton_with_ctx(
+                &mut bw.word_automaton,
+                k,
+                opp.reverse_operator(),
+                ctx.as_deref_mut(),
+            );
             let mut m = and(&bw.word_automaton, &bw.m).into_automaton();
-            quantify(&mut m, &label_set(&bw.identifiers_to_quantify))?;
+            quantify_with_ctx(&mut m, &label_set(&bw.identifiers_to_quantify), ctx)?;
             stack.push(Expression::Automaton(AutomatonExpression::new(
                 string_value,
                 m,
@@ -1566,6 +1626,7 @@ impl Operator {
         opp: ArithmeticOp,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<(), ActError> {
         self.validate_arity(stack.len())?;
         let b = stack.pop().expect("validated arity above");
@@ -1578,9 +1639,9 @@ impl Operator {
             .into());
         }
         if opp == ArithmeticOp::UnaryNegative {
-            self.process_unary_operator(b, fresh, stack)
+            self.process_unary_operator(b, fresh, stack, ctx)
         } else {
-            self.process_binary_operator(opp, b, fresh, stack)
+            self.process_binary_operator(opp, b, fresh, stack, ctx)
         }
     }
 
@@ -1596,7 +1657,9 @@ impl Operator {
         mut b: Expression,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<(), ActError> {
+        let mut ctx = ctx;
         let ns = self.number_system();
         let op = &self.op_text;
 
@@ -1630,7 +1693,13 @@ impl Operator {
                 // thisP)`, i.e. `0 - output`. Note MINUS, not the `_` this operator IS —
                 // `ArithmeticOp::UnaryNegative` is precisely the value
                 // `ArithmeticOp::arith` rejects, so the rewrite is load-bearing.
-                apply_word_arith_operator(&mut bw.word_automaton, 0, ArithmeticOp::Minus, false)?;
+                apply_word_arith_operator_with_ctx(
+                    &mut bw.word_automaton,
+                    0,
+                    ArithmeticOp::Minus,
+                    false,
+                    ctx.as_deref_mut(),
+                )?;
             }
             // The expression string is NOT updated, so `_T[i]` still displays as `T[i]`.
             stack.push(b);
@@ -1641,7 +1710,7 @@ impl Operator {
         let c = fresh.next_identifier();
         let m =
             ns.arithmetic_const_c(identifier_of(&b), &c, &BigInt::from(0), ArithmeticOp::Plus)?;
-        let m = and_then_quantify_if_arithmetic(&b, m)?;
+        let m = and_then_quantify_if_arithmetic(&b, m, ctx)?;
         stack.push(Expression::Arithmetic(ArithmeticExpression::new(
             format!("({op}{b})"),
             m,
@@ -1672,7 +1741,9 @@ impl Operator {
         mut b: Expression,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<(), ActError> {
+        let mut ctx = ctx;
         let ns = self.number_system();
         let op = &self.op_text;
         let mut a = stack.pop().expect("validated arity in act_arithmetic");
@@ -1693,8 +1764,12 @@ impl Operator {
                     Expression::Word(w) => w,
                     _ => unreachable!("matched above"),
                 };
-                aw.word_automaton =
-                    apply_word_operator(&aw.word_automaton, &bw.word_automaton, opp);
+                aw.word_automaton = apply_word_operator_with_ctx(
+                    &aw.word_automaton,
+                    &bw.word_automaton,
+                    opp,
+                    ctx.as_deref_mut(),
+                );
                 aw.m = and(&aw.m, &bw.m).into_automaton();
                 aw.identifiers_to_quantify
                     .extend(bw.identifiers_to_quantify.iter().cloned());
@@ -1715,7 +1790,13 @@ impl Operator {
                     _ => unreachable!("matched above"),
                 };
                 // `reverse = true` -> per-state `arith(op, output, k)`, i.e. `T[…] op k`.
-                apply_word_arith_operator(&mut aw.word_automaton, k, opp, true)?;
+                apply_word_arith_operator_with_ctx(
+                    &mut aw.word_automaton,
+                    k,
+                    opp,
+                    true,
+                    ctx.as_deref_mut(),
+                )?;
             }
             stack.push(a);
             return Ok(());
@@ -1730,7 +1811,13 @@ impl Operator {
                     _ => unreachable!("matched above"),
                 };
                 // `reverse = false` -> per-state `arith(op, k, output)`, i.e. `k op T[…]`.
-                apply_word_arith_operator(&mut bw.word_automaton, k, opp, false)?;
+                apply_word_arith_operator_with_ctx(
+                    &mut bw.word_automaton,
+                    k,
+                    opp,
+                    false,
+                    ctx.as_deref_mut(),
+                )?;
             }
             stack.push(b);
             return Ok(());
@@ -1779,7 +1866,7 @@ impl Operator {
             let mut acc = Automaton::true_false(true);
             for o in word.word_automaton.fa.o.clone() {
                 let mut n = word.word_automaton.clone();
-                compare_word_automaton(&mut n, o, RelationalOp::Equal);
+                compare_word_automaton_with_ctx(&mut n, o, RelationalOp::Equal, ctx.as_deref_mut());
                 let mut cc = if o == 0 && opp == ArithmeticOp::Mult {
                     // `0 * anything = 0`, asserted directly on `c` — this is the ONLY
                     // conjunct that never mentions `arithmetic.identifier`, i.e. WB-003's
@@ -1797,8 +1884,12 @@ impl Operator {
                 acc = and(&acc, &n).into_automaton();
             }
             acc = and(&acc, &word.m).into_automaton();
-            quantify(&mut acc, &label_set(&word.identifiers_to_quantify))?;
-            m = and_then_quantify_if_arithmetic(arith_expr, acc)?;
+            quantify_with_ctx(
+                &mut acc,
+                &label_set(&word.identifiers_to_quantify),
+                ctx.as_deref_mut(),
+            )?;
+            m = and_then_quantify_if_arithmetic(arith_expr, acc, ctx.as_deref_mut())?;
         } else {
             // ---- 5: no word operand (`:200-231`) -----------------------------
             // Exactly one of `a`/`b` may be a constant here (arm 3 consumed the
@@ -1850,8 +1941,8 @@ impl Operator {
             } else {
                 ns.arithmetic(identifier_of(&a), identifier_of(&b), &c, opp)?
             };
-            let built = and_then_quantify_if_arithmetic(&a, built)?;
-            m = and_then_quantify_if_arithmetic(&b, built)?;
+            let built = and_then_quantify_if_arithmetic(&a, built, ctx.as_deref_mut())?;
+            m = and_then_quantify_if_arithmetic(&b, built, ctx)?;
         }
 
         stack.push(Expression::Arithmetic(ArithmeticExpression::new(
@@ -2069,6 +2160,21 @@ impl Word {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
     ) -> Result<(), ActError> {
+        self.act_with_ctx(fresh, stack, None)
+    }
+
+    /// [`Word::act`] with an explicit [`DeterminizeContext`] — see
+    /// [`Token::act_with_ctx`]. `Word::act` itself never determinizes (every
+    /// [`Expression`] `act` it calls builds through `and`/`NumberSystem` only), so `ctx`
+    /// is threaded here purely so the dispatch in [`Token::act_with_ctx`] is uniform and
+    /// stays correct if a later unit widens what `Word::act` does.
+    pub fn act_with_ctx(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
+        let _ = ctx;
         // `super.validateArity(S, "word ", " indices")` (`Token.java:56-58`).
         if stack.len() < self.arity {
             return Err(TokenError::InsufficientStackOperands {
@@ -2210,6 +2316,18 @@ impl Function {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
     ) -> Result<(), ActError> {
+        self.act_with_ctx(fresh, stack, None)
+    }
+
+    /// [`Function::act`] with an explicit [`DeterminizeContext`] — see
+    /// [`Token::act_with_ctx`]. Reaches the determinization dispatcher through its
+    /// closing `AutomatonQuantification.quantify`.
+    pub fn act_with_ctx(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
         // `super.validateArity(S, "function ", " arguments")` (`Token.java:56-58`).
         if stack.len() < self.arity {
             return Err(TokenError::InsufficientStackOperands {
@@ -2271,7 +2389,7 @@ impl Function {
         bound.bind(identifiers);
         let mut anded = and(&bound, &m).into_automaton();
         let quantify_set: BTreeSet<String> = quantify.into_iter().collect();
-        wr_core::quantify::quantify(&mut anded, &quantify_set)?;
+        quantify_with_ctx(&mut anded, &quantify_set, ctx)?;
 
         stack.push(Expression::Automaton(AutomatonExpression::new(
             string_value,
@@ -2353,13 +2471,37 @@ impl Token {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
     ) -> Result<(), ActError> {
+        self.act_with_ctx(fresh, stack, None)
+    }
+
+    /// [`Token::act`] with an explicit [`DeterminizeContext`] — Walnut's
+    /// `[strategy …]`/`[export …]` metacommand state, which Java reads out of the
+    /// `Prover.mainProver.metaCommands` singleton *inside*
+    /// `DeterminizationStrategies.determinize`. This is the `wr-logic` half of threading
+    /// that singleton explicitly (`PORTING.md`'s standing ruling for Java global mutable
+    /// state).
+    ///
+    /// `None` is exactly [`Token::act`] — strategy `SC` everywhere, no export, no
+    /// counter movement. `Some(ctx)` is the port of `Logging.shouldPrintDetails() ==
+    /// true`, so **the caller owes the print-details gate**: Java's whole metacommand
+    /// block is wrapped in `if (Logging.shouldPrintDetails())` precisely so the automata
+    /// counter does not advance for the silent automaton constructions `NumberSystem`
+    /// makes behind `Logging.disablePrint()`. This port models those by passing `None`
+    /// (`wr_core::numsys` never receives a context), and models the outer gate by
+    /// `wr_cli::eval_def` only passing `Some` when the command ended in `::`.
+    pub fn act_with_ctx(
+        &self,
+        fresh: &mut FreshIdentifiers,
+        stack: &mut Vec<Expression>,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), ActError> {
         match self {
             Token::Variable(t) => t.act(stack),
             Token::NumberLiteral(t) => t.act(stack),
             Token::AlphabetLetter(t) => t.act(stack),
-            Token::Operator(op) => return op.act(fresh, stack),
-            Token::Word(w) => return w.act(fresh, stack),
-            Token::Function(f) => return f.act(fresh, stack),
+            Token::Operator(op) => return op.act_with_ctx(fresh, stack, ctx),
+            Token::Word(w) => return w.act_with_ctx(fresh, stack, ctx),
+            Token::Function(f) => return f.act_with_ctx(fresh, stack, ctx),
         }
         Ok(())
     }
@@ -4111,7 +4253,7 @@ mod tests {
             number_literal(3, &ns("msd_2")),
             word_expression("T[i]", thue_morse("i")),
         ] {
-            let out = and_then_quantify_if_arithmetic(&operand, m.clone()).unwrap();
+            let out = and_then_quantify_if_arithmetic(&operand, m.clone(), None).unwrap();
             assert_eq!(out.label, m.label);
             assert_eq!(out.fa.q, m.fa.q);
             assert_eq!(out.fa.o, m.fa.o);

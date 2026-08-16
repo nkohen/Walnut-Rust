@@ -225,27 +225,6 @@ pub enum Excluded {
     /// fixture could have produced (`docs/BOUNDARY-MAP.md` §4.2). Detected structurally, not
     /// hard-coded: see [`transitively_dropped`].
     TransitiveDropDependency(Vec<String>),
-    /// Declares a `[strategy …]`/`[export …]` metacommand that this port **parses and
-    /// validates but does not yet act on**.
-    ///
-    /// This is a pre-existing, explicitly documented deferral, not something this harness
-    /// invented: `crates/wr-cli/src/prover.rs`'s module docs ("The parsed `MetaCommands` is
-    /// not threaded into determinization yet") record that `MetaCommands` implements
-    /// [`wr_core::determinize::DeterminizeContext`] but that nothing hands it down the
-    /// `eval_def_command` → `wr_logic::eval` → `wr_core::quantify` chain, so every
-    /// determinization still runs with U0c's no-op default (`SC`, no export, no counter
-    /// movement). Wiring it is a separate unit's decision — it means threading an
-    /// `Option<&mut dyn DeterminizeContext>` through `wr-logic`, and it interacts with
-    /// `determinize.rs`'s standing "pass `None` whenever `should_print_details()` is false or
-    /// the automaton indices shift" requirement.
-    ///
-    /// Comparing such a fixture would be measuring the deferral, not the port: fixture 637
-    /// asks for `[strategy 6 BRZ]`, which real Walnut answers in 130 ms because Brzozowski
-    /// collapses a 1,790-state NFA to 12 states; run with the default `SC` instead, the same
-    /// step is a subset construction over that NFA and does not finish inside this harness's
-    /// per-fixture budget. Its `details` expectation records `strategy: Brzozowski`
-    /// explicitly, so it could not match either way.
-    MetacommandNotWired(String),
 }
 
 impl std::fmt::Display for Excluded {
@@ -255,9 +234,6 @@ impl std::fmt::Display for Excluded {
             Excluded::OtfStrategy(s) => write!(f, "skip-otf-deferred[{s}]"),
             Excluded::TransitiveDropDependency(names) => {
                 write!(f, "skip-transitive-drop-dep[{}]", names.join(","))
-            }
-            Excluded::MetacommandNotWired(meta) => {
-                write!(f, "skip-metacommand-not-wired[{meta}]")
             }
         }
     }
@@ -298,16 +274,6 @@ pub fn deferred_otf_strategy(command_script: &str) -> Option<String> {
         .iter()
         .find(|s| **s == name)
         .map(|s| s.to_string())
-}
-
-/// The metacommand blocks that this port parses but does not act on — currently every
-/// `strategy`/`export` one. See [`Excluded::MetacommandNotWired`].
-pub fn unwired_metacommands(command_script: &str) -> Option<String> {
-    let unwired: Vec<String> = declared_metacommands(command_script)
-        .into_iter()
-        .filter(|m| m.starts_with("strategy") || m.starts_with("export"))
-        .collect();
-    (!unwired.is_empty()).then(|| unwired.join("]["))
 }
 
 /// The commands whose SECOND token is the name of a library entry the command **creates**

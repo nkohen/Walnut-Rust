@@ -96,7 +96,7 @@ use std::rc::Rc;
 /// `crate::quantify::quantify_helper` (∃-projection — the single most common
 /// determinization site in the whole engine) and `wr_io::reader::read_automaton_txt`
 /// (`.txt` loading), both of which call `crate::determinize::determinize` directly
-/// rather than through an `Automaton` method. All four currently pass `None`. This
+/// rather than through an `Automaton` method. This
 /// matters because it's what actually puts the `[strategy …]`/`[export …]` hook on the
 /// port's real call graph — an earlier version of this comment claimed only these two
 /// overloads mattered, which a reviewer caught: it was true for Java but left `quantify`
@@ -106,18 +106,59 @@ use std::rc::Rc;
 /// `.txt`-load determinizations). Fixed by routing those two call sites through the
 /// dispatcher too, not just by correcting this comment.
 ///
-/// None of the four supplies a context yet: Java reads the `Prover.mainProver.
-/// metaCommands` singleton *inside* the dispatcher, and threading the Rust equivalent
-/// down from `Prover` is Phase 3b (`U21`), which will widen all four call sites (or the
-/// two non-`Automaton` ones directly, and `Automaton`'s methods via a new overload/
-/// parameter — that call-graph-widening plan is U21's to make, not fixed here).
+/// Three of the four now take a real context on the `eval`/`def` path: Java reads the
+/// `Prover.mainProver.metaCommands` singleton *inside* the dispatcher, and this port
+/// threads the equivalent down from `Prover` explicitly (`PORTING.md`'s ruling for Java
+/// global mutable state) — see [`Automaton::determinize_and_minimize_with_ctx`],
+/// [`Automaton::determinize_and_minimize_from_with_ctx`] and
+/// [`crate::quantify::quantify_with_ctx`]. The fourth, `wr_io::reader`'s `.txt` load,
+/// still passes `None` unconditionally: reproducing Java there would mean threading a
+/// context through `wr_logic::predicate_env::PredicateEnv`, and it only ever matters for
+/// a library file that is genuinely nondeterministic (no corpus fixture is), so the gap
+/// is recorded in `wr_logic::eval::evaluate_with_logging_and_ctx`'s docs rather than
+/// closed blind.
 ///
 /// With `None` the dispatcher is behaviorally identical to the pre-U0c code at each of
 /// these four sites — strategy is unconditionally [`crate::determinize::Strategy::Sc`],
 /// the export sink and the automata counter are never touched, and the only fallible arm
 /// ([`crate::determinize::brzozowski`]) is unreachable — so this `expect` cannot fire.
+/// It is asserted, not assumed, in [`dispatch_determinize`].
 const NO_CONTEXT_CANNOT_FAIL: &str =
     "determinize with no metacommand context always takes the SC arm, which is infallible";
+
+/// The one place this crate turns a [`crate::determinize::DeterminizeError`] back into
+/// Java's thrown `WalnutException`.
+///
+/// With `ctx == None` the dispatcher is infallible (see [`NO_CONTEXT_CANNOT_FAIL`]), so
+/// this is `expect`ed; with a real context a `[strategy n BRZ]` on a word automaton is
+/// reachable, and Java throws
+/// `WalnutException("DFAOs are not supported for non-SC strategies.")`
+/// (`DeterminizationStrategies.java:115-119`) out of `determinizeAndMinimize` — caught by
+/// `EvalDef.compute`. `crate::walnut_panic`'s guard-authoring rule says such a guard
+/// panics with **exactly** the Java message and nothing else, which is what lets
+/// `wr_logic::eval::compute`'s existing boundary turn it into the same positioned error
+/// message Java produces.
+pub(crate) fn dispatch_determinize(
+    a: &mut Automaton,
+    initial: &BTreeSet<usize>,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) {
+    let had_ctx = ctx.is_some();
+    if let Err(e) = crate::determinize::determinize(a, initial, ctx) {
+        assert!(had_ctx, "{NO_CONTEXT_CANNOT_FAIL}");
+        match e {
+            crate::determinize::DeterminizeError::DfaoWithNonScStrategy(_) => {
+                panic!("DFAOs are not supported for non-SC strategies.")
+            }
+            // `brzozowski`'s intermediate `justMinimize()`; documented as unreachable
+            // there (subset construction's output is always deterministic and
+            // q0-reachable), so this arm exists only so the match is total.
+            crate::determinize::DeterminizeError::Minimize(m) => {
+                panic!("determinize: intermediate minimize failed: {m:?}")
+            }
+        }
+    }
+}
 
 /// `Automaton.normalizeNumberSystems`'s unconditional warning (`Automaton.java:178-179`),
 /// verbatim — see [`Automaton::normalize_number_systems`]. `pub` so `wr-cli`'s tests can
@@ -1466,11 +1507,42 @@ impl Automaton {
     /// `CLAUDE.md`'s mechanical-port rule — NOT fixed here by adding an unconditional
     /// trim, which would be an undeclared behavioral divergence from `Automaton.java`.
     pub fn determinize_and_minimize(&mut self) {
+        self.determinize_and_minimize_with_ctx(None);
+    }
+
+    /// [`Automaton::determinize_and_minimize`] with an explicit
+    /// [`crate::determinize::DeterminizeContext`] — Walnut's `[strategy …]`/`[export …]`
+    /// metacommand state, which Java reads out of the `Prover.mainProver.metaCommands`
+    /// singleton inside the dispatcher (see [`NO_CONTEXT_CANNOT_FAIL`]'s docs and
+    /// `determinize.rs`'s module docs).
+    ///
+    /// `None` is exactly the no-arg method above. `Some(ctx)` is the port of Java's
+    /// `Logging.shouldPrintDetails() == true` state, so **the caller owes the
+    /// print-details gate**: pass `None` whenever `should_print_details()` is false, or
+    /// the automata indices shift and `[strategy 6 …]` selects the wrong automaton.
+    ///
+    /// Note the counter only moves when a determinization actually happens: Java's
+    /// `!isDeterministic()` guard (`Automaton.java:385`) skips the dispatcher entirely on
+    /// an already-deterministic input, which is directly visible in Walnut's own
+    /// `details` fixtures (a `quantifying:` block with a `Minimizing:` line but no
+    /// `Determinizing [#n, …]` line is exactly this branch).
+    ///
+    /// # Panics
+    ///
+    /// With `Some(ctx)` the dispatcher becomes fallible — a non-`SC` strategy on a DFAO
+    /// is Java's `WalnutException("DFAOs are not supported for non-SC strategies.")`
+    /// (`DeterminizationStrategies.java:115-119`). Ported as a `panic!` carrying that
+    /// message verbatim, per [`crate::walnut_panic`]'s guard-authoring rule: Java catches
+    /// it in `EvalDef.compute`, and this port catches it at the same place.
+    pub fn determinize_and_minimize_with_ctx(
+        &mut self,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    ) {
         if !self.fa.is_deterministic() {
             // Working with an NFA. Let's trim, then determinize from {q0}.
             self.fa = crate::trim::trim(&self.fa);
             let initial: BTreeSet<usize> = [self.fa.q0].into_iter().collect();
-            crate::determinize::determinize(self, &initial, None).expect(NO_CONTEXT_CANNOT_FAIL);
+            dispatch_determinize(self, &initial, ctx);
         }
         // `FA.justMinimize`'s `convertNFAtoDFA()` call is a storage-representation
         // optimization only (see `fa.rs` module docs: this crate always uses one
@@ -1491,7 +1563,20 @@ impl Automaton {
     /// necessarily a singleton). Unlike the no-arg overload, this is unconditional —
     /// Java's version has no `!isDeterministic` guard either.
     pub fn determinize_and_minimize_from(&mut self, initial: &BTreeSet<usize>) {
-        crate::determinize::determinize(self, initial, None).expect(NO_CONTEXT_CANNOT_FAIL);
+        self.determinize_and_minimize_from_with_ctx(initial, None);
+    }
+
+    /// [`Automaton::determinize_and_minimize_from`] with an explicit
+    /// [`crate::determinize::DeterminizeContext`] — see
+    /// [`Automaton::determinize_and_minimize_with_ctx`] for the contract (including the
+    /// caller-owed print-details gate and the DFAO panic). Unlike that method this one is
+    /// unconditional, so `Some(ctx)` ALWAYS consumes an automata index here.
+    pub fn determinize_and_minimize_from_with_ctx(
+        &mut self,
+        initial: &BTreeSet<usize>,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    ) {
+        dispatch_determinize(self, initial, ctx);
         self.fa = crate::minimize::minimize(&self.fa).expect(
             "subset_construction's output is always deterministic and q0-reachable -- \
              minimize's documented preconditions",
@@ -1503,6 +1588,18 @@ impl Automaton {
     /// `Automaton.asDFA` (`Automaton.java:152-158`).
     pub fn as_dfa(&self) -> AutomatonDFA {
         AutomatonDFA::from(self.clone())
+    }
+
+    /// [`Automaton::as_dfa`] with an explicit
+    /// [`crate::determinize::DeterminizeContext`] — see
+    /// [`Automaton::determinize_and_minimize_with_ctx`] for the contract. This is the
+    /// path `LogicalOperator`'s `~` (negation) and the `A`/`I` quantifiers take
+    /// (`not(a.M.asDFA())`), so it is on the eval call graph, not a convenience.
+    pub fn as_dfa_with_ctx(
+        &self,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    ) -> AutomatonDFA {
+        AutomatonDFA::from_with_ctx(self.clone(), ctx)
     }
 }
 
@@ -1550,7 +1647,16 @@ impl AutomatonDFA {
     /// `isTRUE_FALSE_AUTOMATON -> return` short-circuit (U0, `:88-90`). That guard is
     /// load-bearing: `determinize_and_minimize` below would otherwise run subset
     /// construction over a trivial automaton's meaningless (possibly stale) state set.
-    fn require_dfa_storage(mut automaton: Automaton) -> Automaton {
+    ///
+    /// Takes an explicit [`crate::determinize::DeterminizeContext`] — see
+    /// [`Automaton::determinize_and_minimize_with_ctx`] for the contract. Only the
+    /// nondeterministic branch reaches the dispatcher, so an already-deterministic input
+    /// consumes no automata index (matching Java, whose `requireDfaStorage` guards the
+    /// call the same way).
+    fn require_dfa_storage_with_ctx(
+        mut automaton: Automaton,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    ) -> Automaton {
         if automaton.fa.is_true_false_automaton() {
             return automaton;
         }
@@ -1560,7 +1666,7 @@ impl AutomatonDFA {
                 // in the original, not a typo introduced here).
                 panic!("NFAOs are not supported..");
             }
-            automaton.determinize_and_minimize();
+            automaton.determinize_and_minimize_with_ctx(ctx);
         }
         // `fa.convertNFAtoDFA()` (`FA.java:700-706`) is NOT a pure storage-representation
         // optimization — an earlier version of this comment claimed that, which an
@@ -1590,10 +1696,20 @@ impl AutomatonDFA {
     /// [`Automaton::as_dfa`]/`Automaton.clone()`'s trivial branch (`:102-104`), which
     /// route through here.
     pub fn from(automaton: Automaton) -> Self {
+        Self::from_with_ctx(automaton, None)
+    }
+
+    /// [`AutomatonDFA::from`] with an explicit
+    /// [`crate::determinize::DeterminizeContext`] — see
+    /// [`Automaton::determinize_and_minimize_with_ctx`] for the contract.
+    pub fn from_with_ctx(
+        automaton: Automaton,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    ) -> Self {
         if automaton.fa.is_true_false_automaton() {
             return AutomatonDFA::true_false(automaton.fa.is_true_automaton());
         }
-        AutomatonDFA(Self::require_dfa_storage(automaton))
+        AutomatonDFA(Self::require_dfa_storage_with_ctx(automaton, ctx))
     }
 
     /// Borrows the wrapped, guaranteed-deterministic [`Automaton`].

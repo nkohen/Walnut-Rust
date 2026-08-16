@@ -29,15 +29,17 @@
 //! `Session`/`Logging`. **`None` means "no metacommands in effect"** and is
 //! bit-for-bit the pre-U0c behavior: strategy `SC`, no export, no counter movement.
 //!
-//! The real `MetaCommands` parser that supplies the values is Phase 3b (`U21`); the
-//! only thing that lands here is the hook it will plug into. In particular this
+//! The real `MetaCommands` parser that supplies the values landed in Phase 3b (`U21`), and
+//! Phase 4 threads it down the `eval`/`def` call chain into this dispatcher
+//! (`wr_cli::prover` → `wr_cli::eval_def` → `wr_logic::eval` → `wr_core::quantify`/
+//! `logicalops`/`word_automaton`). In particular this
 //! dispatcher does **not** yet emit Java's two `Logging` lines (`DETERMINIZING …`/
 //! `DETERMINIZED …`, `:111-112` and `:129-130`) — no `wr-core` algorithm threads
 //! [`crate::logging::Logging`] yet (see `product.rs`'s identical note). The format
 //! string those lines need is ported and pinned regardless, as
 //! [`Strategy::output_name`].
 //!
-//! ## The `shouldPrintDetails()` gate is the caller's job — read this before wiring 3b
+//! ## The `shouldPrintDetails()` gate is the caller's job
 //!
 //! Java's whole metacommand block is wrapped in `if (Logging.shouldPrintDetails())`,
 //! with an explicit comment saying why: the automata counter must NOT advance for the
@@ -47,6 +49,17 @@
 //! `should_print_details()` is false** — otherwise indices shift and `[strategy 6 …]`
 //! /`[export 1 …]` select the wrong automaton. `Some(ctx)` here means exactly what
 //! `shouldPrintDetails() == true` means in Java.
+//!
+//! Both halves of Java's flag are honoured, in two different places:
+//!
+//! * `printDetails` — `wr_cli::prover::Prover::eval_def_commands` passes `Some(ctx)` only
+//!   when the command ended in `::`.
+//! * `printEnabled` — Java flips this off with `Logging.disablePrint()` around every
+//!   automaton `NumberSystem` builds for itself. This port models that structurally:
+//!   `crate::numsys` is never handed a context, so nothing it builds can move the counter.
+//!   That is *not* bit-for-bit Java, because Java's `disablePrint`/`enablePrint` are not
+//!   save/restore and a nested pair re-enables early — see `docs/WALNUT-BUGS.md` WB-039,
+//!   which is logged and awaiting an explicit replicate-vs-diverge decision.
 
 use crate::automaton::Automaton;
 use crate::fa::Fa;
@@ -227,7 +240,7 @@ impl From<MinimizeError> for DeterminizeError {
 pub fn determinize(
     a: &mut Automaton,
     initial: &BTreeSet<usize>,
-    ctx: Option<&mut dyn DeterminizeContext>,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<(), DeterminizeError> {
     let mut strategy = Strategy::Sc;
     if let Some(ctx) = ctx {

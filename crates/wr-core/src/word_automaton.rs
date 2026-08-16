@@ -78,12 +78,29 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 /// [`Automaton::determinize_and_minimize`] call collapses states that became
 /// equivalent once output was restricted to `0`/`1`.
 pub fn compare_word_automaton(word_a: &mut Automaton, o: i32, op: RelationalOp) {
+    compare_word_automaton_with_ctx(word_a, o, op, None);
+}
+
+/// [`compare_word_automaton`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`Automaton::determinize_and_minimize_with_ctx`] for the contract. The closing call is
+/// the CONDITIONAL no-arg `determinizeAndMinimize()`, so a comparison whose rewritten
+/// table is still deterministic (the usual case — a DFAO's outputs were just replaced by
+/// 0/1) consumes no automata index. Walnut's `details637.txt` shows exactly that: its
+/// `comparing (=) against 1:` blocks carry a `Minimizing:` line and no
+/// `Determinizing [#n, …]` line.
+pub fn compare_word_automaton_with_ctx(
+    word_a: &mut Automaton,
+    o: i32,
+    op: RelationalOp,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) {
     for p in 0..word_a.fa.q {
         let out_p = word_a.fa.o[p];
         word_a.fa.set_output_if_equal(p, op.compare(out_p, o));
     }
     // As of now, this is *not* a word automaton.
-    word_a.determinize_and_minimize();
+    word_a.determinize_and_minimize_with_ctx(ctx);
 }
 
 /// `WordAutomaton.compareWordAutomata(Automaton, Automaton, String)`
@@ -115,6 +132,21 @@ pub fn apply_word_arith_operator(
     op: ArithmeticOp,
     reverse: bool,
 ) -> Result<(), NumSysError> {
+    apply_word_arith_operator_with_ctx(word_a, o, op, reverse, None)
+}
+
+/// [`apply_word_arith_operator`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`Automaton::determinize_and_minimize_with_ctx`] for the contract. Reaches the
+/// dispatcher only through [`minimize_self_with_output`]'s per-output-value
+/// sub-automata, each of whose `determinizeAndMinimize()` calls is itself conditional.
+pub fn apply_word_arith_operator_with_ctx(
+    word_a: &mut Automaton,
+    o: i32,
+    op: ArithmeticOp,
+    reverse: bool,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Result<(), NumSysError> {
     for p in 0..word_a.fa.q {
         let this_p = word_a.fa.o[p];
         word_a.fa.o[p] = if reverse {
@@ -123,7 +155,7 @@ pub fn apply_word_arith_operator(
             op.arith(o, this_p)?
         };
     }
-    minimize_self_with_output(word_a);
+    minimize_self_with_output_with_ctx(word_a, ctx);
     Ok(())
 }
 
@@ -133,11 +165,23 @@ pub fn apply_word_arith_operator(
 /// overflow case) — see this module's docs on fallibility for why this is a faithful
 /// port of Java's own uncaught-exception-through-the-BFS behavior, not a shortcut.
 pub fn apply_word_operator(word_a: &Automaton, word_b: &Automaton, op: ArithmeticOp) -> Automaton {
+    apply_word_operator_with_ctx(word_a, word_b, op, None)
+}
+
+/// [`apply_word_operator`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`Automaton::determinize_and_minimize_with_ctx`] for the contract.
+pub fn apply_word_operator_with_ctx(
+    word_a: &Automaton,
+    word_b: &Automaton,
+    op: ArithmeticOp,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Automaton {
     let n = product::cross_product(word_a, word_b, |a_out, b_out| {
         op.arith(a_out, b_out)
             .unwrap_or_else(|e| panic!("WordAutomaton::apply_word_operator: {e}"))
     });
-    minimize_with_output(&n)
+    minimize_with_output_with_ctx(&n, ctx)
 }
 
 /// `WordAutomaton.reverseWithOutput(Automaton, boolean)` (`WordAutomaton.java:109-192`)
@@ -276,12 +320,25 @@ pub fn uncombine(word_a: &Automaton, outputs: &[i32]) -> Vec<Automaton> {
 /// applies), and recombining via [`crate::logicalops::combine`]. If the uncombined
 /// automata are each minimal, the recombined DFAO is minimal too.
 pub fn minimize_with_output(word_a: &Automaton) -> Automaton {
+    minimize_with_output_with_ctx(word_a, None)
+}
+
+/// [`minimize_with_output`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`Automaton::determinize_and_minimize_with_ctx`] for the contract. Note the loop:
+/// Java reads the metacommands once per `determinizeAndMinimize()` call, so this can
+/// consume ONE AUTOMATA INDEX PER DISTINCT OUTPUT VALUE (each conditional on that
+/// sub-automaton actually being nondeterministic), not one per call to this function.
+pub fn minimize_with_output_with_ctx(
+    word_a: &Automaton,
+    mut ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Automaton {
     let mut outputs = word_a.fa.o.clone();
     remove_duplicates(&mut outputs);
     let mut subautomata = uncombine(word_a, &outputs);
     for subautomaton in subautomata.iter_mut() {
         // These are *not* word automata.
-        subautomaton.determinize_and_minimize();
+        subautomaton.determinize_and_minimize_with_ctx(ctx.as_deref_mut());
     }
     let mut n = subautomata.remove(0);
     let label = n.label.clone(); // We keep the old labels, since they are replaced in combine.
@@ -295,7 +352,17 @@ pub fn minimize_with_output(word_a: &Automaton) -> Automaton {
 /// move-assignment here — see `automaton.rs`'s own module docs on why this crate never
 /// needs to port Java's manual `clone`/`copy` boilerplate.
 pub fn minimize_self_with_output(word_a: &mut Automaton) {
-    let n = minimize_with_output(word_a);
+    minimize_self_with_output_with_ctx(word_a, None);
+}
+
+/// [`minimize_self_with_output`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`minimize_with_output_with_ctx`].
+pub fn minimize_self_with_output_with_ctx(
+    word_a: &mut Automaton,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) {
+    let n = minimize_with_output_with_ctx(word_a, ctx);
     *word_a = n;
 }
 

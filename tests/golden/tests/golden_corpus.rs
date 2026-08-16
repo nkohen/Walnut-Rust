@@ -71,10 +71,11 @@
 //! 3. **Transitive DROP dependency** — a subset-relevant fixture whose command consumes a
 //!    library name that only a DROP-scope fixture could have produced. Computed structurally
 //!    from the manifest ([`support::transitively_dropped`]), not hard-coded.
-//! 4. **`[strategy …]`/`[export …]` metacommands**, which `wr-cli` parses and validates but
-//!    does not yet thread into determinization — a pre-existing, documented deferral
-//!    (`crates/wr-cli/src/prover.rs`'s module docs). See [`Excluded::MetacommandNotWired`];
-//!    comparing these would measure the deferral, not the port.
+//!
+//! (There used to be a fourth: `[strategy …]`/`[export …]` metacommands, parsed but not
+//! threaded into determinization. That is now wired through the `eval`/`def` path — see
+//! `crates/wr-cli/src/prover.rs`'s module docs — so fixtures 637, 659 and 660 are compared
+//! normally. 638-641 remain excluded, but under (2): they ask for OTF strategies.)
 //!
 //! Plus one *partial* exclusion: the fixtures whose recorded expectation includes CAS
 //! incidence-matrix files (`.mpl`/`.m`/`.wl`/`.sage`). The CAS matrix writer is confirmed
@@ -138,8 +139,8 @@ use std::time::{Duration, Instant};
 
 use support::{
     build_session_tree, compare_messages, corpus_root, deferred_otf_strategy, global_library_names,
-    load_expected, load_fixtures, transitively_dropped, unwired_metacommands, walnut_java_dir,
-    Excluded, Expected, Fixture, PathRewrite, PRELUDE,
+    load_expected, load_fixtures, transitively_dropped, walnut_java_dir, Excluded, Expected,
+    Fixture, PathRewrite, PRELUDE,
 };
 use wr_cli::prover::Prover;
 use wr_cli::session::Session;
@@ -370,6 +371,31 @@ const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
     ),
     (
         628,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    // 637 and 660 joined this list the moment `[strategy …]`/`[export …]` were wired through
+    // to `wr_core::determinize` — before that they were not compared at all (they were the
+    // whole of the old `Excluded::MetacommandNotWired` class). They are the same root cause,
+    // not a new one, and specifically NOT a metacommand failure:
+    //
+    //   * 637's `[strategy 6 BRZ]` demonstrably takes effect. Its sixth determinization is a
+    //     1,790-state NFA that does not finish inside this harness's 60s cap under `SC`; with
+    //     the metacommand wired the whole fixture completes in well under a second, exactly as
+    //     real Walnut does (130ms). Its `details` expectation additionally spells
+    //     `Determinizing [#6, strategy: Brzozowski]` — a log LINE this port does not emit yet,
+    //     which is the same gap 375-379/383/628 have.
+    //   * 660's `[export 1 BA]` writes its `_pre` dump; Java's export is a side-effecting file
+    //     write that never touches the returned automaton, so it cannot affect this comparison
+    //     either way.
+    //
+    // Both now compare their AUTOMATON too (the `details` check no longer short-circuits —
+    // see `fold_failures`), and both pass it; only the log text differs.
+    (
+        637,
+        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+    ),
+    (
+        660,
         "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
     ),
     // -- root cause 2 (CLOSED): `transduce` over a reversed (lsd) custom-base DFAO --------
@@ -775,7 +801,7 @@ impl FixtureJob {
         let verdict = match self.exclusion {
             Some(reason) => Verdict::Skipped(reason),
             // `execute` is only ever false for a fixture that `classify` already excluded
-            // (both are driven by `unwired_metacommands`), so this arm is unreachable — but
+            // (both are driven by `deferred_otf_strategy`), so this arm is unreachable — but
             // it is a real `Option`, and a future exclusion class that forgets to keep the two
             // in step should say so loudly rather than silently compare a result that was
             // never computed.
@@ -824,13 +850,21 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// The one "do not even run it" rule — see the call site's comment and
-/// [`Excluded::MetacommandNotWired`]. Deliberately keyed on the *command text*, not on which
-/// [`Excluded`] variant `classify` happened to pick: fixtures 638-641 declare BOTH an unwired
-/// `[strategy …]` and a deferred OTF strategy, and get the (more specific) OTF reason, but
-/// they are the same ruinously expensive query as 637 and must not be executed either.
+/// The one "do not even run it" rule: a fixture asking for a deferred **OTF** strategy
+/// (`CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`, fixtures 638-641).
+///
+/// Those four are the same query as 637 — `E x,y,z (n=x+y+z)&(QQ[x]=@1)&(QQ[y]=@1)&(QQ[z]=@1)`,
+/// whose sixth determinization is a 1,790-state NFA that real Walnut only survives because the
+/// metacommand switches it off subset construction. 637 itself is now executed and compared
+/// (its `[strategy 6 BRZ]` is wired through, so it takes the same cheap Brzozowski path Java
+/// does), but 638-641 name strategies this port deliberately does not implement, so they would
+/// fall back to `SC` on that NFA and blow the per-fixture budget for no information.
+///
+/// Keyed on the *command text* rather than on which [`Excluded`] variant `classify` picked, so
+/// the two cannot drift apart silently — `no_later_fixture_depends_on_an_unexecuted_one` checks
+/// that skipping them cannot change any other fixture's answer.
 fn skips_execution(fixture: &Fixture) -> bool {
-    unwired_metacommands(&fixture.command_script).is_some()
+    deferred_otf_strategy(&fixture.command_script).is_some()
 }
 
 /// Nothing later in the corpus may read a library file that a not-executed fixture would have
@@ -1007,9 +1041,6 @@ fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Opt
     if let Some(names) = transitive.get(&fixture.id) {
         return Some(Excluded::TransitiveDropDependency(names.clone()));
     }
-    if let Some(meta) = unwired_metacommands(&fixture.command_script) {
-        return Some(Excluded::MetacommandNotWired(meta));
-    }
     None
 }
 
@@ -1092,12 +1123,19 @@ fn compare_test_case(
     // 3. details (`:946`). `rewrite` maps this harness's own throwaway library directories
     // back to the ones `walnut-java` recorded — see [`PathRewrite`] for why that is the one
     // extra normalization and why it cannot hide a port defect.
+    //
+    // A details mismatch is COLLECTED, not returned: it used to short-circuit, which meant a
+    // fixture whose `details` text diverged never had its AUTOMATON compared at all — so an
+    // automaton divergence could hide behind a text one indefinitely. Every remaining
+    // `details` divergence in `KNOWN_DIVERGENCES` is a log-text gap whose state counts already
+    // match; that claim is only checkable if the automaton comparison still runs.
+    let mut failures: Vec<String> = Vec::new();
     if let Err(why) = compare_messages(
         &expected.details,
         &rewrite.apply(actual.details()),
         "details",
     ) {
-        return Verdict::Fail(why);
+        failures.push(why);
     }
 
     // 4. automaton pairs (`:947-961`). `loadTestCases` always records exactly one pair for a
@@ -1105,12 +1143,15 @@ fn compare_test_case(
     // Ostrowski fixture (id 625), which is DROP scope and never compared here.
     let actual_pairs = actual.automaton_pairs().len();
     if actual_pairs != 1 {
-        return Verdict::Fail(format!(
-            "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
-        ));
+        return fold_failures(
+            failures,
+            Verdict::Fail(format!(
+                "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
+            )),
+        );
     }
     let actual_automaton = actual.automaton_pairs()[0].automaton();
-    match (&expected.automaton_path, actual_automaton) {
+    let automaton_verdict = match (&expected.automaton_path, actual_automaton) {
         (None, None) => Verdict::Pass,
         (None, Some(_)) => Verdict::Fail(
             "the corpus records no automaton for this fixture, but the port produced one"
@@ -1128,10 +1169,13 @@ fn compare_test_case(
                 ) {
                     Ok(a) => a,
                     Err(e) => {
-                        return Verdict::Fail(format!(
-                            "the recorded automaton {} could not be read: {e:?}",
-                            path.display()
-                        ))
+                        return fold_failures(
+                            failures,
+                            Verdict::Fail(format!(
+                                "the recorded automaton {} could not be read: {e:?}",
+                                path.display()
+                            )),
+                        )
                     }
                 };
             // `EqualityUtils.faEqual(actualA.fa, expectedA.fa)` (`:958`). Two normalizations
@@ -1158,6 +1202,23 @@ fn compare_test_case(
                 }
             }
         }
+    };
+    fold_failures(failures, automaton_verdict)
+}
+
+/// Combines the mismatches collected so far with the automaton comparison's own verdict.
+///
+/// `Verdict::Pass` only survives when nothing was collected; otherwise every reason is
+/// reported together, so a `details` divergence can never hide an automaton one (which is
+/// exactly what the old short-circuit did).
+fn fold_failures(mut failures: Vec<String>, last: Verdict) -> Verdict {
+    if let Verdict::Fail(why) = last {
+        failures.push(why);
+    }
+    if failures.is_empty() {
+        Verdict::Pass
+    } else {
+        Verdict::Fail(failures.join("\n  --- and ---\n"))
     }
 }
 

@@ -37,21 +37,28 @@
 //! `Prover.mainProver` — the singleton — simply does not exist; callers construct a
 //! `Prover`.
 //!
-//! # The parsed `MetaCommands` is not threaded into determinization yet
+//! # The parsed `MetaCommands` reaches determinization through `eval`/`def`
 //!
-//! `[strategy …]`/`[export …]` are fully **parsed** here and
+//! `[strategy …]`/`[export …]` are parsed here and
 //! [`crate::meta_commands::MetaCommands`] implements
-//! [`wr_core::determinize::DeterminizeContext`], but nothing hands that context down to
-//! `wr_core::determinize::determinize` yet: the whole `eval` call chain
-//! (`eval_def_command` → `wr_logic::eval` → `wr_core::quantify`) still passes `None`, i.e.
-//! U0c's documented no-op default (`SC`, no export, no counter movement). Wiring the real
-//! context through that chain means threading an `Option<&mut dyn DeterminizeContext>`
-//! parameter through `wr-logic`, which is a separate unit's decision — and note
-//! `determinize.rs`'s standing requirement that the caller pass `None` whenever
-//! `should_print_details()` is false, or the automaton indices shift. Until then a
-//! metacommand parses, validates, and has no effect on the computation;
-//! [`Prover::meta_commands`]/[`Prover::meta_commands_mut`] expose the parsed state so that
-//! unit has something to pass.
+//! [`wr_core::determinize::DeterminizeContext`]; [`Prover::eval_def_commands`] hands that
+//! context down the `eval` call chain
+//! (`eval_def_command_with_stdout_and_ctx` → `wr_logic::eval::compute_with_ctx` →
+//! `Token::act_with_ctx` → `wr_core::quantify`/`logicalops`/`word_automaton` →
+//! `wr_core::determinize::determinize`), so `[strategy 6 BRZ]` really does make the
+//! seventh determinization of that command use Brzozowski, and `[export 1 BA]` really
+//! does write `<name>_1_pre.ba`.
+//!
+//! `determinize.rs`'s standing requirement — pass `None` whenever
+//! `should_print_details()` is false, or the automaton indices shift — is honoured at
+//! [`Prover::eval_def_commands`]'s own call site (see the comment there for how the
+//! `printEnabled`/`printDetails` halves of Java's flag each map).
+//!
+//! **Deliberately still out of scope:** every command OTHER than `eval`/`def`. Java's
+//! `metaCommands` is a process-wide singleton, so a `[strategy 0 BRZ]…rightquo x y z::`
+//! would take effect there too; this port wires only the `eval`/`def` path, which is what
+//! Walnut's own corpus exercises (fixtures 637-641, 659, 660 — all `eval`). Widening it is
+//! a mechanical follow-on, arm by arm, not a redesign.
 //!
 //! # `FreshIdentifiers` is per-evaluation, not per-session
 //!
@@ -94,6 +101,7 @@ use regex_automata::meta::Regex;
 use regex_automata::util::captures::Captures;
 use regex_automata::Input;
 
+use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
 use wr_core::logicalops::ConvertNsError;
 use wr_core::morphism::MorphismError;
@@ -108,7 +116,7 @@ use crate::automaton_ops::{
 };
 use crate::convert::{convert_command, ConvertError};
 use crate::describe::{describe, DescribeError};
-use crate::eval_def::{eval_def_command_with_stdout, EvalDefError};
+use crate::eval_def::{eval_def_command_with_stdout_and_ctx, EvalDefError};
 use crate::image::{image, ImageError};
 use crate::join::{join_command, JoinError};
 use crate::macro_cmd::macro_command;
@@ -1459,7 +1467,28 @@ impl Prover {
         // One `FreshIdentifiers` per evaluation -- `PORTING.md`'s
         // `Token.getUniqueString()` ruling.
         let mut fresh = FreshIdentifiers::new();
-        let tc = eval_def_command_with_stdout(
+        // THE `shouldPrintDetails()` GATE (`DeterminizationStrategies.java:95`, and this
+        // module's docs above). Java reads `Prover.mainProver.metaCommands` from inside
+        // the determinization dispatcher, but only when `Logging.shouldPrintDetails()`
+        // holds -- with its own comment explaining why ("several silent automata
+        // creations for NS, Ostrowski, and other caches"). `Logging.shouldPrintDetails()`
+        // is `printEnabled && printDetails`; this port splits those two halves:
+        //
+        // * `printDetails` is `self.print_details`, set by `parse_setup` from the `::`
+        //   suffix -- and `MetaCommands::parse_meta_commands` has ALREADY refused any
+        //   metacommand on a command without it (`MetaCommands.java:91-93`), so a `Some`
+        //   here on a `;`/`:` command could only ever carry an empty `MetaCommands`.
+        //   Gating anyway keeps the counter provably still, exactly as Java's does.
+        // * `printEnabled` is Java's `Logging.disablePrint()`/`enablePrint()` bracket,
+        //   used only around the automata `NumberSystem` builds for itself. This port
+        //   models it structurally: `wr_core::numsys` calls `quantify`/`reverse`/... with
+        //   no context at all, so those constructions cannot move the counter.
+        let ctx: Option<&mut dyn DeterminizeContext> = if self.print_details {
+            Some(&mut self.meta_commands)
+        } else {
+            None
+        };
+        let tc = eval_def_command_with_stdout_and_ctx(
             &self.session,
             &mut self.logging,
             &mut fresh,
@@ -1469,6 +1498,7 @@ impl Prover {
             eval_name.as_deref(),
             free_vars.as_deref(),
             &mut self.out,
+            ctx,
         )?;
         Ok(tc)
     }
@@ -2654,18 +2684,26 @@ mod tests {
         fs::remove_dir_all(&dir2).ok();
     }
 
-    /// **A tripwire, not an endorsement.** `[export …]` is parsed, validated and accepted,
-    /// but no `MetaCommands` is threaded into `wr_core::determinize` yet (see the module
-    /// docs), so the pre-determinization dumps Java writes — `<name>_0_pre.gv`,
-    /// `<name>_1_pre.gv`, … — are silently not produced. Every other unimplemented surface
-    /// in this crate fails loudly with `NotYetImplemented`; this one accepts and discards,
-    /// which is exactly the kind of gap that stays invisible.
+    /// `[export …]` end-to-end through real `Prover::dispatch`: the metacommand is
+    /// parsed, the parsed `MetaCommands` is threaded into `wr_core::determinize` as the
+    /// [`wr_core::determinize::DeterminizeContext`], and Walnut's pre-determinization
+    /// dumps (`<name>_<idx>_pre.<fmt>`) actually appear.
     ///
-    /// So pin the CURRENT behavior: the day the determinize context is wired through, this
-    /// test goes red and must be rewritten to assert the files that now appear.
+    /// This test began life as a TRIPWIRE pinning the opposite (`[export …]` parsed and
+    /// silently discarded, no `_pre` file, counter never moved), with instructions to
+    /// rewrite it the day the context was wired through. This is that rewrite; the
+    /// counter/file assertions are inverted, not deleted.
+    ///
+    /// `?msd_2 Ei i < x` performs exactly two non-silent determinizations — the
+    /// ∃-projection (`AutomatonQuantification.quantifyHelper`) and its leading-zero fixup
+    /// (`AutomatonLogicalOps.fixLeadingZerosProblem`) — so indices `0` and `1` are
+    /// consumed and the wildcard `*` export dumps both. Everything `NumberSystem` builds
+    /// for `i < x` stays silent (Java brackets it in `Logging.disablePrint()`; this port
+    /// hands `wr_core::numsys` no context at all), which is why the count is 2 and not
+    /// more.
     #[test]
-    fn export_metacommands_are_accepted_but_write_no_pre_determinization_files_yet() {
-        let (mut p, dir, _) = prover("exportnoop");
+    fn export_metacommands_write_the_pre_determinization_dumps() {
+        let (mut p, dir, _) = prover("exportwired");
         assert!(p
             .dispatch("[export * gv] eval e \"?msd_2 Ei i < x\"::")
             .unwrap());
@@ -2676,23 +2714,74 @@ mod tests {
             Some("gv")
         );
         assert_eq!(p.meta_commands().get_export_name(0).as_deref(), Some("e"));
-        assert!(p.meta_commands().export_failures().is_empty());
-        // ...and yet the determinizer never called back even once: no automaton index was
-        // consumed (the counter is still at its initial value).
-        assert_eq!(p.meta_commands_mut().increment_automata_index(), 0);
+        assert!(
+            p.meta_commands().export_failures().is_empty(),
+            "{:?}",
+            p.meta_commands().export_failures()
+        );
 
-        // ...and no `_pre` file was written, though the ordinary result file was.
-        let stray: Vec<String> = fs::read_dir(dir.join("Result"))
+        // ...and the determinizer called back exactly twice, so the NEXT index handed out
+        // is 2 (the counter is a post-increment, `MetaCommands.java:27-29`).
+        assert_eq!(p.meta_commands_mut().increment_automata_index(), 2);
+
+        // ...and both `_pre` dumps were written, alongside the ordinary result file.
+        let mut pre: Vec<String> = fs::read_dir(dir.join("Result"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
             .filter(|n| n.contains("_pre"))
             .collect();
-        assert!(
-            stray.is_empty(),
-            "the export metacommand is still a no-op; if these appeared, WIRE THIS TEST \
-             UP TO THE NEW BEHAVIOR: {stray:?}"
+        pre.sort();
+        assert_eq!(
+            pre,
+            vec!["e_0_pre.gv".to_string(), "e_1_pre.gv".to_string()]
         );
         assert!(dir.join("Result").join("e.txt").is_file());
+
+        // The same, with a SINGLE index and the `ba` format -- fixture 660's shape
+        // (`[export 1 BA]eval ...::`). Only the named index is dumped.
+        assert!(p
+            .dispatch("[export 1 BA] eval f \"?msd_2 Ei i < x\"::")
+            .unwrap());
+        assert!(
+            p.meta_commands().export_failures().is_empty(),
+            "{:?}",
+            p.meta_commands().export_failures()
+        );
+        let mut f_pre: Vec<String> = fs::read_dir(dir.join("Result"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("f_") && n.contains("_pre"))
+            .collect();
+        f_pre.sort();
+        assert_eq!(f_pre, vec!["f_1_pre.ba".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `shouldPrintDetails()` gate at `Prover::eval_def_commands`' call site: an
+    /// ordinary `eval` with NO metacommand prefix must not move `MetaCommands`' automata
+    /// counter at all, because Java only reads the metacommands when
+    /// `Logging.shouldPrintDetails()` holds — i.e. when the command ended in `::`.
+    ///
+    /// Both halves matter and are checked separately: a `;` command (no details) leaves
+    /// the counter at 0 even though it performs the same two determinizations, while the
+    /// identical `::` command advances it to 2. Get this wrong and every
+    /// `[strategy n …]`/`[export n …]` index silently targets a different automaton.
+    #[test]
+    fn only_a_details_printing_command_moves_the_automata_counter() {
+        let (mut p, dir, _) = prover("detailsgate");
+        assert!(p.dispatch("eval q1 \"?msd_2 Ei i < x\";").unwrap());
+        assert_eq!(
+            p.meta_commands_mut().increment_automata_index(),
+            0,
+            "a `;` command must not consult the metacommands at all"
+        );
+
+        assert!(p.dispatch("eval q2 \"?msd_2 Ei i < x\"::").unwrap());
+        assert_eq!(
+            p.meta_commands_mut().increment_automata_index(),
+            2,
+            "a `::` command performs the same two determinizations, and counts them"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

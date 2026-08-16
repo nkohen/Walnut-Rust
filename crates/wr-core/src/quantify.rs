@@ -68,10 +68,16 @@
 //!   `CLAUDE.md`'s prime directive #1 is to compare by language equivalence, never by
 //!   structure — so a [`BTreeSet`] union is used, which is simpler and obviously
 //!   dedup-correct.
-//! * **Step 2 always trims.** Java's no-arg `determinizeAndMinimize()` trims *only* when
-//!   the freshly-rebuilt table is not already deterministic (`Automaton.java:385`); this
+//! * **Step 2 always trims** (but no longer always DETERMINIZES). Java's no-arg
+//!   `determinizeAndMinimize()` skips *both* the trim and the determinization when the
+//!   freshly-rebuilt table is already deterministic (`Automaton.java:385`); this
 //!   port trims unconditionally, so the two differ exactly on the (rare) projection that
-//!   happens to come out deterministic. Trimming is always language-preserving, so the
+//!   happens to come out deterministic. The determinization itself is now guarded by
+//!   Java's own condition — it has to be, because the automata counter behind
+//!   `[strategy n …]`/`[export n …]` advances once per *actual* determinization, and
+//!   Walnut's own `details637.txt` shows the guard firing (a `quantifying:` block with a
+//!   `Minimizing:` line and no `Determinizing [#n, …]` line). Trimming is always
+//!   language-preserving, so the
 //!   divergence is invisible to the correctness bar, and it is the *safer* choice: it
 //!   establishes [`crate::minimize::minimize`]'s documented precondition (every state
 //!   reachable from `q0`; violate it and the "q0 aliasing quirk", `docs/WALNUT-BUGS.md`
@@ -148,7 +154,7 @@
 //!   [`crate::logicalops::zero_reachable_states`].
 
 use crate::automaton::Automaton;
-use crate::logicalops::{fix_leading_zeros_problem, fix_trailing_zeros_problem};
+use crate::logicalops::{fix_leading_zeros_problem_with_ctx, fix_trailing_zeros_problem};
 use crate::minimize::{minimize, MinimizeError};
 use crate::numsys::determine_msd;
 use crate::trim::trim;
@@ -189,7 +195,29 @@ impl From<MinimizeError> for QuantifyError {
 /// `a.fa` is a minimal (generally *partial* — `minimize` drops non-co-reachable states)
 /// DFA over the reduced alphabet, and state numbering bears no relation to Walnut's.
 pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
-    quantify_helper(a, labels)?;
+    quantify_with_ctx(a, labels, None)
+}
+
+/// [`quantify`] with an explicit [`crate::determinize::DeterminizeContext`] — Walnut's
+/// `[strategy …]`/`[export …]` metacommand state, which Java reads out of the
+/// `Prover.mainProver.metaCommands` singleton inside the determinization dispatcher.
+///
+/// `None` is exactly [`quantify`]. `Some(ctx)` is the port of
+/// `Logging.shouldPrintDetails() == true`, so the caller owes the print-details gate (see
+/// [`crate::automaton::Automaton::determinize_and_minimize_with_ctx`]).
+///
+/// **One `quantify` consumes up to TWO automata indices**, and Walnut's own `details`
+/// fixtures show both: `quantifyHelper`'s `determinizeAndMinimize()` (skipped when the
+/// projected automaton happens to be deterministic already) and then the zero fixup's
+/// unconditional `determinizeAndMinimize(IntSet)` — e.g. `details637.txt`'s
+/// `Determinizing [#6, strategy: Brzozowski]` (the projection) immediately followed by
+/// `Determinizing [#7, strategy: SC]` (its `fixing leading zeros` block).
+pub fn quantify_with_ctx(
+    a: &mut Automaton,
+    labels: &BTreeSet<String>,
+    mut ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Result<(), QuantifyError> {
+    quantify_helper(a, labels, ctx.as_deref_mut())?;
 
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:39`): a trivial automaton has no
     // tracks and no numeration direction, so the fixup is skipped entirely. Note this
@@ -227,7 +255,7 @@ pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Quan
             // be a single crate-wide decision (starting from `determinize_and_minimize`/
             // `determinize_and_minimize_from` in `automaton.rs`, U2), not a one-off fix
             // here.
-            fix_leading_zeros_problem(a);
+            fix_leading_zeros_problem_with_ctx(a, ctx);
             Ok(())
         }
         Some(false) => {
@@ -267,6 +295,14 @@ pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Quan
             // SHORT-CIRCUITED (empty label set, or a label-less automaton) on an input
             // that already had an unreachable state. Java has the identical shape at the
             // identical call site, so it is ported verbatim, not guarded.
+            //
+            // NOTE the asymmetry this creates for the automata-index counter: unlike its
+            // msd sibling, this fixup closes with `just_minimize` and never reaches the
+            // determinization dispatcher, so it consumes NO automata index. That is
+            // Java's shape too (`AutomatonLogicalOps.fixTrailingZerosProblem` calls
+            // `fa.justMinimize()`, not `determinizeAndMinimize`), hence the unused `ctx`
+            // here -- an lsd `quantify` costs one index, an msd one costs two.
+            let _ = ctx;
             fix_trailing_zeros_problem(a);
             Ok(())
         }
@@ -275,7 +311,11 @@ pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Quan
 
 /// Ports `AutomatonQuantification.quantifyHelper` (`:49-108`): the projection itself,
 /// followed by determinize + minimize. Leaves `a` untouched on any `Err`.
-fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
+fn quantify_helper(
+    a: &mut Automaton,
+    labels: &BTreeSet<String>,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Result<(), QuantifyError> {
     // Java: `if (labelsToQuantify.isEmpty() || A.getLabel() == null ||
     // A.getLabel().isEmpty()) return;` (`:50-52`) — note this precedes `validateLabels`,
     // so asking to quantify a name out of a *label-less* automaton is silently accepted,
@@ -408,15 +448,33 @@ fn quantify_helper(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), Q
     // `no_context_is_exactly_plain_subset_construction` pins this), and with `ctx = None`
     // the dispatcher's only fallible arm is unreachable -- the same reasoning
     // `Automaton::determinize_and_minimize`'s `NO_CONTEXT_CANNOT_FAIL` already documents.
-    // That's a Rust-native dispatcher invariant, not a ported Java "can't happen", so
-    // `PORTING.md`'s Result-not-panic rule for the latter (see `QuantifyError::Minimize`'s
-    // doc just above) doesn't apply to it -- unlike the `minimize` call below, which
-    // stays a propagated `Result` exactly as before.
+    // With `ctx = Some(..)` that arm IS reachable (a non-`SC` strategy on a DFAO), and
+    // `crate::automaton::dispatch_determinize` renders it as Java's own thrown
+    // `WalnutException` message -- see its docs. Either way this is a Rust-native
+    // dispatcher concern, not a ported Java "can't happen", so `PORTING.md`'s
+    // Result-not-panic rule for the latter (see `QuantifyError::Minimize`'s doc just
+    // above) doesn't apply to it -- unlike the `minimize` call below, which stays a
+    // propagated `Result` exactly as before.
+    //
+    // The `!isDeterministic()` GUARD, however, is Java's own (`Automaton.java:385`) and
+    // is ported verbatim -- evaluated on the freshly-rebuilt table, BEFORE the trim,
+    // exactly where Java evaluates it. It used to be absent here (this port determinized
+    // unconditionally), which was invisible while `ctx` was always `None` but is not
+    // invisible now: `MetaCommands`' automata counter advances once per *actual*
+    // determinization, so an extra one shifts every later `[strategy n …]`/`[export n …]`
+    // index. Walnut's own golden fixture proves the guard fires in practice --
+    // `details637.txt`'s second `quantifying:` block has a `Minimizing:` line and NO
+    // `Determinizing [#n, …]` line, i.e. Java skipped the dispatcher there, and the very
+    // next index (`#2`) went to that quantification's `fixing leading zeros` step
+    // instead. (Skipping also preserves a DFAO's real output values, which subset
+    // construction would flatten to 0/1 -- another way the old unconditional call
+    // diverged.)
+    let was_deterministic = projected.fa.is_deterministic();
     projected.fa = trim(&projected.fa);
-    let initial: BTreeSet<usize> = [projected.fa.q0].into_iter().collect();
-    crate::determinize::determinize(&mut projected, &initial, None).expect(
-        "determinize with no metacommand context always takes the SC arm, which is infallible",
-    );
+    if !was_deterministic {
+        let initial: BTreeSet<usize> = [projected.fa.q0].into_iter().collect();
+        crate::automaton::dispatch_determinize(&mut projected, &initial, ctx);
+    }
     projected.fa = minimize(&projected.fa)?;
 
     *a = projected;

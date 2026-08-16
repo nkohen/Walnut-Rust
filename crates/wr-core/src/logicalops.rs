@@ -822,6 +822,22 @@ fn reverse_and_canonize(a: &Automaton) -> Automaton {
 /// the identical guard, added for the identical reason, in `crate::quantify`'s private
 /// `quantify_helper` (at its `a.fa.q == 0` early return).
 pub fn fix_leading_zeros_problem(a: &mut Automaton) {
+    fix_leading_zeros_problem_with_ctx(a, None);
+}
+
+/// [`fix_leading_zeros_problem`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — Walnut's `[strategy …]`/`[export …]`
+/// metacommand state; see
+/// [`crate::automaton::Automaton::determinize_and_minimize_with_ctx`] for the contract
+/// (including the caller-owed `shouldPrintDetails()` gate).
+///
+/// This fixup's closing `determinizeAndMinimize(IntSet)` is **unconditional**, so with
+/// `Some(ctx)` it always consumes one automata index — the `Determinizing [#n, …]` line
+/// Walnut prints inside every `fixing leading zeros:` block of a `details` fixture.
+pub fn fix_leading_zeros_problem_with_ctx(
+    a: &mut Automaton,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) {
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:269`, U0). Load-bearing, not
     // cosmetic: `determine_zero()` on a trivial automaton's empty alphabet returns 0,
     // and `zero_reachable_states` would then index `fa.d[fa.q0]` — out of bounds for
@@ -837,7 +853,7 @@ pub fn fix_leading_zeros_problem(a: &mut Automaton) {
     a.set_canonized(false);
     let zero = a.determine_zero();
     let initial_state = zero_reachable_states(&mut a.fa, zero);
-    a.determinize_and_minimize_from(&initial_state);
+    a.determinize_and_minimize_from_with_ctx(&initial_state, ctx);
 }
 
 /// `AutomatonLogicalOps.zeroReachableStates` (`:289-316`, `private`) — the states
@@ -984,6 +1000,23 @@ pub fn remove_leading_zeros(
     a: &Automaton,
     list_of_labels: &[String],
 ) -> Result<Automaton, RemoveLeadingZerosError> {
+    remove_leading_zeros_with_ctx(a, list_of_labels, None)
+}
+
+/// [`remove_leading_zeros`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] — see
+/// [`crate::automaton::Automaton::determinize_and_minimize_with_ctx`] for the contract.
+///
+/// This reaches the dispatcher only through [`remove_leading_zeros_helper`]'s closing
+/// `reverse(M, false)`, i.e. **once per LSD track named in `list_of_labels`** and not at
+/// all for an msd one. Java gives that `reverse` no `Logging.disablePrint()` bracket
+/// (unlike everything `NumberSystem` builds internally), so it really does advance
+/// Walnut's automata counter.
+pub fn remove_leading_zeros_with_ctx(
+    a: &Automaton,
+    list_of_labels: &[String],
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) -> Result<Automaton, RemoveLeadingZerosError> {
     // `AutomatonQuantification.validateLabels(A, listOfLabels)` (`:344`). Four lines
     // rather than a call into `crate::quantify`: that module inlines the identical check
     // inside its private `quantify_helper`, where it sits *after* an early return this
@@ -1017,8 +1050,9 @@ pub fn remove_leading_zeros(
     // identity, expressible only since U0. `or(FALSE, N)` short-circuits to `N`, so the
     // first iteration costs nothing.
     let mut m = Automaton::true_false(false);
+    let mut ctx = ctx;
     for n in list_of_inputs {
-        let mut helper = remove_leading_zeros_helper(a, n)?;
+        let mut helper = remove_leading_zeros_helper(a, n, ctx.as_deref_mut())?;
         m = or(&mut m, &mut helper).into_automaton();
     }
     // `M = and(A, M);` (`:361`) — note the argument order, and that `and` never mutates
@@ -1056,6 +1090,7 @@ pub fn remove_leading_zeros(
 fn remove_leading_zeros_helper(
     a: &Automaton,
     n: usize,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
 ) -> Result<Automaton, RemoveLeadingZerosError> {
     // `if (n >= A.richAlphabet.getA().size() || n < 0)` (`:376`). The `n < 0` half is
     // unrepresentable for a `usize`.
@@ -1102,7 +1137,7 @@ fn remove_leading_zeros_helper(
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
-        reverse(&mut m, false);
+        reverse_with_ctx(&mut m, false, ctx);
     }
     Ok(m)
 }
@@ -1129,6 +1164,18 @@ fn remove_leading_zeros_helper(
 /// The result is a DFA (Java's `:412` note: "the output of this is a DFA"), even though
 /// the input may be an NFA.
 pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
+    reverse_with_ctx(a, reverse_msd, None);
+}
+
+/// [`reverse`] with an explicit [`crate::determinize::DeterminizeContext`] — see
+/// [`crate::automaton::Automaton::determinize_and_minimize_with_ctx`] for the contract.
+/// The closing `determinizeAndMinimize(setOfFinalStates)` is unconditional, so with
+/// `Some(ctx)` this always consumes one automata index.
+pub fn reverse_with_ctx(
+    a: &mut Automaton,
+    reverse_msd: bool,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+) {
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:415`, U0). Note this returns
     // BEFORE the `flipNS` step, so reversing a trivial automaton does not flip its
     // (empty) msd list either — faithful, and vacuous since the list is empty.
@@ -1137,7 +1184,7 @@ pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
     }
     let initial: BTreeSet<usize> = [a.fa.q0].into_iter().collect();
     let set_of_final_states = a.fa.reverse(&initial);
-    a.determinize_and_minimize_from(&set_of_final_states);
+    a.determinize_and_minimize_from_with_ctx(&set_of_final_states, ctx);
 
     if reverse_msd {
         flip_ns(a);

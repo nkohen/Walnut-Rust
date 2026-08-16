@@ -1953,6 +1953,72 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-039 — `Logging.disablePrint()` is not save/restore, so `NumberSystem.constant(n≥2)` leaks its internal automaton constructions into the counted region, making `[strategy n …]`/`[export n …]` indices unstable
+
+- **Where:** `Main/Logging.java:168-169` (`disablePrint`/`enablePrint`, plain assignments to a
+  `static boolean printEnabled`, no save/restore), `Automata/NumberSystem.java:936`/`:968`
+  (`constant(BigInteger)`'s bracket) around its recursive `getConstant(floorHalf)`/
+  `getConstant(ceilHalf)` calls, consumed by `Automata/FA/DeterminizationStrategies.java:95`
+  (`if (Logging.shouldPrintDetails())`, i.e. `printEnabled && printDetails`).
+- **What:** `DeterminizationStrategies.determinize` guards its whole `MetaCommands` block —
+  automata-index increment, strategy lookup, `[export …]` dump — behind
+  `Logging.shouldPrintDetails()`, with a comment stating exactly why: *"this is only done when
+  print is true. That's because there are several silent automata creations for NS, Ostrowski, and
+  other caches."* `NumberSystem` implements that silence by bracketing each such construction in
+  `Logging.disablePrint(); …; Logging.enablePrint();`. But those two are **unconditional
+  assignments, not a save/restore pair**, so a NESTED bracket's closing `enablePrint()` re-enables
+  printing for the remainder of the *outer* bracket. `constant(n)` for `n ≥ 2` hits this on its
+  very first line of work: it calls `disablePrint()`, then `getConstant(floorHalf)` → `constant(1)`
+  → `disablePrint() … enablePrint()`, which turns printing back **on** — and the rest of
+  `constant(n)`'s body (two `AutomatonLogicalOps.and` calls and an
+  `AutomatonQuantification.quantify`, `:962-965`) then runs *counted*. So a `NumberSystem`
+  construction the code explicitly intends to be invisible advances the automata counter.
+- **Consequence (the part that actually bites):** the index a `[strategy n …]`/`[export n …]`
+  metacommand names is **not a stable function of the query**. It depends on `constant()`'s
+  `constantsDynamicTable` memo, i.e. on what earlier commands in the same session happened to
+  build. Running the *identical* command twice gives two different index sequences.
+- **Trigger (minimal, verified live against `Walnut-all.jar`, 2026-08-16):** a single command file
+  ```
+  eval r1 "?msd_2 Ei (i > 2) & (i < x)"::
+  eval r2 "?msd_2 Ei (i > 2) & (i < x)"::
+  ```
+  `r1_detailed_log.txt` records **three** determinizations —
+  `Determinizing [#0 …]: 3 states` (leaked from `constant(2)`'s own `quantify`),
+  `[#1 …]: 7 states`, `[#2 …]: 4 states` — while `r2_detailed_log.txt`, for the byte-identical
+  command, records only **two**: `[#0 …]: 7 states`, `[#1 …]: 4 states`. `constant(2)` was cached
+  the second time round, so its leak disappeared and every index shifted down by one. `[strategy 1
+  BRZ]` therefore means a different automaton on the second run than on the first. The same file
+  with `i > 5` instead of `i > 2` shows the three-determinization shape again (fresh constant), and
+  `?msd_2 x > 1`-style queries never leak at all (`constant(1)` is `makeOne()`, which builds
+  nothing).
+- **Found:** Phase 4, wiring `[strategy …]`/`[export …]` through to `wr_core::determinize`
+  (2026-08-16). Surfaced by an index-sequence regression test transcribed from real
+  `*_detailed_log.txt` output: four of five ground-truth queries matched this port exactly, and the
+  fifth (`?msd_3 Ei Ej (i + j = x) & (i > 2)`) had one EXTRA index in Java, which traced back to
+  here.
+- **Rust port:** **`diverged (NOT signed off — needs an explicit decision)`.** This port models
+  Java's `printEnabled` *structurally* rather than as state: `wr_core::numsys` is simply never
+  handed a `DeterminizeContext`, so nothing it builds can ever advance the counter. That
+  implements `DeterminizationStrategies.java:96-98`'s stated intent and yields a **stable**,
+  query-determined index sequence — but it is a real behavioral divergence for any query whose
+  operand is a constant `≥ 2` that the session has not already built. Pinned, not hidden, by
+  `wr_cli::eval_def`'s `the_automata_index_sequence_matches_real_walnut_java`, whose fifth case
+  carries Java's sequence alongside the port's. Porting verbatim is possible but not cheap: it
+  means threading the context through the whole of `numsys` (comparison / arithmetic / constant /
+  multiplication / division, plus the constructor) *and* giving the context a mutable
+  `print_enabled` flag with Java's exact non-reentrant `disable`/`enable` call sites, in order to
+  reproduce a sequence that is itself cache-order dependent. **Per `CLAUDE.md` this is the user's
+  call, not an agent's** — either sign off on the divergence above or schedule the verbatim port.
+  Note the blast radius is narrow: no fixture in Walnut's own corpus is affected (637-641/659/660
+  all avoid the leak — `@1`/`=1` constants go through `constant(1)`, which does not recurse), and
+  neither is any other part of this port, since the counter has no consumer besides the two
+  metacommands.
+- **Upstream:** not filed. The Java-side fix is mechanical: make `disablePrint`/`enablePrint`
+  save-and-restore (return the previous value / take it back), or replace the pair with a
+  try-with-resources scope object, so nesting composes.
+
+---
+
 ## Dead code / doc-vs-implementation mismatches (tracked in `PROGRESS.md`, not duplicated here)
 
 Several Phase 0 findings are confirmed-dead code or javadoc/implementation mismatches with **no

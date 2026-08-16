@@ -26,11 +26,17 @@ rather than passing silently.
 | | |
 |---|---|
 | fixtures replayed | **675** (the whole `IntegrationTest.L` list, in order) |
-| compared | **583** |
-| **pass** | **576** (98.8% of compared) |
-| **fail** | **7** (all in `KNOWN_DIVERGENCES`, one root cause — below) |
-| skipped (excluded, each with a recorded reason) | **92** |
+| compared | **586** |
+| **pass** | **577** (98.5% of compared) |
+| **fail** | **9** (all in `KNOWN_DIVERGENCES`, one root cause — below) |
+| skipped (excluded, each with a recorded reason) | **89** |
 | timed out / not-run | **0** |
+
+Previous snapshot: 583 compared / 576 pass / 7 fail / 92 skipped. The three extra compared
+fixtures are 637, 659 and 660, which used to be excluded as `skip-metacommand-not-wired`;
+wiring `[strategy …]`/`[export …]` through to `wr_core::determinize` made them comparable.
+659 (an `error` fixture — a metacommand on a `;` command) now **passes**; 637 and 660 land in
+the pre-existing `details` log-text class below, their automata compared and matching.
 
 Skip breakdown:
 
@@ -39,7 +45,6 @@ Skip breakdown:
 | 68 | `skip-drop-scope[negative_base_number_system]` |
 | 16 | `skip-drop-scope[drop_command]` (`split`/`rsplit`/`ost`) |
 | 4 | `skip-otf-deferred[CCL / CCLS / BRZ_CCL / BRZ_CCLS]` |
-| 3 | `skip-metacommand-not-wired[strategy 6 BRZ]`, `[export 1 BA]` ×2 |
 | 1 | `skip-transitive-drop-dep[test444,test445,test446,test447]` (fixture 448) |
 
 Partial comparisons (compared, but not in full — recorded per id in the run report):
@@ -48,12 +53,14 @@ Partial comparisons (compared, but not in full — recorded per id in the run re
   expectation includes CAS incidence matrices (`.mpl`/`.m`/`.wl`/`.sage`); the CAS writer is
   confirmed DROP scope for this port, so automaton/details/error are compared and only the
   matrix files are not.
-* fixtures **637-641, 659, 660** — `not executed`. See `Excluded::MetacommandNotWired`;
-  `no_later_fixture_depends_on_an_unexecuted_one` proves nothing downstream reads their output.
+* fixtures **638-641** — `not executed`. They ask for a deferred OTF strategy on the same
+  1,790-state query as 637, which without a working `[strategy …]` would blow the per-fixture
+  budget for no information; `no_later_fixture_depends_on_an_unexecuted_one` proves nothing
+  downstream reads their output. (637, 659 and 660 ARE executed and compared now.)
 
-## The 7 remaining divergences — one root cause
+## The 9 remaining divergences — one root cause
 
-### 1. `details` log-text fidelity (7 fixtures: 375, 376, 377, 378, 379, 383, 628)
+### 1. `details` log-text fidelity (9 fixtures: 375, 376, 377, 378, 379, 383, 628, 637, 660)
 
 **Not a decision-procedure defect.** Every *state count* in these fixtures already matches
 real Walnut exactly, pre-minimization ones included — the recorded
@@ -70,7 +77,27 @@ Both are **pre-existing, documented deferrals**, not something this unit introdu
 `crates/wr-logic/src/eval.rs`'s module docs ("DEFERRED GAP: the per-`act()` `Logging` calls
 are NOT ported") and `crates/wr-core/src/product.rs`'s "Progress logging not ported" note.
 `eval.rs` already says the gap "**must land before Phase 3b's U27**" — it did not, and this is
-the honest accounting of what that costs: 7 of 583 compared fixtures.
+the honest accounting of what that costs: 9 of 586 compared fixtures.
+
+**637 and 660 joined this class when the metacommands were wired**, and are worth calling out
+because their failure is emphatically NOT a metacommand failure:
+
+* 637 is `[strategy 6 BRZ]eval test637 "E x,y,z (n=x+y+z)&(QQ[x]=@1)&(QQ[y]=@1)&(QQ[z]=@1)"::`.
+  Its seventh determinization (index 6) is a 1,790-state NFA whose subset construction does not
+  finish inside the 60s per-fixture cap; with the metacommand wired the whole fixture completes
+  in well under a second, matching real Walnut's 130ms. That is itself the proof the index
+  arithmetic is right — target index 5 or 7 instead and the fixture times out. Its `details`
+  expectation additionally spells `Determinizing [#6, strategy: Brzozowski]`, a log LINE this
+  port does not emit yet: the same gap as the seven above.
+* 660 is `[export 1 BA]eval test660 "TH[a+c] + TH[b-d] = 0"::`. The export is a side-effecting
+  file write (`<name>_1_pre.ba`) that never touches the returned automaton, so it cannot move
+  this comparison either way; only the log text differs.
+
+**Both now have their AUTOMATON compared and matching** — as do all seven older members of this
+class. That is newly checkable: `compare_test_case` used to `return` on the first `details`
+mismatch, so an automaton divergence could hide behind a text one indefinitely. It now collects
+mismatches (`fold_failures`) and reports them together; the run report shows no `--- and ---`
+separator anywhere, i.e. all nine are text-only.
 
 (The other two `details` fixtures whose text mentions a file path, 656 and 668 —
 `describe GG;` and `describe $diffbyone;` — DO pass. Their only divergence was the absolute
@@ -181,6 +208,8 @@ so this can never make a broken run look green; what it buys is that the report 
 timeout, N never attempted" instead of "one timeout, N verdicts of unknown worth".
 `a_timeout_halts_the_run_and_later_fixtures_are_not_run` (fast tier) pins the policy.
 
-The one fixture that genuinely would not finish, 637, is excluded for an unrelated and
-independently correct reason (`[strategy 6 BRZ]` is not wired into determinization yet), and
-is not executed at all — see `Excluded::MetacommandNotWired`.
+The one fixture that would not finish under plain subset construction, 637, now runs in well
+under a second because its `[strategy 6 BRZ]` metacommand is wired through to
+`wr_core::determinize` — exactly as it is in real Walnut. Its four OTF siblings (638-641) name
+strategies this port deliberately does not implement, so they would fall back to `SC` on the
+same 1,790-state NFA; they stay unexecuted (`skips_execution`).
