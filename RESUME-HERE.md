@@ -1,58 +1,54 @@
-# RESUME-HERE — Phase 4 underway; U29 complete, U30/U31/U32 not started
+# RESUME-HERE — Phase 4 underway; U29+U30 complete, U31/U32 not started
 
-**2026-08-15 checkpoint.** Phase 4 (Hardening) is approved and in progress. Plan at
+**2026-08-16 checkpoint.** Phase 4 (Hardening) is approved and in progress. Plan at
 `~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo — not checked in; if that path
-is ever unavailable, the plan's full text (as revised after adversarial review) is preserved in
-this session's conversation transcript and summarized in `CLAUDE.md`'s "Current status" section).
+is ever unavailable, the plan's full text is summarized in `CLAUDE.md`'s "Current status"
+section).
 
 ## What's done: U29 (Tier-3 differential-generator harness)
 
-`tests/differential-gen/` — a two-sided harness comparing the Rust port against a live
-`walnut-java` JVM oracle over a large stream of randomly generated small KEEP-subset queries.
-Three commits:
+`tests/differential-gen/` — 120,000 generated queries across 4 seeds vs a live `walnut-java` JVM
+oracle, 0 divergences, meeting the N≥10⁵ exit criterion. Went through the full two-reviewer loop
+twice (Milestone 0 build, then the scale-up). Full detail in `CLAUDE.md`'s "Current status" and
+`tests/differential-gen/STATUS.md`. No new genuine Walnut (Java) bug found by this unit.
 
-1. `4ca773c` — Milestone 0 build: Java driver (`tests/differential-gen/java/DiffGenDriver.java`,
-   documented recipe per `tests/differential-gen/CAPTURE.md`, not committed into `walnut-java`'s
-   tracked source) + Rust harness crate (`wr-differential-gen`), 10,000-query soak clean.
-2. `b6e9b3a` — the mandatory two-independent-reviewer round on commit 1 (Opus + Sonnet,
-   split-context). Both independently found the same headline bug (a false-green pass/fail gate
-   that didn't check for a degraded/dead oracle); Opus additionally found a missed JVM-restart
-   case (`Answer::Fatal`/OOM), a temp-file race that could mask a real divergence as a match, and
-   zero test coverage on the query-ID echo check ("the load-bearing invariant" — mutation-tested
-   proof the existing suite couldn't detect its removal). All fixed here.
-3. `3c3d852` — scaled to 120,000 generated queries across 4 seeds: **120,000 match, 0
-   divergences, 0 skips**, meeting U29's exit criterion (N≥10⁵, zero unresolved divergences).
-   Full numbers and methodology in `tests/differential-gen/STATUS.md`.
+## What's done: U30 (Tier-5 fuzzing)
 
-**No new genuine Walnut (Java) bug found** — `docs/WALNUT-BUGS.md` unchanged at 37 entries
-(WB-001–WB-037).
+`fuzz/` — three `cargo-fuzz` targets (`wr_io_reader`, `wr_logic_parser`, `wr_core_regex`), real
+seed corpora, all clean at scale. This unit ran an unusually deep review chain — **five rounds**,
+each finding a real bug — because the very first fix attempt turned out to relocate a panic
+rather than eliminate it, which is exactly the kind of thing a second (and third, and fourth...)
+independent look is for. Commits: `4fc968f` → `b230db4` → `9a26f37`/`f60f086` → `4ea178b` →
+`e8258c7`. Full narrative in `CLAUDE.md`'s "Current status" section. Headline outcomes:
 
-**What this run does NOT cover, by construction** (documented, not an oversight — see
-`tests/differential-gen/STATUS.md`'s exclusions section): `::`-detail-printing queries,
-`transduce`/`def`/`reg`/other non-`eval` `Commands/*`, the `I` (infinitely-often) quantifier,
-custom bases, word/macro/function tokens, formula depth >3, quantifier nesting >2. So this run
-neither confirms nor clears the two pre-existing Phase-3b follow-ups (still open, still separately
-scoped, unchanged since before Phase 4 started):
+- 4 fuzz-discovered process-killing panics fixed, all confirmed genuine port bugs (not Walnut
+  bugs) against the real jar.
+- **WB-038 logged** — `AutomatonReader` silently accepts an out-of-alphabet transition digit,
+  ported verbatim per the mechanical-port rule.
+- A real architectural fix (a top-level panic-recovery boundary at command dispatch, mirroring
+  Java's `Prover.readBuffer` catch) after review found the first attempt only relocated the panic
+  to six other commands.
+- **An unrelated correctness-fatal bug found and fixed as a byproduct**: `reverse` wrote a stale
+  number system into its output (`flip_ns` didn't update `Automaton::ns_name`), which could let a
+  genuinely mixed-numeration `union` silently succeed. Fixing it **closed the previously-open
+  lsd-`transduce` golden-corpus divergence** (fixtures 532-534) — that was never a `Transducer`
+  bug. **Golden corpus: 573/583 → 576/583.**
+- `wr-io`'s header parser unified onto shared grammar primitives, closing several real
+  reader-fidelity divergences (alphabet dedup, set-grammar whitespace, ASCII-vs-Unicode
+  whitespace, Java regex `$`/`.` leniency around rare Unicode line terminators, an
+  `alphabet_size` overflow panic).
 
-1. **`details`-fixture `Logging` threading** (7 of `tests/golden`'s 10 known divergences) —
-   `wr-core`'s product/determinize/minimize/quantify don't thread a `Logging` handle through yet;
-   `crates/wr-logic/src/eval.rs` already flags this as owed. Tentatively "U28" if picked up.
-2. **lsd-direction `transduce` divergence** (3 of `tests/golden`'s 10 known divergences, fixtures
-   532-534) — `Transducer::transduceNonDeterministic`'s reverse-input/reverse-result branch, not
-   yet root-caused past that isolation. `tests/golden/STATUS.md` has the fixture IDs.
-
-Neither is part of Phase 4's plan as scoped (the plan's U31 #7 explicitly keeps the
-lsd-`transduce` hunt separate, in U29's now-built live-JVM bisection infra, should it be picked up
-later — but U29 as executed didn't reach for it, since the generator doesn't emit `transduce`
-commands at all). Pick either up as a deliberate follow-up, same phase-gating convention as
-everything else.
+**Both pre-existing Phase-3b follow-ups this checkpoint used to track are now resolved or
+narrowed:**
+1. ~~lsd-direction `transduce` divergence~~ — **CLOSED** by U30's `reverse`/`flip_ns` fix (see
+   above). Removed from `tests/golden`'s `KNOWN_DIVERGENCES`.
+2. **`details`-fixture `Logging` threading** — still open, still the only golden-corpus gap (7 of
+   583 fixtures). `wr-core`'s product/determinize/minimize/quantify don't thread a `Logging`
+   handle through yet; `crates/wr-logic/src/eval.rs` already flags this as owed. Tentatively "U28"
+   if picked up — check current numbering is still free before assuming.
 
 ## What's NOT started
 
-- **U30** — Tier-5 fuzzing (`cargo-fuzz`, 3 targets: `wr-io` reader, `wr-logic` parser, `wr-core`
-  regex engine). Fully independent of U29/U31; can start any time. First step per the plan: a
-  ~30-min spike confirming `cargo-fuzz` builds/runs at all on this machine (darwin 24.6.0 arm64,
-  ASAN has known rough edges there) before committing to the full design.
 - **U31** — Tier-4 property-suite completion (quotients, `convertNS`, `Morphism`,
   `fixleadzero`/`fixtrailzero`, `NumberSystem::Div`, lsd trailing-zero fixup, `Transducer`). Full
   gap list + the plan's corrected oracle designs (notably: `convertNS` needs a captured sweep +
@@ -65,8 +61,11 @@ everything else.
 
 ## Process note worth keeping
 
-The plan-review step (an independent Opus agent adversarially reviewing the *plan document*
-itself, not just the code, before any implementation started) caught real architectural defects
-that would otherwise have surfaced mid-implementation or, worse, produced a silently-wrong 10⁵-
-query "pass." Worth repeating for U30/U31/U32 if their scope turns out to need more than the
-plan file's existing detail once execution starts.
+U30's review chain is the clearest evidence yet for this project's adversarial-loop discipline:
+every one of five rounds found something real, and the findings got progressively narrower each
+round (process-killing panics → an architectural relocation bug → an unrelated correctness-fatal
+bug found as a byproduct → structural grammar-duplication bugs → rare Unicode edge cases), which
+is the expected and healthy shape of convergence, not a reason to have stopped earlier. Two
+reviewers per round, different models, split context, given only the diff — not the author's
+rationale — held up as the right process the whole way through. Worth the same discipline for
+U31/U32 rather than assuming U30's thoroughness was a one-off.

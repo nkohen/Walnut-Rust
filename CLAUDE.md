@@ -407,6 +407,44 @@ launcher was built — measured single-JVM throughput (~1,000 q/s) clears 10⁵ 
 distinct seeds gave run diversity without adding an aggregation-correctness surface for no
 throughput benefit.
 
-Next: U30 (fuzzing), U31 (Tier-4 property-suite completion), U32 (perf vs Java) — see the plan
-file for full scope of each. `cargo test --workspace` green throughout; `cargo fmt`/`clippy`
-clean.
+**U30 complete** — Tier-5 fuzzing (`fuzz/`, `cargo-fuzz` + ASAN, working on Apple Silicon via an
+`rust-lld` linker workaround documented in `fuzz/README.md`). Three targets (`wr_io_reader`,
+`wr_logic_parser`, `wr_core_regex`) with real seed corpora, all clean at millions of executions.
+This unit ran an unusually long implementer → adversarial-review chain — **five review rounds**,
+each finding a real bug, which is the process working as intended (CLAUDE.md's merge gate exists
+precisely so this class of finding doesn't ship silently) rather than a sign anything was
+rushed. Cumulative result across commits
+`4fc968f`→`b230db4`→`9a26f37`/`f60f086`→`4ea178b`→`e8258c7`:
+- **4 fuzz-discovered process-killing panics fixed** (i32-overflow parses, an undeclared-dest-state
+  guard, an out-of-alphabet-digit encode guard, an unvalidated numeration base) — all confirmed
+  genuine PORT bugs (Java's `Prover.readBuffer` catches and recovers; the Rust port didn't), not
+  Walnut bugs, verified against the real jar rather than inferred.
+- **WB-038 logged**: `AutomatonReader` silently accepts an out-of-alphabet transition digit,
+  encoding it to a bogus `-1` key that either silently corrupts the automaton's language (no
+  diagnostic) or crashes on a later write — a genuine Walnut (Java) bug, ported verbatim.
+- **A real architectural fix**, not a patch: a top-level panic-recovery boundary at command
+  dispatch (`Prover::caught`, mirroring `Prover.readBuffer`'s `catch (RuntimeException)`), after
+  review found the first attempt at guarding individual `encode`/`decode` call sites had merely
+  *relocated* the panic to six other commands (`union`/`intersect`/`join`/`inf`/`test`/`reverse`).
+  `Automaton::decode` made Java-faithful (bounds-checked truncating division) in the same pass.
+- **An unrelated correctness-fatal bug found and fixed as a byproduct**: `reverse`'s `flip_ns`
+  flipped the `msd`/`lsd` boolean but left `Automaton::ns_name` stale, so the output header (and,
+  worse, a later `union`'s numeration-mismatch guard) used the wrong number system — confirmed
+  live to let a genuinely mixed-numeration `union` silently succeed where real Walnut correctly
+  refuses. Fixing this **closed the previously-open lsd-`transduce` golden-corpus divergence**
+  (fixtures 532-534, `tests/golden/STATUS.md` §2, tracked since Phase 3b) — it was never a
+  `Transducer` bug, it was this. **Golden corpus moved from 573/583 to 576/583.**
+- **`wr-io`'s header parser unified** onto the same `parse_methods` grammar primitives the rest of
+  the reader already used, closing three real divergences the unification itself surfaced (missing
+  alphabet dedup, an over-restrictive `{...}` set grammar, Unicode-vs-Java's-ASCII-only `\s`
+  whitespace handling) plus, in the final round, Java's regex `$`/`.` leniency around rare Unicode
+  line terminators (NEL/LS/PS) and an `alphabet_size` overflow that panicked in debug and diverged
+  from Java's `Math.multiplyExact`-throws behavior in release.
+- Golden corpus, differential (20,000+ queries), and all three fuzz targets re-run clean after
+  every round; `cargo test --workspace` green throughout (1300+ tests); `fmt`/`clippy` clean
+  (workspace and `fuzz/`'s own nightly toolchain). Known remaining gaps documented in code, not
+  silently dropped: a lone-`\r` line-splitting divergence (no corpus/fuzz reach), the `details`-
+  fixture `Logging`-threading gap (7 known golden divergences, unrelated, pre-existing).
+
+Next: U31 (Tier-4 property-suite completion), U32 (perf vs Java) — see the plan file for full
+scope of each. `cargo test --workspace` green throughout; `cargo fmt`/`clippy` clean.
