@@ -322,38 +322,164 @@ mod tests {
         })
     }
 
+    /// Removes a `temp_session`'s directory tree when it goes out of scope, **including
+    /// on an unwinding panic**.
+    ///
+    /// The plain `fs::remove_dir_all(&dir).ok()` at the end of a `#[test]` body never runs
+    /// if the body panics, so a single failing `proptest!` case used to leak the whole
+    /// tree into `std::env::temp_dir()`. Every test here keeps its trailing explicit
+    /// cleanup for the happy path (unchanged); this guard is what covers the failing one.
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// The EXACT language `fix_leading_zeros_problem` produces, decided from the operand's
+    /// OWN transition table by a hand-rolled subset-construction walk — an independent
+    /// re-derivation of `wr_core::logicalops`'s oracle of the same shape (that one is
+    /// `#[cfg(test)]`-private to its crate, so it cannot be shared).
+    ///
+    /// The primitive is `determinizeAndMinimize(IntSet)` — subset construction, then
+    /// Valmari, both language-preserving — run from `Z0` over the table `A'` = `A` with
+    /// the one `(q0, zero) -> q0` edge `zeroReachableStates` force-writes in, where `Z0`
+    /// is `q0`'s `zero*`-closure in `A'`. So `L(fixed) = { w : δ_{A'}(Z0, w) ∩ F ≠ ∅ }`.
+    fn lead_zero_oracle(a: &Automaton, zero: i32, word: &[i32]) -> bool {
+        let fa = &a.fa;
+        let step = |cur: &std::collections::BTreeSet<usize>, sym: i32| {
+            let mut next = std::collections::BTreeSet::new();
+            for &s in cur {
+                if let Some(dests) = fa.d[s].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+                if s == fa.q0 && sym == zero {
+                    next.insert(fa.q0);
+                }
+            }
+            next
+        };
+        let mut z0 = std::collections::BTreeSet::from([fa.q0]);
+        loop {
+            let before = z0.len();
+            let grown = step(&z0, zero);
+            z0.extend(grown);
+            if z0.len() == before {
+                break;
+            }
+        }
+        let mut cur = z0;
+        for &sym in word {
+            cur = step(&cur, sym);
+        }
+        cur.iter().any(|&s| fa.is_accepting(s))
+    }
+
+    /// The EXACT language `fix_trailing_zeros_problem` produces: a right quotient by
+    /// `zero*`, `L(fixed) = { w : ∃k ≥ 0, w·0^k ∈ L(A) }`. The fixup only widens the
+    /// accepting set, so this needs no table mutation — run `w` on the operand, then ask
+    /// a from-scratch zero-edge BFS whether any state so reached can reach acceptance on
+    /// zeros. No length bound to guess, and no call to the fixup.
+    fn trail_zero_oracle(a: &Automaton, zero: i32, word: &[i32]) -> bool {
+        let fa = &a.fa;
+        let mut cur = std::collections::BTreeSet::from([fa.q0]);
+        for &sym in word {
+            let mut next = std::collections::BTreeSet::new();
+            for &s in &cur {
+                if let Some(dests) = fa.d[s].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+            }
+            cur = next;
+        }
+        let mut seen = cur.clone();
+        let mut queue: std::collections::VecDeque<usize> = cur.into_iter().collect();
+        while let Some(s) = queue.pop_front() {
+            if fa.is_accepting(s) {
+                return true;
+            }
+            if let Some(dests) = fa.d[s].get(&zero) {
+                for &t in dests {
+                    if seen.insert(t) {
+                        queue.push_back(t);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Tier-4 (`CLAUDE.md`'s correctness ladder, `docs/DESIGN.md` §5) at the COMMAND
-    /// level: the two standalone zero-fixup commands establish their closure properties
-    /// end to end — through the real `Automata Library/` read, the primitive, and the
-    /// write-back — not just when the primitive is called in isolation.
+    /// level: the two standalone zero-fixup commands compute exactly what their primitives
+    /// promise, end to end — through the real `Automata Library/` read, the primitive, and
+    /// the write-back — not just when the primitive is called in isolation.
     ///
-    /// The invariants are the same two `wr_core::logicalops`'s own properties check, and
-    /// the same two `wr_logic::quantify`'s `quantified_language_is_closed_under_leading_
-    /// zeros` checks for the ∃-pipeline's internal use of the leading-zeros fixup — and
-    /// they are deliberately NOT mirror images of each other, because the fixups are not
-    /// (see `fix_trailing_zeros_problem`'s doc comment):
+    /// The load-bearing assertions are the two **equalities**, checked word-for-word over
+    /// every word of length `0..=4` (an exhaustive 31-word sweep, not a sample) against
+    /// [`lead_zero_oracle`] / [`trail_zero_oracle`], each decided from the operand the
+    /// command itself read back off disk:
     ///
-    /// * `fixleadzero` CLOSES the language under a leading zero, in both directions, and
-    ///   loses nothing that was already accepted;
-    /// * `fixtrailzero` is a right quotient by `zero*`, so its result is closed under
-    ///   REMOVING a trailing zero and NOT under adding one. Asserting the mirror of the
-    ///   first property here would be wrong, not merely unproven.
+    /// * `fixleadzero`: `L(c) = { w : δ_{A'}(Z0, w) ∩ F ≠ ∅ }`;
+    /// * `fixtrailzero`: `L(d) = { w : ∃k ≥ 0, w·0^k ∈ L(A) }`.
     ///
-    /// Each oracle is a direct statement about the command's OWN output word set, checked
-    /// with `Fa::accepts_word`; nothing re-implements or re-runs either fixup.
+    /// An earlier draft asserted only one-sided closure/containment statements. That was
+    /// vacuous against the most likely failure mode — mutation-tested and confirmed:
+    /// replacing either primitive with "return the 1-state `Σ*` automaton" satisfied every
+    /// one of them. Neither survives the equalities.
+    ///
+    /// The closure corollaries are kept below because they are the statements a reader of
+    /// these two commands actually wants, and they are deliberately NOT mirror images of
+    /// each other, because the fixups are not (see `fix_trailing_zeros_problem`'s doc
+    /// comment): `fixleadzero` closes the language under a leading zero in BOTH
+    /// directions and loses nothing already accepted, while `fixtrailzero`'s result is
+    /// closed under REMOVING a trailing zero and NOT under adding one — asserting the
+    /// mirror of the first here would be wrong, not merely unproven.
+    ///
+    /// # The operand is TRIMMED before it is written to disk
+    ///
+    /// `fixtrailzero` closes with `FA.justMinimize`, which — faithfully — does not trim,
+    /// so an operand carrying a state unreachable from `q0` that also cannot reach
+    /// acceptance hands Valmari a table violating its reachability precondition and
+    /// triggers `docs/WALNUT-BUGS.md` WB-001, a deliberately ported quirk that would show
+    /// up here as an oracle disagreement. `crate::trim::trim` is language-preserving and
+    /// its postcondition is exactly that precondition, so trimming the generated operand
+    /// before writing it constrains the generator's domain rather than weakening the
+    /// oracle. (`fixleadzero` needs no such care: it closes with
+    /// `determinizeAndMinimize(IntSet)`, whose subset construction re-establishes
+    /// reachability. It is trimmed anyway, so both commands see the same operand and the
+    /// two equalities are about one table.) An earlier version of this test claimed the
+    /// trimming without doing it.
     #[test]
     fn fix_zero_commands_establish_their_closure_properties_end_to_end() {
         let (session, dir) = temp_session("zero-closure-props");
+        let _guard = TempDirGuard(dir.clone());
         let path = dir.join("Automata Library").join("A.txt");
         proptest!(
             ProptestConfig::with_cases(24),
             |(a in arb_partial_dfa(3), probe in prop::collection::vec(0i32..2, 0..4))| {
                 let mut original = a;
+                original.fa = wr_core::trim::trim(&original.fa);
                 wr_io::writer::write_automaton_txt(&mut original, &path).unwrap();
+
+                // The operand exactly as the commands themselves see it, so the oracles
+                // reason about the table the fixups actually ran on rather than about a
+                // pre-write copy the `.txt` round trip might have normalized.
+                let operand = read_from_automata_library(&session, "A")
+                    .expect("the file was just written by this test");
+                let zero = operand.determine_zero();
 
                 let lead = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c")
                     .expect("fixleadzero must succeed on a well-formed operand");
                 let lead = lead.automaton_pairs()[0].automaton().unwrap().clone();
+                for w in all_words_up_to_four() {
+                    prop_assert_eq!(
+                        lead.fa.accepts_word(&w),
+                        lead_zero_oracle(&operand, zero, &w),
+                        "fixleadzero disagrees with subset construction from Z0 on {:?}", w
+                    );
+                }
+
                 let mut padded = vec![0];
                 padded.extend_from_slice(&probe);
                 prop_assert_eq!(
@@ -371,6 +497,14 @@ mod tests {
                 let trail = fix_trail_zero_command(&session, "fixtrailzero d A;", "A", "d")
                     .expect("fixtrailzero must succeed on a well-formed operand");
                 let trail = trail.automaton_pairs()[0].automaton().unwrap().clone();
+                for w in all_words_up_to_four() {
+                    prop_assert_eq!(
+                        trail.fa.accepts_word(&w),
+                        trail_zero_oracle(&operand, zero, &w),
+                        "fixtrailzero disagrees with the right quotient by 0* on {:?}", w
+                    );
+                }
+
                 let mut with_zero = probe.clone();
                 with_zero.push(0);
                 if trail.fa.accepts_word(&with_zero) {
@@ -389,6 +523,26 @@ mod tests {
             }
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every `{0,1}` word of length `0..=4` — the 31-word sweep both equalities above are
+    /// checked over.
+    fn all_words_up_to_four() -> Vec<Vec<i32>> {
+        let mut out = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for w in &frontier {
+                for d in [0i32, 1] {
+                    let mut w2 = w.clone();
+                    w2.push(d);
+                    next.push(w2);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
     }
 
     #[test]

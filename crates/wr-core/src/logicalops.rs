@@ -3581,29 +3581,99 @@ mod tests {
         false
     }
 
+    /// The EXACT language [`fix_leading_zeros_problem`] produces, decided from the
+    /// ORIGINAL transition table by a hand-rolled subset-construction walk.
+    ///
+    /// The primitive is `Automaton.determinizeAndMinimize(IntSet)` (subset construction,
+    /// then Valmari — both language-preserving) started from `Z0`, over the table `A'` =
+    /// `A` with the single `(q0, zero) -> q0` edge [`zero_reachable_states`] force-writes
+    /// into it, where `Z0` is `q0`'s `zero*`-closure in `A'`. So
+    ///
+    /// ```text
+    /// L(fixed) = { w : δ_{A'}(Z0, w) ∩ F ≠ ∅ }
+    /// ```
+    ///
+    /// and that is what this decides — with `Fa::d`/`Fa::is_accepting` lookups and
+    /// nothing else. It never calls `fix_leading_zeros_problem`,
+    /// `zero_reachable_states`, `determinize`, `minimize` or `equiv`.
+    ///
+    /// Note this is genuinely NOT a function of `L(A)` alone: the forced self-loop is
+    /// usable only at `q0`, so which words it admits depends on which prefixes return
+    /// the run to `q0` — a structural fact about `A`, not a language-level one. That is
+    /// exactly why the closure/containment statements this replaced could not be
+    /// tightened into an equality *about `L(A)`*, and why the equality has to be stated
+    /// against the table instead.
+    fn fix_leading_zeros_oracle(fa: &Fa, zero: i32, word: &[i32]) -> bool {
+        // One subset-construction step over `A'` (the original table PLUS the forced
+        // `(q0, zero) -> q0` edge, applied here rather than mutated in).
+        let step = |cur: &BTreeSet<usize>, sym: i32| -> BTreeSet<usize> {
+            let mut next = BTreeSet::new();
+            for &s in cur {
+                if let Some(dests) = fa.d[s].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+                if s == fa.q0 && sym == zero {
+                    next.insert(fa.q0);
+                }
+            }
+            next
+        };
+
+        // `Z0` — `q0`'s `zero*`-closure in `A'`, to a fixed point.
+        let mut z0 = BTreeSet::from([fa.q0]);
+        loop {
+            let before = z0.len();
+            let grown = step(&z0, zero);
+            z0.extend(grown);
+            if z0.len() == before {
+                break;
+            }
+        }
+
+        let mut cur = z0;
+        for &sym in word {
+            cur = step(&cur, sym);
+        }
+        cur.iter().any(|&s| fa.is_accepting(s))
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
-        /// Tier-4, `fixleadzero`: the closure the fixup exists to establish, plus both
-        /// one-sided containments that pin WHICH language it closes to.
+        /// Tier-4, `fixleadzero`: the **exact** characterization of what the fixup
+        /// computes, plus the two corollaries the command is actually sold on.
         ///
-        /// 1. **Closure** — `w` is accepted iff `0w` is. (`Automaton.determinizeAndMinimize
-        ///    (IntSet)` is run from `Z0`, the zero-closure of `q0`, and `zeroReachableStates`'
-        ///    forced `(q0, zero) -> q0` self-loop makes `δ(Z0, zero) = Z0` in BOTH directions
-        ///    — `⊆` from the closure, `⊇` from the self-loop.)
-        /// 2. **Soundness** — nothing is lost: `L(A) ⊆ L(fixed)`.
-        /// 3. **Completeness for the thing the command promises** — every word that the
-        ///    ORIGINAL automaton accepted with some number of leading zeros is accepted
-        ///    without them: `0^k w ∈ L(A) ⟹ w ∈ L(fixed)`.
+        /// The load-bearing assertion is the first one:
         ///
-        /// All three oracles run on the untouched clone of the input with nothing but
-        /// `Fa::accepts_word`. Note (2) and (3) are containments, not an equality: the
-        /// forced self-loop is a real, load-bearing mutation of the transition TABLE (see
-        /// `zero_reachable_states`' doc), so `L(fixed)` can legitimately contain words no
-        /// leading-zero padding of `L(A)` produces — asserting equality here would be
-        /// asserting away ported behaviour.
+        /// ```text
+        /// L(fixed) = { w : δ_{A'}(Z0, w) ∩ F ≠ ∅ }
+        /// ```
+        ///
+        /// checked word-for-word against [`fix_leading_zeros_oracle`] over EVERY word of
+        /// length `0..=4` (an exhaustive 31-word sweep, not a sample), so the property has
+        /// an upper bound as well as a lower one. An earlier draft asserted only closure
+        /// and the two containments below; that was vacuous against this primitive's most
+        /// likely failure mode — mutation-tested and confirmed: replacing the whole fixup
+        /// with "return the 1-state `Σ*` automaton" satisfied every one of those
+        /// assertions. It does not survive the equality.
+        ///
+        /// The corollaries, kept because they are the statements a reader of `fixleadzero`
+        /// actually wants and they are checked with a *different* oracle (`accepts_word`
+        /// on the untouched clone), are:
+        ///
+        /// * **Closure** — `w` is accepted iff `0w` is. (`zeroReachableStates`' forced
+        ///   `(q0, zero) -> q0` self-loop makes `δ(Z0, zero) = Z0` in BOTH directions —
+        ///   `⊆` from the closure, `⊇` from the self-loop.)
+        /// * **Soundness** — nothing is lost: `L(A) ⊆ L(fixed)`, and more precisely every
+        ///   word the ORIGINAL automaton accepted with some number of leading zeros is
+        ///   accepted without them: `0^k w ∈ L(A) ⟹ w ∈ L(fixed)`.
+        ///
+        /// Those stay one-sided on purpose: the forced self-loop is a real mutation of
+        /// the transition TABLE (see `zero_reachable_states`' doc), so `L(fixed)` can
+        /// legitimately contain words no leading-zero padding of `L(A)` produces. The
+        /// upper bound lives in the equality above, where it can be stated exactly.
         #[test]
-        fn fix_leading_zeros_closes_the_language_under_a_leading_zero(
+        fn fix_leading_zeros_is_exactly_subset_construction_from_the_zero_closure(
             a in arb_partial_nfa(4),
             probe in prop::collection::vec(0i32..2, 0..4),
         ) {
@@ -3612,6 +3682,15 @@ mod tests {
             fix_leading_zeros_problem(&mut fixed);
 
             let zero = 0; // encode([0]) over the alphabet {0, 1}
+
+            for w in all_digit_words(&[0, 1], 4) {
+                prop_assert_eq!(
+                    fixed.fa.accepts_word(&w),
+                    fix_leading_zeros_oracle(&original.fa, zero, &w),
+                    "fixleadzero disagrees with subset construction from Z0 on {:?}", w
+                );
+            }
+
             let mut padded = vec![zero];
             padded.extend_from_slice(&probe);
             prop_assert_eq!(
@@ -4146,8 +4225,16 @@ mod tests {
         );
     }
 
+    /// The exact panic text WB-010 produces on this shape. `Automaton::encode_with`'s
+    /// out-of-alphabet guard (`automaton.rs`), reached through `right_quotient`'s
+    /// internal re-encode of `B` into `A`'s digit space: `B`'s digit `2` has no
+    /// counterpart in `A`'s `{0, 1}`. Shared with
+    /// `left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure`,
+    /// which must distinguish THIS failure from any other panic.
+    const WB_010_PANIC: &str = "digit 2 not in track 0's alphabet";
+
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "digit 2 not in track 0's alphabet")]
     fn left_quotient_panics_on_the_wb_010_trigger_the_guard_misses() {
         // Pins WB-010 (docs/WALNUT-BUGS.md) directly, not just the guard's DIRECTION:
         // the two `*_direction_sensitive` tests above only show `left_quotient`'s
@@ -4472,6 +4559,15 @@ mod tests {
         /// no cheap syntactic predicate over `B` gets right — the hand-built pin above
         /// records that exact mistake being made and caught. `cargo test`'s harness
         /// captures the caught panic's message, so this produces no output noise.
+        ///
+        /// **But WHICH panic is checked, not assumed.** A measured 39% of the generated
+        /// case space (779 of 2,001, one-off instrumented run) takes the failure branch,
+        /// so "any panic counts as WB-010" would
+        /// silently absorb an unrelated regression — a genuinely different panic (an
+        /// index-out-of-bounds in `reverse`, an arithmetic overflow, a broken invariant
+        /// assert) is a real signal, not a documented quirk. The caught payload is
+        /// therefore downcast and matched against [`WB_010_PANIC`], the same text the
+        /// hand-built pin above asserts, and anything else FAILS the property.
         #[test]
         fn left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure(
             a in arb_partial_automaton_over(3, vec![0, 1]),
@@ -4487,9 +4583,28 @@ mod tests {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 left_quotient(&a, &b)
             }));
-            let Ok(m) = outcome else {
-                // WB-010 fired. Ported verbatim; nothing more to check.
-                return Ok(());
+            let m = match outcome {
+                Ok(m) => m,
+                Err(payload) => {
+                    // Only the DOCUMENTED failure is allowed here. `panic!`'s payload is
+                    // a `String` for a formatted message and a `&'static str` for a
+                    // literal one, so both are tried before giving up.
+                    let msg = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                        .unwrap_or("<non-string panic payload>")
+                        .to_string();
+                    prop_assert_eq!(
+                        &msg, WB_010_PANIC,
+                        "left_quotient panicked, but NOT with WB-010's documented \
+                         out-of-alphabet re-encode failure -- this is an unexpected \
+                         regression, not the ported quirk"
+                    );
+                    // WB-010 fired, confirmed by its own message. Ported verbatim;
+                    // nothing more to check.
+                    return Ok(());
+                }
             };
             for z in all_digit_words(&[0, 1], 4) {
                 prop_assert_eq!(
@@ -5509,20 +5624,12 @@ mod tests {
         out
     }
 
-    /// Is every state of `fa` reachable from `q0` by a word whose LENGTH is a multiple of
-    /// `j`? A plain BFS over `(state, depth mod j)` pairs, written here rather than reused
-    /// from anywhere in the crate.
-    ///
-    /// This is exactly `docs/WALNUT-BUGS.md` **WB-001**'s precondition on this code path:
-    /// `convertMsdBaseToExponent` re-keys the transition table by digit GROUPS of size `j`,
-    /// so a state reachable only "mid-group" becomes unreachable from `q0`, and the
-    /// `minimizeSelfWithOutput` that immediately follows runs Valmari on a table violating
-    /// its reachability precondition — silently corrupting the language, in Java and in
-    /// this port alike (`convert_ns_reaches_wb_001_when_regrouping_strands_a_state` pins
-    /// the 2-state parity fixture where it bites, verified live against the real jar). The
-    /// property below therefore *constrains its generator away from that shape* rather than
-    /// weakening its oracle to accommodate a deliberately-ported quirk.
-    fn every_state_reachable_at_a_multiple_of(fa: &Fa, j: usize) -> bool {
+    /// Which states of `fa` are reachable from `q0` by a word whose LENGTH is a multiple
+    /// of `j` — i.e. which states survive as reachable once `convertMsdBaseToExponent`
+    /// re-keys the table by digit GROUPS of size `j` (`δ' = δ^j`). A plain BFS over
+    /// `(state, depth mod j)` pairs, written here rather than reused from anywhere in the
+    /// crate.
+    fn reachable_at_a_multiple_of(fa: &Fa, j: usize) -> Vec<bool> {
         let mut seen = vec![vec![false; j]; fa.q];
         let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
         seen[fa.q0][0] = true;
@@ -5538,7 +5645,94 @@ mod tests {
                 }
             }
         }
-        (0..fa.q).all(|s| seen[s][0])
+        (0..fa.q).map(|s| seen[s][0]).collect()
+    }
+
+    /// Can `docs/WALNUT-BUGS.md` **WB-001** fire when `fa` is regrouped into digit groups
+    /// of size `j`? This is WB-001's precondition *on this code path*, derived from the
+    /// call chain rather than approximated:
+    ///
+    /// * `convertMsdBaseToExponent` re-keys the transition table by digit groups, so the
+    ///   reachable set collapses to [`reachable_at_a_multiple_of`] — a state reachable
+    ///   only "mid-group" becomes unreachable from `q0`;
+    /// * the very next statement is `minimizeSelfWithOutput`, i.e.
+    ///   `WordAutomaton::minimize_with_output`, which does NOT hand the DFAO to Valmari
+    ///   whole. It `uncombine`s it into one plain automaton **per distinct output value**
+    ///   `v` — accepting exactly the states whose output is `v` — and runs
+    ///   `determinize_and_minimize()` on each (already deterministic and total here, so
+    ///   the `trim` step is skipped and Valmari sees an untrimmed table);
+    /// * and Valmari's quirk needs `q0` to be unable to reach ANY accepting state *while
+    ///   some accepting state exists* (`minimize.rs`'s "q0 aliasing quirk" docs).
+    ///
+    /// Per sub-automaton that reads: `q0` reaches no state whose output is `v`, while some
+    /// state has output `v` (true by construction — `v` is drawn from `fa.o`, over all
+    /// states, reachable or not). So the exact condition is the one below.
+    ///
+    /// # Why not just "is every state reachable?"
+    ///
+    /// That was this helper's first form, and it is *sufficient but not necessary*: a
+    /// stranded state whose output value ALSO occurs on some reachable state cannot
+    /// trigger the quirk, because the sub-automaton for that value still has an accepting
+    /// state `q0` can reach. Concrete counterexample — the WB-001 parity fixture's own
+    /// transition table with both outputs equal: `q = 2`, `j = 2`, `0 --0,1--> 1` and
+    /// `1 --0,1--> 0`, outputs `[1, 1]`. State `1` is reachable only at ODD lengths, so
+    /// the all-states form says "skip"; but the only present output value is `1`, which
+    /// `q0` itself carries, so `q0` is trivially co-reachable in the only sub-automaton
+    /// and WB-001 provably cannot fire. Cases of that shape are now tested rather than
+    /// discarded. The property still *constrains its generator away* from the genuinely
+    /// bug-triggering shape (`convert_ns_reaches_wb_001_when_regrouping_strands_a_state`
+    /// pins the 2-state parity fixture where it bites, verified live against the real jar)
+    /// rather than weakening its oracle to accommodate a deliberately-ported quirk.
+    fn wb_001_can_fire_on_regrouping(fa: &Fa, j: usize) -> bool {
+        let reachable = reachable_at_a_multiple_of(fa, j);
+        let present: BTreeSet<i32> = fa.o.iter().copied().collect();
+        present
+            .into_iter()
+            .any(|v| !(0..fa.q).any(|s| reachable[s] && fa.o[s] == v))
+    }
+
+    /// Pins [`wb_001_can_fire_on_regrouping`] on both sides, so the refinement cannot
+    /// silently rot into either a rubber stamp (which would let the property report the
+    /// deliberately-ported WB-001 corruption as a failure) or the coarse all-states form
+    /// it replaced (which threw away ~19% of the case space for nothing).
+    ///
+    /// Both fixtures share `convert_ns_reaches_wb_001_when_regrouping_strands_a_state`'s
+    /// transition table — `0 --0,1--> 1`, `1 --0,1--> 0` — where state `1` is reachable
+    /// only at ODD length and so is stranded by `j = 2` regrouping. Only the outputs
+    /// differ, and that alone decides whether WB-001 can fire.
+    #[test]
+    fn the_wb_001_regrouping_predicate_keys_on_output_values_not_bare_reachability() {
+        let parity = |o: Vec<i32>| Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o,
+            d: vec![
+                BTreeMap::from([(0, vec![1]), (1, vec![1])]),
+                BTreeMap::from([(0, vec![0]), (1, vec![0])]),
+            ],
+        };
+
+        // Distinct outputs: the sub-automaton for value `0` accepts only the stranded
+        // state `1`, so `q0` reaches no accepting state there. WB-001 fires.
+        assert!(
+            wb_001_can_fire_on_regrouping(&parity(vec![1, 0]), 2),
+            "the pinned WB-001 fixture must still be rejected"
+        );
+        assert!(wb_001_can_fire_on_regrouping(&parity(vec![0, 1]), 2));
+
+        // Equal outputs: state `1` is just as stranded, but the only present output value
+        // is one `q0` itself carries, so every sub-automaton has an accepting state `q0`
+        // reaches and WB-001 provably cannot fire. The coarse all-states predicate
+        // discarded this shape.
+        assert!(!wb_001_can_fire_on_regrouping(&parity(vec![1, 1]), 2));
+        assert!(!wb_001_can_fire_on_regrouping(&parity(vec![0, 0]), 2));
+        assert!(
+            !reachable_at_a_multiple_of(&parity(vec![1, 1]), 2)[1],
+            "the equal-output fixture really does strand state 1 -- otherwise the \
+             assertions above would be vacuous"
+        );
     }
 
     /// A TOTAL random single-track `msd_2` automaton (every state has both digits), so
@@ -5591,18 +5785,30 @@ mod tests {
         ///
         /// Restricted to base 2 on purpose (WB-032: every power of 2 is provably
         /// unaffected by the truncated-log quirk, so here the port must be RIGHT, not
-        /// merely bug-compatible), and constrained away from WB-001's stranded-state shape
-        /// — see [`every_state_reachable_at_a_multiple_of`].
+        /// merely bug-compatible), and constrained away from WB-001's *actual* triggering
+        /// shape — see [`wb_001_can_fire_on_regrouping`], which is the precondition
+        /// derived from `minimize_with_output`'s per-output-value uncombine, not the
+        /// coarser "every state reachable" over-approximation an earlier draft used.
+        ///
+        /// The filter is a `prop_assume!`, not a bare `return Ok(())`: proptest counts a
+        /// bare early return as an ordinary PASS, so a future change that made every
+        /// generated case hit the skip would leave this property silently vacuous and
+        /// green forever. A rejection is tracked, and starving the property aborts the
+        /// run with "too many local rejects".
+        ///
+        /// Measured over 4,548 generated inputs (a one-off 4,000-case instrumented run):
+        /// the refined condition rejects **10.7%**, where the coarser all-states form
+        /// rejected **30.0%** — so 19.3% of the case space is now actually tested rather
+        /// than discarded, and every one of those cases passes. No input was rejected by
+        /// the refinement that the coarser form accepted, as its derivation requires.
         #[test]
         fn convert_ns_to_a_power_of_two_base_preserves_the_integer_language(
             a in arb_total_msd2_automaton(4),
             j in 2usize..=3,
         ) {
-            if !every_state_reachable_at_a_multiple_of(&a.fa, j) {
-                // WB-001's precondition is violated: both engines corrupt the language
-                // here, by design. Skipped, not asserted away.
-                return Ok(());
-            }
+            // WB-001's precondition would be violated: both engines corrupt the language
+            // there, by design. Rejected, not asserted away.
+            prop_assume!(!wb_001_can_fire_on_regrouping(&a.fa, j));
             let to_base = 2i32.pow(j as u32);
             let mut converted = a.clone();
             convert_ns(&mut converted, true, to_base).expect("msd_2 -> msd_2^j must succeed");

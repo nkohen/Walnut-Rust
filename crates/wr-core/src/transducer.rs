@@ -2209,8 +2209,10 @@ mod tests {
         /// i.e. `N`'s output at `n` is what the transducer emits when it reaches position
         /// `n` of the sequence, having already consumed positions `0 … n-1`.
         ///
-        /// The oracle walks `M` once per position and then walks `T` along the resulting
-        /// letter sequence, using only `Fa::d` / `Fa::o` / `sigma` lookups. It never calls
+        /// The oracle is [`dekking_oracle`] — written for a prior unit in this same
+        /// module, and reused here rather than duplicated. It walks `M` once per position
+        /// and then walks `T` along the resulting letter sequence, using only `Fa::d` /
+        /// `Fa::o` / `sigma` lookups. It never calls
         /// `transduce_*`, `create_map`, `create_iterates`, `get_destination_for_dfa` or
         /// `minimize_self_with_output`, and in particular it knows nothing about the
         /// `phi_a` state-map machinery or the `(M-state, iterates)` BFS key that the
@@ -2241,36 +2243,27 @@ mod tests {
                 max_word_len: 100_000,
             };
             let n_result = t.transduce_non_deterministic_with_budget(&mut m, &mut logging, budget);
-            if matches!(n_result, Err(TransduceError::Exploded(_))) {
-                return Ok(());
-            }
+            // `prop_assume!`, not a bare `return Ok(())`: proptest counts an early return
+            // as an ordinary PASS, so if a future change made every generated case blow
+            // the budget this property would go silently vacuous and stay green forever.
+            // A rejection is tracked instead, and starving the property aborts the run
+            // with "too many local rejects".
+            prop_assume!(!matches!(n_result, Err(TransduceError::Exploded(_))));
             let n_auto = n_result.expect("the generators exclude every other error path");
 
             let width = 1usize << k; // 2^k, the number of positions at this width
             let n = n_raw % width;
+            let word = msd_digits(n as u32, k as u32);
 
-            // a_j = M's output on the k-digit msd representation of j.
-            let letter_at = |j: usize| -> i32 {
-                let mut state = original.fa.q0;
-                for slot in (0..k).rev() {
-                    let digit = ((j >> slot) & 1) as i32;
-                    state = original.fa.d[state][&digit][0];
-                }
-                original.fa.o[state]
-            };
-
-            // Run T along a_0 … a_{n-1}, then emit on a_n.
-            let mut t_state = t.automaton.fa.q0;
-            for j in 0..n {
-                let sym = t.encode_input(letter_at(j));
-                t_state = t.automaton.fa.d[t_state][&sym][0];
-            }
-            let expected = t.sigma[t_state][&t.encode_input(letter_at(n))];
+            // The expected output is `dekking_oracle`'s — the same independent
+            // step-by-step oracle a prior unit already wrote in this module, reused rather
+            // than re-derived inline (an earlier draft of this property duplicated it
+            // verbatim; the two were checked to agree before being merged).
+            let expected = dekking_oracle(&t, &original, k as u32, &word);
 
             // And read N at the same position.
             let mut state = n_auto.fa.q0;
-            for slot in (0..k).rev() {
-                let digit = ((n >> slot) & 1) as i32;
+            for &digit in &word {
                 state = n_auto.fa.d[state][&digit][0];
             }
             prop_assert_eq!(
