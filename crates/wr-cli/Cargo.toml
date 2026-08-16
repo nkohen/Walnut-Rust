@@ -24,3 +24,12 @@ wr-cts = { path = "../wr-cts" }
 # numbering, which is what lets `Prover.java`'s `static int GROUP_… = 20` constants be ported
 # as literal group indices.
 regex-automata.workspace = true
+
+# Phase 4 U31: the Tier-4 property-suite unblock. `wr-cli` had no `proptest` dependency at
+# all, so no property test was structurally possible in this crate. Same workspace pin
+# `wr-core`/`wr-logic`/`wr-cts` already use. Used by `simple_transforms.rs`'s
+# `fixleadzero`/`fixtrailzero` closure properties — Tier 4 is about decision-procedure
+# math, not dispatch plumbing, so this crate gets property tests only where a genuine
+# algorithmic invariant lives at the command level.
+[dev-dependencies]
+proptest.workspace = true

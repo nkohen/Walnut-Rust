@@ -7,3 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 wr-core = { path = "../wr-core" }
+
+# Phase 4 U31: the Tier-4 property-suite unblock. `wr-io` had no `proptest` dependency at
+# all, so no property test was structurally possible in this crate. Same workspace pin
+# `wr-core`/`wr-logic`/`wr-cts` already use.
+[dev-dependencies]
+proptest.workspace = true

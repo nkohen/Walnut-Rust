@@ -3998,6 +3998,296 @@ mod tests {
         let _ = left_quotient(&a, &b);
     }
 
+    // ------------------------------------------- Tier-4 properties over the quotients
+    //
+    // Phase 4, U31. Everything below compares the two quotient constructions against a
+    // WORD-LEVEL brute-force definition of the quotient, computed with nothing but
+    // `Fa::accepts_word` on the ORIGINAL operands. That oracle never calls
+    // `right_quotient`/`left_quotient`, `and`, `Automaton::is_empty`, `equiv`, or any
+    // other piece of the machinery under test, so it is genuinely independent rather
+    // than a re-derivation of the same construction.
+
+    /// Random single-track partial DFAs over an ARBITRARY digit list (`arb_partial_dfa`
+    /// is hard-wired to `{0, 1}` through [`single_track`]). The digits are the track's
+    /// alphabet, so `alphabet_size == digits.len()` and encoded symbol `i` means digit
+    /// `digits[i]` — see `automaton.rs`'s module docs.
+    fn arb_partial_automaton_over(
+        q_max: usize,
+        digits: Vec<i32>,
+    ) -> impl Strategy<Value = Automaton> {
+        let alphabet_size = digits.len();
+        (1..=q_max).prop_flat_map(move |q| {
+            let digits = digits.clone();
+            let o = prop::collection::vec(0i32..=1, q);
+            let trans = prop::collection::vec(
+                prop::collection::vec(prop::option::of(0usize..q), alphabet_size),
+                q,
+            );
+            (o, trans).prop_map(move |(o, trans)| {
+                let d = trans
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .filter_map(|(sym, dest)| dest.map(|d| (sym as i32, vec![d])))
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect();
+                Automaton::new(
+                    Fa {
+                        true_false: None,
+                        q0: 0,
+                        q,
+                        alphabet_size,
+                        o,
+                        d,
+                    },
+                    vec![digits.clone()],
+                    vec!["x".to_string()],
+                    vec![Some(true)],
+                )
+            })
+        })
+    }
+
+    /// Every word of digits from `digits` with length `0..=max_len`, in the caller's own
+    /// digit space (NOT encoded) — the enumeration both oracles below quantify over.
+    fn all_digit_words(digits: &[i32], max_len: usize) -> Vec<Vec<i32>> {
+        let mut out = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for w in &frontier {
+                for &d in digits {
+                    let mut w2 = w.clone();
+                    w2.push(d);
+                    next.push(w2);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// `a`'s encoded symbol for digit `d`, or `None` if `a`'s track cannot represent it.
+    /// (`Automaton::encode` panics instead — deliberately, see its doc comment — which is
+    /// no use to an oracle that has to reason ABOUT that shape; WB-010's generator below
+    /// feeds digits one operand does not have.)
+    fn symbol_for_digit(a: &Automaton, d: i32) -> Option<i32> {
+        a.alphabet[0].iter().position(|&x| x == d).map(|i| i as i32)
+    }
+
+    /// The set of states `a` can be in after reading the digit word `w` from `start`
+    /// (a plain NFA simulation over `Fa::d`, nothing else).
+    fn digit_run(a: &Automaton, start: &BTreeSet<usize>, w: &[i32]) -> BTreeSet<usize> {
+        // A quotient whose result language is empty can come back with ZERO states (see
+        // `minimize`, which drops every non-co-reachable state), and `Fa`'s own
+        // `accepts_word`/`is_accepting` would index `o[q0]` out of bounds on that shape.
+        // The oracle simply reports "no run", which is the right answer for L = ∅.
+        let mut cur: BTreeSet<usize> = start.iter().copied().filter(|&p| p < a.fa.q).collect();
+        for &d in w {
+            let Some(sym) = symbol_for_digit(a, d) else {
+                return BTreeSet::new();
+            };
+            let mut next = BTreeSet::new();
+            for &p in &cur {
+                if let Some(dests) = a.fa.d[p].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+            }
+            cur = next;
+        }
+        cur
+    }
+
+    /// Does `a`, started in any state of `start`, accept the digit word `w`?
+    fn accepts_digit_word_from(a: &Automaton, start: &BTreeSet<usize>, w: &[i32]) -> bool {
+        digit_run(a, start, w).iter().any(|&p| a.fa.is_accepting(p))
+    }
+
+    /// Every `(a-state, b-state)` pair reachable from `(a_start, b.q0)` by reading ONE
+    /// common digit word in both — a from-scratch synchronized-product reachability BFS,
+    /// written here in the test module and calling nothing from `crate::product`,
+    /// `crate::equiv` or the quotient constructions themselves.
+    ///
+    /// This is what lets both oracles below be *exact* rather than sampled: quantifying
+    /// "∃y ∈ L(B) with xy ∈ L(A)" over the pair graph terminates, where enumerating
+    /// candidate `y` words would have to guess a length bound.
+    fn reachable_pairs(
+        a: &Automaton,
+        a_start: usize,
+        b: &Automaton,
+        digits: &[i32],
+    ) -> BTreeSet<(usize, usize)> {
+        let mut seen: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+        seen.insert((a_start, b.fa.q0));
+        queue.push_back((a_start, b.fa.q0));
+        while let Some((p, q)) = queue.pop_front() {
+            for &d in digits {
+                let (Some(sa), Some(sb)) = (symbol_for_digit(a, d), symbol_for_digit(b, d)) else {
+                    continue;
+                };
+                let (Some(pd), Some(qd)) = (a.fa.d[p].get(&sa), b.fa.d[q].get(&sb)) else {
+                    continue;
+                };
+                for &p2 in pd {
+                    for &q2 in qd {
+                        if seen.insert((p2, q2)) {
+                            queue.push_back((p2, q2));
+                        }
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    /// `L(A) / L(B) = { x : ∃y ∈ L(B), xy ∈ L(A) }` — the textbook definition, decided
+    /// exactly: `x` is in the quotient iff some state `A` can reach on `x` admits a
+    /// common continuation with `B` that both accept.
+    fn brute_force_right_quotient(a: &Automaton, b: &Automaton, digits: &[i32], x: &[i32]) -> bool {
+        digit_run(a, &BTreeSet::from([a.fa.q0]), x)
+            .into_iter()
+            .any(|p| {
+                reachable_pairs(a, p, b, digits)
+                    .into_iter()
+                    .any(|(pa, qb)| a.fa.is_accepting(pa) && b.fa.is_accepting(qb))
+            })
+    }
+
+    /// `L(B) \ L(A) = { z : ∃w ∈ L(B), wz ∈ L(A) }` (`left_quotient`'s own doc comment's
+    /// definition), decided exactly the same way: collect every `A`-state reachable by
+    /// SOME word of `L(B)`, then ask whether `z` is accepted from any of them.
+    fn brute_force_left_quotient(a: &Automaton, b: &Automaton, digits: &[i32], z: &[i32]) -> bool {
+        let after_b: BTreeSet<usize> = reachable_pairs(a, a.fa.q0, b, digits)
+            .into_iter()
+            .filter(|&(_, q)| b.fa.is_accepting(q))
+            .map(|(p, _)| p)
+            .collect();
+        !after_b.is_empty() && accepts_digit_word_from(a, &after_b, z)
+    }
+
+    proptest! {
+        // Each case runs |A.q| cross-product-plus-emptiness checks inside the quotient
+        // (each one a `totalizeCrossProduct` + `determinizeAndMinimize`), so this runs on
+        // fewer cases than the default 256 — the same `ProptestConfig` discipline
+        // `numsys.rs` and `regex/tests.rs` already apply to their expensive constructions.
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// Tier-4: `rightQuotient` against the brute-force set-theoretic quotient.
+        ///
+        /// Both operands are TRIMMED first, for exactly the reason
+        /// `not_matches_the_complement_oracle` trims: `right_quotient` closes with
+        /// `M.determinizeAndMinimize()`, `M` inherits `A`'s state set verbatim, and a
+        /// randomly generated automaton with a state unreachable from `q0` can therefore
+        /// hit `docs/WALNUT-BUGS.md` WB-001 (the q0-aliasing quirk) and return a
+        /// legitimately "wrong" language. That is ported behavior, not a port defect, so
+        /// the generator is constrained to the shape where WB-001 provably cannot fire
+        /// (`trim` leaves every surviving state reachable from `q0`) rather than the
+        /// property being weakened to accommodate it. Trimming is language-preserving
+        /// and, for the quotient specifically, also *quotient*-preserving: a state that
+        /// cannot reach acceptance in `A` has `L(A from i) = ∅`, so it would have been
+        /// assigned output `0` anyway.
+        #[test]
+        fn right_quotient_matches_the_brute_force_quotient(
+            a in arb_partial_automaton_over(4, vec![0, 1]),
+            b in arb_partial_automaton_over(4, vec![0, 1]),
+        ) {
+            let mut a = a;
+            let mut b = b;
+            a.fa = crate::trim::trim(&a.fa);
+            b.fa = crate::trim::trim(&b.fa);
+
+            let m = right_quotient(&a, &b, false);
+            for x in all_digit_words(&[0, 1], 4) {
+                prop_assert_eq!(
+                    accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &x),
+                    brute_force_right_quotient(&a, &b, &[0, 1], &x),
+                    "right quotient disagrees on x = {:?}", x
+                );
+            }
+        }
+
+        /// Tier-4: `leftQuotient` against the brute-force set-theoretic quotient, on the
+        /// EQUAL-alphabet shape — the one shape on which WB-010's wrong-direction guard
+        /// is coincidentally right (see `left_quotient`'s doc comment), so naive
+        /// quotient semantics genuinely do apply and the port must compute them.
+        #[test]
+        fn left_quotient_matches_the_brute_force_quotient_on_equal_alphabets(
+            a in arb_partial_automaton_over(4, vec![0, 1]),
+            b in arb_partial_automaton_over(4, vec![0, 1]),
+        ) {
+            let mut a = a;
+            let mut b = b;
+            a.fa = crate::trim::trim(&a.fa);
+            b.fa = crate::trim::trim(&b.fa);
+
+            let m = left_quotient(&a, &b);
+            for z in all_digit_words(&[0, 1], 4) {
+                prop_assert_eq!(
+                    accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &z),
+                    brute_force_left_quotient(&a, &b, &[0, 1], &z),
+                    "left quotient disagrees on z = {:?}", z
+                );
+            }
+        }
+
+        /// Tier-4 **on WB-010's guarded shape**: `A` over `{0,1}`, `B` over `{0,1,2}`, so
+        /// `leftQuotient`'s `isSubsetA(A, B)` guard PASSES while the containment the
+        /// internal `rightQuotient` re-encode actually needs (`B ⊆ A`) does not hold.
+        /// `left_quotient_panics_on_the_wb_010_trigger_the_guard_misses` above pins one
+        /// hand-built input that reaches the resulting failure; this property covers the
+        /// whole shape, and it deliberately does NOT assert naive quotient semantics
+        /// everywhere — that would report the deliberately-ported-verbatim WB-010 quirk
+        /// as a test failure.
+        ///
+        /// What it asserts instead is the exact two-sided contract:
+        ///
+        /// * whenever the port **answers**, the answer is the textbook left quotient
+        ///   (over `A`'s own digit alphabet — the space `rightQuotient`'s re-encode maps
+        ///   `B` into); and
+        /// * the port may **fail** only on this documented shape. Since the generator
+        ///   here always produces `B ⊄ A`, the interesting half of that is enforced by
+        ///   the sibling property above, which uses equal alphabets and admits no
+        ///   failure at all.
+        ///
+        /// The panic is caught rather than predicted: whether `B`'s digit-`2` transitions
+        /// survive `left_quotient`'s internal `reverse_and_canonize` (and so reach the
+        /// re-encode at all) depends on `Fa::reverse`'s accepting-state seeding, which
+        /// no cheap syntactic predicate over `B` gets right — the hand-built pin above
+        /// records that exact mistake being made and caught. `cargo test`'s harness
+        /// captures the caught panic's message, so this produces no output noise.
+        #[test]
+        fn left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure(
+            a in arb_partial_automaton_over(3, vec![0, 1]),
+            b in arb_partial_automaton_over(3, vec![0, 1, 2]),
+        ) {
+            let mut a = a;
+            let mut b = b;
+            a.fa = crate::trim::trim(&a.fa);
+            b.fa = crate::trim::trim(&b.fa);
+            prop_assert!(is_subset_alphabet(&a.alphabet, &b.alphabet));
+            prop_assert!(!is_subset_alphabet(&b.alphabet, &a.alphabet));
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                left_quotient(&a, &b)
+            }));
+            let Ok(m) = outcome else {
+                // WB-010 fired. Ported verbatim; nothing more to check.
+                return Ok(());
+            };
+            for z in all_digit_words(&[0, 1], 4) {
+                prop_assert_eq!(
+                    accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &z),
+                    brute_force_left_quotient(&a, &b, &[0, 1], &z),
+                    "left quotient disagrees on z = {:?}", z
+                );
+            }
+        }
+    }
+
     // ------------------------------------------------------------------------
     // The TRUE/FALSE short-circuits (U0) — `AutomatonLogicalOps.java:45-149`.
     //
@@ -4588,20 +4878,84 @@ mod tests {
         (961, 3), (969, 3), (971, 3), (985, 3), (989, 3), (990, 3), (991, 3),
     ];
 
+    /// The rest of the same capture: every affected pair with `1000 < root <= 46340` (the
+    /// largest `root` with `root^2 <= 2^31`, i.e. the last one an `int` alphabet can hold).
+    ///
+    /// **Added in Phase 4, U31**, extending the sweep below from `root <= 1000` to the
+    /// whole `int`-representable range — the half `docs/WALNUT-BUGS.md` WB-032 describes
+    /// ("125 perfect squares are affected too, the smallest being `34225 = 185^2`") but
+    /// that no test previously touched. That gap mattered for a concrete reason: for
+    /// `root > 1000` the argument handed to [`java_log`] is up to `2^31`, well outside the
+    /// `2..=200_000` range over which `java_log` was verified bit-for-bit against a real
+    /// JVM, so nothing in this crate pinned its agreement with Java up there at all.
+    ///
+    /// **Captured from a real JVM** by the same recipe as the table above — a throwaway
+    /// driver evaluating Java's own `(int) (Math.log(x) / Math.log(root))` over the sweep
+    /// (`openjdk 11.0.16.1`, `aarch64`, the JVM WB-032's original capture used):
+    ///
+    /// ```java
+    /// for (long root = 2; root <= 46340; root++) {
+    ///     long x = root;
+    ///     for (int exponent = 2; ; exponent++) {
+    ///         x *= root;
+    ///         if (x > (long) Integer.MAX_VALUE) break;
+    ///         int got = (int) (Math.log((double) x) / Math.log((double) root));
+    ///         if (got != exponent) System.out.println("(" + root + ", " + exponent + ")");
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// That run reproduced the `root <= 1000` table above **entry for entry**, which is
+    /// the cross-check that the recapture is comparable to the original one; it reported
+    /// 343 affected pairs in total, exactly the figure WB-032 records. Every affected pair
+    /// (in both tables) has Java returning `exponent - 1`, never any other wrong value —
+    /// asserted below rather than assumed.
+    #[rustfmt::skip]
+    const WB032_AFFECTED_ROOT_GT_1000: &[(i32, i32)] = &[
+        (1003, 3), (1012, 3), (1014, 3), (1022, 3), (1025, 3), (1037, 3), (1052, 3), (1058, 3), (1064, 3),
+        (1067, 3), (1073, 3), (1074, 3), (1084, 3), (1093, 3), (1095, 3), (1103, 3), (1109, 3), (1113, 3),
+        (1117, 3), (1132, 3), (1133, 3), (1136, 3), (1137, 3), (1140, 3), (1142, 3), (1154, 3), (1156, 3),
+        (1160, 3), (1168, 3), (1170, 3), (1182, 3), (1186, 3), (1188, 3), (1190, 3), (1202, 3), (1206, 3),
+        (1207, 3), (1216, 3), (1218, 3), (1220, 3), (1222, 3), (1231, 3), (1242, 3), (1243, 3), (1246, 3),
+        (1248, 3), (1253, 3), (1254, 3), (1257, 3), (1272, 3), (1279, 3), (1283, 3), (1284, 3), (1285, 3),
+        (1290, 3), (1377, 2), (1459, 2), (1512, 2), (2486, 2), (2519, 2), (2662, 2), (2740, 2), (2766, 2),
+        (2865, 2), (4498, 2), (4847, 2), (5395, 2), (5396, 2), (5561, 2), (5632, 2), (5646, 2), (5853, 2),
+        (5992, 2), (5998, 2), (6074, 2), (6165, 2), (6177, 2), (6371, 2), (6888, 2), (6926, 2), (11036, 2),
+        (11359, 2), (11428, 2), (11511, 2), (11569, 2), (11647, 2), (11729, 2), (11841, 2), (11866, 2), (11903, 2),
+        (11978, 2), (12300, 2), (12306, 2), (12448, 2), (12451, 2), (12525, 2), (12613, 2), (12746, 2), (12885, 2),
+        (13117, 2), (13186, 2), (19995, 2), (20128, 2), (20753, 2), (21041, 2), (21152, 2), (21189, 2), (21552, 2),
+        (21658, 2), (21885, 2), (22414, 2), (22431, 2), (22551, 2), (22680, 2), (22952, 2), (23151, 2), (23669, 2),
+        (23679, 2), (23751, 2), (23759, 2), (23926, 2), (24318, 2), (24341, 2), (24443, 2), (24618, 2), (24885, 2),
+        (25276, 2), (25279, 2), (28050, 2), (28573, 2), (38415, 2), (38785, 2), (41380, 2), (41672, 2), (41836, 2),
+        (41863, 2), (42189, 2), (42322, 2), (42564, 2), (42639, 2), (42726, 2), (42819, 2), (42981, 2), (43003, 2),
+        (43093, 2), (43346, 2), (43408, 2), (43461, 2), (43634, 2), (43661, 2), (43867, 2), (44069, 2), (44137, 2),
+        (44184, 2), (44199, 2), (44331, 2), (44367, 2), (44497, 2), (44566, 2), (44594, 2), (44749, 2), (44915, 2),
+        (45008, 2), (45482, 2), (45495, 2), (45835, 2), (45931, 2), (45964, 2), (46027, 2), (46094, 2), (46169, 2),
+        (46224, 2), (46326, 2),
+    ];
+
     /// The real pin on [`truncated_log_ratio`]: a bounded sweep asserting the port computes
     /// **exactly what real Java computes**, right answers and WB-032's wrong ones alike, for
-    /// every `(root, exponent)` with `root <= 1000` and `root^exponent <= 2^31`.
+    /// every `(root, exponent)` with `root <= 46340` and `root^exponent <= 2^31` — i.e. for
+    /// every conversion an `int`-alphabet `convert` command can express.
     ///
     /// This is the test the module's first draft lacked. That draft checked only a handful
     /// of hand-picked pairs and a `< 3.0` guard on the `ln(1000)/ln(10)` quotient — neither
     /// of which can see a last-bit disagreement with Java on some *other* base, which is
     /// precisely how the `f64::ln` bug survived (`msd_3 -> msd_243` converted to `msd_81`).
+    /// Phase 4's U31 widened it from `root <= 1000` to the full range; see
+    /// [`WB032_AFFECTED_ROOT_GT_1000`] for the capture recipe and for why the wider range
+    /// is not redundant with the narrower one.
     #[test]
     fn truncated_log_ratio_agrees_with_real_java() {
-        let affected: HashSet<(i32, i32)> = WB032_AFFECTED_ROOT_LE_1000.iter().copied().collect();
+        let affected: HashSet<(i32, i32)> = WB032_AFFECTED_ROOT_LE_1000
+            .iter()
+            .chain(WB032_AFFECTED_ROOT_GT_1000)
+            .copied()
+            .collect();
         let mut swept = 0usize;
         let mut wrong = 0usize;
-        for root in 2i64..=1000 {
+        for root in 2i64..=46340 {
             let mut x = root;
             for exponent in 2i32.. {
                 x *= root;
@@ -4623,12 +4977,18 @@ mod tests {
             }
         }
         // Guards against the sweep silently collapsing (a bad bound would make the
-        // assertions above vacuous) and against the captured table going stale.
-        assert_eq!(swept, 2406, "the swept range changed");
+        // assertions above vacuous) and against the captured tables going stale.
+        assert_eq!(swept, 48036, "the swept range changed");
         assert_eq!(
             wrong,
-            WB032_AFFECTED_ROOT_LE_1000.len(),
+            WB032_AFFECTED_ROOT_LE_1000.len() + WB032_AFFECTED_ROOT_GT_1000.len(),
             "every captured WB-032 pair must be inside the swept range"
+        );
+        // `docs/WALNUT-BUGS.md` WB-032's own headline figure, so a table edit that
+        // silently changed the population would fail here rather than in prose.
+        assert_eq!(
+            wrong, 343,
+            "WB-032 records 343 affected (root, exponent) pairs"
         );
     }
 
@@ -4887,6 +5247,171 @@ mod tests {
                 "msd_2 -> {}_{base_mid} -> msd_2 must be the identity on the language",
                 if msd_mid { "msd" } else { "lsd" }
             );
+        }
+    }
+
+    // -------------------------------------------- Tier-4 property over `convert_ns`
+    //
+    // Phase 4, U31. Deliberately NOT a "`base_new == root^j`" property test: WB-032 is
+    // ported verbatim as a quirk, so on its 343 affected `(root, exponent)` pairs the port
+    // is *supposed* to disagree with the mathematics, and the only oracle that agrees with
+    // the port's intended behaviour there is the port itself (circular) or the JVM capture
+    // above (`truncated_log_ratio_agrees_with_real_java`, which is the right tool and
+    // already exists). What follows is the genuinely non-circular half: WB-032's own entry
+    // establishes that **every power of 2 is safe** (`log(2^n)/log(2)` is exact in binary
+    // floating point), so on a power-of-2 root the conversion has to be mathematically
+    // correct, and a from-scratch digit-regrouping oracle can say so.
+
+    /// `d` written as exactly `j` base-`k` digits, most significant first — the digit-level
+    /// meaning of "base `k^j`". Computed here by plain integer arithmetic; nothing in
+    /// `convert_ns`'s implementation is consulted.
+    fn expand_digit(d: i32, k: i32, j: usize) -> Vec<i32> {
+        let mut out = vec![0; j];
+        let mut rest = d;
+        for slot in (0..j).rev() {
+            out[slot] = rest % k;
+            rest /= k;
+        }
+        assert_eq!(rest, 0, "digit {d} does not fit in {j} base-{k} digits");
+        out
+    }
+
+    /// Every base-`base` word of length `0..=max_len`.
+    fn all_words_over(base: i32, max_len: usize) -> Vec<Vec<i32>> {
+        let digits: Vec<i32> = (0..base).collect();
+        let mut out = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for w in &frontier {
+                for &d in &digits {
+                    let mut w2 = w.clone();
+                    w2.push(d);
+                    next.push(w2);
+                }
+            }
+            out.extend(next.iter().cloned());
+            frontier = next;
+        }
+        out
+    }
+
+    /// Is every state of `fa` reachable from `q0` by a word whose LENGTH is a multiple of
+    /// `j`? A plain BFS over `(state, depth mod j)` pairs, written here rather than reused
+    /// from anywhere in the crate.
+    ///
+    /// This is exactly `docs/WALNUT-BUGS.md` **WB-001**'s precondition on this code path:
+    /// `convertMsdBaseToExponent` re-keys the transition table by digit GROUPS of size `j`,
+    /// so a state reachable only "mid-group" becomes unreachable from `q0`, and the
+    /// `minimizeSelfWithOutput` that immediately follows runs Valmari on a table violating
+    /// its reachability precondition — silently corrupting the language, in Java and in
+    /// this port alike (`convert_ns_reaches_wb_001_when_regrouping_strands_a_state` pins
+    /// the 2-state parity fixture where it bites, verified live against the real jar). The
+    /// property below therefore *constrains its generator away from that shape* rather than
+    /// weakening its oracle to accommodate a deliberately-ported quirk.
+    fn every_state_reachable_at_a_multiple_of(fa: &Fa, j: usize) -> bool {
+        let mut seen = vec![vec![false; j]; fa.q];
+        let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+        seen[fa.q0][0] = true;
+        queue.push_back((fa.q0, 0));
+        while let Some((s, phase)) = queue.pop_front() {
+            for dests in fa.d[s].values() {
+                for &t in dests {
+                    let next = (phase + 1) % j;
+                    if !seen[t][next] {
+                        seen[t][next] = true;
+                        queue.push_back((t, next));
+                    }
+                }
+            }
+        }
+        (0..fa.q).all(|s| seen[s][0])
+    }
+
+    /// A TOTAL random single-track `msd_2` automaton (every state has both digits), so
+    /// `convert_ns`'s own `totalize` never runs and the state set the oracle reasons about
+    /// is exactly the generated one.
+    fn arb_total_msd2_automaton(q_max: usize) -> impl Strategy<Value = Automaton> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let o = prop::collection::vec(0i32..=1, q);
+            let trans = prop::collection::vec(prop::collection::vec(0usize..q, 2), q);
+            (o, trans).prop_map(move |(o, trans)| {
+                let d = trans
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(sym, &dest)| (sym as i32, vec![dest]))
+                            .collect::<BTreeMap<i32, Vec<usize>>>()
+                    })
+                    .collect();
+                Automaton::new(
+                    Fa {
+                        true_false: None,
+                        q0: 0,
+                        q,
+                        alphabet_size: 2,
+                        o,
+                        d,
+                    },
+                    vec![vec![0, 1]],
+                    vec!["x".to_string()],
+                    vec![Some(true)],
+                )
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Tier-4: `convertNS` from `msd_2` to `msd_{2^j}` denotes the same set of
+        /// integers, checked against a from-scratch digit-regrouping oracle.
+        ///
+        /// The oracle is `expand_digit` — "one base-`2^j` digit *is* `j` base-2 digits" —
+        /// applied to the ORIGINAL automaton, and nothing else; it never calls
+        /// `convert_ns`, `convert_msd_base_to_exponent`, `truncated_log_ratio`, `java_log`
+        /// or `equiv`. Because `value_{2^j}(w) == value_2(expand(w))` (asserted below, so
+        /// the digit-level statement really is the integer-level one), this says exactly
+        /// that the converted automaton accepts the same integers as the original —
+        /// presented to each in its own base, at the corresponding representation length.
+        ///
+        /// Restricted to base 2 on purpose (WB-032: every power of 2 is provably
+        /// unaffected by the truncated-log quirk, so here the port must be RIGHT, not
+        /// merely bug-compatible), and constrained away from WB-001's stranded-state shape
+        /// — see [`every_state_reachable_at_a_multiple_of`].
+        #[test]
+        fn convert_ns_to_a_power_of_two_base_preserves_the_integer_language(
+            a in arb_total_msd2_automaton(4),
+            j in 2usize..=3,
+        ) {
+            if !every_state_reachable_at_a_multiple_of(&a.fa, j) {
+                // WB-001's precondition is violated: both engines corrupt the language
+                // here, by design. Skipped, not asserted away.
+                return Ok(());
+            }
+            let to_base = 2i32.pow(j as u32);
+            let mut converted = a.clone();
+            convert_ns(&mut converted, true, to_base).expect("msd_2 -> msd_2^j must succeed");
+            prop_assert_eq!(&converted.alphabet, &vec![util::int_range_list(to_base)]);
+            prop_assert_eq!(&converted.msd, &vec![Some(true)]);
+
+            for w in all_words_over(to_base, 3) {
+                let expanded: Vec<i32> =
+                    w.iter().flat_map(|&d| expand_digit(d, 2, j)).collect();
+                // The oracle's own sanity guard: the two words really do denote the same
+                // integer, so "same acceptance" really is "same integer language".
+                let v_hi = w.iter().fold(0i64, |acc, &d| acc * i64::from(to_base) + i64::from(d));
+                let v_lo = expanded.iter().fold(0i64, |acc, &d| acc * 2 + i64::from(d));
+                prop_assert_eq!(v_hi, v_lo);
+
+                prop_assert_eq!(
+                    converted.fa.accepts_word(&w),
+                    a.fa.accepts_word(&expanded),
+                    "msd_2 -> msd_{} disagrees on base-{} word {:?} (= base-2 {:?})",
+                    to_base, to_base, w, expanded
+                );
+            }
         }
     }
 }
