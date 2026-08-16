@@ -461,6 +461,20 @@ mod tests {
     /// hand tests above and by `quantified_language_is_closed_under_leading_zeros`, which
     /// uses the unpinned generator.
     fn arb_two_track(q_max: usize, pin_zero_class: bool) -> impl Strategy<Value = Automaton> {
+        arb_two_track_in_direction(q_max, pin_zero_class, true)
+    }
+
+    /// [`arb_two_track`] with the numeration DIRECTION as a parameter (Phase 4, U31).
+    ///
+    /// The pre-U31 generator was hard-wired to `msd: vec![Some(true), Some(true)]`, so
+    /// every Tier-4 property in this file exercised only `determineMsd`'s `Some(true)`
+    /// arm — i.e. only `fixLeadingZerosProblem`. Phase 3b's L1 wired up the `Some(false)`
+    /// arm (`fixTrailingZerosProblem`); this is what lets a property test reach it.
+    fn arb_two_track_in_direction(
+        q_max: usize,
+        pin_zero_class: bool,
+        msd: bool,
+    ) -> impl Strategy<Value = Automaton> {
         (1..=q_max).prop_flat_map(move |q| {
             let o = prop::collection::vec(0i32..=1, q);
             let table = prop::collection::vec(
@@ -495,7 +509,7 @@ mod tests {
                     },
                     vec![vec![0, 1], vec![0, 1]],
                     vec!["y".to_string(), "x".to_string()],
-                    vec![Some(true), Some(true)],
+                    vec![Some(msd), Some(msd)],
                 );
                 if pin_zero_class {
                     for y in [0, 1] {
@@ -526,6 +540,28 @@ mod tests {
             }
         }
         false
+    }
+
+    /// One step of the pure ∃`y`-projection, as a subset transition over the ORIGINAL
+    /// two-track automaton: union the destinations of `(y, x_digit)` over both `y` values.
+    /// Linear in the subset size, so the property above needs no `2^|w|` enumeration —
+    /// unlike [`brute_force_exists_y`], which is fine for a fixed short word but not for
+    /// the zero-padding closure this feeds.
+    fn projected_step(
+        original: &Automaton,
+        subset: &BTreeSet<usize>,
+        x_digit: i32,
+    ) -> BTreeSet<usize> {
+        let mut next = BTreeSet::new();
+        for y in [0, 1] {
+            let sym = original.encode(&[y, x_digit]);
+            for &s in subset {
+                if let Some(dests) = original.fa.d[s].get(&sym) {
+                    next.extend(dests.iter().copied());
+                }
+            }
+        }
+        next
     }
 
     proptest! {
@@ -572,6 +608,81 @@ mod tests {
             padded.extend_from_slice(&word);
 
             prop_assert_eq!(a.fa.accepts_word(&word), a.fa.accepts_word(&padded));
+        }
+
+        /// Tier-4, the **lsd** half (Phase 4, U31 — this file had none).
+        ///
+        /// On an lsd automaton `quantify` runs `fixTrailingZerosProblem`, not
+        /// `fixLeadingZerosProblem`, and the two are genuinely **not** mirror images (see
+        /// `wr_core::logicalops::fix_trailing_zeros_problem`'s doc comment, and
+        /// `CLAUDE.md`'s Phase-3b/L1 note: "leading closes under prepending zeros;
+        /// trailing only right-quotients"). So this is deliberately NOT the mirror of
+        /// `quantified_language_is_closed_under_leading_zeros` above. The exact statement:
+        ///
+        /// ```text
+        /// L(∃y A)  =  { w : ∃k ≥ 0, w·0^k ∈ L(pure ∃y-projection of A) }
+        /// ```
+        ///
+        /// The oracle computes both halves of that from the ORIGINAL two-track automaton
+        /// and nothing else: [`projected_step`] is a hand-written NFA subset walk that
+        /// unions over `y ∈ {0,1}` at every position (the definition of ∃-projection), and
+        /// the `∃k` is decided by iterating that subset under the zero letter — never
+        /// guessing a length bound, because the subsets live in a space of at most `2^q`
+        /// elements, so a repeat is reached within `2^q` steps. It calls neither `exists`,
+        /// nor `quantify`, nor either zero fixup, nor `determinize`/`minimize`.
+        ///
+        /// This is strictly stronger than a separate "projection is right" plus "fixup is
+        /// right" pair: it pins the composition, which is what `quantify`'s lsd arm
+        /// actually computes.
+        ///
+        /// The corollary asserted at the end is the asymmetry itself: the result is closed
+        /// under REMOVING a trailing zero. The mirror direction (adding one) is genuinely
+        /// FALSE for this fixup and is deliberately not asserted — `w ∈ L` only says some
+        /// zero-extension of `w` was in the projection, which says nothing about `w0`.
+        #[test]
+        fn lsd_quantify_is_the_projection_right_quotiented_by_trailing_zeros(
+            original in arb_two_track_in_direction(4, false, false),
+            x_digits in prop::collection::vec(0i32..2, 0..4),
+        ) {
+            let mut a = original.clone();
+            exists(&mut a, &labels(&["y"])).unwrap();
+            prop_assert_eq!(&a.msd, &vec![Some(false)], "the surviving track stays lsd");
+
+            // The pure ∃y-projection, as a subset of the ORIGINAL automaton's states.
+            let mut subset: BTreeSet<usize> = BTreeSet::from([original.fa.q0]);
+            for &d in &x_digits {
+                subset = projected_step(&original, &subset, d);
+            }
+            // ∃k ≥ 0 with w·0^k in the projection: iterate the subset under the zero
+            // letter. At most 2^q distinct subsets exist, so 2^q steps suffice.
+            let mut expected = false;
+            let mut seen: BTreeSet<BTreeSet<usize>> = BTreeSet::new();
+            loop {
+                if subset.iter().any(|&s| original.fa.is_accepting(s)) {
+                    expected = true;
+                    break;
+                }
+                if subset.is_empty() || !seen.insert(subset.clone()) {
+                    break;
+                }
+                subset = projected_step(&original, &subset, 0);
+            }
+
+            let word: Vec<i32> = x_digits.iter().map(|&d| a.encode(&[d])).collect();
+            prop_assert_eq!(
+                a.fa.accepts_word(&word), expected,
+                "lsd quantification is not the right quotient by 0* at x = {:?}", x_digits
+            );
+
+            let zero = a.encode(&[0]);
+            let mut with_zero = word.clone();
+            with_zero.push(zero);
+            if a.fa.accepts_word(&with_zero) {
+                prop_assert!(
+                    a.fa.accepts_word(&word),
+                    "not closed under REMOVING a trailing zero at x = {:?}", x_digits
+                );
+            }
         }
 
         /// Structural post-conditions of `exists`: the quantified track is gone from every

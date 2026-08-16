@@ -1012,6 +1012,7 @@ impl Transducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A single-track `msd_2`-shaped DFAO with the given per-state outputs and
     /// transition table; `d[state]` lists `(symbol, destination)` pairs, so a state
@@ -2108,5 +2109,174 @@ mod tests {
         assert_eq!(c.label, vec!["n".to_string()]);
         assert_eq!(c.alphabet, vec![vec![0, 1]]);
         assert_eq!(c.msd, vec![Some(true)]);
+    }
+    // ---------------------------------------------------- Tier-4 property (Phase 4, U31)
+
+    /// A TOTAL random single-track `msd_2` DFAO: every state has a destination on both
+    /// digits, and every output is in `{0, 1}`.
+    ///
+    /// Totality is the load-bearing constraint. `transduceNonDeterministic` routes a total
+    /// `M` straight to `transduceMsdDeterministic` and never enters the dead-state branch,
+    /// which is where `docs/WALNUT-BUGS.md` **WB-035** lives — its `minOutput` marker is
+    /// used both as an un-encoded transducer INPUT symbol and as a marker in the RESULT's
+    /// output alphabet, and it is ported verbatim as a bug. A mathematical oracle
+    /// disagrees with the port BY DESIGN on every WB-035 trigger, so a generator that
+    /// reached that branch would drown the genuine Dekking-construction signal this
+    /// property exists to check. (WB-035 has three dedicated tests of its own above,
+    /// including the one-value-different control; it is covered, just not here.)
+    ///
+    /// `msd = Some(true)` for the same class of reason: the lsd direction reverses `M`
+    /// before transducing and reverses the result afterwards, which is a different code
+    /// path with its own (separately closed) history.
+    fn arb_total_msd_dfao(q_max: usize) -> impl Strategy<Value = Automaton> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let o = prop::collection::vec(0i32..=1, q);
+            let trans = prop::collection::vec(prop::collection::vec(0usize..q, 2), q);
+            (o, trans).prop_map(move |(o, trans)| {
+                let d: Vec<BTreeMap<i32, Vec<usize>>> = trans
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .enumerate()
+                            .map(|(sym, &dest)| (sym as i32, vec![dest]))
+                            .collect()
+                    })
+                    .collect();
+                Automaton::new(
+                    Fa {
+                        true_false: None,
+                        q0: 0,
+                        q,
+                        alphabet_size: 2,
+                        o,
+                        d,
+                    },
+                    vec![vec![0, 1]],
+                    vec!["x".to_string()],
+                    vec![Some(true)],
+                )
+            })
+        })
+    }
+
+    /// A TOTAL transducer over the input alphabet `{0, 1}` — every state has a transition
+    /// AND a `sigma` entry for both letters — with NON-NEGATIVE outputs.
+    ///
+    /// Totality keeps `createMap`/`sigma` out of `TransduceError::NoTransducerTransition`/
+    /// `NoTransducerOutput` (Java's two uncaught NPEs on a partial transducer, ported as
+    /// rejections and pinned by their own tests); the `{0, 1}` alphabet matches the
+    /// generated `M`'s output values exactly, so `transduceNonDeterministic`'s
+    /// compatibility guard passes and `encode_input` is the identity — the coincidence
+    /// WB-035's half (1) depends on, kept deliberately intact here so this property is
+    /// about the construction and not about that quirk.
+    fn arb_total_transducer(q_max: usize) -> impl Strategy<Value = Transducer> {
+        (1..=q_max).prop_flat_map(move |q| {
+            let dests = prop::collection::vec(prop::collection::vec(0usize..q, 2), q);
+            let outs = prop::collection::vec(prop::collection::vec(0i32..=2, 2), q);
+            (dests, outs).prop_map(move |(dests, outs)| {
+                let rows: Vec<Vec<(i32, usize, i32)>> = dests
+                    .iter()
+                    .zip(outs.iter())
+                    .map(|(drow, orow)| {
+                        (0..2)
+                            .map(|letter| (letter as i32, drow[letter], orow[letter]))
+                            .collect()
+                    })
+                    .collect();
+                let borrowed: Vec<&[(i32, usize, i32)]> = rows.iter().map(Vec::as_slice).collect();
+                transducer(&[0, 1], &borrowed)
+            })
+        })
+    }
+
+    proptest! {
+        // Each case builds a whole transduction (a periodicity search plus a BFS whose
+        // per-state cost grows with the words it carries), so this runs well under the
+        // default case count — `CLAUDE.md`'s "generate SMALL" guardrail, and the same
+        // `ProptestConfig` discipline `numsys.rs` applies to its expensive constructions.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Tier-4: the Dekking transduction really is "run the transducer along the
+        /// automatic sequence", checked against a step-by-step brute-force oracle.
+        ///
+        /// For a `k`-digit input word `w` denoting `n`, let `a_j` be `M`'s output on the
+        /// `k`-digit representation of `j`. The result `N` must satisfy
+        ///
+        /// ```text
+        /// N(w) = sigma_T( delta_T(T.q0, a_0 a_1 … a_{n-1}), a_n )
+        /// ```
+        ///
+        /// i.e. `N`'s output at `n` is what the transducer emits when it reaches position
+        /// `n` of the sequence, having already consumed positions `0 … n-1`.
+        ///
+        /// The oracle walks `M` once per position and then walks `T` along the resulting
+        /// letter sequence, using only `Fa::d` / `Fa::o` / `sigma` lookups. It never calls
+        /// `transduce_*`, `create_map`, `create_iterates`, `get_destination_for_dfa` or
+        /// `minimize_self_with_output`, and in particular it knows nothing about the
+        /// `phi_a` state-map machinery or the `(M-state, iterates)` BFS key that the
+        /// construction is actually built out of — so a wrong lag/period, a wrong
+        /// `stateMorphed` index, or a wrong `iterates[0][T.q0]` read shows up here as a
+        /// disagreement rather than being re-derived.
+        ///
+        /// Note this needs no prolongability assumption on `M` (`delta_M(q0, 0) == q0` is
+        /// NOT required): the oracle re-reads the level-`k` sequence at the same width `k`
+        /// the automaton is being asked about.
+        #[test]
+        fn transduction_matches_a_step_by_step_oracle(
+            m in arb_total_msd_dfao(3),
+            t in arb_total_transducer(2),
+            k in 1usize..=3,
+            n_raw in 0usize..8,
+        ) {
+            let original = m.clone();
+            let mut m = m;
+            let mut logging = Logging::new();
+            // A tight explicit budget rather than the (huge) default: this is the fast
+            // test tier, and an over-budget case is skipped, never silently passed as a
+            // success. See this module's "Cost" docs for why no cheaper a-priori bound on
+            // the work exists.
+            let budget = TransduceBudget {
+                max_map_steps: 2_000_000,
+                max_bfs_states: 2_000,
+                max_word_len: 100_000,
+            };
+            let n_result = t.transduce_non_deterministic_with_budget(&mut m, &mut logging, budget);
+            if matches!(n_result, Err(TransduceError::Exploded(_))) {
+                return Ok(());
+            }
+            let n_auto = n_result.expect("the generators exclude every other error path");
+
+            let width = 1usize << k; // 2^k, the number of positions at this width
+            let n = n_raw % width;
+
+            // a_j = M's output on the k-digit msd representation of j.
+            let letter_at = |j: usize| -> i32 {
+                let mut state = original.fa.q0;
+                for slot in (0..k).rev() {
+                    let digit = ((j >> slot) & 1) as i32;
+                    state = original.fa.d[state][&digit][0];
+                }
+                original.fa.o[state]
+            };
+
+            // Run T along a_0 … a_{n-1}, then emit on a_n.
+            let mut t_state = t.automaton.fa.q0;
+            for j in 0..n {
+                let sym = t.encode_input(letter_at(j));
+                t_state = t.automaton.fa.d[t_state][&sym][0];
+            }
+            let expected = t.sigma[t_state][&t.encode_input(letter_at(n))];
+
+            // And read N at the same position.
+            let mut state = n_auto.fa.q0;
+            for slot in (0..k).rev() {
+                let digit = ((n >> slot) & 1) as i32;
+                state = n_auto.fa.d[state][&digit][0];
+            }
+            prop_assert_eq!(
+                n_auto.fa.o[state], expected,
+                "transduction disagrees at position {} of the width-{} sequence", n, k
+            );
+        }
     }
 }
