@@ -1868,6 +1868,52 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-038 — `AutomatonReader` silently accepts out-of-alphabet transition digits, encoding them to a bogus `-1` key that either corrupts the automaton or crashes a later write
+
+- **Where:** `Automata/AutomatonReader.java`, `readAutomaton` (`:71-72`) and `readTransducer`
+  (`:245-247`), both calling `RichAlphabet.encode` (`RichAlphabet.java:110-116`).
+- **What:** `validateTransition` (`:113-124`) checks only the transition's **arity**, never
+  whether each digit is in its track's alphabet. `RichAlphabet.encode` computes
+  `Math.addExact(encoding, Math.multiplyExact(encoder.getInt(i), A.get(i).indexOf(l.get(i))))` —
+  `List.indexOf` returns `-1` for an absent digit, so the term is `-encoder[i]` and the transition
+  is stored in `Int2ObjectRBTreeMap` under a key no valid input can produce. Nothing downstream
+  reconciles it. Three outcomes, all silent at read time: (a) an undeclared destination is caught
+  later by `validateDeclaredStates` (`:191`) — the one case with a good message, and it is a
+  *coincidence*, not a check for this; (b) the `-1` key survives into an ordinary automaton and is
+  dropped by the next pass that iterates `0..alphabetSize`, so Walnut writes out a **different
+  language than the file described, with no diagnostic**; (c) the key reaches
+  `AutomatonWriter.writeToGV` (`:142`) → `RichAlphabet.decode` (`:130`) → `ArrayList.get(-1)` →
+  uncaught `IndexOutOfBoundsException`.
+- **Trigger:** any `.txt` library file with a body digit outside its header's alphabet (incl. a
+  negative digit under `msd_k`). **Confirmed live** against `Walnut-all.jar` (2026-08-16):
+  `Automata Library/fw.txt` = `msd_2 / 0 0 / 0 -> 0 / 1 -> 1 / 1 1 / 0 -> 0 / 5 -> 1` →
+  `def f2e "?msd_2 $fw(x)";` succeeds silently and writes the input **minus** the `5 -> 1` line.
+  `Automata Library/fy.txt` = ` lsd_2 / 0 1 / 20 -> 0` → `eval f2b "?lsd_2 $fy(x)";` prints
+  `java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 2` and the session
+  continues (`Prover.readBuffer`'s `catch (RuntimeException)`). A direct `new Automaton(path)` on
+  either file returns normally (1 and 2 states) — the reader itself never objects.
+- **Found:** Phase 4, U30 (fuzz-testing `wr-io`'s `.txt` reader), finding F2, 2026-08-16.
+  Root-caused by compiling a driver against the jar's own classes to get the untruncated stack
+  trace, after the truncated REPL trace pointed at the wrong frame.
+- **Rust port:** `ported verbatim (quirk)`. `Automaton::encode_index_of` reproduces the `-1` key,
+  used by both the automaton and transducer readers; `Automaton::encode`'s panic is retained for
+  callers whose digits come from an alphabet this crate itself built (not raw file input). One
+  knock-on difference is *not* replicated: `Automaton::decode` uses `rem_euclid`/`div_euclid`
+  where Java uses truncating `%`/`/`, so `decode(-1)` returns a digit here where Java throws —
+  meaning outcome (c) above yields a written-but-wrong automaton on this port rather than Java's
+  exception. This is a **pre-existing, separate** divergence (not introduced by this fix), flagged
+  in `RESUME-HERE.md` as a candidate follow-up unit (closing it either means adding a Java-matching
+  bounds check that turns this port's silent corruption into a clean error — a deliberate
+  improvement over Java, since Java's own behavior here is undesirable even on its own terms — or
+  explicitly deciding to leave it, but either way it needs its own scoped unit, not a fold-in).
+- **Upstream:** not filed. A per-digit alphabet-membership check in `validateTransition`, alongside
+  its existing arity check, would fix it in Java.
+- **Severity:** medium — this is silent wrong output on a plausible input (a hand-edited or
+  corrupted library file), not just a crash; outcome (b) is the more concerning half since it
+  produces no diagnostic at all.
+
+---
+
 ## Not-yet-confirmed / flagged as a question, not a finding
 
 - **`Image.determineImageNumberSystemPrefix` returns `""`** when the referenced word automaton has
