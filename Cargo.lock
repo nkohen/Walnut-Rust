@@ -472,6 +472,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wr-differential-gen"
+version = "0.0.0"
+dependencies = [
+ "wr-cli",
+ "wr-core",
+ "wr-io",
+]
+
+[[package]]
 name = "wr-golden"
 version = "0.0.0"
 dependencies = [

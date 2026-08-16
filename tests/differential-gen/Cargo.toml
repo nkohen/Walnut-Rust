@@ -1,0 +1,18 @@
+[package]
+name = "wr-differential-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+wr-cli = { path = "../../crates/wr-cli" }
+wr-core = { path = "../../crates/wr-core" }
+wr-io = { path = "../../crates/wr-io" }
+# No RNG crate: the generator uses a hand-rolled SplitMix64 (see `tests/support/mod.rs`).
+# A ~15-line, fully specified bit-mixer is both cheaper than a new dependency (the root
+# `Cargo.toml`'s "keep the tree lean" rule) and STRICTER on the property this harness
+# actually needs — that a recorded seed replays the exact same 10^5-query stream on any
+# machine and any future toolchain, which `rand`'s own docs explicitly do NOT promise
+# across minor versions.

@@ -13,6 +13,7 @@ members = [
     "crates/wr-cts",    # thin adapter over RustConstantTermSequences primitives (see DESIGN.md §4)
     "tests/differential", # Tier 3: Rust-vs-real-walnut-java query comparison, generated/captured live
     "tests/golden",       # Tier 1: replay of Walnut's own recorded integration-test corpus (U27)
+    "tests/differential-gen", # Tier 3 at scale: generated queries vs a long-lived walnut-java JVM oracle (U29)
 ]
 
 [workspace.package]
