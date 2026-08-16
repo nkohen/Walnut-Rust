@@ -318,6 +318,13 @@ pub enum Answer {
     Error(String),
     /// A JVM `Error` (OOM / StackOverflow). Not a semantic answer: the harness records
     /// `skip-too-big` and restarts the child, because the JVM's state is no longer trusted.
+    ///
+    /// The restart is the CALLER's job — `ask` cannot do it, because the response is a
+    /// perfectly well-formed protocol message and the pipe is still in sync. `../soak.rs`'s
+    /// query loop calls [`JavaOracle::respawn`] on every `Fatal`; anything else that drives
+    /// this oracle must do the same. (`DiffGenDriver` catches `Throwable` broadly and keeps
+    /// looping, so without that restart the rest of the run would be answered by a JVM with a
+    /// wounded heap and a static `Session` of unknown state.)
     Fatal(String),
 }
 
@@ -356,6 +363,24 @@ pub enum OracleError {
     /// The child died, the protocol desynchronized, or the response was malformed. Also
     /// already restarted.
     Protocol(String),
+}
+
+/// The pipe's synchronization check: the id the oracle echoed must be EXACTLY the decimal
+/// rendering of the id we asked for.
+///
+/// This is the load-bearing invariant of the whole protocol. If a response from a killed or
+/// lagging child were ever accepted as the answer to a later query, every subsequent verdict
+/// would compare the Rust port against the wrong oracle answer — producing a flood of phantom
+/// divergences, or (far worse) a phantom *match* that hides a real one. So the comparison is
+/// exact and total: no trimming, no numeric re-parse, no "close enough".
+pub fn check_query_id_echo(asked: u64, echoed: &str) -> Result<(), OracleError> {
+    if echoed == asked.to_string() {
+        Ok(())
+    } else {
+        Err(OracleError::Protocol(format!(
+            "pipe desynchronized: asked query_id {asked}, the oracle echoed {echoed:?}"
+        )))
+    }
 }
 
 /// One long-lived `walnut-java` JVM, driven over the pipe protocol in `../../CAPTURE.md`.
@@ -466,10 +491,10 @@ impl JavaOracle {
 
         // THE load-bearing invariant (plan, review finding B2): a desynchronized pipe must be
         // loud and immediate, never a flood of phantom divergences over the rest of the run.
-        if echoed != id.to_string() {
-            let e = OracleError::Protocol(format!(
-                "pipe desynchronized: asked query_id {id}, the oracle echoed {echoed:?}"
-            ));
+        // The comparison itself lives in `check_query_id_echo` so it is directly unit-testable
+        // with a hand-fed desynchronized response — a review round found that mutating the
+        // check to a no-op here left every existing test green.
+        if let Err(e) = check_query_id_echo(id, &echoed) {
             let _ = self.respawn();
             return Err(e);
         }
@@ -528,6 +553,19 @@ fn spawn_child(
     heap: &str,
 ) -> Result<(Child, ChildStdin, Receiver<Vec<u8>>), String> {
     let classpath = format!("{}:{}", jar.display(), classes.display());
+    // The child's stderr is APPENDED to one file per scratch tree, across restarts, rather
+    // than discarded: a JVM that dies of an `OutOfMemoryError`, or a `java` that refuses the
+    // classpath, says so only there. Discarding it made the one failure mode this oracle is
+    // most likely to hit (a wounded heap) undiagnosable after the fact. Falling back to
+    // `null` if the file cannot be opened keeps a read-only scratch tree from failing the run.
+    let stderr = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(scratch.join("jvm-stderr.log"))
+    {
+        Ok(f) => Stdio::from(f),
+        Err(_) => Stdio::null(),
+    };
     let mut child = Command::new(jdk_tool("java"))
         .arg(heap)
         .arg("-cp")
@@ -536,7 +574,7 @@ fn spawn_child(
         .arg(scratch)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| format!("spawning the JVM oracle (is `java` on PATH?): {e}"))?;
 
@@ -832,6 +870,51 @@ mod tests {
             Answer::Fatal("java.lang.OutOfMemoryError".to_string())
         );
         assert!(decode_answer("automation", "typo").is_err());
+    }
+
+    // -- the query-id echo check ----------------------------------------------
+
+    /// The synchronized case: the only input that may be accepted.
+    #[test]
+    fn a_matching_query_id_echo_is_accepted() {
+        assert!(check_query_id_echo(1, "1").is_ok());
+        assert!(check_query_id_echo(0, "0").is_ok());
+        assert!(check_query_id_echo(10_000, "10000").is_ok());
+        assert!(check_query_id_echo(u64::MAX, &u64::MAX.to_string()).is_ok());
+    }
+
+    /// The regression guard for the protocol's load-bearing invariant. A review round mutated
+    /// the check inside `ask` to a no-op and the whole suite stayed green; these cases fail
+    /// against any such mutation. The `"1"`-vs-`2` and `"2"`-vs-`1` pair are the two real
+    /// desync shapes: a STALE response from a killed child (the echo lags the request) and a
+    /// response that has run AHEAD (the harness lost a record).
+    #[test]
+    fn a_desynchronized_query_id_echo_is_a_protocol_fault() {
+        for (asked, echoed) in [
+            (2u64, "1"),         // a stale answer from the previous, killed query
+            (1u64, "2"),         // the reader dropped a record and is running ahead
+            (7u64, " 7"),        // whitespace is NOT trimmed: the record framing is exact
+            (7u64, "7 "),        //
+            (7u64, "07"),        // no numeric re-parse: only the exact decimal rendering matches
+            (7u64, "+7"),        //
+            (7u64, ""),          // an empty record (e.g. two adjacent NULs)
+            (7u64, "\0"),        //
+            (7u64, "7\n"),       // a trailing newline is part of the record, not a delimiter
+            (7u64, "automaton"), // the record boundary itself slipped by one field
+        ] {
+            let got = check_query_id_echo(asked, echoed);
+            match got {
+                Err(OracleError::Protocol(why)) => {
+                    assert!(
+                        why.contains("desynchronized") && why.contains(&asked.to_string()),
+                        "the fault must name the mismatch: {why}"
+                    );
+                }
+                other => panic!(
+                    "asked {asked}, echoed {echoed:?}: expected a protocol fault, got {other:?}"
+                ),
+            }
+        }
     }
 
     // -- the comparator -------------------------------------------------------

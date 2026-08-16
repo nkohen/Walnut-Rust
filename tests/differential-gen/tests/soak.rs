@@ -107,9 +107,10 @@ fn milestone_0_soak() {
 
     let scratch = scratch_root(seed);
     let jvm_dir = scratch.join("jvm");
+    let stage_dir = scratch.join("stage");
     let rust_home = scratch.join("rust");
     let rust_session = rust_home.join("Session");
-    for d in [&jvm_dir, &rust_home, &rust_session] {
+    for d in [&jvm_dir, &stage_dir, &rust_home, &rust_session] {
         fs::create_dir_all(d).unwrap_or_else(|e| panic!("creating {}: {e}", d.display()));
     }
     // The Rust-side session tree, created once. Headless `eval "…";` writes nothing (Java's
@@ -160,9 +161,14 @@ fn milestone_0_soak() {
     // happened to be rejected by both engines would report "10,000 match" and look like
     // strong evidence while having compared no automaton at all — a false green.
     let mut by_kind: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut oracle_fatals = 0u64;
+    let mut fatal_restart_failures: Vec<String> = Vec::new();
 
-    let scratch_txt = scratch.join("java-result.txt");
-    let session_dir = rust_session.to_string_lossy().into_owned();
+    // BOTH paths carry a trailing separator, matching Java's own `Session.setPathsAndNames`
+    // and `tests/golden`'s `build_session_tree` (which returns both that way). Without it on
+    // `session_dir`, the port concatenates and writes into `…/rustSessionResult/` instead of
+    // `…/rust/Session/Result/` — observed live before this fix.
+    let session_dir = format!("{}/", rust_session.to_string_lossy());
     let home_dir = format!("{}/", rust_home.to_string_lossy());
 
     let query_loop = Instant::now();
@@ -197,7 +203,22 @@ fn milestone_0_soak() {
 
         let oracle_kind = java.kind();
         *by_kind.entry(oracle_kind).or_default() += 1;
-        let verdict = rust_verdict(&session_dir, &home_dir, &scratch_txt, &query, java);
+
+        // A JVM `Error` (OOM / StackOverflow) is a well-formed protocol response, so `ask`
+        // does NOT restart the child for it — but `DiffGenDriver` catches `Throwable` broadly
+        // and keeps looping, which leaves every later query answered by a JVM with a wounded
+        // heap and a static `Session` of unknown state. Restart it here, before the next
+        // query. A failed restart is recorded and reported, not panicked over: the run's own
+        // gate below will notice if the oracle is genuinely gone.
+        if matches!(java, Answer::Fatal(_)) {
+            oracle_fatals += 1;
+            if let Err(e) = oracle.respawn() {
+                fatal_restart_failures.push(format!("index {index}: {e}"));
+                println!("[{index}] WARNING: restart after a JVM error failed: {e}");
+            }
+        }
+
+        let verdict = rust_verdict(&session_dir, &home_dir, &stage_dir, query_id, &query, java);
         match &verdict {
             Verdict::Match => matches += 1,
             Verdict::SkipTooBig(_) => skips += 1,
@@ -237,7 +258,9 @@ fn milestone_0_soak() {
     println!("skip-too-big     : {skips}");
     println!("  jvm timeouts   : {oracle_timeouts}");
     println!("  protocol faults: {oracle_protocol_faults}");
+    println!("  jvm errors     : {oracle_fatals}");
     println!("jvm restarts     : {}", oracle.restarts);
+    println!("failed restarts  : {}", fatal_restart_failures.len());
     println!("oracle answers by kind:");
     for (kind, n) in &by_kind {
         println!("  {kind:<10}: {n}");
@@ -267,6 +290,94 @@ fn milestone_0_soak() {
             divergences.len()
         );
     }
+
+    assert_healthy_run(
+        total,
+        matches,
+        skips,
+        divergences.len() as u64,
+        oracle_protocol_faults,
+        &fatal_restart_failures,
+        by_kind.get("automaton").copied().unwrap_or(0),
+    );
+}
+
+/// The **anti-false-green gate**, run after the divergence check.
+///
+/// "No divergences" alone is not evidence of anything. If the oracle degrades mid-run — a JVM
+/// that OOMs and stays wounded, a wedged child, a stale jar — every query becomes a
+/// `skip-too-big`, the divergence list stays empty, and this test reports PASS having compared
+/// literally nothing. So the run must also look like a run that DID the work.
+///
+/// **A failure here says the HARNESS or the ORACLE is broken, not that the port is.** It is a
+/// statement about the shape of the run, not about walnut-rs's semantics — the port-defect
+/// signal is the divergence panic above, which has already fired by this point if it applies.
+///
+/// The thresholds:
+/// * **accounting is total** — every query ends up in exactly one bucket. Not a health
+///   threshold but an invariant: if it fails, the loop's bookkeeping is wrong and every other
+///   number printed above (including "0 divergences") is untrustworthy.
+/// * **`matches > 0`** — the minimal proof that the comparison path ran at all.
+/// * **at least half the oracle's answers were automata** — the point of a Tier-3 run is to
+///   exercise `wr_core::equiv` against real automata; a run answered entirely in `true`/
+///   `false`/`error` compares no transition table. Observed on healthy runs: ~99% (the
+///   generator always keeps at least one free variable in scope, so an automaton is the
+///   overwhelmingly common answer), so 50% is a floor with a very wide margin — it fires on a
+///   degraded oracle, never on generator jitter.
+/// * **skips below 5%** — a skip is a query that was NOT compared. Healthy runs observe 0
+///   (the generator is held to `CLAUDE.md`'s "generate SMALL", so nothing should approach
+///   either engine's 20s budget); 5% leaves room for machine-load jitter on a loaded CI box
+///   while still catching the "the oracle died and everything became a skip" failure, which
+///   drives this to ~100%.
+/// * **zero protocol faults** — a desynchronized or malformed pipe is never normal. Unlike a
+///   timeout it is not a resource verdict; it means the harness and the driver disagree about
+///   the protocol, which invalidates the answers on BOTH sides of the boundary.
+/// * **zero failed restarts** — a restart that could not be performed leaves the rest of the
+///   run talking to a dead or wounded JVM.
+#[allow(clippy::too_many_arguments)]
+fn assert_healthy_run(
+    total: u64,
+    matches: u64,
+    skips: u64,
+    divergences: u64,
+    oracle_protocol_faults: u64,
+    fatal_restart_failures: &[String],
+    automaton_answers: u64,
+) {
+    const BROKEN: &str = "This is a BROKEN-HARNESS/BROKEN-ORACLE signal, not necessarily a port \
+                          defect: the run did not actually compare what it claims to have \
+                          compared, so its `0 divergences` result is not evidence of anything.";
+
+    assert_eq!(
+        matches + skips + divergences,
+        total,
+        "verdict accounting does not add up: {matches} match + {skips} skip + {divergences} \
+         divergence != {total} queries. {BROKEN}"
+    );
+    assert!(
+        matches > 0,
+        "not a single query MATCHED across {total} queries. {BROKEN}"
+    );
+    assert!(
+        automaton_answers * 2 >= total,
+        "the oracle answered with an automaton for only {automaton_answers} of {total} queries \
+         (< 50%), so the semantic-equivalence oracle barely ran. {BROKEN}"
+    );
+    assert!(
+        skips * 20 <= total,
+        "{skips} of {total} queries were skipped (> 5%) — each one is a query that was NOT \
+         compared. {BROKEN}"
+    );
+    assert_eq!(
+        oracle_protocol_faults, 0,
+        "{oracle_protocol_faults} oracle protocol faults (a desynchronized or malformed pipe). \
+         {BROKEN}"
+    );
+    assert!(
+        fatal_restart_failures.is_empty(),
+        "the JVM could not be restarted after a JVM error, so the rest of the run was answered \
+         by an untrusted child: {fatal_restart_failures:?}. {BROKEN}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -289,14 +400,15 @@ fn milestone_0_soak() {
 fn rust_verdict(
     session_dir: &str,
     home_dir: &str,
-    scratch_txt: &Path,
+    scratch_dir: &Path,
+    query_id: u64,
     query: &str,
     java: Answer,
 ) -> Verdict {
     let (tx, rx) = sync_channel::<Verdict>(1);
     let session_dir = session_dir.to_string();
     let home_dir = home_dir.to_string();
-    let scratch_txt = scratch_txt.to_path_buf();
+    let scratch_dir = scratch_dir.to_path_buf();
     let query = query.to_string();
 
     let spawned = std::thread::Builder::new()
@@ -304,7 +416,14 @@ fn rust_verdict(
         .name(format!("diffgen:{query}"))
         .spawn(move || {
             let v = panic::catch_unwind(AssertUnwindSafe(|| {
-                evaluate_and_compare(&session_dir, &home_dir, &scratch_txt, &query, &java)
+                evaluate_and_compare(
+                    &session_dir,
+                    &home_dir,
+                    &scratch_dir,
+                    query_id,
+                    &query,
+                    &java,
+                )
             }))
             .unwrap_or_else(|payload| {
                 // A panic in the port is a real defect (the U26/U27 "unguarded `act()`"
@@ -351,7 +470,8 @@ enum RustSide {
 fn evaluate_and_compare(
     session_dir: &str,
     home_dir: &str,
-    scratch_txt: &Path,
+    scratch_dir: &Path,
+    query_id: u64,
     query: &str,
     java: &Answer,
 ) -> Verdict {
@@ -410,7 +530,7 @@ fn evaluate_and_compare(
     let (Answer::Automaton(java_txt), RustSide::Automaton(ours)) = (java, &rust) else {
         unreachable!("compare_non_automaton returns None only for automaton-vs-automaton");
     };
-    compare_automata(java_txt, ours, scratch_txt)
+    compare_automata(java_txt, ours, scratch_dir, query_id)
 }
 
 /// Semantic language equivalence between the JVM's serialized automaton and the port's.
@@ -423,13 +543,33 @@ fn evaluate_and_compare(
 ///   alphabets is NOT detected, so the two must be brought into the same order first);
 /// * `totalize(0)` on both, because Walnut `.txt` automata need not be total (a missing
 ///   transition means implicit rejection) while the equivalence oracle requires total DFAs.
-fn compare_automata(java_txt: &str, ours: &Automaton, scratch_txt: &Path) -> Verdict {
+///
+/// # Why the staging file is named after `query_id`
+///
+/// The path MUST be unique per query. [`rust_verdict`]'s timeout abandons its worker rather
+/// than killing it (documented stopgap), so a worker from an earlier, timed-out query can
+/// still reach this code while a later query is running. On a single shared path the two race:
+/// the loser reads the winner's serialized automaton and compares the port's answer for one
+/// query against the ORACLE'S ANSWER FOR ANOTHER — which is a phantom divergence at best and,
+/// if the two happen to agree, a real divergence silently recorded as a `Match`. `query_id` is
+/// monotone and never reused within a run, so no two live workers can collide.
+fn compare_automata(
+    java_txt: &str,
+    ours: &Automaton,
+    scratch_dir: &Path,
+    query_id: u64,
+) -> Verdict {
     // `wr-io`'s reader is path-based only today (the plan's U30 notes this and proposes a
     // `&str` entry point); one small rewritten file per query is the Milestone-0 stopgap.
-    if let Err(e) = fs::write(scratch_txt, java_txt) {
+    let staged = scratch_dir.join(format!("java-result-{query_id}.txt"));
+    if let Err(e) = fs::write(&staged, java_txt) {
         return Verdict::Divergence(format!("harness could not stage the JVM's automaton: {e}"));
     }
-    let mut theirs = match wr_io::reader::read_automaton_txt(scratch_txt) {
+    let parsed = wr_io::reader::read_automaton_txt(&staged);
+    // Removed as soon as it has been read, so a 10^4-query run does not leave 10^4 files
+    // behind. Best-effort: a failed removal is not a verdict, only clutter.
+    let _ = fs::remove_file(&staged);
+    let mut theirs = match parsed {
         Ok(a) => a,
         Err(e) => {
             return Verdict::Divergence(format!(
@@ -552,13 +692,14 @@ fn the_harness_detects_divergence_and_survives_a_hang() {
     }
     let scratch = scratch_root(0xDEAD_BEEF_DEAD_BEEF);
     let jvm_dir = scratch.join("jvm");
+    let stage_dir = scratch.join("stage");
     let rust_home = scratch.join("rust");
     let rust_session = rust_home.join("Session");
-    for d in [&jvm_dir, &rust_home, &rust_session] {
+    for d in [&jvm_dir, &stage_dir, &rust_home, &rust_session] {
         fs::create_dir_all(d).unwrap();
     }
-    let scratch_txt = scratch.join("java-result.txt");
-    let session_dir = rust_session.to_string_lossy().into_owned();
+    // Trailing separator on BOTH, exactly as the run itself builds them (see `milestone_0_soak`).
+    let session_dir = format!("{}/", rust_session.to_string_lossy());
     let home_dir = format!("{}/", rust_home.to_string_lossy());
 
     let mut oracle = JavaOracle::start(&jvm_dir, JVM_HEAP_MB).expect("starting the JVM oracle");
@@ -571,10 +712,23 @@ fn the_harness_detects_divergence_and_survives_a_hang() {
         matches!(java, Answer::Automaton(_)),
         "expected an automaton for a one-free-variable predicate, got {java:?}"
     );
-    let same = evaluate_and_compare(&session_dir, &home_dir, &scratch_txt, "?msd_2 x < 3", &java);
+    let same = evaluate_and_compare(
+        &session_dir,
+        &home_dir,
+        &stage_dir,
+        1,
+        "?msd_2 x < 3",
+        &java,
+    );
     assert_eq!(same, Verdict::Match, "the identical predicate must match");
-    let different =
-        evaluate_and_compare(&session_dir, &home_dir, &scratch_txt, "?msd_2 x < 4", &java);
+    let different = evaluate_and_compare(
+        &session_dir,
+        &home_dir,
+        &stage_dir,
+        2,
+        "?msd_2 x < 4",
+        &java,
+    );
     assert!(
         matches!(different, Verdict::Divergence(_)),
         "comparing `x < 4` against the oracle's `x < 3` must diverge, got {different:?}"
@@ -620,6 +774,61 @@ fn env_u64_accepts_decimal_and_hex() {
     assert_eq!(env_u64("WR_DIFFGEN_TEST_ONLY"), Some(42));
     std::env::remove_var("WR_DIFFGEN_TEST_ONLY");
     assert_eq!(env_u64("WR_DIFFGEN_TEST_ONLY"), None);
+}
+
+/// The anti-false-green gate must accept a run that plainly did the work…
+#[test]
+fn the_health_gate_accepts_a_healthy_run() {
+    assert_healthy_run(10_000, 10_000, 0, 0, 0, &[], 9_900);
+    // A handful of skips and a lopsided-but-legitimate answer mix is still healthy.
+    assert_healthy_run(10_000, 9_600, 400, 0, 0, &[], 5_000);
+}
+
+/// …and REJECT every shape of a degraded one. Each of these previously reported PASS, because
+/// the only assertion was "the divergence list is empty" — which an oracle that answers
+/// nothing satisfies perfectly.
+#[test]
+fn the_health_gate_rejects_a_degraded_run() {
+    let cases: [(&str, fn()); 6] = [
+        // The exact false green the reviewers found: the oracle died, every query became a
+        // skip, zero divergences, PASS.
+        ("every query skipped", || {
+            assert_healthy_run(10_000, 0, 10_000, 0, 0, &[], 0)
+        }),
+        // Degraded but not dead: 90% skipped is still a run that compared almost nothing.
+        ("most queries skipped", || {
+            assert_healthy_run(10_000, 1_000, 9_000, 0, 0, &[], 1_000)
+        }),
+        // The oracle answered, but never with an automaton — the equivalence oracle never ran.
+        ("no automata compared", || {
+            assert_healthy_run(10_000, 10_000, 0, 0, 0, &[], 100)
+        }),
+        ("protocol faults", || {
+            assert_healthy_run(10_000, 9_999, 1, 0, 1, &[], 9_900)
+        }),
+        ("a restart that failed", || {
+            assert_healthy_run(
+                10_000,
+                10_000,
+                0,
+                0,
+                0,
+                &["index 5: no jvm".to_string()],
+                9_900,
+            )
+        }),
+        ("buckets that do not add up", || {
+            assert_healthy_run(10_000, 9_000, 0, 0, 0, &[], 9_000)
+        }),
+    ];
+    for (what, run) in cases {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(run));
+        assert!(
+            outcome.is_err(),
+            "the health gate accepted a degraded run ({what}) — that is the false green this \
+             gate exists to prevent"
+        );
+    }
 }
 
 #[test]

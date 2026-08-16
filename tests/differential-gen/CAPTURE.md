@@ -78,6 +78,14 @@ kind      := "automaton" | "true" | "false" | "error" | "fatal"
 | `error`     | the thrown `Exception`'s exact `getMessage()` (or its class name when the message is null) |
 | `fatal`     | a JVM `Error` (OOM / StackOverflow), as `<class>: <message>`. **Not** a semantic answer — the harness records `skip-too-big` and restarts the child |
 
+A `fatal` is a well-formed response on a still-synchronized pipe, so `JavaOracle::ask` does not
+restart the child for it (unlike a timeout or a protocol fault, which it handles itself). The
+**query loop** does, on every `Answer::Fatal`: the driver catches `Throwable` broadly and keeps
+looping, so without that restart every later query would be answered by a JVM with a wounded
+heap and a static `Session` of unknown state. The child's stderr is appended to
+`<scratch>/jvm/jvm-stderr.log` across restarts, which is where an `OutOfMemoryError`'s own
+trace lands.
+
 The driver sends `eval "<query>";` — always `;`-terminated, never `::`. Detail-printing
 (`::`) output is a *known-divergent* surface pending the separate `details`-logging follow-up
 (`RESUME-HERE.md`), so generating it here would manufacture guaranteed-false divergences.
@@ -86,7 +94,9 @@ The generator never emits a `"` either, so the wrapper can never be escaped out 
 Two properties are load-bearing:
 
 * **`query_id` is echoed on every response**, and the harness asserts
-  `response.query_id == request.query_id` **before** treating the response as an answer. A
+  `response.query_id == request.query_id` **before** treating the response as an answer (the
+  check is `support::check_query_id_echo`, kept a standalone function so the mismatch branch
+  has direct unit coverage — see `a_desynchronized_query_id_echo_is_a_protocol_fault`). A
   desynchronized pipe then fails loudly and immediately, instead of producing a flood of
   phantom divergences across the rest of the run.
 * **stdout is flushed after every response.** This is a streaming pipe protocol; Java's
@@ -164,6 +174,14 @@ Two independent 10,000-query runs:
 Oracle answers by kind (first run): 9,199 `automaton`, 424 `true`, 375 `false`, 2 `error` —
 i.e. the bulk of the evidence really is semantic-equivalence comparisons of real automata, not
 matched rejections.
+
+That distribution is not just reported, it is **asserted**: `assert_healthy_run` fires after
+the divergence check and fails the run unless it actually did the work — every query accounted
+for in exactly one bucket, at least one match, ≥ 50% of the oracle's answers `automaton`,
+≤ 5% skipped, zero protocol faults, zero failed restarts. Without it a degraded oracle (an
+OOMing JVM, a wedged child, a stale jar) turns every query into a `skip-too-big`, leaves the
+divergence list empty, and reports **PASS having compared nothing**. A failure of that gate is
+a broken-harness/broken-oracle signal, not a port defect.
 
 This **replaces the plan's unverified "~0.27ms/query" guess with a measurement**: ~1 ms/query
 end-to-end for *both* engines, including the JVM round trip. Extrapolating, 10^5 queries of
