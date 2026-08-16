@@ -134,6 +134,19 @@ cargo test -p wr-differential-gen --release -- --ignored --nocapture
 WR_DIFFGEN_QUERIES=200 WR_DIFFGEN_SEED=0x1234 \
   cargo test -p wr-differential-gen --release -- --ignored --nocapture milestone_0_soak
 
+# The 10^5 scale-up: several SEQUENTIAL batches on DIFFERENT seeds, one JVM each. Distinct
+# seeds are the point — a single 120,000-query run on one seed is one stream, not four. There
+# is deliberately no multi-process sharding launcher: single-JVM throughput (~1,000 q/s, below)
+# clears 10^5 in ~2 minutes, so sharding would add an aggregation-correctness surface without
+# buying throughput. `;` (not `&&`) between batches, so a batch that fails its divergence
+# assertion does not prevent the remaining seeds from running.
+for S in 0x57414c4e55545231 0x57414c4e55545232 0x00000000deadbeef 0x0123456789abcdef; do
+  WR_DIFFGEN_QUERIES=30000 WR_DIFFGEN_SEED=$S \
+    cargo test -p wr-differential-gen --release -- --ignored --nocapture milestone_0_soak \
+    > "batch-$S.txt" 2>&1
+  echo "$S exit=$?"; tail -25 "batch-$S.txt"
+done
+
 # The harness's own live self-check: it must be able to REPORT a divergence, and it must
 # survive (kill, restart, resync) a JVM that does not answer in time.
 cargo test -p wr-differential-gen --release -- --ignored --nocapture \
@@ -195,6 +208,11 @@ Milestone 0's three questions, answered:
    instantaneous rate *rises* monotonically across the run (479 q/s at query 500 → 1,010 q/s at
    query 9,500), which is JIT warm-up dominating, with no counteracting drift. One JVM served
    all 10,000 queries with zero restarts.
+**Superseded as the headline result by the U29 scale-up** — 120,000 queries across 4 distinct
+seeds, 0 divergences, 0 skips. See `STATUS.md` in this directory for that run's full numbers,
+its exclusions (what the generator does *not* emit), and its cap/skip accounting. The Milestone
+0 figures above are kept because they are what the three questions below were answered from.
+
 3. **Does the kill/restart/resync path fire correctly?** Yes — proven by
    `the_harness_detects_divergence_and_survives_a_hang`, which forces a timeout with an
    unsatisfiable deadline, asserts the child was killed and respawned, and then asserts the
