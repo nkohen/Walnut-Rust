@@ -366,8 +366,47 @@ and not yet root-caused past that. `cargo test --workspace` green throughout (20
 DESIGN.md §5) — run it with `cargo test -p wr-golden --release -- --ignored --nocapture`.
 
 **Phase 3b is complete.** Everything DESIGN.md's Phase 3 exit criterion asked for
-("eval/def/reg, and now everything else, work," verified Tier 1 green) is now true. Next: decide
-Phase 4 scope, or pick up the two open follow-ups above (`details`-fixture `Logging` threading;
-the lsd `transduce` divergence) — needs the user's explicit go-ahead per
-`docs/ROADMAP-TO-AUTONOMY.md`'s phase-gating before starting, same as every other phase/sub-phase
-boundary in this project.
+("eval/def/reg, and now everything else, work," verified Tier 1 green) is now true.
+
+**Phase 4 (Hardening) is underway** — the user gave the go-ahead 2026-08-15. Plan at
+`~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo), adversarially reviewed by an
+independent Opus agent before any code landed (caught 3 blocking design defects — a fatal
+thread/halt timeout mismatch, an unhandled JVM-hang pipe-desync hazard, a weakened error
+comparator — plus several significant scope errors, all fixed in the plan before execution
+started). Four units: **U29** (Tier-3 differential-generator harness, at scale), U30 (Tier-5
+fuzzing), U31 (Tier-4 property-suite completion), U32 (performance vs JVM Walnut).
+
+**U29 complete.** A two-sided harness (`tests/differential-gen/`) drives one long-lived
+`walnut-java` JVM through `Prover.dispatchForIntegrationTest` (headless `eval`, writes nothing to
+`Automata Library`) over a NUL-delimited pipe protocol, and compares its answers against the
+Rust port's own `Prover::dispatch_for_integration_test` for each of a large stream of randomly
+generated small KEEP-subset queries (base 2-4 msd/lsd, quantifier depth ≤2, formula depth ≤3) —
+automata via `wr_core::equiv` semantic equivalence, errors by exact string match, with a
+query-ID echo check that turns any pipe desync into a loud failure instead of a phantom
+divergence. Milestone 0 (10,000 queries, commit `4ca773c`) went through the full
+two-independent-reviewer loop (Opus + Sonnet, split-context); both reviewers independently found
+the same headline defect — the soak test's pass/fail gate only checked for divergences, so a
+degraded/dead oracle would report a false "PASS" having compared nothing — plus Opus found two
+more real, evidence-backed bugs (`Answer::Fatal`/OOM never triggered the JVM restart the code's
+own docs claimed it did; a shared non-unique temp-file path that could race an abandoned timed-out
+worker against a later query and silently mask a real divergence as a match) and a coverage gap
+(the query-ID echo check — described as "the load-bearing invariant" — had zero regression tests;
+mutation-testing proved the existing suite couldn't detect its removal). All fixed in the
+follow-up commit `b6e9b3a`. Scaled to **120,000 generated queries across 4 seeds: 120,000 match,
+0 divergences, 0 skips** (commit `3c3d852`, `tests/differential-gen/STATUS.md`), meeting U29's
+exit criterion (N≥10⁵, zero unresolved divergences) — ~92.5% of comparisons were real
+`wr_core::equiv` automaton checks (not vacuous error/error matches), ~76% distinct query strings,
+near-uniform numeration-system spread including heavy `lsd_*` coverage. No new genuine Walnut
+(Java) bug found (`docs/WALNUT-BUGS.md` unchanged at 37 entries). **Known, explicit non-coverage**
+(by construction, not oversight): this generator never emits `::`-detail-printing queries,
+`transduce`/`def`/`reg`/other `Commands/*`, the `I` quantifier, custom bases, or word/macro/
+function tokens — so it neither confirms nor clears the two pre-existing Phase-3b follow-ups
+(`details`-fixture `Logging` threading; the lsd-`transduce` divergence,
+`tests/golden/STATUS.md`), which remain open, separately-scoped work. No multi-process sharding
+launcher was built — measured single-JVM throughput (~1,000 q/s) clears 10⁵ in ~2 minutes, so
+distinct seeds gave run diversity without adding an aggregation-correctness surface for no
+throughput benefit.
+
+Next: U30 (fuzzing), U31 (Tier-4 property-suite completion), U32 (perf vs Java) — see the plan
+file for full scope of each. `cargo test --workspace` green throughout; `cargo fmt`/`clippy`
+clean.
