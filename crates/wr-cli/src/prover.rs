@@ -3266,6 +3266,63 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    // ------------------------------------------- `reverse` flips the number system
+
+    /// End-to-end pin for `wr_core::logicalops::flip_ns`'s name flip, at the two layers
+    /// where the stale name was actually observable.
+    ///
+    /// Every expectation below was captured from the real `Walnut-all.jar` on exactly
+    /// these commands:
+    ///
+    /// ```text
+    /// reg ok msd_2 "0*1";  reg two msd_2 "1(0|1)*";
+    /// reverse rv $ok;      -> rv.txt headed `lsd_2` (walnut-rs used to write `msd_2`)
+    /// reverse rv2 $rv;     -> rv2.txt headed `msd_2` (the round trip)
+    /// union mixed rv two;  -> `Automata must have the same number system(s).`, no file
+    /// union okrv2 rv2 two; -> succeeds (both `msd_2` again)
+    /// ```
+    #[test]
+    fn reverse_flips_the_number_system_name_it_writes_and_the_mismatch_guard_sees_it() {
+        let (mut p, dir, _) = prover("reverse-flips-ns");
+        let lib = dir.join("Automata Library");
+        assert!(p.dispatch("reg ok msd_2 \"0*1\";").unwrap());
+        assert!(p.dispatch("reg two msd_2 \"1(0|1)*\";").unwrap());
+
+        assert!(p.dispatch("reverse rv $ok;").unwrap());
+        let rv = fs::read_to_string(lib.join("rv.txt")).unwrap();
+        assert_eq!(
+            rv.lines().next(),
+            Some("lsd_2"),
+            "reversing an msd automaton makes it lsd -- the whole point"
+        );
+
+        // Double reversal round-trips. This ALSO passed with the bug (two stale flips
+        // cancel), so it is here to keep the real fix from breaking it, not as the
+        // detector.
+        assert!(p.dispatch("reverse rv2 $rv;").unwrap());
+        let rv2 = fs::read_to_string(lib.join("rv2.txt")).unwrap();
+        assert_eq!(rv2.lines().next(), Some("msd_2"));
+
+        // The follow-on that made the stale name a silently-WRONG-ANSWER bug rather than
+        // a cosmetic one: `union`'s guard compares number systems by NAME.
+        let err = p.dispatch("union mixed rv two;").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Automata must have the same number system(s).",
+            "an lsd operand and an msd one must be refused"
+        );
+        assert!(
+            !lib.join("mixed.txt").exists(),
+            "a refused union must write nothing"
+        );
+
+        // ...and a genuinely matching pair still goes through, so the guard is not just
+        // rejecting everything.
+        assert!(p.dispatch("union okrv2 rv2 two;").unwrap());
+        assert!(lib.join("okrv2.txt").is_file());
+        fs::remove_dir_all(&dir).ok();
+    }
+
     // ------------------------------------------------- the panic-recovery boundary
 
     /// WB-038's blast radius, pinned at the layer that fixes it.

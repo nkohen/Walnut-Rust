@@ -21,14 +21,14 @@ The corpus lives in the sibling `walnut-java` oracle repo and is **not** vendore
 `WALNUT_JAVA_DIR` if the checkout is not beside this one. A run with no corpus fails loudly
 rather than passing silently.
 
-## Headline numbers (measured 2026-08-15, release build)
+## Headline numbers (measured 2026-08-16, release build)
 
 | | |
 |---|---|
 | fixtures replayed | **675** (the whole `IntegrationTest.L` list, in order) |
 | compared | **583** |
-| **pass** | **573** (98.3% of compared) |
-| **fail** | **10** (all in `KNOWN_DIVERGENCES`, two root causes — below) |
+| **pass** | **576** (98.8% of compared) |
+| **fail** | **7** (all in `KNOWN_DIVERGENCES`, one root cause — below) |
 | skipped (excluded, each with a recorded reason) | **92** |
 | timed out / not-run | **0** |
 
@@ -51,7 +51,7 @@ Partial comparisons (compared, but not in full — recorded per id in the run re
 * fixtures **637-641, 659, 660** — `not executed`. See `Excluded::MetacommandNotWired`;
   `no_later_fixture_depends_on_an_unexecuted_one` proves nothing downstream reads their output.
 
-## The 10 remaining divergences — two root causes
+## The 7 remaining divergences — one root cause
 
 ### 1. `details` log-text fidelity (7 fixtures: 375, 376, 377, 378, 379, 383, 628)
 
@@ -83,21 +83,29 @@ Closing it means threading a `&mut Logging` through every `Token::act`/`Operator
 call sites. That is a unit of engineering in its own right, touching already-reviewed
 Phase-2/3a code, and is the recommended follow-up (call it U28).
 
-### 2. `transduce` over a reversed (lsd) custom-base word automaton (3 fixtures: 532, 533, 534)
+### 2. `transduce` over a reversed (lsd) custom-base word automaton — **CLOSED (2026-08-16)**
 
-`transduce test532 RUNSUM2 test531;` where `test531 = reverse test531 F;` and `F` is the
-Fibonacci word over `msd_fib` — so the transducer's input is an **`lsd_fib`** DFAO, which is
-the one branch of `Transducer.transduceNonDeterministic` that reverses its input
-(`Transducer.java:286-292`) and reverses the result back (`:325-327`). Fixtures 533 and 534
-are downstream of 532 (`reverse test533 test532;`, then an equality check against it), so all
-three share the one root cause.
+Fixtures 532, 533 and 534 used to fail here. `transduce test532 RUNSUM2 test531;` (where
+`test531 = reverse test531 F;` and `F` is the Fibonacci word over `msd_fib`) was the one
+`transduce` fixture whose input is an **`lsd_fib`** DFAO, i.e. the one taking
+`Transducer.transduceNonDeterministic`'s reverse-input/reverse-result branch, and it was the
+one that failed; 533 and 534 are downstream of it.
 
-Every other `transduce` fixture passes — 527, 528, 529, 530, 550, 551, 552, 553 — including
-`transduce test530 RUNSUM2 F;`, the same transducer on the same word automaton in its **msd**
-direction. So the defect is specific to the lsd/reversal path, not to the Dekking construction.
-**Open; not yet root-caused past that.** A follow-up should bisect
-`word_automaton::reverse_with_output`'s number-system flip on a custom base against the real
-`walnut-java` CLI, the same way U27 bisected the `all_reps` bug (below).
+The root cause was not in `Transducer` at all — this file's earlier suggestion to bisect
+`word_automaton::reverse_with_output`'s number-system flip was right about the location, and
+the bug was one level down in it. `wr_core::logicalops::flip_ns` flipped the per-track
+`Automaton::msd` direction flag but left the recorded `Automaton::ns_name` untouched, where
+Java's `NumberSystem.flipNS` replaces the whole `NumberSystem` object and so changes its
+`getName()` too. Since `Automaton::track_ns_names` deliberately prefers the recorded name
+(a custom base's name is not derivable from its alphabet), everything downstream of a
+`reverse` saw `msd_fib` on an automaton that was really `lsd_fib`.
+
+The same defect had two other live symptoms outside the corpus, both confirmed against the
+real jar: `reverse rv $ok;` wrote an `msd_2` header where Walnut writes `lsd_2`, and
+`union mixed rv two;` — which real Walnut refuses with `Automata must have the same number
+system(s).` — silently succeeded, writing a union of an lsd automaton with an msd one.
+Fixed in `flip_ns`; see its docs and
+`logicalops::tests::flip_ns_flips_the_recorded_number_system_name_not_just_the_direction`.
 
 ## What U27 fixed along the way
 

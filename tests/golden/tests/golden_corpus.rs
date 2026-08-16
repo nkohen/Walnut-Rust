@@ -372,20 +372,16 @@ const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
         628,
         "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
     ),
-    // -- root cause 2: `transduce` over a reversed (lsd) custom-base word automaton -------
+    // -- root cause 2 (CLOSED): `transduce` over a reversed (lsd) custom-base DFAO --------
     //
-    // `test531 = reverse F` is an `lsd_fib` DFAO, so `transduce test532 RUNSUM2 test531`
-    // takes `Transducer.transduceNonDeterministic`'s reverse-input/reverse-result branch
-    // (`Transducer.java:286-292, 325-327`) — the ONE branch no other transduce fixture
-    // exercises (527/528/529/530/550/551/552/553 all pass, including the same transducer on
-    // the same word automaton in its msd direction). 533 and 534 are downstream of 532.
-    // Open; see tests/golden/STATUS.md §2 for the suggested bisection.
-    (
-        532,
-        "transduce over an lsd custom-base DFAO diverges (open port bug, STATUS.md §2)",
-    ),
-    (533, "downstream of 532 (`reverse test533 test532;`)"),
-    (534, "downstream of 532 (compares test533 against test530)"),
+    // 532/533/534 used to live here: `test531 = reverse F` is an `lsd_fib` DFAO, so
+    // `transduce test532 RUNSUM2 test531` was the ONE `transduce` fixture taking
+    // `Transducer.transduceNonDeterministic`'s reverse-input/reverse-result branch, and it
+    // was the ONE that failed. The root cause turned out not to be in `Transducer` at all:
+    // `wr_core::logicalops::flip_ns` flipped `Automaton::msd` but left `Automaton::ns_name`
+    // stale, so `reverse F` produced an automaton whose recorded number system still SAID
+    // `msd_fib` while it was really `lsd_fib`. Fixed there (see that function's docs); these
+    // three entries went stale and are deleted rather than left as a false claim.
 ];
 
 // ---------------------------------------------------------------------------

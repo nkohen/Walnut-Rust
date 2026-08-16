@@ -344,7 +344,42 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 /// (`if (NS == null) continue;`). `msd: Vec<Option<bool>>` is this crate's stand-in for
 /// Java's per-track `List<NumberSystem>` (see `Automaton`'s struct doc comment), so
 /// `None` plays the null role and the base — which Java re-parses out of the name and
-/// preserves — is carried by the track's alphabet here and needs no touching.
+/// preserves — is carried by the track's alphabet here.
+///
+/// # The NAME has to be flipped too, not just the direction flag
+///
+/// Java replaces the whole object with `new NumberSystem(newName)`, so
+/// `NumberSystem.getName()` afterwards is the FLIPPED name. This port splits Java's one
+/// object into the parallel [`Automaton::msd`] flag and [`Automaton::ns_name`] string,
+/// and until this fix only the flag was flipped. That was a live, silent
+/// wrong-output bug, because [`Automaton::track_ns_names`] deliberately *prefers* the
+/// recorded name over reconstructing one from the flag (it has to — a custom base's name
+/// is not derivable from its alphabet):
+///
+/// * `reverse rv $ok;` on an `msd_2` automaton wrote a `rv.txt` headed `msd_2` where real
+///   Walnut writes `lsd_2` (confirmed live against `Walnut-all.jar`; the bodies were
+///   byte-identical, only the header was wrong);
+/// * worse, `union`/`intersect`/`concat` compare number systems BY NAME
+///   (`NumberSystem.isNSDiffering`), so `union mixed rv two` — which real Walnut refuses
+///   with `Automata must have the same number system(s).`, writing nothing — silently
+///   SUCCEEDED here, writing a union of an lsd automaton with an msd one.
+///
+/// Double reversal happened to round-trip anyway (two stale flips cancel), which is why
+/// the existing `reverse`-twice coverage never caught it.
+///
+/// The new name is Java's exactly (`:172-174`): `determineMsdOrLsd`/`determineBase` split
+/// the OLD name at its FIRST `_`, and the result is
+/// `(prefix == "msd" ? "lsd" : "msd") + "_" + <everything after the first underscore>`.
+/// So `msd_2` ⇄ `lsd_2`, `msd_fib` ⇄ `lsd_fib`, `msd_neg_3` ⇄ `lsd_neg_3` — and note it is
+/// NOT a symmetric prefix swap: a name whose prefix is neither `msd` nor `lsd` becomes
+/// `msd_…`, because Java's ternary tests only for `MSD`. The direction flag is then taken
+/// from the NEW name (`NumberSystem`'s constructor does `isMsd = msdOrLsd.equals(MSD)`,
+/// `:136`), which keeps the two halves of this port's split representation consistent with
+/// each other for that same non-`msd`/`lsd` prefix case.
+///
+/// A track with no recorded name (an automaton this crate built in memory, always a plain
+/// base-*k* one) just has its flag flipped, which is what `track_ns_names`'s reconstruction
+/// branch then renders.
 ///
 /// # The custom-base half, and its one declared limitation (U5)
 ///
@@ -371,9 +406,21 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 /// see [`crate::numsys::NumberSystem::flip_with_custom_base_files`], which is the API a
 /// caller that *does* have the files should use instead of relying on this.
 pub(crate) fn flip_ns(a: &mut Automaton) {
-    for slot in a.msd.iter_mut() {
-        if let Some(is_msd) = slot.as_mut() {
-            *is_msd = !*is_msd;
+    for i in 0..a.msd.len() {
+        // `if (NS == null) continue;` — a `{0,1}`-style explicit-set track has no
+        // number system at all, so neither its flag nor its (necessarily absent) name
+        // is touched.
+        if a.msd[i].is_none() {
+            continue;
+        }
+        match a.ns_name.get(i).and_then(|n| n.clone()) {
+            Some(name) => {
+                let new_name = flipped_ns_name(&name);
+                // `NumberSystem`'s constructor: `isMsd = determineMsdOrLsd(name).equals(MSD)`.
+                a.msd[i] = Some(new_name.starts_with(crate::numsys::MSD_UNDERSCORE));
+                a.ns_name[i] = Some(new_name);
+            }
+            None => a.msd[i] = Some(!a.msd[i].unwrap()),
         }
     }
     for slot in a.all_reps.iter_mut() {
@@ -383,6 +430,38 @@ pub(crate) fn flip_ns(a: &mut Automaton) {
             *all_reps = Rc::new(flipped);
         }
     }
+}
+
+/// The name half of [`flip_ns`]'s loop body (`NumberSystem.java:172-174`):
+/// `(determineMsdOrLsd(name).equals(MSD) ? LSD : MSD) + "_" + determineBase(name)`.
+///
+/// # The no-underscore case
+///
+/// `determineMsdOrLsd` is `name.substring(0, name.indexOf("_"))`, so a name with no `_`
+/// at all makes Java evaluate `substring(0, -1)` and throw
+/// `StringIndexOutOfBoundsException`. That is unreachable through every real path into
+/// [`Automaton::ns_name`] — every writer of it (`wr-io`'s reader, `wr-cli`'s
+/// `alphabet`/`reg`, `crate::numsys`) sources the string from
+/// `normalize_number_system_token` or a [`crate::numsys::NumberSystem`]'s own name, and
+/// every branch of the former yields an `msd_`/`lsd_`-prefixed string — but
+/// [`Automaton::set_ns_names`] does not validate the shape, so the case is representable
+/// in-crate. It is ported the way [`Automaton::decode`]'s equivalent is: `panic!` with the
+/// JDK's own message and nothing else, recovered at `wr_cli::prover`'s
+/// `Prover::caught` boundary exactly as `Prover.readBuffer`'s `catch (RuntimeException)`
+/// recovers Java's.
+fn flipped_ns_name(name: &str) -> String {
+    let Some(underscore) = name.find('_') else {
+        // `String.substring(0, -1)`'s message verbatim (`checkBoundsBeginEnd`).
+        panic!("begin 0, end -1, length {}", name.len());
+    };
+    let msd_or_lsd = &name[..underscore];
+    let base = &name[underscore + 1..];
+    let flipped = if msd_or_lsd == crate::numsys::MSD {
+        crate::numsys::LSD
+    } else {
+        crate::numsys::MSD
+    };
+    format!("{flipped}_{base}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2209,6 +2288,106 @@ mod tests {
         );
         flip_ns(&mut a);
         assert_eq!(a.msd, vec![Some(false), None, Some(true)]);
+    }
+
+    /// The RECORDED NAME must flip too, not just the direction flag — see [`flip_ns`]'s
+    /// docs for the two live wrong-output bugs the stale name caused (`reverse` wrote an
+    /// `msd_2` header where real Walnut writes `lsd_2`; `union` then failed to reject a
+    /// genuinely mixed-numeration pair, because `isNSDiffering` compares by NAME).
+    ///
+    /// [`Automaton::track_ns_names`] is what the writer and the `union`/`intersect`/
+    /// `concat` guards actually read, so it is asserted rather than the raw field.
+    #[test]
+    fn flip_ns_flips_the_recorded_number_system_name_not_just_the_direction() {
+        for (before, after) in [
+            ("msd_2", "lsd_2"),
+            ("lsd_2", "msd_2"),
+            // A custom base keeps everything after the FIRST underscore, so the base
+            // survives verbatim (`Automata Library` header `msd_fib` -> `lsd_fib`;
+            // confirmed against the real `Walnut-all.jar`'s `reverse` output).
+            ("msd_fib", "lsd_fib"),
+            ("lsd_fib", "msd_fib"),
+            ("msd_neg_3", "lsd_neg_3"),
+            // NOT a symmetric prefix swap: Java's ternary only tests for `MSD`, so any
+            // other prefix — including a second `msd` buried later — becomes `msd_`.
+            ("foo_7", "msd_7"),
+            ("lsdx_7", "msd_7"),
+        ] {
+            let mut a = single_track(ends_with_one(), Some(before.starts_with("msd_")));
+            a.set_ns_names(vec![Some(before.to_string())]);
+
+            flip_ns(&mut a);
+
+            assert_eq!(
+                a.track_ns_names(),
+                vec![Some(after.to_string())],
+                "flip of {before}"
+            );
+            // The direction flag is taken from the NEW name, exactly as
+            // `NumberSystem`'s constructor derives `isMsd` from it.
+            assert_eq!(
+                a.msd,
+                vec![Some(after.starts_with("msd_"))],
+                "direction flag of {before}"
+            );
+        }
+    }
+
+    /// Two flips must land back on the ORIGINAL name. This round-tripped even with the
+    /// bug (two stale flips cancel), which is exactly why the pre-existing
+    /// double-reversal coverage never caught it — so it is pinned explicitly.
+    #[test]
+    fn flipping_a_number_system_name_twice_round_trips() {
+        for name in ["msd_2", "lsd_5", "msd_fib", "lsd_neg_3"] {
+            let mut a = single_track(ends_with_one(), Some(name.starts_with("msd_")));
+            a.set_ns_names(vec![Some(name.to_string())]);
+            flip_ns(&mut a);
+            flip_ns(&mut a);
+            assert_eq!(a.track_ns_names(), vec![Some(name.to_string())]);
+            assert_eq!(a.msd, vec![Some(name.starts_with("msd_"))]);
+        }
+    }
+
+    /// A track with no RECORDED name (an automaton built in memory, which is always a
+    /// plain base-*k* one) still just flips its flag, and `track_ns_names`'s
+    /// reconstruction branch renders the flipped direction.
+    #[test]
+    fn flip_ns_without_a_recorded_name_still_flips_the_reconstructed_one() {
+        let mut a = single_track(ends_with_one(), Some(true));
+        assert_eq!(a.track_ns_names(), vec![Some("msd_2".to_string())]);
+        flip_ns(&mut a);
+        assert_eq!(a.track_ns_names(), vec![Some("lsd_2".to_string())]);
+    }
+
+    /// `determineMsdOrLsd`'s `substring(0, indexOf("_"))` on a name with no `_` is
+    /// `substring(0, -1)` — a `StringIndexOutOfBoundsException` in Java. Unreachable
+    /// through any real writer of `ns_name` (see [`flipped_ns_name`]'s docs), ported as
+    /// the JDK's own message so `Prover::caught` reports it the way `Prover.readBuffer`
+    /// reports Java's.
+    #[test]
+    fn flipping_a_name_with_no_underscore_raises_javas_own_message() {
+        let mut a = single_track(ends_with_one(), Some(true));
+        a.set_ns_names(vec![Some("msd2".to_string())]);
+        assert_eq!(
+            crate::walnut_panic::catch_walnut_panic(|| flip_ns(&mut a)),
+            Err("begin 0, end -1, length 4".to_string())
+        );
+    }
+
+    /// `reverse(A, true)` — the `Main/Commands/Reverse.java` path — is what actually
+    /// carries the flip out to a written file.
+    #[test]
+    fn reverse_with_msd_reversal_flips_the_name_a_writer_would_emit() {
+        let mut a = single_track(ends_with_one(), Some(true));
+        a.set_ns_names(vec![Some("msd_2".to_string())]);
+        reverse(&mut a, true);
+        assert_eq!(a.track_ns_names(), vec![Some("lsd_2".to_string())]);
+
+        // `reverse(A, false)` (`:315`/`:333`/`:378`/`:459`) must NOT touch it.
+        let mut b = single_track(ends_with_one(), Some(true));
+        b.set_ns_names(vec![Some("msd_2".to_string())]);
+        reverse(&mut b, false);
+        assert_eq!(b.track_ns_names(), vec![Some("msd_2".to_string())]);
     }
 
     /// The custom-base half of `flip_ns` (U5): a track carrying an all-representations
