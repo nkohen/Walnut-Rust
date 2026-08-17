@@ -475,7 +475,48 @@ pattern unconverted (the highest-skip-rate one, ~37%) — fixed, plus a coverage
 hand-built pin verified live against the real jar. `cargo test --workspace` green throughout
 (1434 tests); `fmt`/`clippy` clean.
 
-Next: **U32** (performance vs JVM Walnut) — the last unit in Phase 4's plan. See the plan file for
-full scope; needs an execution-time decision on benchmark sourcing (the plan's two documented
-options — golden-corpus throughput as the exit proxy, vs. first wiring `[strategy N NAME]` to
-unlock `thm5`-class fixtures; default is the former).
+**U32 prerequisite complete — `[strategy N NAME]`/`[export N FORMAT]` now actually work.** The
+user explicitly chose the larger of U32's two documented benchmark-sourcing options (wiring
+`[strategy N NAME]` through, to unlock `thm5`-class fixtures for a genuine slow-workload
+comparison rather than relying only on the golden corpus's uniformly-fast fixtures), anticipating
+increased library usage upon performance upgrades. Previously these metacommands were fully
+*parsed* by `MetaCommands` (which already implemented `wr_core::determinize::DeterminizeContext`)
+but never *threaded* anywhere — every determinization silently used `SC` regardless of what a
+query asked for. Now a real `Option<&mut dyn DeterminizeContext>` flows from `Prover`'s dispatch
+through `wr-logic`'s eval path, `wr-cli`'s `PredicateEnv`/library-automaton loading, down to every
+`wr_core::determinize::determinize` call site — gated exactly on Java's real `printDetails`
+(`::`-suffix) condition, with `printEnabled` modeled structurally (`wr_core::numsys` never gets a
+context, matching Java's stated intent that internal `NumberSystem` constructions stay silent).
+Commits `63e7e46`→`e07beb3`/`3a39ce4`→`6e7ce6f`. This went through **three full adversarial-review
+rounds**, each finding real issues, converging cleanly:
+- **Round 1** found two live-reproduced correctness-risk bugs beyond the initial implementation:
+  loading a library automaton (`$name(...)`) inside a `::`-suffixed query desynced every later
+  metacommand index (Java counts the load-time determinize, the port didn't); and the commit had
+  deleted a U21-era tripwire test that used to catch "parses and silently discards" bugs, silently
+  reintroducing that exact failure mode for the (deliberately still out-of-scope) non-`eval`/`def`
+  commands. Also corrected **WB-039**'s documented scope (the underlying Java bug — nested
+  `disablePrint`/`enablePrint` not being save/restore — also fires in `NumberSystem.multiplication`,
+  not just `constant`; the user's sign-off on keeping the port's stable indices stood unchanged).
+- **Round 2** fixed both via real `PredicateEnv` context-threading (not a workaround) and a
+  restored tripwire, plus surfaced **WB-040** (Java's `[export gv]` mutates the automaton
+  mid-determinize — confirmed unreachable in the port's current call shape) — but its own review
+  found the golden-corpus harness's just-tightened `KNOWN_DIVERGENCES` gate still tagged several
+  early-return failure paths as "text-only" without the automaton comparison having actually run,
+  undermining the very invariant that gate exists to enforce.
+- **Round 3** closed that gate-laundering gap (mutation-verified in both directions), corrected a
+  parity nuance in WB-039's multiplication trigger (one leaked index vs two, depending on `n`'s
+  parity), and hardened `PredicateEnv`'s trait shape so a future implementor can't silently stop
+  counting load-time determinizations.
+
+Verified against the real jar throughout (WB-039/WB-040 both confirmed live; fixture 637's full
+Brzozowski-path state-count trace matches Java's bit-for-bit, completing in well under a second
+where plain `SC` doesn't finish in 60s). **Golden corpus: 577/586 pass** (9 known divergences, all
+independently re-confirmed genuinely text-only — 7 are the pre-existing `Logging`-threading gap,
+637/660 join that same class), up from 576/583 (the `MetacommandNotWired` exclusion category is
+gone). No net-new `WB-` entries beyond WB-039/WB-040 (both logged during this unit, both handled
+per CLAUDE.md's rule — WB-039 with explicit user sign-off on a deliberate divergence, WB-040
+confirmed unreachable in the port). `cargo test --workspace` green (1425 tests); `fmt`/`clippy`
+clean.
+
+Next: build U32's actual Criterion benchmark, now able to include `thm5`-class fixtures for a
+genuine algorithmic-throughput comparison rather than only typical-query overhead.
