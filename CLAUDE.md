@@ -590,9 +590,38 @@ corpus unchanged (577/586, 0 regression); a 5,000-query Tier-3 spot check (fresh
 clean. `benches/STATUS.md` keeps U32's original baseline verbatim alongside this unit's numbers
 for comparison, not overwritten.
 
-Next, if picked up: `benches/STATUS.md`'s candidate #2 (flatten `wr_core::fa::Fa`'s
-`Vec<BTreeMap<i32, Vec<usize>>>` transition representation) is the only remaining lever with real
-expected return, and the only one of the four candidates that touches trust-critical code —
-needs the full two-reviewer loop and careful handling of the iteration-order risk the profile
-just confirmed matters (`subset_construction`'s `BTreeSet::insert` ordering). Not started; no
-plan written yet.
+**U34 — `subset_construction`'s hot loop flattened; fixture 637 closed, and the whole 11-of-11
+target now met.** Investigation of "flatten `Fa.d`'s `Vec<BTreeMap<i32, Vec<usize>>>`
+representation" (U33's candidate #2) found the attribution was more specific than the original
+framing implied: ~87% of U33's whole "B-tree navigation" bucket (27.6% of real work) was one
+local `BTreeSet<usize>` inside `subset_construction`'s per-`(metastate, symbol)` union
+(`determinize.rs`), not `Fa.d`'s own storage. Plan at
+`~/.claude/plans/glossy-compacting-lantern.md` (outside this repo), adversarially reviewed
+**three rounds** before any code landed — round 2 found a genuine blocking defect in round 1's
+own proposed fix (a `TransitionRowBuilder` design that would have silently dropped destinations
+from every nondeterministic cross-product), an unusually deep review chain reflecting the size of
+the deferred `Fa.d` migration it was designing. The plan split into two phases with an explicit,
+pre-registered go/no-go checkpoint: **Phase 1** — a small, one-function fix to
+`subset_construction`'s own hot loop (a reusable scratch `Vec<usize>` + a borrowed `HashMap`
+lookup replacing the per-iteration `BTreeSet` allocation-and-clone), independently proven a pure
+representation swap by both code reviewers (Opus, Fable — different from the authoring model),
+each running their own large-scale structural-equivalence probe (404,000 and 20,000 cases,
+respectively, using the removed pre-change code as an oracle) rather than just reading the diff.
+**Phase 1 alone closed the whole gap**: fixture 637 went from 1.16× slower than Java to **2.65×
+faster**, and all 11 benchmark workloads are now faster in Rust than in Java (up from U33's
+10-of-11) — `DESIGN.md` §8's Phase-4 exit clause is now met across the board. The pre-registered
+checkpoint rule (proceed to the larger `Fa.d` migration only if 637 is still >5% slower than
+Java, AND a fresh profile still attributes ≥8% of real work to `Fa.d`-rooted `BTreeMap`/allocator
+frames outside `subset_construction`) evaluated to **stop** on both counts (637 is now faster,
+not slower; residual `Fa.d`-attributable share measured at 4.7%) — so **Phase 2, the larger
+`Fa.d`/`TransitionRow` representation change, was not implemented**, per the plan's own
+pre-committed decision rule rather than a post-hoc call. The plan's fully-designed §2 (the
+`TransitionRow`/`SmallVec`/`TransitionRowBuilder` design, its order-sensitivity audit across
+~15 files, and the `DuplicatePolicy` semantics) remains available to resume from if a future
+workload's profile looks different — not thrown away, just not currently justified. Golden corpus
+unchanged (577/586, 0 regression); differential-gen 22,000 queries (0 divergences) across the
+checkpoint spot-check and a follow-up run; `cargo test --workspace` green (1453 tests, +1 —
+a regression test pinning `subset_construction`'s exact output structure on an
+unsorted/duplicated destination list, added after adversarial review found the sort+dedup
+invariant had no clean-failure tripwire, only a hang). Full numbers, the checkpoint's profile
+breakdown, and the reproduction commands are in `benches/STATUS.md`'s new §U34.
