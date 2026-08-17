@@ -721,18 +721,13 @@ impl PredicateEnv for FileLibraries {
         self.load_number_system(name)
     }
 
-    fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-        self.word_with_ctx(name, None)
-    }
+    // `word`/`function` are the trait's derived forms (`self.word_with_ctx(name, None)`)
+    // and are deliberately NOT overridden here — the two `_with_ctx` methods below are the
+    // required ones, so this file-backed environment cannot accidentally end up with a
+    // context-dropping lookup. See [`wr_logic::predicate_env::PredicateEnv::word_with_ctx`].
 
-    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-        self.function_with_ctx(name, None)
-    }
-
-    /// Overridden (the trait's default drops `ctx`) because this environment is
-    /// file-backed: `AutomatonReader` determinizes a nondeterministic word file on load,
-    /// and Java counts that determinization. See
-    /// [`wr_logic::predicate_env::PredicateEnv::word_with_ctx`].
+    /// This environment is file-backed: `AutomatonReader` determinizes a nondeterministic
+    /// word file on load, and Java counts that determinization — hence the `ctx`.
     fn word_with_ctx(
         &self,
         name: &str,
@@ -746,10 +741,12 @@ impl PredicateEnv for FileLibraries {
         self.read_library_automaton_with_ctx(&address, ctx)
     }
 
-    /// Overridden for the same reason as [`Self::word_with_ctx`]; this is the one that is
-    /// actually reachable in practice, since `Automata Library/` is where hand-written
-    /// NFAs live (`Word Automata Library/` files are DFAOs, which Java refuses to
-    /// determinize at all).
+    /// The same, for `$name(…)`; this is the commonest one in practice, since
+    /// `Automata Library/` is where hand-written NFAs live. It is *not* the only one:
+    /// `AutomatonReader.java:88-96` refuses to determinize a nondeterministic file only
+    /// when `FA.isFAO()` (some state's output is `> 1`), so a word file whose outputs are
+    /// all `0`/`1` — a characteristic sequence, say — is determinized on load and counted
+    /// exactly like an `Automata Library/` NFA.
     fn function_with_ctx(
         &self,
         name: &str,

@@ -106,17 +106,22 @@ use std::rc::Rc;
 /// `.txt`-load determinizations). Fixed by routing those two call sites through the
 /// dispatcher too, not just by correcting this comment.
 ///
-/// Three of the four now take a real context on the `eval`/`def` path: Java reads the
+/// **All four** now take a real context on the `eval`/`def` path: Java reads the
 /// `Prover.mainProver.metaCommands` singleton *inside* the dispatcher, and this port
 /// threads the equivalent down from `Prover` explicitly (`PORTING.md`'s ruling for Java
 /// global mutable state) — see [`Automaton::determinize_and_minimize_with_ctx`],
-/// [`Automaton::determinize_and_minimize_from_with_ctx`] and
-/// [`crate::quantify::quantify_with_ctx`]. The fourth, `wr_io::reader`'s `.txt` load,
-/// still passes `None` unconditionally: reproducing Java there would mean threading a
-/// context through `wr_logic::predicate_env::PredicateEnv`, and it only ever matters for
-/// a library file that is genuinely nondeterministic (no corpus fixture is), so the gap
-/// is recorded in `wr_logic::eval::evaluate_with_logging_and_ctx`'s docs rather than
-/// closed blind.
+/// [`Automaton::determinize_and_minimize_from_with_ctx`],
+/// [`crate::quantify::quantify_with_ctx`] and, for the `.txt` load,
+/// `wr_io::reader::read_automaton_txt_with_custom_base_resolver_and_ctx` (reached from
+/// the lexer through `wr_logic::predicate_env::PredicateEnv::word_with_ctx`/
+/// `function_with_ctx`). An earlier version of this comment described the reader as an
+/// unclosed gap "recorded rather than closed blind"; it was closed, because a genuinely
+/// nondeterministic library file's load-time determinization really is Java's index `#0`
+/// on a query like `?msd_2 Ei $mynfa(i) & (i < x)` — verified live against
+/// `Walnut-all.jar` and pinned by `wr_cli::eval_def`'s
+/// `a_nondeterministic_library_automatons_load_consumes_index_zero_like_java`.
+/// The `None`-passing entry points below and in `wr_io::reader` remain, for every caller
+/// that has no enclosing command (tests, `wr-core`'s own `numsys` — see WB-039).
 ///
 /// With `None` the dispatcher is behaviorally identical to the pre-U0c code at each of
 /// these four sites — strategy is unconditionally [`crate::determinize::Strategy::Sc`],

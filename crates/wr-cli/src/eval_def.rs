@@ -1384,6 +1384,17 @@ mod tests {
             // performs. Captured live from `Walnut-all.jar` (2026-08-16) on
             // `eval r "?msd_2 Ex (x*3 = y)"::`. Same signed-off divergence as `q5`.
             ("?msd_2 Ex (x*3 = y)", vec![(0, 3), (1, 3)]),
+            // WB-039's second site again, this time on its EVEN branch — the parity
+            // distinction the entry originally missed. `multiplication(n)`'s `n > 2` arm
+            // splits on `n.mod(2)` (`NumberSystem.java:1006`): the odd half quantifies TWO
+            // variables (`quantify(P, Set.of(b, c))`, `:1016`) and therefore leaks two
+            // indices, but the even half quantifies ONE (`quantify(P, b)`, `:1009`) and
+            // leaks exactly one. Java's sequence for `x*4` is `[(0, 4), (1, 4), (2, 3)]`,
+            // three entries to this port's two — one leaked, not two. Captured live from
+            // `Walnut-all.jar` (2026-08-16) on `eval m1 "?msd_2 Ex (x*4 = y)"::` (three
+            // determinizations) versus a byte-identical rerun in the same session (two,
+            // the memo having swallowed the leak). Same signed-off divergence as `q5`/`q6`.
+            ("?msd_2 Ex (x*4 = y)", vec![(0, 4), (1, 3)]),
         ] {
             let mut ctx = RecordingCtx::default();
             eval_with_ctx(&session, predicate, &mut ctx);
@@ -1449,6 +1460,100 @@ mod tests {
             let actual: Vec<(usize, usize)> = ctx.seen.iter().map(|(i, _, q)| (*i, *q)).collect();
             assert_eq!(actual, expected, "index sequence for `{predicate}`");
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The context reaches a library load **nested one level down**, inside a word
+    /// token's own index sub-predicate — `TD[NU[i]]`, where `NU` is a nondeterministic
+    /// word file.
+    ///
+    /// The lexer recurses to lex a word index (`Predicate.putWord`, `:302-303`, builds a
+    /// fresh `Predicate` from the index text) and to lex a function argument
+    /// (`putFunction`, `:459-462`). Both recursion points must pass the context down, or a
+    /// load performed while lexing the *inner* predicate silently fails to advance the
+    /// counter and every later `[strategy n …]`/`[export n …]` in the command targets the
+    /// wrong automaton. The existing coverage only exercised the top level
+    /// (`a_nondeterministic_library_automatons_load_consumes_index_zero_like_java`), so
+    /// the recursion was correct-by-reading, not correct-by-test.
+    ///
+    /// **Why this shape, and why it ends in an error.** Walnut has no *successful* query
+    /// in which a nested sub-predicate performs a library load: a word index and a
+    /// function argument are both TERM positions, and every token that loads a library
+    /// file yields a `WordExpression` (a word) or a boolean automaton (a function), which
+    /// `Word.act`/`Function.act` refuse there. Confirmed live against `Walnut-all.jar`
+    /// (2026-08-16) for all four combinations — `TD[NU[i]]`, `TD[NU[i]+0]`, `$gfun(NU[i])`
+    /// and (as the reviewer of this unit noted) `$f($g(i))`, which the grammar rejects
+    /// outright. So the nested load is reachable only on a path that then fails, and the
+    /// observable this test pins is precisely that: **the nested load happens, and is
+    /// counted, BEFORE the type error**. Real Java on
+    /// `eval n1 "?msd_2 Ei TD[NU[i]] = @1"::` prints, in order:
+    ///
+    /// ```text
+    /// NFA input: determinizing.
+    ///  Determinizing [#0, strategy: SC]: 2 states
+    /// computing NU[...] / computed NU[i] / computing TD[...]
+    /// argument 1 of function TD cannot be of type Main.EvalComputations.Expressions.WordExpression
+    /// ```
+    ///
+    /// — one determinization, index `#0`, the `NU` load, and then the failure. This
+    /// asserts the same sequence and the same message.
+    #[test]
+    fn the_context_reaches_a_load_nested_inside_a_word_index() {
+        let (session, dir) = temp_session("nestedctx");
+        let words = dir.join("Word Automata Library");
+        // Nondeterministic (state 0's symbol `1` goes to both 0 and 1) and NOT an
+        // `isFAO` — every output is 0 or 1 — so `AutomatonReader.java:87-96` determinizes
+        // it on load rather than throwing `nonDeterministicO`. That distinction is what
+        // makes a *word* file able to consume an index at all.
+        fs::write(
+            words.join("NU.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 0 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+        // The outer word: deterministic, and a genuine DFAO (output 2), so its own load
+        // consumes nothing and cannot be confused with `NU`'s.
+        fs::write(
+            words.join("TD.txt"),
+            "msd_2\n\n0 1\n0 -> 0\n1 -> 1\n\n1 2\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        let mut ctx = RecordingCtx::default();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        let mut fresh = FreshIdentifiers::new();
+        let mut out: Vec<u8> = Vec::new();
+        let err = eval_def_command_with_stdout_and_ctx(
+            &session,
+            &mut logging,
+            &mut fresh,
+            true,
+            true,
+            "?msd_2 Ei TD[NU[i]] = @1",
+            None,
+            None,
+            &mut out,
+            Some(&mut ctx),
+        )
+        .expect_err("Walnut rejects a word expression in an index position");
+
+        // The nested load was counted — the whole point. Java: `Determinizing [#0,
+        // strategy: SC]: 2 states`, and nothing else before the error.
+        let seen: Vec<(usize, usize)> = ctx.seen.iter().map(|(i, _, q)| (*i, *q)).collect();
+        assert_eq!(
+            seen,
+            vec![(0, 2)],
+            "the `NU` load inside `TD[...]`'s index must consume index #0, as it does in Java"
+        );
+        // ...and the failure that follows is Java's, verbatim.
+        assert!(
+            err.to_string().contains(
+                "argument 1 of function TD cannot be of type \
+                 Main.EvalComputations.Expressions.WordExpression"
+            ),
+            "{err}"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 

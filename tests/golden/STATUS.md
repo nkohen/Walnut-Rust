@@ -13,6 +13,23 @@ makes into an invariant the harness enforces on every run — a regression that 
 waved it through. `only_a_text_only_failure_can_be_excused_by_a_known_divergence` (a fast-tier
 test, no corpus run needed) covers the rule itself.
 
+**The tagging was initially applied incompletely, and that is now fixed.** Five comparison
+sites tagged their failure `Text` while returning *before* the automaton comparison ran, which
+is exactly the "did not run ≠ passed" case the tagging exists to catch — a listed fixture that
+started erroring outright, or whose `.gv`/matrix output diverged, would have been reported as
+"text-only" with zero automaton evidence behind the claim. Two of the five were live (the
+`compare_error` branch for "the corpus records success but the port errored", and
+`compare_test_case`'s mirror image "the port succeeded but the corpus records an error"); the
+other three (matrix size, matrix content, graphviz) were latent, since none of the nine listed
+fixtures has a `gv*.gv` expectation and the six with CAS matrices take the DROP-scope skip.
+All five are corrected: the two error-vs-success shapes are now `FailedHalf::Automaton` (no
+comparison happened, and none *can* — the corpus records no automaton on an error fixture),
+and the three text comparisons now collect into `failures` and fall through to step 4 the way
+the `details` check already did, so the automaton comparison genuinely runs and carries its own
+tag. `an_error_where_the_corpus_records_success_is_not_a_text_only_failure` and
+`a_text_mismatch_no_longer_pre_empts_the_automaton_comparison` (both fast-tier) pin this;
+both were mutation-verified — reverting either fix makes its test fail.
+
 ## How to run it
 
 ```bash

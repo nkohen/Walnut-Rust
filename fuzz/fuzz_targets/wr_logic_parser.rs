@@ -29,6 +29,7 @@ use std::rc::Rc;
 
 use libfuzzer_sys::fuzz_target;
 use wr_core::automaton::Automaton;
+use wr_core::determinize::DeterminizeContext;
 use wr_core::numsys::{NumSysError, NumberSystem};
 use wr_logic::predicate::Predicate;
 use wr_logic::predicate_env::{InMemoryPredicateEnv, PredicateEnv, PredicateEnvError};
@@ -113,12 +114,20 @@ impl PredicateEnv for BoundedEnv {
         self.inner.number_system(name)
     }
 
-    fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-        self.inner.word(name)
+    fn word_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        self.inner.word_with_ctx(name, ctx)
     }
 
-    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-        self.inner.function(name)
+    fn function_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        self.inner.function_with_ctx(name, ctx)
     }
 
     fn macro_text(&self, name: &str) -> Result<String, PredicateEnvError> {

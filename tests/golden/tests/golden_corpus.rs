@@ -183,9 +183,13 @@ enum FailedHalf {
     /// half a [`KNOWN_DIVERGENCES`] entry may excuse.
     Text,
     /// The `wr_core::equiv` automaton comparison — **including** the cases where it could
-    /// not be run at all (an unreadable recorded automaton, a missing/extra automaton, the
-    /// wrong number of pairs). "Did not run" is not "passed", so those are tagged here
-    /// deliberately rather than as [`FailedHalf::Harness`].
+    /// not be run at all: an unreadable recorded automaton, a missing/extra automaton, the
+    /// wrong number of pairs, the command **erroring** where the corpus records a successful
+    /// result, and the command **succeeding** where the corpus records an error (so the
+    /// corpus recorded no automaton to compare against). "Did not run" is not "passed", so
+    /// those are tagged here deliberately rather than as [`FailedHalf::Text`] — tagging them
+    /// `Text` is exactly how a listed fixture that stopped producing any automaton at all
+    /// could be waved through with zero automaton evidence.
     Automaton,
     /// Neither comparison: the harness itself, the command's own dispatch, or a port panic.
     /// Never excusable by a known entry.
@@ -1174,6 +1178,165 @@ fn only_a_text_only_failure_can_be_excused_by_a_known_divergence() {
     assert_eq!(fold_failures(Vec::new(), Verdict::Pass), Verdict::Pass);
 }
 
+/// The same invariant, driven through the **real comparison functions** rather than through
+/// hand-built [`Verdict`]s — because the tagging is only worth anything if the comparators
+/// actually apply it, and the hand-built test above cannot see a comparator that tags the
+/// wrong half.
+///
+/// The shape under test is the one that matters most in practice: a fixture the corpus
+/// records a SUCCESSFUL result for, where the port errors (or panics, which `FixtureJob::run`
+/// turns into a `Harness` failure, or fails at dispatch, which arrives here). No automaton
+/// comparison happens on that path at all, so it must never be excusable by a
+/// `KNOWN_DIVERGENCES` entry.
+#[test]
+fn an_error_where_the_corpus_records_success_is_not_a_text_only_failure() {
+    let success = Expected {
+        automaton_path: None,
+        error: String::new(),
+        details: String::new(),
+        graph_viz: String::new(),
+        matrix_output: vec![String::new(); 4],
+    };
+
+    // The port errored where the corpus says the command succeeds: nothing was compared.
+    let verdict = compare_error(&success, "Undefined variable: index out of bounds");
+    assert!(matches!(verdict, Verdict::Fail(_)));
+    assert!(
+        !verdict.is_text_only_failure(),
+        "an outright port error on a corpus-expects-success fixture has zero automaton \
+         evidence behind it, so `KNOWN_DIVERGENCES` must not be able to excuse it: {verdict:?}"
+    );
+
+    // Both sides errored and only the wording differs: that IS a text comparison.
+    let errored = Expected {
+        error: "Undefined variable: x".to_string(),
+        ..success.clone()
+    };
+    assert!(compare_error(&errored, "Undefined variable: y").is_text_only_failure());
+    assert_eq!(
+        compare_error(&errored, "Undefined variable: x"),
+        Verdict::Pass
+    );
+}
+
+/// [`compare_test_case`]'s own tagging, driven end to end on a real [`TestCase`] and a real
+/// recorded automaton file.
+///
+/// Two things are pinned here, and the second is the one the earlier short-circuiting code
+/// got wrong:
+///  1. a text mismatch (here graphviz) no longer pre-empts step 4 — the automaton comparison
+///     still runs, so when the automaton ALSO differs the verdict carries both reasons and is
+///     not text-only;
+///  2. the same text mismatch with a MATCHING automaton is still text-only, so the
+///     tightening does not turn any genuine text-only divergence into a hard failure.
+///
+/// Under the old code case 1 returned `FailedHalf::Text` from the graphviz check and the
+/// automaton was never looked at — indistinguishable from case 2 at the gate, i.e. a listed
+/// fixture whose language silently broke would have reported green.
+#[test]
+fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
+    let dir = std::env::temp_dir().join(format!(
+        "wr-golden-tagging-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // `x = x` over msd_2: accepts everything.
+    let everything = dir.join("everything.txt");
+    std::fs::write(&everything, "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
+    // A different language: `x = 0`.
+    let only_zero = dir.join("only_zero.txt");
+    std::fs::write(
+        &only_zero,
+        "msd_2\n\n0 1\n0 -> 0\n1 -> 1\n\n1 0\n0 -> 1\n1 -> 1\n",
+    )
+    .unwrap();
+
+    let read = |p: &Path| wr_io::reader::read_automaton_txt(p.to_str().unwrap()).unwrap();
+    let session = Session::new(
+        Some(dir.join("Session").to_str().unwrap()),
+        Some(dir.to_str().unwrap()),
+        false,
+    );
+    let rewrite = PathRewrite {
+        home_dir: dir.display().to_string(),
+        session_dir: dir.join("Session").display().to_string(),
+    };
+    // The port's answer, in both cases: the `accepts everything` automaton. `gv_address` is
+    // empty, so `TestCase::graph_viz()` yields `""` — a mismatch against any recorded one.
+    let actual = || TestCase::from_automaton(read(&everything));
+
+    let expected_with_gv = |automaton_path: &Path| Expected {
+        automaton_path: Some(automaton_path.to_path_buf()),
+        error: String::new(),
+        details: String::new(),
+        graph_viz: "digraph G { rankdir = LR; }".to_string(),
+        matrix_output: vec![String::new(); 4],
+    };
+
+    // 1. graphviz differs AND the automaton differs.
+    let mut notes = Vec::new();
+    let verdict = compare_test_case(
+        &session,
+        &expected_with_gv(&only_zero),
+        &actual(),
+        &rewrite,
+        &mut notes,
+    );
+    assert!(
+        verdict.message().contains("graphviz"),
+        "the graphviz mismatch must still be reported: {verdict:?}"
+    );
+    assert!(
+        verdict.message().contains("automaton language differs"),
+        "the automaton comparison must have RUN despite the graphviz mismatch: {verdict:?}"
+    );
+    assert!(
+        !verdict.is_text_only_failure(),
+        "a text mismatch must not launder a broken automaton into an excusable one: {verdict:?}"
+    );
+
+    // 2. the same graphviz mismatch with a MATCHING automaton is still text-only.
+    let mut notes = Vec::new();
+    let verdict = compare_test_case(
+        &session,
+        &expected_with_gv(&everything),
+        &actual(),
+        &rewrite,
+        &mut notes,
+    );
+    assert!(
+        verdict.is_text_only_failure(),
+        "a genuine text-only divergence must stay excusable: {verdict:?}"
+    );
+
+    // 3. the corpus records an ERROR but the command succeeded: no automaton was recorded,
+    //    so the automaton comparison cannot run — never excusable.
+    let mut notes = Vec::new();
+    let verdict = compare_test_case(
+        &session,
+        &Expected {
+            automaton_path: None,
+            error: "Undefined variable: x".to_string(),
+            details: String::new(),
+            graph_viz: String::new(),
+            matrix_output: vec![String::new(); 4],
+        },
+        &actual(),
+        &rewrite,
+        &mut notes,
+    );
+    assert!(
+        !verdict.is_text_only_failure(),
+        "the corpus recorded no automaton for an error fixture, so nothing was compared: \
+         {verdict:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Option<Excluded> {
     if !fixture.subset_relevant {
         return Some(Excluded::DropScope(fixture.drop_reason.clone()));
@@ -1190,14 +1353,25 @@ fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Opt
 /// The `catch(Exception e)` arm of `runSpecificTest` (`:963-965`):
 /// `assertEquals(expected.getError(), e.getMessage())` — an EXACT comparison, with none of
 /// `assertEqualMessages`' normalization.
+///
+/// **The two mismatch branches are tagged differently, and that difference is the point.**
+/// Only one of them is a text comparison at all:
+///   * the corpus recorded an error too, and the two error strings differ — a genuine TEXT
+///     divergence, and the only shape a [`KNOWN_DIVERGENCES`] entry may excuse;
+///   * the corpus recorded a **successful** result and the port errored (or panicked into an
+///     error) instead — here the automaton comparison never ran, and "did not run" is not
+///     "passed" ([`FailedHalf::Automaton`]'s own contract). Tagging this `Text` would let a
+///     listed fixture that starts erroring outright be waved through as "text-only" with zero
+///     automaton evidence, which is precisely what the tagging exists to prevent.
 fn compare_error(expected: &Expected, actual: &str) -> Verdict {
     if expected.error == actual {
         Verdict::Pass
     } else if expected.error.is_empty() {
         Verdict::fail(
-            FailedHalf::Text,
+            FailedHalf::Automaton,
             format!(
-                "command failed, but the corpus records a successful result.\n  actual error: {actual}"
+                "command failed, but the corpus records a successful result — so the automaton \
+                 comparison never ran.\n  actual error: {actual}"
             ),
         )
     } else {
@@ -1219,14 +1393,34 @@ fn compare_test_case(
     notes: &mut Vec<String>,
 ) -> Verdict {
     if !expected.error.is_empty() {
+        // Tagged `Automaton`, not `Text`, even though the strings being contrasted are text:
+        // the corpus recorded an ERROR for this fixture, so it recorded no automaton (nor
+        // details/matrix/graphviz) to compare against. The automaton comparison therefore
+        // cannot run at all — and "did not run" is not "passed", so no `KNOWN_DIVERGENCES`
+        // entry may excuse it. This is also why this one check still short-circuits where the
+        // three below now fall through: there is genuinely nothing left to compare, and
+        // running the remaining steps against absent expectations would only manufacture
+        // cascading phantom mismatches.
         return Verdict::fail(
-            FailedHalf::Text,
+            FailedHalf::Automaton,
             format!(
-                "command succeeded, but the corpus records an error: {}",
+                "command succeeded, but the corpus records an error (so no automaton was \
+                 recorded to compare against): {}",
                 expected.error
             ),
         );
     }
+
+    // Every mismatch from here on is COLLECTED, not returned. It used to short-circuit, which
+    // meant a fixture whose matrix/graphviz/`details` text diverged never had its AUTOMATON
+    // compared at all — so an automaton divergence could hide behind a text one indefinitely,
+    // AND (worse, once `KNOWN_DIVERGENCES` started being gated on `FailedHalf`) a text-tagged
+    // early return would advertise "the automaton half is fine" about a comparison that never
+    // ran. Every remaining `details` divergence in `KNOWN_DIVERGENCES` is a log-text gap whose
+    // state counts already match; that claim is only checkable if the automaton comparison
+    // still runs, so all three text comparisons push into `failures` and execution continues
+    // to step 4.
+    let mut failures: Vec<(FailedHalf, String)> = Vec::new();
 
     // 1. matrix output (`:933-938`)
     let actual_matrix = match actual.matrix_output() {
@@ -1242,17 +1436,16 @@ fn compare_test_case(
         // CAS incidence-matrix export is DROP scope for this port; compared automaton/details
         // still apply. Recorded, not silent.
         notes.push("cas-matrix-skipped (CAS export is DROP scope)".to_string());
+    } else if expected.matrix_output.len() != actual_matrix.len() {
+        failures.push((
+            FailedHalf::Text,
+            format!(
+                "matrix output size differs: expected {}, actual {}",
+                expected.matrix_output.len(),
+                actual_matrix.len()
+            ),
+        ));
     } else {
-        if expected.matrix_output.len() != actual_matrix.len() {
-            return Verdict::fail(
-                FailedHalf::Text,
-                format!(
-                    "matrix output size differs: expected {}, actual {}",
-                    expected.matrix_output.len(),
-                    actual_matrix.len()
-                ),
-            );
-        }
         for (i, (e, a)) in expected
             .matrix_output
             .iter()
@@ -1260,38 +1453,39 @@ fn compare_test_case(
             .enumerate()
         {
             if let Err(why) = compare_messages(e.trim(), a.trim(), &format!("matrix output[{i}]")) {
-                return Verdict::fail(FailedHalf::Text, why);
+                failures.push((FailedHalf::Text, why));
             }
         }
     }
 
-    // 2. graphviz (`:940-945`) — only when the corpus recorded one.
+    // 2. graphviz (`:940-945`) — only when the corpus recorded one. A `.gv` rendering
+    // mismatch says nothing about the automaton's language (it is a view of the same object),
+    // so it is collected like the others rather than pre-empting step 4.
     if !expected.graph_viz.trim().is_empty() {
-        let actual_gv = match actual.graph_viz() {
-            Ok(gv) => gv,
-            Err(e) => {
-                return Verdict::fail(FailedHalf::Harness, format!("reading actual graphviz: {e}"))
+        match actual.graph_viz() {
+            Ok(actual_gv) => {
+                if let Err(why) = compare_messages(
+                    expected.graph_viz.trim(),
+                    actual_gv.trim(),
+                    "graphviz output",
+                ) {
+                    failures.push((FailedHalf::Text, why));
+                }
             }
-        };
-        if let Err(why) = compare_messages(
-            expected.graph_viz.trim(),
-            actual_gv.trim(),
-            "graphviz output",
-        ) {
-            return Verdict::fail(FailedHalf::Text, why);
+            // A harness-level read failure is never excusable, but it must not discard the
+            // matrix reasons collected above — hence the fold rather than a bare return.
+            Err(e) => {
+                return fold_failures(
+                    failures,
+                    Verdict::fail(FailedHalf::Harness, format!("reading actual graphviz: {e}")),
+                )
+            }
         }
     }
 
     // 3. details (`:946`). `rewrite` maps this harness's own throwaway library directories
     // back to the ones `walnut-java` recorded — see [`PathRewrite`] for why that is the one
     // extra normalization and why it cannot hide a port defect.
-    //
-    // A details mismatch is COLLECTED, not returned: it used to short-circuit, which meant a
-    // fixture whose `details` text diverged never had its AUTOMATON compared at all — so an
-    // automaton divergence could hide behind a text one indefinitely. Every remaining
-    // `details` divergence in `KNOWN_DIVERGENCES` is a log-text gap whose state counts already
-    // match; that claim is only checkable if the automaton comparison still runs.
-    let mut failures: Vec<(FailedHalf, String)> = Vec::new();
     if let Err(why) = compare_messages(
         &expected.details,
         &rewrite.apply(actual.details()),

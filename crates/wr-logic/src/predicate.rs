@@ -2698,11 +2698,19 @@ mod tests {
         fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
             self.inner.number_system(name)
         }
-        fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-            self.inner.word(name)
+        fn word_with_ctx(
+            &self,
+            name: &str,
+            ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        ) -> Result<Automaton, PredicateEnvError> {
+            self.inner.word_with_ctx(name, ctx)
         }
-        fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
-            self.inner.function(name)
+        fn function_with_ctx(
+            &self,
+            name: &str,
+            ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        ) -> Result<Automaton, PredicateEnvError> {
+            self.inner.function_with_ctx(name, ctx)
         }
         fn macro_text(&self, name: &str) -> Result<String, PredicateEnvError> {
             let n = self.calls.get() + 1;

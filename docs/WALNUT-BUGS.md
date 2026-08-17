@@ -1034,14 +1034,35 @@ bug costs a silent wrong answer somewhere downstream.
   `WALNUT-BUGS.md` entry existed for it before this one; confirmed by grepping the file for
   `NFAO`/`is_fao`/`nonDeterministicO` and finding nothing). Confirmed by reading
   `AutomatonReader.java:88-98` directly, not inferred.
+- **A SECOND failure shape, added 2026-08-16 (Phase 4, `[strategy …]`/`[export …]` wiring):** once
+  the reader's load-time determinization started going through the real dispatcher with a
+  `DeterminizeContext`, this same gap gained a *different*, user-visible symptom whenever a non-`SC`
+  strategy is in play. Under `SC` the behavior is as described above — silent, information-losing
+  corruption. Under `[strategy n BRZ]`, the port's missing `is_fao()` check means the DFAO reaches
+  `DeterminizationStrategies.determinize`'s own DFAO guard (`:115-119`) instead, so the load fails
+  with **`"DFAOs are not supported for non-SC strategies."`** Real Java prints
+  **`"NFAOs are not supported.."`** for the identical input — it never reaches the strategy check
+  at all, because `AutomatonReader.java:87-96`'s `isFAO()` throw runs first, *before* any
+  determinization is attempted, and the strategy therefore makes no difference to Java's message.
+  Verified live against `Walnut-all.jar` (2026-08-16): with the NFAO file in `Automata Library/`,
+  both `eval r1 "?msd_2 Ei $nfao(i) & (i < x)"::` and
+  `[strategy 0 BRZ]eval r1 "?msd_2 Ei $nfao(i) & (i < x)"::` print exactly
+  `NFAOs are not supported..`. So the divergence in this configuration is a hard error with the
+  wrong text rather than silent corruption — still one `is_fao()` guard away from correct, and
+  arguably the less dangerous of the two shapes, but a distinct one worth recording rather than
+  discovering twice.
 - **Rust port:** `not yet reached` — the underlying gap is in `read_automaton_txt_impl` (pre-dates
   this unit; U13 only added a new, more visible caller in `read_automaton_dfa_txt`), and is
-  currently unaddressed. Pinned, not silently left unnoticed, by
+  currently unaddressed. Pinned, not silently left unnoticed, by two tests in
+  `crates/wr-io/src/reader.rs` —
   `read_automaton_dfa_txt_on_a_genuine_nfao_file_silently_determinizes_instead_of_erroring_wb022`
-  in `crates/wr-io/src/reader.rs`, which asserts the CURRENT (divergent) behavior explicitly, so
-  a future fix (adding the `is_fao()` guard to `read_automaton_txt_impl`, before the
-  auto-determinize step) is a visible, intentional behavior change — the test will fail and have
-  to be updated — rather than something nobody notices moving.
+  (the `SC` shape) and
+  `a_genuine_nfao_file_under_a_non_sc_strategy_errors_with_the_wrong_message_wb022` (the
+  strategy shape, which asserts both the wrong text the port produces AND that it is not Java's).
+  Both assert the CURRENT (divergent) behavior explicitly, so a future fix (adding the `is_fao()`
+  guard to `read_automaton_txt_impl`, before the auto-determinize step) is a visible, intentional
+  behavior change — the tests will fail and have to be updated — rather than something nobody
+  notices moving.
 - **Upstream:** not applicable — Java's behavior here is the one to replicate, not fix.
 - **Severity:** moderate — silent, information-losing wrong output (not a crash) on a plausible
   hand-written input shape; bounded by the fact that no real corpus fixture hits it and that
@@ -1963,7 +1984,9 @@ bug costs a silent wrong answer somewhere downstream.
   - `constant(BigInteger)`'s bracket, `:936`/`:968`, around its recursive
     `getConstant(floorHalf)`/`getConstant(ceilHalf)` calls;
   - `multiplication(BigInteger)`'s bracket, `:983`/`:1021`, around the `n > 2` branch's
-    `getMultiplication(BIG_TWO)` (`:1000`) and `getMultiplication(k)` (`:1004`) recursion.
+    `getMultiplication(BIG_TWO)` (`:1000`) and `getMultiplication(k)` (`:1004`) recursion. **How
+    much this one leaks depends on `n`'s parity** — see below; the leak itself fires for every
+    `n > 2`, but it costs one index for even `n` and two for odd `n`.
 - **What:** `DeterminizationStrategies.determinize` guards its whole `MetaCommands` block —
   automata-index increment, strategy lookup, `[export …]` dump — behind
   `Logging.shouldPrintDetails()`, with a comment stating exactly why: *"this is only done when
@@ -1979,9 +2002,18 @@ bug costs a silent wrong answer somewhere downstream.
     printing back **on** — so the rest of `constant(n)`'s body (two `AutomatonLogicalOps.and` calls
     and an `AutomatonQuantification.quantify`, `:962-965`) runs *counted*. **One** leaked index.
   - `multiplication(n)`, `n > 2`, hits it the same way through `getMultiplication(BIG_TWO)` →
-    `multiplication(2)`'s own bracket — so the rest of `multiplication(n)`'s body runs counted,
-    including its `AutomatonQuantification.quantify(P, Set.of(b, c))` (`:1016`), which is a
-    TWO-variable quantification and therefore **two** leaked indices, not one.
+    `multiplication(2)`'s own bracket — so the rest of `multiplication(n)`'s body runs counted.
+    **How many indices that leaks depends on `n`'s parity**, because the `n > 2` branch splits on
+    `n.mod(BIG_TWO)` (`:1006`) and the two halves quantify differently:
+    - **odd `n = 2k+1`** (`:1012-1017`) ends in
+      `AutomatonQuantification.quantify(P, Set.of(b, c))` (`:1016`) — a TWO-variable
+      quantification, hence **two** leaked indices;
+    - **even `n = 2k`** (`:1007-1010`) ends in `AutomatonQuantification.quantify(P, b)` (`:1009`)
+      — a single variable, hence **one** leaked index.
+
+    So the cost is *one or two, depending on `n`'s parity*, not unconditionally two. Both were
+    confirmed live (triggers below); an earlier draft of this entry generalized the odd case's
+    "two" to all `n > 2`, which is wrong for `n = 4, 6, 8, …`.
 - **Consequence (the part that actually bites):** the index a `[strategy n …]`/`[export n …]`
   metacommand names is **not a stable function of the query**. It depends on the relevant memo
   (`constantsDynamicTable` / `multiplicationsDynamicTable`), i.e. on what earlier commands in the
@@ -2003,8 +2035,8 @@ bug costs a silent wrong answer somewhere downstream.
   with `i > 5` instead of `i > 2` shows the three-determinization shape again (fresh constant), and
   `?msd_2 x > 1`-style queries never leak at all (`constant(1)` is `makeOne()`, which builds
   nothing).
-- **Trigger 2 — `multiplication()` (verified live against `Walnut-all.jar`, 2026-08-16):** the same
-  shape, costing two indices instead of one —
+- **Trigger 2 — `multiplication()`, ODD `n` (verified live against `Walnut-all.jar`, 2026-08-16):**
+  the same shape, costing two indices instead of one —
   ```
   eval m1 "?msd_2 Ex (x*3 = y)"::
   eval m2 "?msd_2 Ex (x*3 = y)"::
@@ -2014,6 +2046,17 @@ bug costs a silent wrong answer somewhere downstream.
   leaked `quantify(P, {b, c})`; `m2`, byte-identical, records only the **two** the query itself
   performs, `[#0 …]: 3 states`, `[#1 …]: 3 states`. `2*j` does NOT leak (`multiplication(2)` takes
   the `n == 2` branch, which recurses into nothing).
+- **Trigger 3 — `multiplication()`, EVEN `n` (verified live against `Walnut-all.jar`, 2026-08-16):**
+  the parity half of the same site, costing exactly **one** index —
+  ```
+  eval m1 "?msd_2 Ex (x*4 = y)"::
+  eval m2 "?msd_2 Ex (x*4 = y)"::
+  ```
+  `m1` records **three** determinizations, `[#0 …]: 4 states`, `[#1 …]: 4 states`,
+  `[#2 …]: 3 states`; `m2`, byte-identical, records only the **two** the query itself performs,
+  `[#0 …]: 4 states`, `[#1 …]: 3 states`. One leaked index, not two, because `n = 4`'s
+  `n.mod(2) == 0` branch quantifies a single variable (`quantify(P, b)`, `:1009`) where `n = 3`'s
+  quantifies `{b, c}`.
 - **Found:** Phase 4, wiring `[strategy …]`/`[export …]` through to `wr_core::determinize`
   (2026-08-16). Surfaced by an index-sequence regression test transcribed from real
   `*_detailed_log.txt` output: four of five ground-truth queries matched this port exactly, and the
@@ -2028,8 +2071,9 @@ bug costs a silent wrong answer somewhere downstream.
   index sequence — but it is a real behavioral divergence for any query that triggers a nested
   `NumberSystem` bracket the session has not already memoized (a constant `≥ 2`, or a
   multiplication by `n > 2`). Pinned, not hidden, by `wr_cli::eval_def`'s
-  `the_automata_index_sequence_matches_real_walnut_java`, whose fifth and sixth cases carry Java's
-  sequence alongside the port's — one per confirmed site. Porting verbatim is possible but not cheap: it
+  `the_automata_index_sequence_matches_real_walnut_java`, whose fifth, sixth and seventh cases
+  carry Java's sequence alongside the port's — one for `constant()`, and one for each parity half
+  of `multiplication()`. Porting verbatim is possible but not cheap: it
   means threading the context through the whole of `numsys` (comparison / arithmetic / constant /
   multiplication / division, plus the constructor) *and* giving the context a mutable
   `print_enabled` flag with Java's exact non-reentrant `disable`/`enable` call sites, in order to

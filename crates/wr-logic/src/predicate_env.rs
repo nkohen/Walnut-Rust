@@ -419,7 +419,12 @@ pub trait PredicateEnv {
     /// The caller (U4's `Word` token) is responsible for the arity check Java does in
     /// `Word`'s constructor (`Word.java:39-45`: `validateArity(name, A.getArity())`);
     /// this method only produces the automaton.
-    fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError>;
+    ///
+    /// **Derived, not primary** — see [`Self::word_with_ctx`], which is the method an
+    /// implementor writes. This is the no-enclosing-command convenience form.
+    fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+        self.word_with_ctx(name, None)
+    }
 
     /// `Automaton.readAutomatonFromFile(name)` (`Predicate.java:453` →
     /// `Automaton.java:148-150`) — the automaton for a user-defined predicate invoked as
@@ -436,7 +441,11 @@ pub trait PredicateEnv {
     /// (`Word Automata Library/` vs `Automata Library/`), so the same bare name can
     /// legitimately resolve to two different automata — collapsing them into one method
     /// with a "kind" parameter would be a gratuitous divergence from the Java call graph.
-    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError>;
+    ///
+    /// **Derived, not primary** — see [`Self::function_with_ctx`].
+    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+        self.function_with_ctx(name, None)
+    }
 
     /// [`Self::word`] with the enclosing command's [`DeterminizeContext`], so that a
     /// **nondeterministic** library file's load-time `determinizeAndMinimize()`
@@ -450,31 +459,42 @@ pub trait PredicateEnv {
     /// (`PORTING.md`'s standing ruling), which is why the context has to reach the
     /// environment at all.
     ///
-    /// **The default implementation ignores `ctx`** and forwards to [`Self::word`]. That is
-    /// correct for any environment that does not determinize on load — in particular
+    /// # This is the REQUIRED method, and [`Self::word`] is the derived one
+    ///
+    /// The dependency deliberately runs in this direction and not the other. An
+    /// implementor must write `word_with_ctx`; `word` then falls out of it as
+    /// `self.word_with_ctx(name, None)`.
+    ///
+    /// The tempting alternative — make `word` required and give `word_with_ctx` a default
+    /// that drops `ctx` and forwards to it — is worse in two ways. It is silently WRONG
+    /// for any file-backed environment that forgets to override it (the load-time
+    /// determinization stops advancing the index counter, so every later
+    /// `[strategy n …]`/`[export n …]` in that command silently targets the wrong
+    /// automaton — a wrong answer, not an error). And a *third* arrangement, giving BOTH
+    /// directions defaults so either may be overridden, is worse still: an implementor
+    /// that overrides neither gets unbounded mutual recursion, i.e. a stack overflow, which
+    /// this project's panic-recovery boundary (`Prover::caught`, U30) cannot catch because
+    /// a stack overflow aborts rather than unwinds. One required method in the direction
+    /// that carries strictly more information makes both failure modes unrepresentable.
+    ///
+    /// An environment that genuinely does not determinize on load — in particular
     /// [`InMemoryPredicateEnv`], whose automata are handed over already built, with no
-    /// `AutomatonReader` step to count. A **file-backed** environment (`wr_cli::Session`)
-    /// must override it.
+    /// `AutomatonReader` step to count — implements this by ignoring `ctx`, which is a
+    /// one-line, visible, deliberate decision rather than an omission.
     fn word_with_ctx(
         &self,
         name: &str,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
-    ) -> Result<Automaton, PredicateEnvError> {
-        let _ = ctx;
-        self.word(name)
-    }
+    ) -> Result<Automaton, PredicateEnvError>;
 
     /// [`Self::function`] with the enclosing command's [`DeterminizeContext`] — see
-    /// [`Self::word_with_ctx`], which this mirrors exactly (same rationale, same default,
-    /// same override obligation).
+    /// [`Self::word_with_ctx`], which this mirrors exactly (same rationale, and likewise
+    /// the required method of the pair).
     fn function_with_ctx(
         &self,
         name: &str,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
-    ) -> Result<Automaton, PredicateEnvError> {
-        let _ = ctx;
-        self.function(name)
-    }
+    ) -> Result<Automaton, PredicateEnvError>;
 
     /// `Predicate.readMacroFile(name)` (`Predicate.java:495-511`) — the raw text of the
     /// macro invoked as `#name(…)`, before argument substitution.
@@ -650,7 +670,15 @@ impl PredicateEnv for InMemoryPredicateEnv {
         Ok(ns)
     }
 
-    fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+    /// `ctx` is deliberately ignored: this environment's automata are handed over already
+    /// built, so there is no `AutomatonReader` load-time determinization to count. See
+    /// [`PredicateEnv::word_with_ctx`] on why this is the required half of the pair.
+    fn word_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        let _ = ctx;
         match self.words.get(name) {
             Some(a) => Ok(a.clone()),
             None => Err(PredicateEnvError::FileDoesNotExist {
@@ -659,7 +687,13 @@ impl PredicateEnv for InMemoryPredicateEnv {
         }
     }
 
-    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+    /// `ctx` ignored, for the same reason as [`Self::word_with_ctx`].
+    fn function_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        let _ = ctx;
         match self.functions.get(name) {
             Some(a) => Ok(a.clone()),
             None => Err(PredicateEnvError::FileDoesNotExist {

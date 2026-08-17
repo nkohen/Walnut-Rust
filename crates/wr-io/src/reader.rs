@@ -2958,6 +2958,83 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// WB-022's **second, newer failure shape**: the same genuine-NFAO file, but loaded
+    /// under a non-`SC` `[strategy …]`.
+    ///
+    /// Real Java never gets as far as a strategy here. `AutomatonReader.java:87-96` tests
+    /// `!isDeterministic()` and then `FA.isFAO()` (any state output `> 1`) and throws
+    /// `WalnutException.nonDeterministicO()` — **`"NFAOs are not supported.."`** — before
+    /// `DeterminizationStrategies.determinize` is ever called, so the strategy makes no
+    /// difference to the message at all. Verified live against `Walnut-all.jar`
+    /// (2026-08-16) with this exact file in `Automata Library/` and the command
+    /// `[strategy 0 BRZ]eval r1 "?msd_2 Ei $nfao(i) & (i < x)"::`, which prints exactly
+    /// `NFAOs are not supported..` — the same output the identical command without the
+    /// metacommand prints.
+    ///
+    /// This port, having no `is_fao()` guard in [`read_automaton_txt_impl`] (that IS
+    /// WB-022), walks straight into the dispatcher, which then rejects the DFAO on the
+    /// *strategy's* terms instead: `DeterminizeError::DfaoWithNonScStrategy`, rendered as
+    /// `"DFAOs are not supported for non-SC strategies."` (`DeterminizationStrategies.java:
+    /// 115-119`'s own text, correct for its own check but the wrong check to have reached).
+    /// So the gap that is silent corruption under `SC` becomes a hard error with the wrong
+    /// message under `BRZ`.
+    ///
+    /// Pinned here rather than fixed, exactly like the `SC` shape above: closing WB-022 is
+    /// one `is_fao()` guard, and when it lands this assertion must change to Java's
+    /// `NFAOs are not supported..` — visibly, on purpose.
+    #[test]
+    fn a_genuine_nfao_file_under_a_non_sc_strategy_errors_with_the_wrong_message_wb022() {
+        struct AlwaysBrz;
+        impl wr_core::determinize::DeterminizeContext for AlwaysBrz {
+            fn next_automaton_index(&mut self) -> usize {
+                0
+            }
+            fn strategy(&mut self, _index: usize) -> wr_core::determinize::Strategy {
+                wr_core::determinize::Strategy::Brz
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "wr-io-test-nfao-brz-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nfao.txt");
+        // The same shape as the `SC` test above: state 0 has two destinations for symbol
+        // 0 (nondeterministic) and state 1's output is 2 (`isFAO`).
+        std::fs::write(
+            &path,
+            "msd_2\n\n0 0\n0 -> 0\n0 -> 1\n1 -> 0\n\n1 2\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        let mut ctx = AlwaysBrz;
+        let err = read_automaton_txt_with_custom_base_resolver_and_ctx(
+            &path,
+            &CustomBasesDir(&dir),
+            Some(&mut ctx),
+        )
+        .expect_err("the dispatcher rejects a DFAO under a non-SC strategy");
+        assert!(
+            matches!(
+                err,
+                ReadError::Determinize(DeterminizeError::DfaoWithNonScStrategy(
+                    wr_core::determinize::Strategy::Brz
+                ))
+            ),
+            "{err:?}"
+        );
+        // The user-visible text, and the whole point of this pin: it is NOT Java's.
+        assert_eq!(
+            err.to_string(),
+            "DFAOs are not supported for non-SC strategies."
+        );
+        assert_ne!(err.to_string(), "NFAOs are not supported..");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn read_automaton_dfa_txt_true_false_fixtures() {
         let dfa_true = read_automaton_dfa_txt(fixture("automaton189.txt")).unwrap();
