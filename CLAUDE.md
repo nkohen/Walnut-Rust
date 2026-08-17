@@ -564,3 +564,35 @@ on the `Session` — measured at 0.31 ms vs 119.5 ms on fixture 207, a 390× art
 wrong way (`WR_BENCH_COLD=1` reproduces it). `cargo test --workspace` green (1452 tests);
 `fmt`/`clippy` clean; `cargo bench` and the head-to-head are separate invocations that never run
 in the fast tier.
+
+**U33 (unplanned, user-requested follow-up to U32's negative finding) — the two cheapest ranked
+fixes from `benches/STATUS.md`'s "what would close the gap" list, both zero algorithmic risk:
+swap the global allocator to `mimalloc`, and enable `lto = "fat"` / `codegen-units = 1` in
+`[profile.release]`.** Neither touches `wr-core`/`wr-logic`/decision-procedure code — a
+`#[global_allocator]` static registered in `wr-cli`'s and `wr-bench`'s binaries only (not the
+library, so an embedder like `ct-research` isn't forced onto it), plus a Cargo profile change.
+Commit `09020db`. **Result: 9-of-11-slower became 10-of-11-faster.** The allocator swap alone
+accounts for essentially the whole effect (1.22×–3.62× per fixture); LTO/codegen-units add a
+uniform but small 1.08×–1.16× on top. A repeat of U32's own CPU profile on the same fixture
+(286) confirms the diagnosis directly: the system-allocator share of CPU time dropped from
+**51.5% to 13.4%** (~248ms→~38ms per iteration); `BTreeSet::insert` inside `subset_construction`
+is now the single largest frame at 24% — i.e. exactly `benches/STATUS.md`'s candidate #2
+(flattening the transition representation), untouched here and correctly out of scope for this
+pass (real correctness risk — iteration order is load-bearing in several ported algorithms).
+
+**DESIGN.md §8's exit criterion is now met on most, not all, workloads — reported without
+softening, same as U32's negative finding was.** Five fixtures (521/295/261/286/293) are genuine
+wins, 1.20×–2.47× faster than Java. Two (179/230) are ties within the harness's own measurement
+spread (~1.04×), not real wins either direction. **Fixture 637 — the most allocation-intensive
+one, the Brzozowski/`thm5`-class query `[strategy 6 BRZ]` was wired up to unlock — is still
+1.16× slower than Java.** The remaining gap sits exactly where the profile predicts. Golden
+corpus unchanged (577/586, 0 regression); a 5,000-query Tier-3 spot check (fresh seed) also
+clean. `benches/STATUS.md` keeps U32's original baseline verbatim alongside this unit's numbers
+for comparison, not overwritten.
+
+Next, if picked up: `benches/STATUS.md`'s candidate #2 (flatten `wr_core::fa::Fa`'s
+`Vec<BTreeMap<i32, Vec<usize>>>` transition representation) is the only remaining lever with real
+expected return, and the only one of the four candidates that touches trust-critical code —
+needs the full two-reviewer loop and careful handling of the iteration-order risk the profile
+just confirmed matters (`subset_construction`'s `BTreeSet::insert` ordering). Not started; no
+plan written yet.
