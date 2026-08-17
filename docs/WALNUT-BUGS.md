@@ -1996,23 +1996,27 @@ bug costs a silent wrong answer somewhere downstream.
   `*_detailed_log.txt` output: four of five ground-truth queries matched this port exactly, and the
   fifth (`?msd_3 Ei Ej (i + j = x) & (i > 2)`) had one EXTRA index in Java, which traced back to
   here.
-- **Rust port:** **`diverged (NOT signed off — needs an explicit decision)`.** This port models
-  Java's `printEnabled` *structurally* rather than as state: `wr_core::numsys` is simply never
-  handed a `DeterminizeContext`, so nothing it builds can ever advance the counter. That
-  implements `DeterminizationStrategies.java:96-98`'s stated intent and yields a **stable**,
-  query-determined index sequence — but it is a real behavioral divergence for any query whose
-  operand is a constant `≥ 2` that the session has not already built. Pinned, not hidden, by
+- **Rust port:** **`diverged (signed off — 2026-08-16)`.** This port models Java's `printEnabled`
+  *structurally* rather than as state: `wr_core::numsys` is simply never handed a
+  `DeterminizeContext`, so nothing it builds can ever advance the counter. That implements
+  `DeterminizationStrategies.java:96-98`'s stated intent and yields a **stable**, query-determined
+  index sequence — but it is a real behavioral divergence for any query whose operand is a
+  constant `≥ 2` that the session has not already built. Pinned, not hidden, by
   `wr_cli::eval_def`'s `the_automata_index_sequence_matches_real_walnut_java`, whose fifth case
   carries Java's sequence alongside the port's. Porting verbatim is possible but not cheap: it
   means threading the context through the whole of `numsys` (comparison / arithmetic / constant /
   multiplication / division, plus the constructor) *and* giving the context a mutable
   `print_enabled` flag with Java's exact non-reentrant `disable`/`enable` call sites, in order to
-  reproduce a sequence that is itself cache-order dependent. **Per `CLAUDE.md` this is the user's
-  call, not an agent's** — either sign off on the divergence above or schedule the verbatim port.
-  Note the blast radius is narrow: no fixture in Walnut's own corpus is affected (637-641/659/660
-  all avoid the leak — `@1`/`=1` constants go through `constant(1)`, which does not recurse), and
-  neither is any other part of this port, since the counter has no consumer besides the two
-  metacommands.
+  reproduce a sequence that is itself cache-order dependent. **User decision (2026-08-16, asked
+  explicitly per `CLAUDE.md`'s rule): keep the port's stable indices as a deliberate divergence,
+  do not schedule the verbatim port.** Rationale given: no corpus fixture is affected, blast
+  radius is narrow (only `[strategy n …]`/`[export n …]` targeting on constants built via nested
+  `NumberSystem` recursion), and stable/deterministic indices are strictly better behavior for
+  anyone actually using those metacommands to target a specific automaton — replicating Java's
+  session-cache-order-dependent instability verbatim would have no research value. Blast radius
+  confirmed narrow: no fixture in Walnut's own corpus is affected (637-641/659/660 all avoid the
+  leak — `@1`/`=1` constants go through `constant(1)`, which does not recurse), and neither is any
+  other part of this port, since the counter has no consumer besides the two metacommands.
 - **Upstream:** not filed. The Java-side fix is mechanical: make `disablePrint`/`enablePrint`
   save-and-restore (return the previous value / take it back), or replace the pair with a
   try-with-resources scope object, so nesting composes.
