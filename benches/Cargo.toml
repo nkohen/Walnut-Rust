@@ -1,0 +1,40 @@
+[package]
+name = "wr-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wr-cli = { path = "../crates/wr-cli" }
+wr-core = { path = "../crates/wr-core" }
+wr-io = { path = "../crates/wr-io" }
+# The workload set is Walnut's own integration corpus, loaded through the two Phase-0 JSON
+# manifests in the sibling `walnut-java` repo -- the same loader `tests/golden` uses (this
+# crate INCLUDES that module rather than copying it, see `src/lib.rs`), so it inherits the
+# same dependency for the same reason: hand-rolling a JSON scanner over 675 fixtures whose
+# `command_script` strings are full of escaped quotes and backslashes is exactly the
+# silent-mis-parse risk this project's correctness discipline exists to avoid. A
+# `publish = false` benchmark package; nothing shipped depends on it.
+serde_json = "1"
+
+[dev-dependencies]
+# Criterion is the standard, well-established Rust benchmarking harness (warm-up, statistical
+# sampling, outlier detection, saved baselines) -- additive measurement tooling, NOT a
+# replacement for any Java dependency, so `docs/DESIGN.md` §6's dependency-replacement table
+# does not apply. It is a dev-dependency of a `publish = false` package that is not reachable
+# from any shipped crate, so the workspace's "keep the tree lean" rule is not weakened for
+# anything that ships.
+#
+# `default-features = false` + `cargo_bench_support` deliberately drops the `plotters`/`rayon`
+# HTML-report stack: this unit's deliverable is a checked-in numbers table (`STATUS.md`)
+# produced by `src/bin/compare.rs`, not a browsable chart, and every crate not pulled in is one
+# fewer thing to audit.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }
+
+[[bench]]
+name = "dispatch"
+harness = false

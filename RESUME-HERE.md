@@ -1,4 +1,4 @@
-# RESUME-HERE — Phase 4 underway; U29+U30+U31 complete, U32 not started
+# RESUME-HERE — Phase 4 COMPLETE (U29+U30+U31+U32); roadmap fully executed
 
 **2026-08-16 checkpoint.** Phase 4 (Hardening) is approved and in progress. Plan at
 `~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo — not checked in; if that path
@@ -59,15 +59,36 @@ even though they're done, because the findings were about test-strength itself (
 that passed against a deliberately-broken implementation), not production logic, which is a
 distinct and easy-to-miss failure mode worth remembering for any future property-test unit.
 
-## What's NOT started
+## What's done: U32 (performance vs JVM Walnut)
 
-- **U32** — Performance vs JVM Walnut. The last unit in Phase 4's plan. Wants U29's JVM-batching
-  infra (done, reusable) and benefits from U31 being complete (it is). Benchmark-sourcing needs a
-  decision at execution time between the plan's two documented options (golden-corpus throughput
-  as the exit proxy, vs. first wiring `[strategy N NAME]` to unlock `thm5`-class fixtures — default
-  is the former, smaller option). Once U32 lands, Phase 4 — and the original DESIGN.md roadmap —
-  is complete; worth a real stop-and-reassess with the user at that point, not an automatic
-  continuation into undefined further work.
+`benches/` — a Criterion benchmark of the Rust side plus a warm-JVM head-to-head over 11 real
+corpus fixtures. Full numbers, methodology and threats to validity in `benches/STATUS.md` and
+`benches/README.md`; narrative in `CLAUDE.md`'s "Current status".
+
+**Read this part before anything else in this section:** DESIGN.md §8's *"faster than Walnut on
+the research workloads"* clause is **NOT met**. The port is 1.35-1.73× faster on sub-millisecond
+per-command overhead and **1.28-1.65× slower on every workload where the decision procedure
+dominates**. A profile attributes 51.5% of the port's CPU time to the system allocator and 12.2%
+to `BTreeMap` navigation — the price of the mechanical-port rule's faithful
+`Vec<BTreeMap<i32, Vec<usize>>>` transition representation against a JVM nursery allocator. This
+is a genuine finding, not a harness artifact (two harness artifacts *were* found and fixed first
+— see `CLAUDE.md`); it is documented rather than dropped, per the plan's explicit instruction.
+
+## What's open
+
+1. **The performance gap above.** `benches/STATUS.md` §"What would close the gap" ranks four
+   candidates; the cheapest (swap the global allocator) is also the one that would *confirm or
+   refute* the allocator diagnosis, so it is the natural first step if this is picked up. All of
+   them touch `wr-core` and would need the full two-reviewer loop. **Nothing here is scheduled** —
+   it needs a user decision, not an automatic continuation.
+2. **`details`-fixture `Logging` threading** (the long-standing "U28"): still open, still 7 of 586
+   golden fixtures. U32 gives it a second, independent motivation — it is also why the
+   benchmark's Rust-side peak-state column is only a lower bound.
+3. **`I`-over-`lsd`** — still the user-deprioritized backlog item from Phase 3b.
+
+**Phase 4, and DESIGN.md's original roadmap, are now fully executed.** Per this project's
+phase-gating convention this is a real stop-and-reassess point with the user, not a licence to
+continue into undefined further work.
 
 ## Process note worth keeping
 

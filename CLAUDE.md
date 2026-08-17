@@ -518,5 +518,49 @@ per CLAUDE.md's rule — WB-039 with explicit user sign-off on a deliberate dive
 confirmed unreachable in the port). `cargo test --workspace` green (1425 tests); `fmt`/`clippy`
 clean.
 
-Next: build U32's actual Criterion benchmark, now able to include `thm5`-class fixtures for a
-genuine algorithmic-throughput comparison rather than only typical-query overhead.
+**U32 complete — Phase 4, and DESIGN.md's original roadmap, are now fully executed.** New
+`benches/` crate (a normal workspace member — unlike `fuzz/`, Criterion needs no separate
+toolchain): `src/lib.rs` (workload table, session/prelude setup, the Rust engine, the JVM
+client, the peak-state parser, the cross-engine answer check), `src/bin/compare.rs` (the
+head-to-head), `benches/dispatch.rs` (Criterion, Rust side only), `java/BenchDriver.java` (a new
+throwaway driver beside — never modifying — U29's `DiffGenDriver`), plus `README.md`
+(methodology) and `STATUS.md` (the numbers). Workloads are 11 **real corpus fixtures** loaded
+through the same Phase-0 manifests Tier 1 uses (`tests/golden`'s loader is `#[path]`-included,
+not copied), spanning 0.3 ms to 2.2 s, plus an opt-in non-fixture row. Both engines are warm,
+timed on their own side of the pipe, run over their own copy of the corpus library trees with
+Walnut's own 19-command prelude, and every workload's answer is checked to agree by
+`wr_core::equiv` **before** its timing is believed (and, for the nine automaton-valued ones,
+against the automaton `walnut-java` itself recorded — all nine match).
+
+**The result is mixed, and DESIGN.md §8's "faster than Walnut on the research workloads" clause
+is NOT met.** The port is 1.35-1.73× **faster** on the two sub-millisecond workloads
+(per-command overhead: parse/dispatch/small-automaton construction), and **1.28-1.65× slower on
+all nine workloads where the decision procedure dominates** — a strikingly flat factor across
+seven very different queries, which points at a systematic per-operation cost, not one bad
+algorithm. A `sample(1)` profile says what it is: **51.5% of the port's CPU time on fixture 286
+is the system allocator** (`tiny_malloc*`/`tiny_free*`/`madvise`/memmove) and another 12.2% is
+`BTreeMap` node navigation, against 36.3% in actual engine code. That is the mechanical-port
+rule showing its price — `Fa`'s `Vec<BTreeMap<i32, Vec<usize>>>` is a faithful transliteration of
+Java's `List<Int2ObjectRBTreeMap<IntList>>`, and the JVM's bump-allocator nursery services that
+allocate-many-short-lived-objects pattern far better than a general-purpose `malloc`.
+`benches/STATUS.md` records the full numbers, the profile, four ranked candidate fixes (global
+allocator swap first — cheapest, and it would *test* the diagnosis), and the threats to validity.
+**This is reported, not buried: it is a real finding about the port, and the first concrete
+argument for scheduling some of CLAUDE.md's "idiomatic Rust later, in separate commits".**
+
+Two side results worth keeping: (1) the `[strategy 6 BRZ]` metacommand this unit's prerequisite
+wired up is worth **510× on the port and 387× on Java** (91.7 ms vs 46.8 s; 4,965 vs 155,153
+peak states) on fixture 637's query — the opt-in `sc637` row; (2) `tests/golden`'s per-fixture
+times are NOT dispatch times (they include the Tier-1 `equiv` comparison, which dominates on a
+large result: fixture 261 is ~0.31 s of dispatch inside ~5.2 s of golden wall clock), a
+distinction that misled this unit's first workload sizing and is now documented in both files.
+
+Two harness bugs found and fixed during bring-up, both of which would have produced meaningless
+numbers: the JVM driver must assign the **static** `Prover.mainProver` (which
+`DeterminizationStrategies.determinize` reads for the current command's metacommands) or
+`[strategy 6 BRZ]` is silently ignored; and the Rust column must use **one session-lifetime
+`Prover`**, because Java caches number systems in a JVM-global static while the port caches them
+on the `Session` — measured at 0.31 ms vs 119.5 ms on fixture 207, a 390× artifact pointing the
+wrong way (`WR_BENCH_COLD=1` reproduces it). `cargo test --workspace` green (1452 tests);
+`fmt`/`clippy` clean; `cargo bench` and the head-to-head are separate invocations that never run
+in the fast tier.
