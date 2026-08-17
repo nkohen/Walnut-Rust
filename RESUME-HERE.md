@@ -1,9 +1,11 @@
-# RESUME-HERE — Phase 4 COMPLETE (U29+U30+U31+U32); roadmap fully executed
+# RESUME-HERE — Phase 4 COMPLETE (U29–U34); DESIGN.md's original roadmap fully executed, all exit criteria met
 
-**2026-08-16 checkpoint.** Phase 4 (Hardening) is approved and in progress. Plan at
-`~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo — not checked in; if that path
-is ever unavailable, the plan's full text is summarized in `CLAUDE.md`'s "Current status"
-section).
+**2026-08-17 checkpoint.** Phase 4 (Hardening) is done — correctness AND performance exit
+criteria both met. Plan at `~/.claude/plans/purrfect-doodling-muffin.md` (outside this repo — not
+checked in; if that path is ever unavailable, the plan's full text is summarized in `CLAUDE.md`'s
+"Current status" section). U33/U34 were unplanned follow-ups the user explicitly requested after
+U32's benchmark surfaced a negative finding — not in the original plan file, fully narrated in
+`CLAUDE.md` instead.
 
 ## What's done: U29 (Tier-3 differential-generator harness)
 
@@ -59,36 +61,61 @@ even though they're done, because the findings were about test-strength itself (
 that passed against a deliberately-broken implementation), not production logic, which is a
 distinct and easy-to-miss failure mode worth remembering for any future property-test unit.
 
-## What's done: U32 (performance vs JVM Walnut)
+## What's done: U32 (performance vs JVM Walnut) — a negative finding, then closed by U33+U34
 
 `benches/` — a Criterion benchmark of the Rust side plus a warm-JVM head-to-head over 11 real
 corpus fixtures. Full numbers, methodology and threats to validity in `benches/STATUS.md` and
 `benches/README.md`; narrative in `CLAUDE.md`'s "Current status".
 
-**Read this part before anything else in this section:** DESIGN.md §8's *"faster than Walnut on
-the research workloads"* clause is **NOT met**. The port is 1.35-1.73× faster on sub-millisecond
-per-command overhead and **1.28-1.65× slower on every workload where the decision procedure
-dominates**. A profile attributes 51.5% of the port's CPU time to the system allocator and 12.2%
-to `BTreeMap` navigation — the price of the mechanical-port rule's faithful
+U32 itself found DESIGN.md §8's *"faster than Walnut on the research workloads"* clause **NOT
+met**: faster on sub-millisecond overhead, but **1.28-1.65× slower on every workload where the
+decision procedure dominates** — profiled to 51.5% of CPU time in the system allocator, 12.2% in
+`BTreeMap` navigation, the price of the mechanical-port rule's faithful
 `Vec<BTreeMap<i32, Vec<usize>>>` transition representation against a JVM nursery allocator. This
-is a genuine finding, not a harness artifact (two harness artifacts *were* found and fixed first
-— see `CLAUDE.md`); it is documented rather than dropped, per the plan's explicit instruction.
+was reported honestly rather than softened (two harness artifacts *were* found and fixed first —
+see `CLAUDE.md` — this is what was left after removing them).
+
+**The user asked to attack the gap. Two follow-up units closed it completely:**
+- **U33** — the two cheapest ranked candidates (swap the global allocator to `mimalloc`, enable
+  `lto = "fat"`/`codegen-units = 1`), zero `wr-core` changes, zero algorithmic risk. Result:
+  9-of-11-slower became 10-of-11-faster; a repeat profile confirmed the diagnosis directly
+  (allocator's CPU share 51.5% → 13.4%). One holdout: fixture 637, the most
+  allocation-intensive workload, still 1.16× slower.
+- **U34** — closed 637 too. Investigation found the actual remaining bottleneck was narrower than
+  U33's framing implied: not `Fa.d`'s storage itself, but one local `BTreeSet<usize>` inside
+  `subset_construction`'s hot loop. A properly plan-first, three-round-adversarially-reviewed
+  process (round 2 caught a genuine blocking defect in round 1's own proposed fix) replaced it
+  with a reusable scratch `Vec` + `HashMap` lookup — a pure representation swap, proven so by two
+  reviewers each independently running large-scale structural-equivalence probes (404,000 and
+  20,000 cases) against the removed code as an oracle. **Result: 637 went from 1.16× slower to
+  2.65× faster. All 11 benchmark workloads are now faster in Rust than in Java.** The plan had a
+  pre-registered go/no-go checkpoint for a larger, riskier `Fa.d`/`TransitionRow` migration
+  (Phase 2) — evaluated to **stop** on both of its own pre-committed conditions (637 no longer
+  slow; residual `Fa.d`-attributable profile share measured at 4.7%, below the 8% threshold), so
+  Phase 2 was correctly not implemented, per the plan's own decision rule rather than a post-hoc
+  call. Its full design remains available to resume from if a future workload's profile differs.
+
+**DESIGN.md §8's Phase-4 exit criterion — both correctness AND performance — is now fully met.**
+Golden corpus unchanged throughout U33/U34 (577/586, 0 regression); no new genuine Walnut bugs
+found by either unit.
 
 ## What's open
 
-1. **The performance gap above.** `benches/STATUS.md` §"What would close the gap" ranks four
-   candidates; the cheapest (swap the global allocator) is also the one that would *confirm or
-   refute* the allocator diagnosis, so it is the natural first step if this is picked up. All of
-   them touch `wr-core` and would need the full two-reviewer loop. **Nothing here is scheduled** —
-   it needs a user decision, not an automatic continuation.
-2. **`details`-fixture `Logging` threading** (the long-standing "U28"): still open, still 7 of 586
-   golden fixtures. U32 gives it a second, independent motivation — it is also why the
-   benchmark's Rust-side peak-state column is only a lower bound.
-3. **`I`-over-`lsd`** — still the user-deprioritized backlog item from Phase 3b.
+1. **`details`-fixture `Logging` threading** (the long-standing "U28"): still open, still 7 of 586
+   golden fixtures — all confirmed text-only divergences (state counts already match exactly),
+   not automaton-level. `wr-core`'s product/determinize/minimize/quantify don't thread a
+   `Logging` handle through yet.
+2. **`I`-over-`lsd`** — still the user-deprioritized backlog item from Phase 3b.
+3. **U34's Phase 2** (the larger `Fa.d`/`TransitionRow` representation migration) — fully
+   designed, deliberately not implemented per its own checkpoint's stop decision. Resume from
+   `~/.claude/plans/glossy-compacting-lantern.md` (outside this repo) only if a future workload's
+   profile shows `Fa.d`-rooted cost above the plan's own thresholds again.
 
-**Phase 4, and DESIGN.md's original roadmap, are now fully executed.** Per this project's
-phase-gating convention this is a real stop-and-reassess point with the user, not a licence to
-continue into undefined further work.
+**Phase 4, and DESIGN.md's entire original roadmap (Phases 0-4), are now fully executed with
+every exit criterion met — correctness (Tier 0-5 all green) and performance (faster than Walnut
+on all 11 benchmarked research workloads).** Per this project's phase-gating convention this is a
+real stop-and-reassess point with the user, not a licence to continue into undefined further
+work. Items 1-3 above are tracked backlog, not scheduled work.
 
 ## Process note worth keeping
 
