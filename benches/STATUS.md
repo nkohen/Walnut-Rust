@@ -9,16 +9,163 @@ timed, why the Rust column uses one session-lifetime `Prover`, why these eleven 
 the one honest caveat about the peak-state column. The numbers below mean very little without
 it.
 
-This file now records **two** measurements, in chronological order:
+This file now records **three** measurements, in chronological order:
 
-* [§U33](#u33--the-allocator-swap--build-profile-tuning-current) — the current state, after the
-  two zero-algorithm changes U32's own "what would close the gap" list ranked first;
+* [§U34](#u34--flattening-subset_constructions-hot-loop-current) — the current state, after
+  U32's "what would close the gap" candidate 2 (its Phase 1 half — see below);
+* [§U33](#u33--the-allocator-swap--build-profile-tuning) — the allocator swap + build-profile
+  tuning, kept verbatim so the delta is auditable rather than asserted;
 * [§U32](#u32--the-original-baseline-default-release-profile-system-allocator) — the original
-  baseline, kept verbatim so the delta is auditable rather than asserted.
+  baseline, likewise kept verbatim.
 
 ---
 
-# U33 — the allocator swap + build-profile tuning (current)
+# U34 — flattening `subset_construction`'s hot loop (current)
+
+Plan: `~/.claude/plans/glossy-compacting-lantern.md` (outside this repo), adversarially reviewed
+**three times** before any code landed — an unusually long plan-review chain even by this
+project's standard, because round 2 found a genuine blocking defect in round 1's own fix (a
+`TransitionRowBuilder` design that would have silently dropped destinations from every
+nondeterministic cross-product transition), not just in the original draft. See the plan's §9 for
+the full process record.
+
+## What this unit actually was, vs. what it was scoped to be
+
+U32's root-cause section attributed 51.5% of the port's CPU time (U33 re-measured it at 13.4%
+post-allocator-swap) to a mix of the system allocator and `BTreeMap` node navigation, and named
+"flatten `wr_core::fa::Fa`'s transition representation" as candidate 2 on its "what would close
+the gap" list — with fixture 637 (`[strategy 6 BRZ]`, a 1,790-state intermediate NFA) still 1.16×
+slower than Java after U33.
+
+**The investigation found the attribution was more specific than the original framing implied.**
+Re-reading U33's own numbers: its "B-tree navigation" bucket was 27.6% of real work (~4,100 of
+14,853 samples), and its own caveat (b) already named the single largest frame within that bucket
+as `BTreeSet::insert` inside `subset_construction` — 3,576 samples, **24% of real work on its
+own**. That's ~87% of the whole B-tree-navigation bucket living in ONE local `BTreeSet<usize>`
+inside one function (`determinize.rs`'s per-`(metastate, symbol)` union), not in `Fa.d`'s own
+`BTreeMap` storage, which is read throughout `product`/`minimize`/`canonicalize`/everywhere else.
+
+So this unit split into two phases with an explicit checkpoint between them (the plan's §4):
+**Phase 1** — fix `subset_construction`'s own hot loop, a small, self-contained,
+one-function change, at much lower risk than a `Fa`-wide representation rewrite; measure; **then
+decide**, with real numbers, whether the larger `Fa.d` migration (flattening `Vec<BTreeMap<i32,
+Vec<usize>>>` into a `TransitionRow`/`SmallVec`-based representation, the plan's fully-designed
+but unimplemented §2) is still justified. **Phase 1 alone closed the gap.** The pre-registered
+checkpoint rule (proceed to Phase 2 only if fixture 637 is *still* >5% slower than Java AND
+`Fa.d`-attributable profile share outside `subset_construction` is ≥8%) evaluated to **stop** on
+both counts — see below. Phase 2 was not implemented.
+
+## The fix
+
+`subset_construction`'s per-`(metastate, symbol)` union used to allocate a fresh `BTreeSet<usize>`
+on every iteration, then unconditionally `.clone()` the whole set just to probe
+`metastate_to_id: HashMap<BTreeSet<usize>, usize>` via the `Entry` API — even on the
+overwhelmingly common post-startup case where the metastate already existed. Replaced with a
+reusable scratch `Vec<usize>` (`.clear()`'d and refilled each symbol iteration, then
+`sort_unstable()` + `dedup()` to reproduce the identical canonical sorted-deduped sequence a
+`BTreeSet<usize>`'s iteration gives), and `metastate_to_id`/`metastate_list` retyped to
+`Vec<usize>` so a **borrowed** lookup (`metastate_to_id.get(scratch.as_slice())`, via
+`Vec<T>: Borrow<[T]>`) runs before any clone — the common already-known-metastate path now pays no
+allocation beyond filling the reused buffer. A pure representation swap: the exact same set of
+destination ids is computed, in the same discovery order, so `subset_construction`'s output
+numbering is provably unchanged (both adversarially-reviewing agents independently confirmed this
+by literally running the old `BTreeSet`-based code as an oracle against the new code and comparing
+output `Fa` structure — not just language — bit-for-bit, over 404,000 and 20,000 randomly
+generated cases respectively, deliberately including unsorted/duplicated destination lists since
+`Fa::d` carries no invariant ruling those out).
+
+## Results
+
+Measured 2026-08-17, same machine/jar/methodology as U32/U33.
+
+```
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   346.339 µs   345.729 µs   664.946 µs   624.125 µs     1.92x            6           6
+207      50   296.073 µs   294.833 µs   410.475 µs   400.729 µs     1.39x            3           3
+293      20    31.538 ms    31.126 ms    80.498 ms    79.996 ms     2.55x        12334         129
+521      20    20.054 ms    19.688 ms    49.483 ms    48.815 ms     2.47x            3           2
+179      20   110.094 ms   109.654 ms   325.802 ms   327.317 ms     2.96x        33000         248
+266      20    35.334 ms    35.177 ms    86.449 ms    85.048 ms     2.45x         7657         608
+230       5   539.497 ms   539.209 ms      1.801 s      1.798 s     3.34x       115802         152
+295      20    67.961 ms    65.959 ms   139.446 ms   138.865 ms     2.05x        11589        1361
+261      20   109.940 ms   106.358 ms   234.229 ms   233.504 ms     2.13x        18674        1510
+286      20   174.674 ms   173.293 ms   383.963 ms   383.154 ms     2.20x        34988        1818
+637      20    22.870 ms    22.800 ms    60.575 ms    60.432 ms     2.65x         4965        1790
+```
+
+**Every one of the 11 workloads is now faster in Rust than in Java** — the 11-of-11 result U33 came
+close to (10-of-11) and U32 was nowhere near (2-of-11). Fixture 637, the one fixture U33 left
+slower (0.86×, i.e. 1.16× slower than Java), is now **2.65× faster** — a genuine reversal, not a
+narrowing, from a single function's worth of change. `DESIGN.md` §8's Phase-4 exit clause ("faster
+than Walnut on the research workloads") is now met across the board, not "in spirit."
+
+| | U33 | now (U34) |
+|---|---|---|
+| Rust faster | 10 of 11 | **11 of 11** |
+| Rust slower | 1 of 11 (637, 1.16×) | **0 of 11** |
+| answers disagreeing between the engines | 0 | 0 |
+
+Every workload's answer was re-checked to agree between the two engines (and, for the nine
+automaton-valued ones, against the recorded corpus automaton) before its timing was believed, same
+discipline as U32/U33.
+
+## The checkpoint: why Phase 2 (the `Fa.d` migration) was not implemented
+
+The plan pre-registered a concrete decision rule *before* this data existed, specifically so the
+decision wouldn't be rationalized after the fact. Proceed to Phase 2 only if **both**:
+
+1. Fixture 637's Rust/Java median ratio is still `> 1.05` (i.e. still measurably slower than Java).
+   **Fails outright** — 637 is now 2.65× *faster*, not slower.
+2. A fresh `sample(1)` profile of fixture 286 (same methodology as U32/U33: a 15-second sample,
+   the blocked JVM-pipe-reader thread's `read` discarded, 11,172 real-work samples remaining)
+   still attributes `≥ 8%` of real work to `BTreeMap`/allocator frames rooted **outside**
+   `subset_construction`'s now-fixed local set. Measured: `Fa::is_deterministic`,
+   `BTreeMap`'s `VacantEntry::insert_entry`, `BTreeMap` drop glue, `Fa::determine_permutation_map`,
+   `Fa::canonicalize`, `Fa::sort_label`, and `trim::trim` together account for 521 samples —
+   **4.7%**, below threshold.
+
+Both conditions fail, so per the pre-registered rule: **stop here.** This is reported as the
+legitimate, pre-committed outcome it is, not a shortfall — `benches/STATUS.md`'s own U32 entry
+made the same point about measurement vs. optimization not being a consolation prize.
+
+**Where the profiled cost went instead**, for honesty about what the *next* candidate would be if
+this workload's performance mattered again: `subset_construction` itself is now the single largest
+frame at **51.2% of real work** (5,716 of 11,172 samples) — up from being the site of the
+`BTreeSet` problem to simply being the most expensive genuine work the engine does on this
+workload (state/symbol iteration, `HashMap` probes, the `sort_unstable`/`dedup` pair), which is
+expected and appropriate: this fixture calls `subset_construction` repeatedly under nested
+quantifiers, and that is real, load-bearing algorithmic work, not overhead. `minimize.rs`'s
+`Partition::mark`/`minimize`/`make_adjacent` together are the next largest chunk (~20.5%) — the
+Valmari partition-refinement algorithm's own cost, unrelated to `Fa.d`'s representation. Neither is
+evidence that the deferred `Fa.d` flattening (the plan's fully-designed, three-times-reviewed §2,
+available to resume from `~/.claude/plans/glossy-compacting-lantern.md` if a future workload's
+profile looks different) would still move the needle on *this* workload; a future unit picking
+this up should profile its own target workload fresh rather than assuming this one generalizes.
+
+## Correctness, verified rather than assumed
+
+| gate | result |
+|---|---|
+| `cargo fmt --all` / `cargo clippy --workspace --all-targets` | clean |
+| `cargo test --workspace` (fast tier) | green, 1453 tests (+1: a new regression test pinning `subset_construction`'s exact output structure on an unsorted/duplicated destination list, added after adversarial review flagged the invariant had no clean-failure tripwire) |
+| Tier 1 golden corpus (`cargo test -p wr-golden --release -- --ignored`) | **577 pass / 9 known divergences / 89 excluded / 0 timeout / 0 not-run** — unchanged from U33 |
+| Tier 3 differential-gen | 2,000-query checkpoint spot check, then a further 20,000-query run: **22,000 total, 0 divergences** |
+| Two independent adversarial code reviewers (Opus, Fable — both different from the authoring model), given only the diff | Both returned **zero correctness-fatal/correctness-risk findings**; one found a real test-gap (fixed — see the test count above), both independently ran their own large-scale structural-equivalence probes (404,000 and 20,000 cases) against the pre-change code as an oracle |
+| Fuzz targets | not re-run for this unit — deliberately scoped down from the full Phase-2 ladder (a 60-line, one-function, function-local diff, already checked by 424,000+ combined structural-equivalence cases from the two code reviewers plus 22,000 live differential queries, is materially different risk from a representation change touching ~15 files) |
+
+## Reproducing
+
+```bash
+cargo run -p wr-bench --release --bin compare              # the table above
+WR_BENCH_ONLY=286 WR_BENCH_ITERS=200 WR_BENCH_WARMUP=2 \
+  cargo run -p wr-bench --release --bin compare &           # then `sample <pid> 15` for the profile
+WR_DIFFGEN_QUERIES=20000 cargo test -p wr-differential-gen --release -- --ignored --nocapture
+```
+
+---
+
+# U33 — the allocator swap + build-profile tuning
 
 Two changes, neither of which touches a single line of decision-procedure code:
 

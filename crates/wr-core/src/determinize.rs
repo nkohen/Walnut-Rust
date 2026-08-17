@@ -293,31 +293,81 @@ pub fn determinize(
 /// worklist that grows by appending newly-discovered metastates — the same
 /// array-append-as-worklist shape as the Java `metastateList`, not a separate queue.
 pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
-    let mut metastate_list: Vec<BTreeSet<usize>> = vec![initial.clone()];
-    let mut metastate_to_id: HashMap<BTreeSet<usize>, usize> = HashMap::new();
-    metastate_to_id.insert(initial.clone(), 0);
+    // U34-P1 (`~/.claude/plans/glossy-compacting-lantern.md` §3): the per-(metastate,
+    // symbol) union used to be a fresh `BTreeSet<usize>`, heap-allocated on every
+    // iteration, then unconditionally `.clone()`d just to probe `metastate_to_id` via
+    // the `Entry` API even when the metastate already existed (the common case
+    // post-startup). Profiling found this was the single largest hot frame in the
+    // engine post-U33 (`BTreeSet::insert`, 24% of real work on a representative
+    // workload, `benches/STATUS.md`'s U33 section).
+    //
+    // This is a pure representation swap, not a behavior change: `scratch` is filled
+    // with the exact same set of destination ids a `BTreeSet<usize>` union would
+    // contain, then `sort_unstable()` + `dedup()` produces the identical canonical
+    // sorted-deduped sequence `BTreeSet<usize>`'s own iteration would give — so it's
+    // usable as an equivalent hash-map key. `metastate_to_id`/`metastate_list`/
+    // `current` all move from `BTreeSet<usize>` to `Vec<usize>` (sorted, deduped) in
+    // lockstep: `current` is a *clone of a `metastate_list` element*
+    // (`metastate_list[cursor].clone()`), so its type necessarily follows
+    // `metastate_list`'s, and a sorted-deduped `Vec` iterates in the identical
+    // ascending order a `BTreeSet` does, so `for &q in &current` walks the same
+    // sequence either way — `subset_construction`'s exact state-discovery order (hence
+    // the output `Fa`'s exact numbering) is unchanged. `metastate_list`'s only other
+    // use, the order-insensitive `.any()` below, is likewise unaffected.
+    //
+    // The borrowed lookup (`metastate_to_id.get(scratch.as_slice())`, via the standard
+    // `Vec<T>: Borrow<[T]>` impl) runs BEFORE any clone, so the already-known-metastate
+    // path — the overwhelmingly common one after the initial exploration burst — pays
+    // no allocation at all beyond filling the reused `scratch` buffer. That path is
+    // where nearly all the removed `BTreeSet::insert`/clone cost lived, so that's where
+    // this change wins. On the far rarer genuinely-new-metastate path, `scratch` is
+    // cloned twice (once for `metastate_to_id`'s stored key, once more into
+    // `metastate_list`) — one MORE clone than the old code's single
+    // clone-for-the-key-then-move-into-the-list, an honest cost, not a further win, on
+    // that specific rare path (adversarial review caught an earlier draft of this
+    // comment claiming otherwise).
+    let mut metastate_list: Vec<Vec<usize>> = vec![initial.iter().copied().collect()];
+    let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
+    metastate_to_id.insert(metastate_list[0].clone(), 0);
 
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
+    let mut scratch: Vec<usize> = Vec::new();
     let mut cursor = 0;
     while cursor < metastate_list.len() {
         let current = metastate_list[cursor].clone();
         let mut row = BTreeMap::new();
         for sym in 0..fa.alphabet_size as i32 {
-            let mut union: BTreeSet<usize> = BTreeSet::new();
+            scratch.clear();
             for &q in &current {
                 if let Some(dests) = fa.d[q].get(&sym) {
-                    union.extend(dests.iter().copied());
+                    scratch.extend(dests.iter().copied());
                 }
             }
-            if union.is_empty() {
+            if scratch.is_empty() {
                 // SC does not totalize: no transition is recorded here at all.
                 continue;
             }
-            let next_id = metastate_list.len();
-            let id = *metastate_to_id.entry(union.clone()).or_insert_with(|| {
-                metastate_list.push(union);
+            scratch.sort_unstable();
+            scratch.dedup();
+            // Adversarial review found breaking this invariant (e.g. dropping the sort
+            // or the dedup) has NO clean test tripwire: a non-canonical key makes every
+            // metastate look "new" to `metastate_to_id`, so `while cursor <
+            // metastate_list.len()` never terminates and the test process is killed by
+            // its resource cap rather than failing an assertion -- exactly what
+            // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists
+            // to prevent. This turns that failure mode into an immediate, located panic.
+            debug_assert!(
+                scratch.windows(2).all(|w| w[0] < w[1]),
+                "subset_construction: metastate key must be sorted with no duplicates"
+            );
+            let id = if let Some(&id) = metastate_to_id.get(scratch.as_slice()) {
+                id
+            } else {
+                let next_id = metastate_list.len();
+                metastate_to_id.insert(scratch.clone(), next_id);
+                metastate_list.push(scratch.clone());
                 next_id
-            });
+            };
             row.insert(sym, vec![id]);
         }
         d.push(row);
@@ -461,6 +511,57 @@ mod tests {
             alphabet_size: 2,
             o: vec![0, 1],
             d: vec![d0, d1],
+        }
+    }
+
+    /// Adversarial-review-requested regression test (both independent reviewers of
+    /// U34-P1 flagged this as untested): `subset_construction`'s new `scratch: Vec`
+    /// path relies on `sort_unstable()+dedup()` to canonicalize a metastate key that
+    /// used to be canonicalized automatically by `BTreeSet`'s type. `Fa::d` carries no
+    /// invariant that a destination list is sorted or duplicate-free (`fa.rs`'s own
+    /// docs), so a hand-built `Fa` with an unsorted, duplicated destination list is a
+    /// legitimate input, not a contrived one -- this pins the exact expected output
+    /// structure (not just language) against one, hand-traced by the algorithm.
+    #[test]
+    fn subset_construction_canonicalizes_an_unsorted_duplicated_destination_list() {
+        // q0 = 0 (non-accepting), 1 (accepting). Single symbol 0.
+        // d[0][0] = [1, 0, 1] -- unsorted AND duplicated (1 appears twice).
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![1, 0, 1]);
+        let fa = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 1,
+            o: vec![0, 1],
+            d: vec![d0, BTreeMap::new()],
+        };
+        let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+        let dfa = subset_construction(&fa, &initial);
+
+        // Hand-traced: metastate {0} discovers {0,1} on symbol 0 (canonicalized from
+        // the unsorted/duplicated [1, 0, 1]); metastate {0,1} maps to itself on symbol
+        // 0 (same canonicalization). Two states total, both with a single self-row.
+        assert_eq!(dfa.q, 2);
+        assert_eq!(dfa.q0, 0);
+        assert_eq!(
+            dfa.o,
+            vec![0, 1],
+            "state 0 = {{0}} non-accepting, state 1 = {{0,1}} accepting"
+        );
+        let mut expected_row = BTreeMap::new();
+        expected_row.insert(0, vec![1]);
+        assert_eq!(dfa.d[0], expected_row, "{{0}} --0--> {{0,1}}");
+        assert_eq!(dfa.d[1], expected_row, "{{0,1}} --0--> {{0,1}} (self-loop)");
+
+        // Language cross-check, independent of the structural trace above: "contains
+        // symbol 0" -- unaffected by the canonicalization detail either way.
+        for word in [vec![], vec![0], vec![0, 0]] {
+            assert_eq!(
+                fa.accepts_word(&word),
+                dfa.accepts_word(&word),
+                "mismatch on {word:?}"
+            );
         }
     }
 
