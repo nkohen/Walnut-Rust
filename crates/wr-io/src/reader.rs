@@ -140,6 +140,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use wr_core::automaton::{Automaton, AutomatonDFA};
+use wr_core::determinize::{DeterminizeContext, DeterminizeError};
 use wr_core::fa::Fa;
 use wr_core::minimize::{minimize, MinimizeError};
 use wr_core::numsys::{self, CustomBaseCandidates, CustomBaseFiles, NumSysError, NumberSystem};
@@ -249,6 +250,12 @@ pub enum ReadError {
     NonDenseStateIds,
     /// Propagated from the auto-determinize-on-load step.
     Minimize(MinimizeError),
+    /// Propagated from the auto-determinize-on-load step's `wr_core::determinize::determinize`
+    /// dispatcher. **Only reachable through a `_and_ctx` entry point** whose
+    /// [`DeterminizeContext`] answers this load's index with a non-`SC` strategy on a DFAO
+    /// file (`DeterminizationStrategies.java:115-119`); every `ctx = None` caller takes the
+    /// infallible `SC` arm, which is why the non-`ctx` entry points cannot produce this.
+    Determinize(DeterminizeError),
     /// Propagated from custom-base [`NumberSystem`] construction (U13): a header token
     /// named a syntactically-plausible custom base whose files failed to resolve into a
     /// valid number system (missing files falling back to a non-numeric name, a
@@ -344,6 +351,13 @@ impl fmt::Display for ReadError {
             // internal-invariant surface, not a Java throw site); Debug is what there is
             // to show, and it is named as such rather than pretending otherwise.
             ReadError::Minimize(e) => write!(f, "Minimization failed: {e:?}"),
+            // `DeterminizationStrategies.java:115-119`'s own message, verbatim, for the one
+            // variant a load can actually raise; the `Minimize` variant is rendered the same
+            // way the arm above renders it.
+            ReadError::Determinize(DeterminizeError::DfaoWithNonScStrategy(_)) => {
+                write!(f, "DFAOs are not supported for non-SC strategies.")
+            }
+            ReadError::Determinize(e) => write!(f, "Determinization failed: {e:?}"),
             // `NumSysError`/`ParseMethodsError` already render Walnut's verbatim text
             // (`Number system msd_1 is not defined.`, `For input string: "…"`), and Java
             // does not wrap either — the exception thrown inside `NumberSystem`'s
@@ -434,7 +448,7 @@ impl CustomBaseResolver for CustomBasesDir<'_> {
 /// A custom-base header (`msd_fib`, ...) is [`ReadError::UnsupportedNumeration`] here —
 /// use [`read_automaton_txt_with_custom_bases`] to resolve those.
 pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadError> {
-    read_automaton_txt_impl(path.as_ref(), None, &mut BTreeSet::new())
+    read_automaton_txt_impl(path.as_ref(), None, &mut BTreeSet::new(), None)
 }
 
 /// Like [`read_automaton_txt`], but a header token that isn't `msd_<k>`/`lsd_<k>`/bare
@@ -509,7 +523,37 @@ pub fn read_automaton_txt_with_custom_base_resolver<P: AsRef<Path>>(
     path: P,
     resolver: &dyn CustomBaseResolver,
 ) -> Result<Automaton, ReadError> {
-    read_automaton_txt_impl(path.as_ref(), Some(resolver), &mut BTreeSet::new())
+    read_automaton_txt_impl(path.as_ref(), Some(resolver), &mut BTreeSet::new(), None)
+}
+
+/// [`read_automaton_txt_with_custom_base_resolver`] with an explicit
+/// [`DeterminizeContext`] for the **load-time determinization** this reader performs on a
+/// nondeterministic file (`AutomatonReader.java:88-98`'s `A.determinizeAndMinimize()`).
+///
+/// Java has no separate entry point for this: `DeterminizationStrategies.determinize`
+/// reads `Prover.mainProver.metaCommands` out of a global, so a `$name(…)` library
+/// automaton that happens to be an NFA advances the `[strategy n …]`/`[export n …]`
+/// counter exactly like any other determinization — and it does so *first*, during
+/// `Predicate` lexing, so it is index `#0` of the whole command. Verified live against
+/// `Walnut-all.jar` (2026-08-16): `?msd_2 Ei $mynfa(i) & (i < x)` with `::` and a
+/// 2-state NFA `mynfa.txt` logs `Determinizing [#0 …]: 2 states` for the load itself.
+///
+/// Two deliberate narrowings, both matching what the jar actually does:
+///
+/// * **An already-deterministic file is not counted.** Java only calls
+///   `determinizeAndMinimize()` inside `if (!A.fa.getT().isDeterministic())`, so a DFA
+///   file never reaches the dispatcher at all. Confirmed live with the same query over a
+///   deterministic `mydfa.txt`: the first index is the query's own `i<x`, not the load.
+/// * **Nested custom-base loads are NOT given the context.** Those are
+///   `NumberSystem`-internal constructions, which this port models as structurally silent
+///   (`docs/WALNUT-BUGS.md` WB-039's signed-off divergence) rather than as Java's
+///   non-reentrant `Logging.disablePrint()` flag.
+pub fn read_automaton_txt_with_custom_base_resolver_and_ctx<P: AsRef<Path>>(
+    path: P,
+    resolver: &dyn CustomBaseResolver,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+) -> Result<Automaton, ReadError> {
+    read_automaton_txt_impl(path.as_ref(), Some(resolver), &mut BTreeSet::new(), ctx)
 }
 
 /// [`read_automaton_txt`]'s parse, reading the `.txt` grammar out of an in-memory string
@@ -527,7 +571,7 @@ pub fn read_automaton_txt_with_custom_base_resolver<P: AsRef<Path>>(
 /// same as in [`read_automaton_txt`] — resolving them needs a file resolver, so use
 /// [`read_automaton_from_str_with_custom_base_resolver`] for that.
 pub fn read_automaton_from_str(content: &str) -> Result<Automaton, ReadError> {
-    read_automaton_str_impl(content, STRING_ADDRESS, None, &mut BTreeSet::new())
+    read_automaton_str_impl(content, STRING_ADDRESS, None, &mut BTreeSet::new(), None)
 }
 
 /// [`read_automaton_from_str`] with [`read_automaton_txt_with_custom_base_resolver`]'s
@@ -542,6 +586,7 @@ pub fn read_automaton_from_str_with_custom_base_resolver(
         STRING_ADDRESS,
         Some(resolver),
         &mut BTreeSet::new(),
+        None,
     )
 }
 
@@ -549,6 +594,7 @@ fn read_automaton_txt_impl(
     path: &Path,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, ReadError> {
     let content = std::fs::read_to_string(path)?;
     read_automaton_str_impl(
@@ -556,6 +602,7 @@ fn read_automaton_txt_impl(
         &path.display().to_string(),
         custom_bases,
         in_progress,
+        ctx,
     )
 }
 
@@ -570,6 +617,7 @@ fn read_automaton_str_impl(
     address: &str,
     custom_bases: Option<&dyn CustomBaseResolver>,
     in_progress: &mut BTreeSet<String>,
+    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, ReadError> {
     let mut lines = content.lines().enumerate();
     let (_, header_line) = lines
@@ -789,17 +837,17 @@ fn read_automaton_str_impl(
     // see `wr_core::automaton`'s corrected module-level note on U0c's actual call-graph
     // coverage. `ctx = None` is bit-for-bit identical to the pre-dispatcher direct
     // call (`wr_core::determinize`'s `no_context_is_exactly_plain_subset_construction`
-    // pins this), and with `ctx = None` the dispatcher's only fallible arm is
-    // unreachable -- the same reasoning `Automaton::determinize_and_minimize`'s
-    // `NO_CONTEXT_CANNOT_FAIL` already documents, so it is `.expect()`ed here rather
-    // than propagated -- unlike the `minimize` call below, which stays a propagated
-    // `Result` (`ReadError::Minimize`) exactly as before.
+    // pins this).
+    //
+    // The `!is_deterministic()` guard is Java's own (`AutomatonReader.java:88`), and it
+    // is load-bearing for index accounting, not just for speed: a DFA library file must
+    // NOT consume an index. Verified live against `Walnut-all.jar` -- see
+    // [`read_automaton_txt_with_custom_base_resolver_and_ctx`]'s docs for both repros.
     if !automaton.fa.is_deterministic() {
         automaton.fa = trim(&automaton.fa);
         let initial: BTreeSet<usize> = [automaton.fa.q0].into_iter().collect();
-        wr_core::determinize::determinize(&mut automaton, &initial, None).expect(
-            "determinize with no metacommand context always takes the SC arm, which is infallible",
-        );
+        wr_core::determinize::determinize(&mut automaton, &initial, ctx)
+            .map_err(ReadError::Determinize)?;
         automaton.fa = minimize(&automaton.fa)?;
     }
 
@@ -1217,11 +1265,16 @@ fn probe_custom_base_candidate(
 ) -> Result<CustomBaseCandidates, ReadError> {
     let (main_name, complement_name) = numsys::custom_base_candidate_names(name, extension)?;
     let main_path = resolver.resolve(&main_name);
+    // `ctx = None`, deliberately: these are `NumberSystem`-internal file loads, which this
+    // port models as structurally silent (never handed a `DeterminizeContext`) rather than
+    // reproducing Java's non-reentrant `Logging.disablePrint()` flag — the signed-off
+    // divergence recorded as `docs/WALNUT-BUGS.md` WB-039.
     let main = if main_path.is_file() {
         Some(read_automaton_txt_impl(
             &main_path,
             Some(resolver),
             in_progress,
+            None,
         )?)
     } else {
         None
@@ -1233,6 +1286,7 @@ fn probe_custom_base_candidate(
                 &complement_path,
                 Some(resolver),
                 in_progress,
+                None,
             )?)
         } else {
             None

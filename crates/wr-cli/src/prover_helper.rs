@@ -158,7 +158,12 @@ pub fn export_automata_to(
             // is handed a shared reference by `DeterminizeContext::export_pre_determinization`,
             // so it writes a clone. Cloning is deep (`PORTING.md`), so the caller's
             // automaton is genuinely untouched — a small, deliberate divergence from Java,
-            // in the safe direction.
+            // in the safe direction. `docs/WALNUT-BUGS.md` WB-040 is the confirmation that
+            // it is not merely defensive: in real Walnut this call site is reached from
+            // `DeterminizationStrategies`' `[export n gv]` block, mid-`determinize`, so the
+            // `canonize()` mutates the automaton about to be determinized — verified live
+            // to drop a state and kill an ordinary `reverse` command. Do NOT "fix" this
+            // divergence by matching Java.
             let mut copy = m.clone();
             write_automaton_gv(
                 &mut copy,

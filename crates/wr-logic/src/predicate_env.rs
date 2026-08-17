@@ -203,6 +203,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use wr_core::automaton::Automaton;
+use wr_core::determinize::DeterminizeContext;
 use wr_core::numsys::{NumSysError, NumberSystem};
 
 // ---------------------------------------------------------------------------
@@ -436,6 +437,44 @@ pub trait PredicateEnv {
     /// legitimately resolve to two different automata — collapsing them into one method
     /// with a "kind" parameter would be a gratuitous divergence from the Java call graph.
     fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError>;
+
+    /// [`Self::word`] with the enclosing command's [`DeterminizeContext`], so that a
+    /// **nondeterministic** library file's load-time `determinizeAndMinimize()`
+    /// (`AutomatonReader.java:88-98`) consumes a `[strategy n …]`/`[export n …]` index the
+    /// way Java's does.
+    ///
+    /// Java needs no such parameter: `DeterminizationStrategies.determinize` reads
+    /// `Prover.mainProver.metaCommands` out of a global, so every determinization anywhere
+    /// under a `::` command is counted — including one triggered by `Predicate`'s own
+    /// lexer while it resolves `T[i]`/`$f(…)`. This port threads that global explicitly
+    /// (`PORTING.md`'s standing ruling), which is why the context has to reach the
+    /// environment at all.
+    ///
+    /// **The default implementation ignores `ctx`** and forwards to [`Self::word`]. That is
+    /// correct for any environment that does not determinize on load — in particular
+    /// [`InMemoryPredicateEnv`], whose automata are handed over already built, with no
+    /// `AutomatonReader` step to count. A **file-backed** environment (`wr_cli::Session`)
+    /// must override it.
+    fn word_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        let _ = ctx;
+        self.word(name)
+    }
+
+    /// [`Self::function`] with the enclosing command's [`DeterminizeContext`] — see
+    /// [`Self::word_with_ctx`], which this mirrors exactly (same rationale, same default,
+    /// same override obligation).
+    fn function_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
+        let _ = ctx;
+        self.function(name)
+    }
 
     /// `Predicate.readMacroFile(name)` (`Predicate.java:495-511`) — the raw text of the
     /// macro invoked as `#name(…)`, before argument substitution.

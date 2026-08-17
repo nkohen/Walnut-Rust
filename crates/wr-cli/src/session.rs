@@ -586,13 +586,37 @@ impl FileLibraries {
         &self,
         address: &str,
     ) -> Result<Automaton, PredicateEnvError> {
+        self.read_library_automaton_with_ctx(address, None)
+    }
+
+    /// [`Self::read_library_automaton`] with the enclosing command's
+    /// [`wr_core::determinize::DeterminizeContext`], so a **nondeterministic** library file's
+    /// load-time `determinizeAndMinimize()` (`AutomatonReader.java:88-98`) consumes a
+    /// `[strategy n …]`/`[export n …]` index the way Java's global counter makes it.
+    ///
+    /// One new-with-`ctx` error shape, worth naming because the mapping below flattens it:
+    /// a context that answers this load's index with a non-`SC` strategy on a DFAO file
+    /// produces [`wr_io::reader::ReadError::Determinize`], which lands in
+    /// [`PredicateEnvError::MalformedAutomaton`] carrying Java's own
+    /// `"DFAOs are not supported for non-SC strategies."` text rather than surfacing as a
+    /// bare `WalnutException` the way Java's throw would. Both refuse the command; only the
+    /// wrapping differs. It is unreachable with `ctx = None` (the `SC` arm cannot fail), and
+    /// with `Some` it needs a genuinely nondeterministic file that is ALSO a DFAO — which
+    /// real Walnut rejects even earlier, with `nonDeterministicO` (`docs/WALNUT-BUGS.md`
+    /// WB-022, this port's pre-existing gap, unchanged here).
+    pub(crate) fn read_library_automaton_with_ctx(
+        &self,
+        address: &str,
+        ctx: Option<&mut (dyn wr_core::determinize::DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
         // A custom base named in this file's own header resolves through the SESSION (session
         // copy shadowing the global one, per file), which is what Java's
         // `ParseMethods.parseAlphabetDeclaration` → `NumberSystem.getComputeIfAbsent` →
         // `Session.getReadAddressForCustomBases` chain does — see the module docs.
-        reader::read_automaton_txt_with_custom_base_resolver(
+        reader::read_automaton_txt_with_custom_base_resolver_and_ctx(
             Path::new(address),
             &*self.paths as &dyn reader::CustomBaseResolver,
+            ctx,
         )
         .map_err(|e| match e {
             ReadError::Io(_) => PredicateEnvError::FileDoesNotExist {
@@ -698,20 +722,44 @@ impl PredicateEnv for FileLibraries {
     }
 
     fn word(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+        self.word_with_ctx(name, None)
+    }
+
+    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+        self.function_with_ctx(name, None)
+    }
+
+    /// Overridden (the trait's default drops `ctx`) because this environment is
+    /// file-backed: `AutomatonReader` determinizes a nondeterministic word file on load,
+    /// and Java counts that determinization. See
+    /// [`wr_logic::predicate_env::PredicateEnv::word_with_ctx`].
+    fn word_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn wr_core::determinize::DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
         // `Predicate.java:295`:
         // `new Automaton(Session.getReadFileForWordsLibrary(name + ".txt"))`.
         let address = self
             .paths
             .read_file_for_words_library(&format!("{name}{TXT_EXTENSION}"));
-        self.read_library_automaton(&address)
+        self.read_library_automaton_with_ctx(&address, ctx)
     }
 
-    fn function(&self, name: &str) -> Result<Automaton, PredicateEnvError> {
+    /// Overridden for the same reason as [`Self::word_with_ctx`]; this is the one that is
+    /// actually reachable in practice, since `Automata Library/` is where hand-written
+    /// NFAs live (`Word Automata Library/` files are DFAOs, which Java refuses to
+    /// determinize at all).
+    fn function_with_ctx(
+        &self,
+        name: &str,
+        ctx: Option<&mut (dyn wr_core::determinize::DeterminizeContext + '_)>,
+    ) -> Result<Automaton, PredicateEnvError> {
         // `Automaton.readAutomatonFromFile` (`Automaton.java:148-150`).
         let address = self
             .paths
             .read_file_for_automata_library(&format!("{name}{TXT_EXTENSION}"));
-        self.read_library_automaton(&address)
+        self.read_library_automaton_with_ctx(&address, ctx)
     }
 
     fn macro_text(&self, name: &str) -> Result<String, PredicateEnvError> {

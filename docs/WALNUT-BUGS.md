@@ -1953,13 +1953,17 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
-## WB-039 — `Logging.disablePrint()` is not save/restore, so `NumberSystem.constant(n≥2)` leaks its internal automaton constructions into the counted region, making `[strategy n …]`/`[export n …]` indices unstable
+## WB-039 — `Logging.disablePrint()` is not save/restore, so any NESTED `disablePrint` bracket in `NumberSystem` leaks its internal automaton constructions into the counted region, making `[strategy n …]`/`[export n …]` indices unstable
 
 - **Where:** `Main/Logging.java:168-169` (`disablePrint`/`enablePrint`, plain assignments to a
-  `static boolean printEnabled`, no save/restore), `Automata/NumberSystem.java:936`/`:968`
-  (`constant(BigInteger)`'s bracket) around its recursive `getConstant(floorHalf)`/
-  `getConstant(ceilHalf)` calls, consumed by `Automata/FA/DeterminizationStrategies.java:95`
-  (`if (Logging.shouldPrintDetails())`, i.e. `printEnabled && printDetails`).
+  `static boolean printEnabled`, no save/restore), consumed by
+  `Automata/FA/DeterminizationStrategies.java:95` (`if (Logging.shouldPrintDetails())`, i.e.
+  `printEnabled && printDetails`). The leak fires at **any** `disablePrint` bracket in
+  `Automata/NumberSystem.java` that can nest inside another; two sites are confirmed live:
+  - `constant(BigInteger)`'s bracket, `:936`/`:968`, around its recursive
+    `getConstant(floorHalf)`/`getConstant(ceilHalf)` calls;
+  - `multiplication(BigInteger)`'s bracket, `:983`/`:1021`, around the `n > 2` branch's
+    `getMultiplication(BIG_TWO)` (`:1000`) and `getMultiplication(k)` (`:1004`) recursion.
 - **What:** `DeterminizationStrategies.determinize` guards its whole `MetaCommands` block —
   automata-index increment, strategy lookup, `[export …]` dump — behind
   `Logging.shouldPrintDetails()`, with a comment stating exactly why: *"this is only done when
@@ -1967,17 +1971,25 @@ bug costs a silent wrong answer somewhere downstream.
   other caches."* `NumberSystem` implements that silence by bracketing each such construction in
   `Logging.disablePrint(); …; Logging.enablePrint();`. But those two are **unconditional
   assignments, not a save/restore pair**, so a NESTED bracket's closing `enablePrint()` re-enables
-  printing for the remainder of the *outer* bracket. `constant(n)` for `n ≥ 2` hits this on its
-  very first line of work: it calls `disablePrint()`, then `getConstant(floorHalf)` → `constant(1)`
-  → `disablePrint() … enablePrint()`, which turns printing back **on** — and the rest of
-  `constant(n)`'s body (two `AutomatonLogicalOps.and` calls and an
-  `AutomatonQuantification.quantify`, `:962-965`) then runs *counted*. So a `NumberSystem`
-  construction the code explicitly intends to be invisible advances the automata counter.
+  printing for the remainder of the *outer* bracket. That is the general rule, and it is not
+  specific to one method — every `NumberSystem` construction that recurses into another bracketed
+  `NumberSystem` construction leaks the remainder of its own body into the counted region:
+  - `constant(n)`, `n ≥ 2`, hits it on its very first line of work: `disablePrint()`, then
+    `getConstant(floorHalf)` → `constant(1)` → `disablePrint() … enablePrint()`, which turns
+    printing back **on** — so the rest of `constant(n)`'s body (two `AutomatonLogicalOps.and` calls
+    and an `AutomatonQuantification.quantify`, `:962-965`) runs *counted*. **One** leaked index.
+  - `multiplication(n)`, `n > 2`, hits it the same way through `getMultiplication(BIG_TWO)` →
+    `multiplication(2)`'s own bracket — so the rest of `multiplication(n)`'s body runs counted,
+    including its `AutomatonQuantification.quantify(P, Set.of(b, c))` (`:1016`), which is a
+    TWO-variable quantification and therefore **two** leaked indices, not one.
 - **Consequence (the part that actually bites):** the index a `[strategy n …]`/`[export n …]`
-  metacommand names is **not a stable function of the query**. It depends on `constant()`'s
-  `constantsDynamicTable` memo, i.e. on what earlier commands in the same session happened to
-  build. Running the *identical* command twice gives two different index sequences.
-- **Trigger (minimal, verified live against `Walnut-all.jar`, 2026-08-16):** a single command file
+  metacommand names is **not a stable function of the query**. It depends on the relevant memo
+  (`constantsDynamicTable` / `multiplicationsDynamicTable`), i.e. on what earlier commands in the
+  same session happened to build — both tables are consulted *before* the `disablePrint()` line, so
+  a cached value skips the bracket entirely and the leak vanishes. Running the *identical* command
+  twice gives two different index sequences.
+- **Trigger 1 — `constant()` (minimal, verified live against `Walnut-all.jar`, 2026-08-16):** a
+  single command file
   ```
   eval r1 "?msd_2 Ei (i > 2) & (i < x)"::
   eval r2 "?msd_2 Ei (i > 2) & (i < x)"::
@@ -1991,35 +2003,103 @@ bug costs a silent wrong answer somewhere downstream.
   with `i > 5` instead of `i > 2` shows the three-determinization shape again (fresh constant), and
   `?msd_2 x > 1`-style queries never leak at all (`constant(1)` is `makeOne()`, which builds
   nothing).
+- **Trigger 2 — `multiplication()` (verified live against `Walnut-all.jar`, 2026-08-16):** the same
+  shape, costing two indices instead of one —
+  ```
+  eval m1 "?msd_2 Ex (x*3 = y)"::
+  eval m2 "?msd_2 Ex (x*3 = y)"::
+  ```
+  `m1` records **four** determinizations, `[#0 …]: 4 states`, `[#1 …]: 3 states`,
+  `[#2 …]: 3 states`, `[#3 …]: 3 states`, of which the first two are `multiplication(3)`'s own
+  leaked `quantify(P, {b, c})`; `m2`, byte-identical, records only the **two** the query itself
+  performs, `[#0 …]: 3 states`, `[#1 …]: 3 states`. `2*j` does NOT leak (`multiplication(2)` takes
+  the `n == 2` branch, which recurses into nothing).
 - **Found:** Phase 4, wiring `[strategy …]`/`[export …]` through to `wr_core::determinize`
   (2026-08-16). Surfaced by an index-sequence regression test transcribed from real
   `*_detailed_log.txt` output: four of five ground-truth queries matched this port exactly, and the
   fifth (`?msd_3 Ei Ej (i + j = x) & (i > 2)`) had one EXTRA index in Java, which traced back to
-  here.
+  here. The `multiplication()` site was added by an adversarial review of that commit (2026-08-16),
+  which found the entry's original "only `constant(n ≥ 2)`" framing under-scoped and reproduced the
+  second trigger live.
 - **Rust port:** **`diverged (signed off — 2026-08-16)`.** This port models Java's `printEnabled`
   *structurally* rather than as state: `wr_core::numsys` is simply never handed a
   `DeterminizeContext`, so nothing it builds can ever advance the counter. That implements
   `DeterminizationStrategies.java:96-98`'s stated intent and yields a **stable**, query-determined
-  index sequence — but it is a real behavioral divergence for any query whose operand is a
-  constant `≥ 2` that the session has not already built. Pinned, not hidden, by
-  `wr_cli::eval_def`'s `the_automata_index_sequence_matches_real_walnut_java`, whose fifth case
-  carries Java's sequence alongside the port's. Porting verbatim is possible but not cheap: it
+  index sequence — but it is a real behavioral divergence for any query that triggers a nested
+  `NumberSystem` bracket the session has not already memoized (a constant `≥ 2`, or a
+  multiplication by `n > 2`). Pinned, not hidden, by `wr_cli::eval_def`'s
+  `the_automata_index_sequence_matches_real_walnut_java`, whose fifth and sixth cases carry Java's
+  sequence alongside the port's — one per confirmed site. Porting verbatim is possible but not cheap: it
   means threading the context through the whole of `numsys` (comparison / arithmetic / constant /
   multiplication / division, plus the constructor) *and* giving the context a mutable
   `print_enabled` flag with Java's exact non-reentrant `disable`/`enable` call sites, in order to
   reproduce a sequence that is itself cache-order dependent. **User decision (2026-08-16, asked
   explicitly per `CLAUDE.md`'s rule): keep the port's stable indices as a deliberate divergence,
-  do not schedule the verbatim port.** Rationale given: no corpus fixture is affected, blast
-  radius is narrow (only `[strategy n …]`/`[export n …]` targeting on constants built via nested
-  `NumberSystem` recursion), and stable/deterministic indices are strictly better behavior for
-  anyone actually using those metacommands to target a specific automaton — replicating Java's
-  session-cache-order-dependent instability verbatim would have no research value. Blast radius
-  confirmed narrow: no fixture in Walnut's own corpus is affected (637-641/659/660 all avoid the
-  leak — `@1`/`=1` constants go through `constant(1)`, which does not recurse), and neither is any
-  other part of this port, since the counter has no consumer besides the two metacommands.
+  do not schedule the verbatim port.** Rationale given: no corpus fixture is affected, the
+  *consumer* surface is narrow (only `[strategy n …]`/`[export n …]` targeting), and
+  stable/deterministic indices are strictly better behavior for anyone actually using those
+  metacommands to target a specific automaton — replicating Java's session-cache-order-dependent
+  instability verbatim would have no research value. **That decision stands and covers the
+  `multiplication()` site too**; the second site widens the entry's qualitative scope (two distinct
+  call sites, not one, and one of them costs two indices) without changing either the rationale or
+  the corpus impact. Blast radius re-confirmed after the second site was found (2026-08-16): no
+  fixture in Walnut's own corpus is affected — of the 17 `::` fixtures in
+  `phase0-artifacts/test-manifest.json`, none multiplies by a constant `≥ 3` (378's `2*j` takes
+  `multiplication`'s non-recursing `n == 2` branch) and 637-641/659/660 all avoid the `constant()`
+  leak (`@1`/`=1` go through `constant(1)`, which does not recurse). Nothing else in this port is
+  affected either, since the counter has no consumer besides the two metacommands.
 - **Upstream:** not filed. The Java-side fix is mechanical: make `disablePrint`/`enablePrint`
   save-and-restore (return the previous value / take it back), or replace the pair with a
   try-with-resources scope object, so nesting composes.
+
+---
+
+## WB-040 — `[export n gv]`'s pre-determinization dump **mutates the automaton it is dumping** (`writeToGV` calls `canonize()`), changing — and here crashing — the computation it was only supposed to observe
+
+- **Where:** `Automata/Writer/AutomatonWriter.java:117` (`writeToGV`'s `automaton.canonize()`, on
+  the non-`TRUE_FALSE` branch), reached from `Main/ProverHelper.java:27`
+  (`exportAutomata`'s `GV_STRING` arm), reached from
+  `Automata/FA/DeterminizationStrategies.java:103-109` — the `[export …]` block, which fires
+  **inside** `determinize`, before any strategy runs. `canonize()` is
+  `Automaton.java:328-331` → `FA.canonizeInternal()` (`FA.java:148-…`), which rebuilds `Q`/`q0`/
+  `O`/`d` through `determinePermutationMap()` and therefore **drops states absent from that map**.
+- **What:** `[export …]` is documented and named as an observation hook — it writes the
+  *pre*-determinization automaton (`_pre` suffix) so a user can inspect the dispatcher's input.
+  The `ba` arm is a genuine observer (`exportToBA(M.fa, …)` reads and writes a file). The `gv` arm
+  is not: it canonizes `M` **in place**, and `M` is the very `Automaton` `determinize` is about to
+  work on. So turning an export on changes what is determinized. That is a live-computation
+  mutation from a debugging flag, not a formatting difference.
+- **Trigger (verified live against `Walnut-all.jar`, 2026-08-16).** `Automata Library/base.txt` a
+  plain 2-state msd_2 DFA, then, in one session:
+  ```
+  reverse revb  $base::            ->  Determinizing [#0, strategy: SC]: 2 states   (succeeds)
+  [export 0 ba]reverse revb2 $base::  ->  Determinizing [#0, strategy: SC]: 2 states   (succeeds)
+  [export 0 gv]reverse revb3 $base::  ->  Determinizing [#0, strategy: SC]: 1 states
+                                          java.lang.IndexOutOfBoundsException:
+                                          Index 1 out of bounds for length 1
+  ```
+  The `ba` and `gv` runs differ in exactly one thing — `exportAutomata`'s `switch` arm — so the
+  state count going from 2 to 1, and the command then dying, is `writeToGV`'s `canonize()`
+  discarding a state the surrounding `reverse` still indexes. Note the `gv` file IS written before
+  the crash, so the failure looks like "the export worked and the command mysteriously broke".
+  An automaton that is already canonical (the ordinary `eval` case: `[export * gv] eval e "?msd_2
+  Ei i < x"::`) shows no state-count change and no crash — which is why this is easy to miss.
+- **Found:** Phase 4, while verifying an adversarial-review finding about `[export …]` on
+  non-`eval` commands (2026-08-16). Incidental to that finding, not caused by it.
+- **Rust port:** **not reachable, and already diverged in the safe direction.**
+  `wr_core::determinize::ExportRequest` hands the sink a shared `&Automaton`, so the export hook
+  *cannot* mutate the automaton being determinized even in principle; and
+  `wr_cli::prover_helper::export_automata`'s `gv` arm explicitly writes a deep clone
+  (`let mut copy = m.clone();`), with a comment already naming this as a deliberate divergence.
+  This entry is the missing half of that comment: the divergence is not merely defensive tidiness,
+  it avoids a confirmed Java misbehavior. Nothing to schedule — but note it constrains any future
+  work that wires `[export …]` into the remaining `Commands/*` arms (see
+  `wr_cli::prover`'s `export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded`):
+  the port must keep exporting a copy, and must NOT "fix" the divergence by matching Java here.
+- **Upstream:** not filed. The Java-side fix is a one-liner in either direction — have `writeToGV`
+  canonize a `clone()`, or (better, since `exportAutomata` is called from a hot dispatcher) drop
+  the `canonize()` and accept the un-permuted state numbering in the `.gv`, which is a rendering
+  detail.
 
 ---
 

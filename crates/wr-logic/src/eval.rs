@@ -585,21 +585,23 @@ pub fn evaluate_with_logging(
 /// [`evaluate_with_logging`] with an explicit [`DeterminizeContext`] — see
 /// [`compute_with_ctx`].
 ///
-/// **Scope note (deliberate, and narrower than Java's):** the context covers the
-/// postorder execution only, not [`Predicate::new`]'s lexing. Java's singleton is global,
-/// so a `.txt` library automaton that happens to be an NFA also advances the counter when
-/// `AutomatonReader` determinizes it (`AutomatonReader.java:92`). Threading a context
-/// through [`PredicateEnv`] to reproduce that is a separate decision; no fixture in
-/// Walnut's own corpus loads a nondeterministic library automaton under a metacommand, so
-/// the gap is recorded here rather than closed blind.
+/// **The context covers lexing as well as postorder execution**, in that order, exactly
+/// as Java's global does. `Predicate`'s lexer reads library files for `T[i]`/`$f(…)`, and
+/// `AutomatonReader` determinizes a nondeterministic one on load
+/// (`AutomatonReader.java:88-98`) — so on a query like `?msd_2 Ei $mynfa(i) & (i < x)`
+/// over an NFA `mynfa.txt`, Java's index `#0` is the *load*, not the first operator.
+/// Verified live against `Walnut-all.jar` (2026-08-16); see
+/// [`wr_io::reader::read_automaton_txt_with_custom_base_resolver_and_ctx`]'s docs for the
+/// repro and for the two deliberate narrowings (an already-deterministic file is not
+/// counted, and nested custom-base loads are not counted).
 pub fn evaluate_with_logging_and_ctx(
     env: &dyn PredicateEnv,
     logging: &mut Logging,
     fresh: &mut FreshIdentifiers,
     predicate_str: &str,
-    ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, EvalError> {
-    let predicate = Predicate::new(env, predicate_str)?;
+    let predicate = Predicate::new_with_ctx(env, predicate_str, ctx.as_deref_mut())?;
     match compute_with_ctx(logging, fresh, predicate.post_order(), ctx)? {
         Expression::Automaton(ae) => Ok(ae.m),
         // `compute` already validated this above (`ResultNotAutomaton` otherwise), so

@@ -121,6 +121,7 @@ use regex_automata::meta::Regex;
 use regex_automata::util::captures::Captures;
 use regex_automata::{Anchored, Input};
 
+use wr_core::determinize::DeterminizeContext;
 use wr_core::numsys::{normalize_number_system_token, MSD_2};
 use wr_core::util::{
     generic_list_string, is_java_whitespace, parse_big_integer, try_parse_int, NumberFormatError,
@@ -534,6 +535,24 @@ impl Predicate {
         Predicate::with_context(env, MSD_2, predicate, 0)
     }
 
+    /// [`Predicate::new`] with the enclosing command's [`DeterminizeContext`].
+    ///
+    /// Lexing is not a purely syntactic step in Walnut: `putWord`/`putFunction` *read
+    /// library files*, and `AutomatonReader` determinizes a nondeterministic one on load
+    /// (`AutomatonReader.java:88-98`). Java's counter is a global, so that load is counted
+    /// like any other determinization — and, being the first thing the command does, it is
+    /// index `#0`. Passing `None` here is the pre-existing behavior (no metacommands in
+    /// effect, or a command without the `::` suffix); passing `Some` is what keeps this
+    /// port's `[strategy n …]`/`[export n …]` indices aligned with Java's on a query that
+    /// loads an NFA library automaton.
+    pub fn new_with_ctx(
+        env: &dyn PredicateEnv,
+        predicate: &str,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<Predicate, LexError> {
+        Predicate::with_context_and_ctx(env, MSD_2, predicate, 0, ctx)
+    }
+
     /// `Predicate(String defaultNumberSystem, String predicate, int realStartingPosition)`
     /// (`:134-146`).
     ///
@@ -548,6 +567,24 @@ impl Predicate {
         default_number_system: &str,
         predicate: &str,
         real_starting_position: usize,
+    ) -> Result<Predicate, LexError> {
+        Predicate::with_context_and_ctx(
+            env,
+            default_number_system,
+            predicate,
+            real_starting_position,
+            None,
+        )
+    }
+
+    /// [`Predicate::with_context`] with the enclosing command's [`DeterminizeContext`] —
+    /// see [`Predicate::new_with_ctx`] for why lexing needs one at all.
+    pub fn with_context_and_ctx(
+        env: &dyn PredicateEnv,
+        default_number_system: &str,
+        predicate: &str,
+        real_starting_position: usize,
+        ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<Predicate, LexError> {
         let mut p = Predicate {
             predicate: predicate.to_string(),
@@ -564,7 +601,7 @@ impl Predicate {
         if p.predicate.bytes().all(is_java_whitespace) {
             return Ok(p);
         }
-        p.tokenize_and_compute_post_order(env)?;
+        p.tokenize_and_compute_post_order(env, ctx)?;
         Ok(p)
     }
 
@@ -627,7 +664,11 @@ impl Predicate {
     /// `<=` (relational); `T[i]` (word) before `T` (variable); `$f(`/`#m(` before the bare
     /// `(`; `@5` (alphabet letter) is only reached because `@` is not a digit, so the
     /// number-literal pattern above it cannot match first.
-    fn tokenize_and_compute_post_order(&mut self, env: &dyn PredicateEnv) -> Result<(), LexError> {
+    fn tokenize_and_compute_post_order(
+        &mut self,
+        env: &dyn PredicateEnv,
+        mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    ) -> Result<(), LexError> {
         let p = patterns();
         // `Stack<String> numberSystems` (`:149-151`): the bottom entry is the default,
         // and a literal "(" is pushed as a scope marker by every left parenthesis.
@@ -703,7 +744,13 @@ impl Predicate {
                     });
                 }
                 last_token_was_operator = false;
-                index = self.put_word(env, &current_number_system, &caps, false)?;
+                index = self.put_word(
+                    env,
+                    &current_number_system,
+                    &caps,
+                    false,
+                    ctx.as_deref_mut(),
+                )?;
             } else if let Some(caps) = find_at(&p.word_with_delimiter, &self.predicate, index) {
                 // `:193-196`
                 if !last_token_was_operator {
@@ -712,7 +759,8 @@ impl Predicate {
                     });
                 }
                 last_token_was_operator = false;
-                index = self.put_word(env, &current_number_system, &caps, true)?;
+                index =
+                    self.put_word(env, &current_number_system, &caps, true, ctx.as_deref_mut())?;
             } else if let Some(caps) = find_at(&p.function, &self.predicate, index) {
                 // `:197-200`
                 if !last_token_was_operator {
@@ -721,7 +769,8 @@ impl Predicate {
                     });
                 }
                 last_token_was_operator = false;
-                index = self.put_function(env, &current_number_system, &caps)?;
+                index =
+                    self.put_function(env, &current_number_system, &caps, ctx.as_deref_mut())?;
             } else if let Some(caps) = find_at(&p.macro_call, &self.predicate, index) {
                 // `:201-203`. QUIRK, ported verbatim: unlike the word and function arms
                 // above, this one never sets `lastTokenWasOperator = false` on its own
@@ -914,6 +963,7 @@ impl Predicate {
         default_number_system: &str,
         caps: &Captures,
         with_delimiter: bool,
+        mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<usize, LexError> {
         let name_span = caps
             .get_group_by_name("name")
@@ -926,7 +976,7 @@ impl Predicate {
         // TXT_EXTENSION))` (`:295`). Java resolves the word/sequence automaton BEFORE
         // scanning for indices; a missing file is reported before any index-syntax
         // error would be, and this ordering matches that.
-        let word_automaton = env.word(&name)?;
+        let word_automaton = env.word_with_ctx(&name, ctx.as_deref_mut())?;
         let _ = with_delimiter; // only affects which pattern matched `caps`, not the body
 
         let text = self.predicate.clone();
@@ -948,11 +998,12 @@ impl Predicate {
                 if depth == 0 {
                     // `:302-303` -- finalize this index as a nested `Predicate`.
                     let index_text = &text[starting_position..i];
-                    indices.push(Predicate::with_context(
+                    indices.push(Predicate::with_context_and_ctx(
                         env,
                         default_number_system,
                         index_text,
                         self.position(starting_position),
+                        ctx.as_deref_mut(),
                     )?);
                     // `:305-311` -- a chained index (`T[i][j]`)?
                     if let Some(next) = find_at(&patterns().left_bracket, &text, i + 1) {
@@ -1011,6 +1062,7 @@ impl Predicate {
         env: &dyn PredicateEnv,
         default_number_system: &str,
         caps: &Captures,
+        mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
     ) -> Result<usize, LexError> {
         let name_span = caps
             .get_group_by_name("name")
@@ -1019,17 +1071,18 @@ impl Predicate {
         let match_end = caps.get_match().expect("matched").end();
 
         // `Automaton.readAutomatonFromFile(functionName)` (`:451`).
-        let automaton = env.function(&function_name)?;
+        let automaton = env.function_with_ctx(&function_name, ctx.as_deref_mut())?;
 
         let parse_result = self.parse_parenthesized_arguments(match_end)?;
 
         let mut arguments: Vec<Predicate> = Vec::with_capacity(parse_result.arguments.len());
         for arg in &parse_result.arguments {
-            arguments.push(Predicate::with_context(
+            arguments.push(Predicate::with_context_and_ctx(
                 env,
                 default_number_system,
                 &arg.text,
                 self.position(arg.start_pos),
+                ctx.as_deref_mut(),
             )?);
         }
 

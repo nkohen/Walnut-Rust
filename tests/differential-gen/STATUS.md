@@ -200,6 +200,26 @@ JVM alongside this scale-up and passed. It proves the comparator can **fail** (t
 kill/restart/resync path works. Without it, a clean 120,000 would be consistent with a
 comparator that says "match" unconditionally.
 
+## Regression re-runs since the scale-up
+
+Batches run to confirm a later change did not move Tier-3, recorded here rather than only in a
+commit message (the scale-up's own practice, extended — an unrecorded verification run is not
+evidence).
+
+| date | seed | queries | result | what it was confirming |
+|---|---|---|---|---|
+| 2026-08-16 | `0x5245564931363038` | 30,000 | 30,000 match, 0 divergence, 0 skip | the `[strategy …]`/`[export …]` review-fix round: threading a `DeterminizeContext` into `Predicate` lexing (`PredicateEnv::{word,function}_with_ctx`) |
+| 2026-08-16 | `0x4632464947534558` | 30,000 | 30,000 match, 0 divergence, 0 skip | same, second seed |
+
+Note what these do and do not cover. The generator emits **no `::`-suffixed queries and no
+`$name(…)`/word tokens** (see "Known, explicit non-coverage" above), so a `DeterminizeContext` is
+never `Some` in this stream and no library automaton is ever loaded: these batches prove the
+threading did not perturb the ordinary `ctx = None` eval path, and prove nothing about index
+accounting itself. That is checked by the ground-truth pins in
+`wr_cli::eval_def`'s `the_automata_index_sequence_matches_real_walnut_java` /
+`a_nondeterministic_library_automatons_load_consumes_index_zero_like_java`, transcribed from real
+`Walnut-all.jar` output, and by the Tier-1 corpus.
+
 ## Divergences
 
 **None.** Zero divergences across 120,000 generated queries on 4 seeds — nothing fixed, nothing

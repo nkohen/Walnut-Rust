@@ -58,7 +58,15 @@
 //! `metaCommands` is a process-wide singleton, so a `[strategy 0 BRZ]…rightquo x y z::`
 //! would take effect there too; this port wires only the `eval`/`def` path, which is what
 //! Walnut's own corpus exercises (fixtures 637-641, 659, 660 — all `eval`). Widening it is
-//! a mechanical follow-on, arm by arm, not a redesign.
+//! a mechanical follow-on, arm by arm, not a redesign. The boundary is pinned by
+//! [`tests::export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded`],
+//! which carries the live-verified Java behavior it diverges from and says, in its own
+//! failure message, to invert itself when an arm is wired.
+//!
+//! Within the wired path the context reaches BOTH halves of a command — `Predicate`'s lexer
+//! (a nondeterministic `$name(…)`/`T[i]` library file is determinized on load, and Java
+//! counts that as index `#0`) and the postorder execution. See
+//! [`wr_logic::eval::evaluate_with_logging_and_ctx`].
 //!
 //! # `FreshIdentifiers` is per-evaluation, not per-session
 //!
@@ -2754,6 +2762,72 @@ mod tests {
             .collect();
         f_pre.sort();
         assert_eq!(f_pre, vec!["f_1_pre.ba".to_string()]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A tripwire, not an endorsement** — the boundary of what the previous test just
+    /// established. Only `eval`/`def` hand their `MetaCommands` down as a
+    /// [`wr_core::determinize::DeterminizeContext`]; every OTHER command that determinizes
+    /// (`reverse`, `union`, `concat`, `star`, `quotient`, `minimize`, …) still passes
+    /// `None`, so an `[export …]`/`[strategy …]` on one of them is parsed, validated,
+    /// accepted — and silently discarded.
+    ///
+    /// Real Walnut does write for these: verified live against `Walnut-all.jar`
+    /// (2026-08-16), `[export 0 gv]reverse revb $base::` prints
+    /// `Writing to …/Result/export_0_pre.gv` (the name is `MetaCommands`'
+    /// `DEFAULT_EXPORT_NAME` placeholder, since no `eval` has run to set
+    /// `Prover.currentEvalName`) and produces the file. So this test pins a **known,
+    /// deliberate scope limitation**, exactly the way the `eval`-side test above pinned
+    /// one before it was closed. Wiring the rest is a mechanical arm-by-arm follow-on, not
+    /// a design question.
+    ///
+    /// **INVERT THIS ASSERTION when `reverse`'s arm gets wired** — the failure message
+    /// says so too. It is meant to change, and to go red loudly if the behavior drifts in
+    /// either direction (a half-wired arm that writes some files, or an accidental hard
+    /// error where today the command still succeeds).
+    ///
+    /// (Java's own behavior on this exact command is worse than "writes a file": the `gv`
+    /// writer canonizes the live automaton mid-determinization and the `reverse` then dies
+    /// with an `IndexOutOfBoundsException` — `docs/WALNUT-BUGS.md` WB-040. That is a
+    /// reason to wire this arm carefully, not a reason to leave it unpinned.)
+    #[test]
+    fn export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded() {
+        let (mut p, dir, _) = prover("exportnoneval");
+        fs::write(
+            dir.join("Automata Library").join("base.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        // The command still succeeds, and the metacommand still parses/validates.
+        assert!(p.dispatch("[export 0 gv]reverse revb $base::").unwrap());
+        assert!(
+            p.meta_commands().export_failures().is_empty(),
+            "{:?}",
+            p.meta_commands().export_failures()
+        );
+        assert_eq!(
+            p.meta_commands().get_export_format(0).as_deref(),
+            Some("gv")
+        );
+
+        // ...and yet the determinizer never called back: no automaton index was consumed
+        // (the counter is still at its initial value, `MetaCommands.java:27-29`).
+        assert_eq!(p.meta_commands_mut().increment_automata_index(), 0);
+
+        // ...and no `_pre` dump was written, though the ordinary result file was.
+        let stray: Vec<String> = fs::read_dir(dir.join("Result"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("_pre"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "`[export …]` on a non-`eval`/`def` command is still a no-op; if these \
+             appeared, that arm has been wired -- INVERT THIS TEST to assert the files \
+             (and the consumed indices) that now appear: {stray:?}"
+        );
+        assert!(dir.join("Automata Library").join("revb.txt").is_file());
         fs::remove_dir_all(&dir).ok();
     }
 

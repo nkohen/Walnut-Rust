@@ -1321,12 +1321,12 @@ mod tests {
     /// states` trace.
     ///
     /// The expectations below are transcribed from `<name>_detailed_log.txt` files
-    /// produced by the real `Walnut-all.jar` for these exact five queries (captured the
+    /// produced by the real `Walnut-all.jar` for these exact six queries (captured the
     /// same way `tests/differential/CAPTURE.md` describes; the same lines are visible in
     /// the committed corpus fixture `details637.txt`). Each tuple is
     /// `(index, |Q| before determinizing)`.
     ///
-    /// Three of these five are load-bearing beyond mere counting:
+    /// Four of these six are load-bearing beyond mere counting:
     ///
     /// * `q2`/`q5` — the arithmetic sub-formula's `quantifying:` block gets **no**
     ///   `Determinizing` line at all in Java, because `Automaton.determinizeAndMinimize()`
@@ -1337,6 +1337,13 @@ mod tests {
     ///   already deterministic), so a `∀` costs the same two indices a `∃` does.
     /// * `q4` — on `lsd`, `fixTrailingZerosProblem` closes with `justMinimize`, not
     ///   `determinizeAndMinimize`, so an `lsd` quantification costs ONE index, not two.
+    /// * `q5`/`q6` — the two confirmed WB-039 sites, one per `NumberSystem` call site
+    ///   (`constant()` and `multiplication()`); see each one's own comment below.
+    ///
+    /// A seventh shape — a **nondeterministic library automaton**, whose load-time
+    /// determinization Java counts as index `#0` — lives in
+    /// [`a_nondeterministic_library_automatons_load_consumes_index_zero_like_java`],
+    /// because it needs library files this loop's shared session does not have.
     #[test]
     fn the_automata_index_sequence_matches_real_walnut_java() {
         let (session, dir) = temp_session("idxseq");
@@ -1364,6 +1371,77 @@ mod tests {
             (
                 "?msd_3 Ei Ej (i + j = x) & (i > 2)",
                 vec![(0, 2), (1, 5), (2, 6), (3, 6), (4, 3)],
+            ),
+            // WB-039's SECOND confirmed site, and the one that costs TWO indices rather
+            // than one: `NumberSystem.multiplication(n)` for `n > 2` brackets its recursive
+            // `multiplication(n-1)`/`multiplication(2)` calls in `Logging.disablePrint()`
+            // (`NumberSystem.java:983`, `:1000`, `:1021`) the same non-reentrant way
+            // `constant()` does, so the inner bracket's `enablePrint()` re-enables printing
+            // for the remainder of the outer one. Java's sequence here is
+            // `[(0, 4), (1, 3), (2, 3), (3, 3)]` — its leading `(0, 4)` and `(1, 3)` are
+            // both `multiplication`-internal — while this port, which never hands
+            // `wr_core::numsys` a context at all, records only the two the query itself
+            // performs. Captured live from `Walnut-all.jar` (2026-08-16) on
+            // `eval r "?msd_2 Ex (x*3 = y)"::`. Same signed-off divergence as `q5`.
+            ("?msd_2 Ex (x*3 = y)", vec![(0, 3), (1, 3)]),
+        ] {
+            let mut ctx = RecordingCtx::default();
+            eval_with_ctx(&session, predicate, &mut ctx);
+            let actual: Vec<(usize, usize)> = ctx.seen.iter().map(|(i, _, q)| (*i, *q)).collect();
+            assert_eq!(actual, expected, "index sequence for `{predicate}`");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `$name(…)` whose library file is a genuine **NFA** costs an index — the FIRST
+    /// one — and one whose file is already deterministic costs none.
+    ///
+    /// This is the lexer half of the index-accounting model. `Predicate.putFunction`
+    /// (`Predicate.java:451`) reads the library file while *tokenizing*, before any
+    /// operator's `act()` runs, and `AutomatonReader.readAutomaton` (`:88-98`) determinizes
+    /// it on the spot if the transition table is nondeterministic. Java's counter is a
+    /// global, so that determinization is counted like any other — which makes it index
+    /// `#0` of the whole command and shifts every later `[strategy n …]`/`[export n …]`
+    /// target by one.
+    ///
+    /// Both expectations were captured live from the real `Walnut-all.jar` (2026-08-16),
+    /// with the exact two library files built below:
+    ///
+    /// ```text
+    /// eval r1 "?msd_2 Ei $mynfa(i) & (i < x)"::   ->  #0: 2, #1: 2, #2: 4, #3: 3
+    /// eval r2 "?msd_2 Ei $mydfa(i) & (i < x)"::   ->  #0: 2, #1: 4, #2: 3
+    /// ```
+    ///
+    /// The second case is what keeps the fix narrow, and it is a real distinction rather
+    /// than an assumed one: Java reaches `determinizeAndMinimize()` only inside
+    /// `if (!A.fa.getT().isDeterministic())`, so a DFA file never touches the dispatcher
+    /// and never advances the counter. A port that counted every library load would be
+    /// wrong in exactly the opposite direction.
+    #[test]
+    fn a_nondeterministic_library_automatons_load_consumes_index_zero_like_java() {
+        let (session, dir) = temp_session("libnfa");
+        let lib = dir.join("Automata Library");
+        // State 0's symbol `1` goes to BOTH 0 and 1 — genuinely nondeterministic.
+        fs::write(
+            lib.join("mynfa.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 0 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+        // The same shape with that one extra edge removed: already deterministic.
+        fs::write(
+            lib.join("mydfa.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        for (predicate, expected) in [
+            (
+                "?msd_2 Ei $mynfa(i) & (i < x)",
+                vec![(0, 2), (1, 2), (2, 4), (3, 3)],
+            ),
+            (
+                "?msd_2 Ei $mydfa(i) & (i < x)",
+                vec![(0, 2), (1, 4), (2, 3)],
             ),
         ] {
             let mut ctx = RecordingCtx::default();
