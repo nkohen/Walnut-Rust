@@ -466,9 +466,15 @@ fn quantify_helper(
     // `details637.txt`'s second `quantifying:` block has a `Minimizing:` line and NO
     // `Determinizing [#n, …]` line, i.e. Java skipped the dispatcher there, and the very
     // next index (`#2`) went to that quantification's `fixing leading zeros` step
-    // instead. (Skipping also preserves a DFAO's real output values, which subset
-    // construction would flatten to 0/1 -- another way the old unconditional call
-    // diverged.)
+    // instead.
+    //
+    // Index accounting is the guard's ONLY effect -- do not read DFAO-output safety into
+    // it. An earlier draft of this comment claimed that skipping "also preserves a DFAO's
+    // real output values, which subset construction would flatten to 0/1"; that is false.
+    // `minimize` runs unconditionally on the very next line and rebuilds outputs as plain
+    // accept/reject bits either way (see `crate::minimize`'s scope note, matching Java's
+    // `ValmariDFA.minValmari`), so no `o > 1` survives this function whether the guard
+    // fires or not.
     let was_deterministic = projected.fa.is_deterministic();
     projected.fa = trim(&projected.fa);
     if !was_deterministic {

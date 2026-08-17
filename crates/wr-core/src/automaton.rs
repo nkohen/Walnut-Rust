@@ -1586,6 +1586,28 @@ impl Automaton {
     }
 
     /// `Automaton.asDFA` (`Automaton.java:152-158`).
+    ///
+    /// # The index-accounting assumption every `as_dfa()` (no-`ctx`) caller makes
+    ///
+    /// This is [`Automaton::as_dfa_with_ctx`] with `ctx = None`, i.e. "if `self` turns out
+    /// to be nondeterministic, determinize it **silently**". Java has no such distinction
+    /// — `asDFA()` determinizes through the same global-reading dispatcher as everything
+    /// else, so a nondeterministic operand there WOULD consume a
+    /// `[strategy n …]`/`[export n …]` index. Every no-`ctx` call site therefore carries
+    /// an unstated precondition: *its operand is already deterministic*, so the `None` is
+    /// unobservable.
+    ///
+    /// That precondition holds for the current call sites — [`crate::logicalops`]'s
+    /// trivial-operand (`TRUE`/`FALSE`) short-circuits in `and`/`or`/`xor`/`imply`/`iff`,
+    /// and [`crate::product::cross_product_and_minimize`] — because on the `eval` call
+    /// graph both boolean operands have already been through
+    /// `determinize_and_minimize`/`minimize`. It is **not** enforced by the type system,
+    /// and it is not a `debug_assert` either: `as_dfa` on a genuine NFA is a legitimate
+    /// use of this function in isolation (that is what [`AutomatonDFA::from`] is for), so
+    /// asserting here would reject correct callers. The consequence of the assumption
+    /// being violated is narrow but real — a shifted index, i.e. `[strategy n …]` naming
+    /// the wrong automaton — so a new caller that can be handed a nondeterministic
+    /// operand should use [`Automaton::as_dfa_with_ctx`] and thread the context.
     pub fn as_dfa(&self) -> AutomatonDFA {
         AutomatonDFA::from(self.clone())
     }

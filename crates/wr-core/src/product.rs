@@ -603,6 +603,13 @@ pub fn cross_product_and_minimize<F>(
 where
     F: FnMut(i32, i32) -> i32,
 {
+    // The two `as_dfa()`s pass no `DeterminizeContext`, which silently assumes BOTH
+    // operands are already deterministic -- if one is not, Java's `asDFA()` would
+    // determinize it through the global-reading dispatcher and consume a
+    // `[strategy n …]`/`[export n …]` index that this port would not. The assumption holds
+    // on the `eval` call graph (every operand reaching a boolean connective has already
+    // been determinized/minimized); see `Automaton::as_dfa`'s docs for why it is a comment
+    // rather than an assertion, and what to do if a caller can violate it.
     cross_product_and_minimize_dfa(&a.as_dfa(), &b.as_dfa(), combine_output)
 }
 

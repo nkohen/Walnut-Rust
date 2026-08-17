@@ -482,6 +482,13 @@ fn flipped_ns_name(name: &str) -> String {
 /// is the TRUE automaton the result is `b.as_dfa()` — which for a trivial `b` is
 /// `b` itself, so `and(TRUE, TRUE) == TRUE` and `and(TRUE, FALSE) == FALSE` fall out
 /// without a separate both-trivial case, exactly as in Java.
+///
+/// **Index-accounting note, and it applies to [`or`]/[`xor`]/[`imply`]/[`iff`] equally:**
+/// the `as_dfa()` in the trivial short-circuit below passes no
+/// [`crate::determinize::DeterminizeContext`], which assumes the surviving operand is
+/// already deterministic. See [`Automaton::as_dfa`]'s docs for the full statement of that
+/// assumption, why it holds on the `eval` call graph, and what a caller that can violate
+/// it should do instead.
 pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         if a.fa.is_true_false_automaton() {

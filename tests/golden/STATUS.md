@@ -4,6 +4,15 @@ Snapshot of the last full run of `tests/golden`. Update it whenever the numbers 
 harness itself asserts the *failing set* is exactly `KNOWN_DIVERGENCES` in
 `tests/golden_corpus.rs`, so this file and that table must stay in step.
 
+The gate matches an entry by **id AND kind**, not by id alone: every reason a fixture failed
+with is tagged with the comparison it came from (`FailedHalf::{Text, Automaton, Harness}`),
+and a `KNOWN_DIVERGENCES` entry is honored only when *every* reason is a `Text` one. That
+turns "all nine of these are text-only, their automata already match" from a claim this file
+makes into an invariant the harness enforces on every run — a regression that broke fixture
+637's or 660's *automaton* is reported as `NOT TEXT-ONLY`, where an id-only match would have
+waved it through. `only_a_text_only_failure_can_be_excused_by_a_known_divergence` (a fast-tier
+test, no corpus run needed) covers the rule itself.
+
 ## How to run it
 
 ```bash

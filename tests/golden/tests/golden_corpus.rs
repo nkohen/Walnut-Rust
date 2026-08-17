@@ -168,10 +168,37 @@ const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 // Verdicts
 // ---------------------------------------------------------------------------
 
+/// Which comparison a failure reason came from.
+///
+/// This exists for one reason: [`KNOWN_DIVERGENCES`]' whole legitimacy rests on the claim
+/// that every entry in it is a **text-only** divergence whose automaton already matches.
+/// Matching a known entry by fixture id alone would let a future regression break the
+/// AUTOMATON comparison for one of those ids and still report green — the id is in the
+/// list, so the gate would wave it through. Tagging each reason turns "these are text-only"
+/// from a one-time manual observation into an invariant the gate enforces on every run
+/// (see [`Verdict::is_text_only_failure`] and its use at the gate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum FailedHalf {
+    /// A TEXT comparison: `details`, the error message, matrix output, graphviz. The only
+    /// half a [`KNOWN_DIVERGENCES`] entry may excuse.
+    Text,
+    /// The `wr_core::equiv` automaton comparison — **including** the cases where it could
+    /// not be run at all (an unreadable recorded automaton, a missing/extra automaton, the
+    /// wrong number of pairs). "Did not run" is not "passed", so those are tagged here
+    /// deliberately rather than as [`FailedHalf::Harness`].
+    Automaton,
+    /// Neither comparison: the harness itself, the command's own dispatch, or a port panic.
+    /// Never excusable by a known entry.
+    Harness,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Verdict {
     Pass,
-    Fail(String),
+    /// Every reason collected for this fixture, each tagged with the comparison it came
+    /// from. More than one entry means [`fold_failures`] combined a text mismatch with an
+    /// automaton one — which is exactly the case the gate must never treat as "known".
+    Fail(Vec<(FailedHalf, String)>),
     Skipped(Excluded),
     /// The fixture did not answer within [`MAX_FIXTURE_SECS`] and its worker thread was
     /// abandoned (carries the cap, not a measured time — there is no measured time, that is
@@ -190,6 +217,38 @@ impl Verdict {
             Verdict::Skipped(_) => "SKIP",
             Verdict::Timeout(_) => "TIMEOUT",
             Verdict::NotRun => "NOT-RUN",
+        }
+    }
+
+    /// One failure reason, tagged with the comparison it came from.
+    fn fail(half: FailedHalf, why: impl Into<String>) -> Verdict {
+        Verdict::Fail(vec![(half, why.into())])
+    }
+
+    /// The reasons as one human-readable block — what the report and the gate print.
+    fn message(&self) -> String {
+        match self {
+            Verdict::Fail(reasons) => reasons
+                .iter()
+                .map(|(_, why)| why.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  --- and ---\n"),
+            _ => String::new(),
+        }
+    }
+
+    /// Whether EVERY collected reason is a [`FailedHalf::Text`] one — i.e. the automaton
+    /// comparison ran and matched, and the harness/dispatch were fine.
+    ///
+    /// A [`KNOWN_DIVERGENCES`] entry is honored only when this is true. A `Timeout`/
+    /// `NotRun`/`Pass` verdict is not a text-only failure (there is no failure, or no
+    /// comparison happened at all), so this is `false` for those by construction.
+    fn is_text_only_failure(&self) -> bool {
+        match self {
+            Verdict::Fail(reasons) => {
+                !reasons.is_empty() && reasons.iter().all(|(half, _)| *half == FailedHalf::Text)
+            }
+            _ => false,
         }
     }
 }
@@ -330,6 +389,14 @@ fn halted_outcome(halt: &Halt, id: usize, command: &str) -> Option<Outcome> {
 ///
 /// An entry here is only legitimate when it names a `docs/WALNUT-BUGS.md` entry, an already-
 /// signed-off scope decision, or an open follow-up unit — never "this one is hard".
+///
+/// **An entry excuses a TEXT divergence only.** Every id below is accepted specifically
+/// because its automaton comparison already passes and only the log text differs — so the
+/// gate honors an entry only when [`Verdict::is_text_only_failure`] holds for that run's
+/// verdict ([`FailedHalf`]). If a future regression breaks fixture 637's or 660's
+/// *automaton*, being on this list will not save it: it is reported as `NOT TEXT-ONLY`.
+/// Before that check existed, matching was by id alone, and exactly that regression would
+/// have reported green.
 const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
     // -- root cause 1: `details` log-text fidelity (see tests/golden/STATUS.md §1) --------
     //
@@ -606,7 +673,10 @@ fn tier1_golden_corpus() {
                 // The job catches the port's own panics itself, so reaching here means the
                 // HARNESS unwound (a comparison helper, or `fresh_prover`). Reported against
                 // the fixture rather than aborting the run.
-                Verdict::Fail(format!("harness thread panicked: {message}")),
+                Verdict::fail(
+                    FailedHalf::Harness,
+                    format!("harness thread panicked: {message}"),
+                ),
                 Vec::new(),
             ),
             Worker::TimedOut => {
@@ -633,9 +703,9 @@ fn tier1_golden_corpus() {
             elapsed.as_secs_f64(),
             truncate(&fixture.command_script, 70),
             match &verdict {
-                Verdict::Fail(why) => format!(
+                Verdict::Fail(_) => format!(
                     "\n         >> {}",
-                    truncate(why.lines().next().unwrap_or(""), 160)
+                    truncate(verdict.message().lines().next().unwrap_or(""), 160)
                 ),
                 _ => String::new(),
             }
@@ -691,7 +761,7 @@ fn tier1_golden_corpus() {
     let failing: BTreeMap<usize, String> = outcomes
         .iter()
         .filter_map(|o| match &o.verdict {
-            Verdict::Fail(why) => Some((o.id, why.clone())),
+            Verdict::Fail(_) => Some((o.id, o.verdict.message())),
             Verdict::Timeout(cap) => Some((
                 o.id,
                 format!(
@@ -719,10 +789,31 @@ fn tier1_golden_corpus() {
         .map(|o| o.id)
         .collect();
 
+    // Which fixtures diverged in a way a `KNOWN_DIVERGENCES` entry is even *allowed* to
+    // excuse: a failure every one of whose reasons is a TEXT one (see `FailedHalf`). An id
+    // in `KNOWN_DIVERGENCES` whose automaton comparison broke — or that timed out, or that
+    // panicked the harness — is a NEW FAILURE, not a known one, however long it has been on
+    // the list. Matching by id alone (what this gate used to do) would let exactly that
+    // regression report green.
+    let text_only: BTreeSet<usize> = outcomes
+        .iter()
+        .filter(|o| o.verdict.is_text_only_failure())
+        .map(|o| o.id)
+        .collect();
+
     let mut problems = String::new();
     for (id, why) in &failing {
-        if !known.contains_key(id) && !not_run.contains(id) {
-            let _ = writeln!(problems, "  NEW FAILURE   fixture {id}: {why}");
+        if !not_run.contains(id) && !(known.contains_key(id) && text_only.contains(id)) {
+            if known.contains_key(id) {
+                let _ = writeln!(
+                    problems,
+                    "  NOT TEXT-ONLY fixture {id} IS in KNOWN_DIVERGENCES, but this run's \
+                     divergence is not a text-only one — every entry there is accepted \
+                     *because* its automaton already matches, so this does not qualify: {why}"
+                );
+            } else {
+                let _ = writeln!(problems, "  NEW FAILURE   fixture {id}: {why}");
+            }
         }
     }
     if !not_run.is_empty() {
@@ -805,20 +896,22 @@ impl FixtureJob {
             // it is a real `Option`, and a future exclusion class that forgets to keep the two
             // in step should say so loudly rather than silently compare a result that was
             // never computed.
-            None if dispatched.is_none() => Verdict::Fail(
-                "harness bug: the fixture was not executed but is not excluded either".to_string(),
+            None if dispatched.is_none() => Verdict::fail(
+                FailedHalf::Harness,
+                "harness bug: the fixture was not executed but is not excluded either",
             ),
             None => match dispatched.expect("checked by the arm above") {
-                Err(payload) => {
-                    Verdict::Fail(format!("PANICKED: {}", panic_message(payload.as_ref())))
-                }
+                Err(payload) => Verdict::fail(
+                    FailedHalf::Harness,
+                    format!("PANICKED: {}", panic_message(payload.as_ref())),
+                ),
                 Ok(Err(error)) => {
                     compare_error(&self.expected, &self.rewrite.apply(&error.to_string()))
                 }
-                Ok(Ok(None)) => Verdict::Fail(
+                Ok(Ok(None)) => Verdict::fail(
+                    FailedHalf::Harness,
                     "dispatch returned no TestCase, but the corpus records an expectation \
-                     (Java's harness fails on a null TestCase too)"
-                        .to_string(),
+                     (Java's harness fails on a null TestCase too)",
                 ),
                 Ok(Ok(Some(actual))) => compare_test_case(
                     prover.session(),
@@ -1031,6 +1124,56 @@ fn a_timeout_halts_the_run_and_later_fixtures_are_not_run() {
     assert!(halted_outcome(&Halt::default(), 1, "eval t \"x=x\";").is_none());
 }
 
+/// [`KNOWN_DIVERGENCES`]' gate condition, tested directly rather than only through a
+/// 15-minute corpus run.
+///
+/// The invariant it enforces: an entry there excuses a **text-only** divergence and nothing
+/// else. A fixture on the list whose automaton comparison ALSO broke must not be waved
+/// through — which is precisely the regression the id-only match could not see, so it gets a
+/// test of its own rather than a comment.
+#[test]
+fn only_a_text_only_failure_can_be_excused_by_a_known_divergence() {
+    let text = |why: &str| Verdict::fail(FailedHalf::Text, why);
+    let automaton = |why: &str| Verdict::fail(FailedHalf::Automaton, why);
+
+    // A pure `details` mismatch — the shape all nine current entries have.
+    assert!(text("details differs").is_text_only_failure());
+
+    // The automaton half broke: never excusable, alone or alongside a text mismatch.
+    assert!(!automaton("language differs").is_text_only_failure());
+    assert!(
+        !fold_failures(
+            vec![(FailedHalf::Text, "details differs".to_string())],
+            automaton("language differs"),
+        )
+        .is_text_only_failure(),
+        "a text mismatch must not launder an automaton mismatch into a 'known' one"
+    );
+    // ...and folding still reports BOTH reasons, so the report says why.
+    let both = fold_failures(
+        vec![(FailedHalf::Text, "details differs".to_string())],
+        automaton("language differs"),
+    );
+    assert!(both.message().contains("details differs"));
+    assert!(both.message().contains("language differs"));
+
+    // Harness-level failures are never text-only either.
+    assert!(!Verdict::fail(FailedHalf::Harness, "PANICKED: boom").is_text_only_failure());
+
+    // Neither is anything that is not a failure at all — in particular a `Timeout`, which the
+    // gate also treats as failing.
+    assert!(!Verdict::Pass.is_text_only_failure());
+    assert!(!Verdict::Timeout(Duration::from_secs(MAX_FIXTURE_SECS)).is_text_only_failure());
+    assert!(!Verdict::NotRun.is_text_only_failure());
+    assert!(
+        !Verdict::Fail(Vec::new()).is_text_only_failure(),
+        "an empty reason list is a harness bug, not a text-only divergence"
+    );
+
+    // And a clean fold is still a pass.
+    assert_eq!(fold_failures(Vec::new(), Verdict::Pass), Verdict::Pass);
+}
+
 fn classify(fixture: &Fixture, transitive: &BTreeMap<usize, Vec<String>>) -> Option<Excluded> {
     if !fixture.subset_relevant {
         return Some(Excluded::DropScope(fixture.drop_reason.clone()));
@@ -1051,14 +1194,20 @@ fn compare_error(expected: &Expected, actual: &str) -> Verdict {
     if expected.error == actual {
         Verdict::Pass
     } else if expected.error.is_empty() {
-        Verdict::Fail(format!(
-            "command failed, but the corpus records a successful result.\n  actual error: {actual}"
-        ))
+        Verdict::fail(
+            FailedHalf::Text,
+            format!(
+                "command failed, but the corpus records a successful result.\n  actual error: {actual}"
+            ),
+        )
     } else {
-        Verdict::Fail(format!(
-            "error message differs (exact comparison, as in Java)\n  expected: {}\n  actual:   {actual}",
-            expected.error
-        ))
+        Verdict::fail(
+            FailedHalf::Text,
+            format!(
+                "error message differs (exact comparison, as in Java)\n  expected: {}\n  actual:   {actual}",
+                expected.error
+            ),
+        )
     }
 }
 
@@ -1070,16 +1219,24 @@ fn compare_test_case(
     notes: &mut Vec<String>,
 ) -> Verdict {
     if !expected.error.is_empty() {
-        return Verdict::Fail(format!(
-            "command succeeded, but the corpus records an error: {}",
-            expected.error
-        ));
+        return Verdict::fail(
+            FailedHalf::Text,
+            format!(
+                "command succeeded, but the corpus records an error: {}",
+                expected.error
+            ),
+        );
     }
 
     // 1. matrix output (`:933-938`)
     let actual_matrix = match actual.matrix_output() {
         Ok(m) => m,
-        Err(e) => return Verdict::Fail(format!("reading actual matrix output: {e}")),
+        Err(e) => {
+            return Verdict::fail(
+                FailedHalf::Harness,
+                format!("reading actual matrix output: {e}"),
+            )
+        }
     };
     if expected.has_cas_matrices() {
         // CAS incidence-matrix export is DROP scope for this port; compared automaton/details
@@ -1087,11 +1244,14 @@ fn compare_test_case(
         notes.push("cas-matrix-skipped (CAS export is DROP scope)".to_string());
     } else {
         if expected.matrix_output.len() != actual_matrix.len() {
-            return Verdict::Fail(format!(
-                "matrix output size differs: expected {}, actual {}",
-                expected.matrix_output.len(),
-                actual_matrix.len()
-            ));
+            return Verdict::fail(
+                FailedHalf::Text,
+                format!(
+                    "matrix output size differs: expected {}, actual {}",
+                    expected.matrix_output.len(),
+                    actual_matrix.len()
+                ),
+            );
         }
         for (i, (e, a)) in expected
             .matrix_output
@@ -1100,7 +1260,7 @@ fn compare_test_case(
             .enumerate()
         {
             if let Err(why) = compare_messages(e.trim(), a.trim(), &format!("matrix output[{i}]")) {
-                return Verdict::Fail(why);
+                return Verdict::fail(FailedHalf::Text, why);
             }
         }
     }
@@ -1109,14 +1269,16 @@ fn compare_test_case(
     if !expected.graph_viz.trim().is_empty() {
         let actual_gv = match actual.graph_viz() {
             Ok(gv) => gv,
-            Err(e) => return Verdict::Fail(format!("reading actual graphviz: {e}")),
+            Err(e) => {
+                return Verdict::fail(FailedHalf::Harness, format!("reading actual graphviz: {e}"))
+            }
         };
         if let Err(why) = compare_messages(
             expected.graph_viz.trim(),
             actual_gv.trim(),
             "graphviz output",
         ) {
-            return Verdict::Fail(why);
+            return Verdict::fail(FailedHalf::Text, why);
         }
     }
 
@@ -1129,13 +1291,13 @@ fn compare_test_case(
     // automaton divergence could hide behind a text one indefinitely. Every remaining
     // `details` divergence in `KNOWN_DIVERGENCES` is a log-text gap whose state counts already
     // match; that claim is only checkable if the automaton comparison still runs.
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<(FailedHalf, String)> = Vec::new();
     if let Err(why) = compare_messages(
         &expected.details,
         &rewrite.apply(actual.details()),
         "details",
     ) {
-        failures.push(why);
+        failures.push((FailedHalf::Text, why));
     }
 
     // 4. automaton pairs (`:947-961`). `loadTestCases` always records exactly one pair for a
@@ -1145,21 +1307,24 @@ fn compare_test_case(
     if actual_pairs != 1 {
         return fold_failures(
             failures,
-            Verdict::Fail(format!(
-                "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
-            )),
+            Verdict::fail(
+                FailedHalf::Automaton,
+                format!(
+                    "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
+                ),
+            ),
         );
     }
     let actual_automaton = actual.automaton_pairs()[0].automaton();
     let automaton_verdict = match (&expected.automaton_path, actual_automaton) {
         (None, None) => Verdict::Pass,
-        (None, Some(_)) => Verdict::Fail(
-            "the corpus records no automaton for this fixture, but the port produced one"
-                .to_string(),
+        (None, Some(_)) => Verdict::fail(
+            FailedHalf::Automaton,
+            "the corpus records no automaton for this fixture, but the port produced one",
         ),
-        (Some(_), None) => Verdict::Fail(
-            "the corpus records an automaton for this fixture, but the port produced none"
-                .to_string(),
+        (Some(_), None) => Verdict::fail(
+            FailedHalf::Automaton,
+            "the corpus records an automaton for this fixture, but the port produced none",
         ),
         (Some(path), Some(ours)) => {
             let mut expected_automaton =
@@ -1171,10 +1336,13 @@ fn compare_test_case(
                     Err(e) => {
                         return fold_failures(
                             failures,
-                            Verdict::Fail(format!(
-                                "the recorded automaton {} could not be read: {e:?}",
-                                path.display()
-                            )),
+                            Verdict::fail(
+                                FailedHalf::Automaton,
+                                format!(
+                                    "the recorded automaton {} could not be read: {e:?}",
+                                    path.display()
+                                ),
+                            ),
                         )
                     }
                 };
@@ -1193,13 +1361,14 @@ fn compare_test_case(
             expected_automaton.fa.totalize(0);
             match automaton_language_equivalent(&ours, &expected_automaton) {
                 Ok(true) => Verdict::Pass,
-                Ok(false) => Verdict::Fail(
-                    "automaton language differs from the recorded one (semantic equivalence)"
-                        .to_string(),
+                Ok(false) => Verdict::fail(
+                    FailedHalf::Automaton,
+                    "automaton language differs from the recorded one (semantic equivalence)",
                 ),
-                Err(e) => {
-                    Verdict::Fail(format!("equivalence oracle refused the comparison: {e:?}"))
-                }
+                Err(e) => Verdict::fail(
+                    FailedHalf::Automaton,
+                    format!("equivalence oracle refused the comparison: {e:?}"),
+                ),
             }
         }
     };
@@ -1211,14 +1380,20 @@ fn compare_test_case(
 /// `Verdict::Pass` only survives when nothing was collected; otherwise every reason is
 /// reported together, so a `details` divergence can never hide an automaton one (which is
 /// exactly what the old short-circuit did).
-fn fold_failures(mut failures: Vec<String>, last: Verdict) -> Verdict {
-    if let Verdict::Fail(why) = last {
-        failures.push(why);
+///
+/// The per-reason [`FailedHalf`] tags are carried through rather than flattened into one
+/// string, because the gate needs them: a [`KNOWN_DIVERGENCES`] entry is honored only for a
+/// failure whose every reason is [`FailedHalf::Text`]. Combining a text reason with an
+/// automaton one therefore produces a failure no known entry can excuse — which is the
+/// whole point of collecting both instead of short-circuiting on the first.
+fn fold_failures(mut failures: Vec<(FailedHalf, String)>, last: Verdict) -> Verdict {
+    if let Verdict::Fail(reasons) = last {
+        failures.extend(reasons);
     }
     if failures.is_empty() {
         Verdict::Pass
     } else {
-        Verdict::Fail(failures.join("\n  --- and ---\n"))
+        Verdict::Fail(failures)
     }
 }
 
@@ -1314,7 +1489,7 @@ fn build_report(
         let _ = writeln!(s, "\n-- divergences --");
         for o in &failures {
             let why = match &o.verdict {
-                Verdict::Fail(w) => w.clone(),
+                Verdict::Fail(_) => o.verdict.message(),
                 Verdict::Timeout(cap) => format!(
                     "TIMED OUT: no answer within the {:.0}s cap (worker thread abandoned)",
                     cap.as_secs_f64()
