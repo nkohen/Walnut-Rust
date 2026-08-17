@@ -42,6 +42,22 @@ use wr_cli::session::{Session, SessionPaths};
 use wr_core::equiv::automaton_language_equivalent;
 use wr_core::logging::Logging;
 
+/// The global allocator, matched to the shipped `walnut-rs` binary's (U33).
+///
+/// `#[global_allocator]` is a whole-program, link-time choice, and `benches/` has **two**
+/// programs — `src/bin/compare.rs` and `benches/dispatch.rs` — that both link this library.
+/// Declaring it here is what makes them agree with each other *and* with
+/// `crates/wr-cli/src/main.rs`: a benchmark measuring the system allocator while the CLI ran
+/// on mimalloc would be timing a configuration nobody actually runs.
+///
+/// This is the direct counterfactual to U32's root-cause finding (51.5% of the port's CPU time
+/// in the system allocator; see [`STATUS.md`](../STATUS.md)). It replaces no algorithm and no
+/// data structure, so it cannot change what any workload computes — and the harness proves
+/// that independently anyway, by checking every answer with `wr_core::equiv` before believing
+/// its timing.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// `tests/golden`'s harness support module, **included** rather than copied.
 ///
 /// It already owns everything this crate needs from the corpus — the Phase-0 manifest loader

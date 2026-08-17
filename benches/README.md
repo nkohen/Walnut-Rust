@@ -113,6 +113,14 @@ would be a twelve-minute benchmark of one fixture.
   computing different things is worse than no benchmark.
 * **Engines run one at a time**, never concurrently, so neither is measured under the other's
   CPU load.
+* **Each engine runs the allocator it actually ships with.** Since U33 the port registers
+  `mimalloc` as its `#[global_allocator]` in `crates/wr-cli/src/main.rs` (the shipped binary),
+  and `src/lib.rs` registers the same one so `compare` and the Criterion bench measure the
+  configuration a user actually runs rather than a different one. `#[global_allocator]` is a
+  per-binary, link-time choice, which is why it is declared twice and in neither library.
+  The JVM keeps its own nursery + generational collector, which is the thing being compared
+  against. Before/after numbers, and the profile that motivated the change, are in
+  [`STATUS.md`](STATUS.md).
 
 ## Peak state count, and the one honest caveat
 

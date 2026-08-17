@@ -24,6 +24,12 @@ wr-cts = { path = "../wr-cts" }
 # numbering, which is what lets `Prover.java`'s `static int GROUP_… = 20` constants be ported
 # as literal group indices.
 regex-automata.workspace = true
+# U33: the global allocator, registered in `src/main.rs` (the `walnut-rs` BINARY only -- the
+# `wr_cli` LIBRARY neither registers nor forces one, so an embedder keeps its own choice).
+# `#[global_allocator]` is a whole-program, link-time selection, so this is the one place the
+# shipped CLI can make it. Rationale + measurement in the `[workspace.dependencies]` entry and
+# `benches/STATUS.md`.
+mimalloc.workspace = true
 
 # Phase 4 U31: the Tier-4 property-suite unblock. `wr-cli` had no `proptest` dependency at
 # all, so no property test was structurally possible in this crate. Same workspace pin

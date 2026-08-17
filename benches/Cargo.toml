@@ -18,6 +18,12 @@ wr-io = { path = "../crates/wr-io" }
 # silent-mis-parse risk this project's correctness discipline exists to avoid. A
 # `publish = false` benchmark package; nothing shipped depends on it.
 serde_json = "1"
+# U33: the same global allocator the shipped `walnut-rs` binary registers, registered here in
+# `src/lib.rs` so BOTH consumers of this crate get it -- `src/bin/compare.rs` (the head-to-head)
+# and `benches/dispatch.rs` (Criterion). `#[global_allocator]` is per-binary, not per-library,
+# so a benchmark that measured the default system allocator while the CLI used mimalloc would
+# be benchmarking something nobody runs. Rationale + before/after in `STATUS.md`.
+mimalloc.workspace = true
 
 [dev-dependencies]
 # Criterion is the standard, well-established Rust benchmarking harness (warm-up, statistical

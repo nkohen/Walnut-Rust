@@ -18,6 +18,24 @@ use std::process::ExitCode;
 
 use wr_cli::prover::{parse_args, ArgsOutcome, Prover, USAGE_MESSAGE};
 
+/// The global allocator (U33, the follow-up to U32's measurement).
+///
+/// `benches/STATUS.md` measured **51.5% of the port's CPU time inside the macOS system
+/// allocator** on a representative decision-procedure workload: `wr_core::fa::Fa` stores
+/// transitions as `Vec<BTreeMap<i32, Vec<usize>>>`, a faithful transliteration of Java's
+/// `List<Int2ObjectRBTreeMap<IntList>>` (`CLAUDE.md`'s mechanical-port rule), so every
+/// product/determinize/minimize step allocates and frees a very large number of small,
+/// short-lived objects — the pattern a JVM nursery is best at and a general-purpose `malloc`
+/// is worst at.
+///
+/// This changes **no algorithm and no data structure**, only the `malloc`/`free` underneath
+/// them, so it cannot change any automaton's language. It is declared here rather than in
+/// `lib.rs` because `#[global_allocator]` is a whole-program, link-time choice: the `wr_cli`
+/// *library* deliberately does not make it, leaving an embedder (e.g. `ct-research`) free to
+/// pick its own.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {

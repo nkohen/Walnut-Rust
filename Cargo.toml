@@ -22,6 +22,25 @@ members = [
 # --workspace`. It gets its own fmt/clippy/build gate; see `fuzz/README.md`.
 exclude = ["fuzz"]
 
+# U33: build-profile tuning. `benches/STATUS.md`'s U32 baseline was measured on the DEFAULT
+# `--release` profile (no LTO, `codegen-units = 16`), which its own "threats to validity"
+# section flagged as untested headroom. `lto = "fat"` + `codegen-units = 1` let the optimizer
+# inline and specialize ACROSS crate boundaries -- which matters here specifically because the
+# hot loops are `wr-core` generics (`product`, `subset_construction`, `Partition::mark`) driven
+# from `wr-logic`/`wr-cli`, and the allocator is now a separate C library (mimalloc) that the
+# default profile could not inline into either.
+#
+# This is compiler-flag tuning only: it changes no source, and it cannot change any automaton's
+# language. The cost is build time (a from-scratch `--release` build roughly doubles), paid by
+# `cargo bench`, `cargo run --release` and `cargo test --release` (the gated-slow tier) --
+# NOT by `cargo test --workspace`, which is a `dev`/`test`-profile build and is untouched.
+#
+# `[profile.bench]` inherits `[profile.release]` (Cargo book, "Profile selection"), so
+# `cargo bench` and `cargo test --release` pick these up without a second block.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
@@ -56,3 +75,20 @@ regex-automata = { version = "0.4", default-features = false, features = [
     "perf",
     "unicode",
 ] }
+# U33 (the follow-up to U32's measurement): the global allocator.
+#
+# `benches/STATUS.md` measured 51.5% of the port's CPU time on a representative workload
+# inside the macOS system allocator, on `wr_core::fa::Fa`'s faithfully-ported
+# `Vec<BTreeMap<i32, Vec<usize>>>` transition table -- the mechanical-port rule's price, since
+# the JVM services that allocate-many-tiny-short-lived-objects pattern with a bump-pointer
+# nursery. This is the drop-in counterfactual: it replaces NO algorithm and NO data structure,
+# only the `malloc`/`free` implementation underneath them, so it carries no correctness risk
+# of the kind `docs/DESIGN.md` §6's dependency-replacement table exists to police (it replaces
+# no Java dependency either -- the JVM's allocator has no crates.io analogue to "port").
+#
+# It is registered per BINARY (`#[global_allocator]` is a program-wide, link-time choice, not a
+# library one): `crates/wr-cli/src/main.rs` (the shipped CLI) and `benches/src/lib.rs` (which
+# both `compare` and the Criterion bench link). `wr-core`/`wr-logic`/`wr-io` do NOT depend on
+# it, so no library in this workspace forces an allocator on its consumers -- `ct-research`
+# keeps its own choice.
+mimalloc = { version = "0.1", default-features = false }
