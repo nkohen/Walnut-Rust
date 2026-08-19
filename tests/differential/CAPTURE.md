@@ -288,3 +288,63 @@ convention as the `u11closed` entry above. The command file and
 The alphabetical-track-order note above applies here too (`lsd3addcmp` is three-track),
 as does the totalize-before-comparing step: real Walnut's automaton for a free-variable
 predicate is partial.
+
+---
+
+# Ground-truth capture: `fixtures/lsd_custom_base/*.txt`
+
+`docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` item 2 (custom-base `lsd` verification) is
+checked against real `walnut-java` `eval`/`def` output by `tests/lsd_custom_base.rs`. Prior
+`lsd` coverage was plain `lsd_k` only in THIS differential suite (`fixtures/lsd/`, the L1
+entry above) — these fixtures are the first over a real CUSTOM base's `lsd` direction *in
+this suite*. Java's own gated-slow Tier-1 golden corpus already covers `∃`/open `∀` over
+`lsd_fib` (e.g. fixtures 65/110-115/135, `phase0-artifacts/test-manifest.json`), passing;
+what's genuinely new here is fast-tier presence plus `I` and `def`-then-`$token` reuse over
+`lsd_fib`, neither of which any existing fixture (gated-slow or otherwise) covers. `lsd_fib`'s
+adder exists only because `NumberSystem`'s opposite-direction-complement fallback
+language-reverses `Custom Bases/msd_fib_addition.txt` (walnut-java ships **no**
+`lsd_fib*.txt`, so this is the only way `?lsd_fib` resolves on either engine). Full
+rationale, and the mutation matrix saying which case catches what (and which of those a
+gated-slow golden fixture would also catch), are in that test file's own module docs.
+
+```bash
+cd ~/dev/walnut-java     # built with ./mvnw -q clean package -DskipTests -Pfat-jar
+cat > "Command Files/lsdfib_capture.txt" <<'CMD'
+eval lfge2 "?lsd_fib x >= 2";
+eval lfquant "?lsd_fib Ex (x < 5 & x >= 2 & y = x)";
+eval lfclosed "?lsd_fib Ax (x >= 5)";
+eval lfclosedtrue "?lsd_fib Ax Ey (y > x)";
+eval lfinffalse "?lsd_fib Ix x < 5";
+eval lfinftrue "?lsd_fib Ix x >= 5";
+eval lfadd "?lsd_fib x + y = z & z < 4";
+eval lfforall "?lsd_fib Ay (y < 3 => y < x)";
+CMD
+java -jar target/Walnut-all.jar lsdfib_capture.txt < /dev/null
+S="Session/<timestamp>/Automata Library"
+cp "$S/lfge2.txt"    .../fixtures/lsd_custom_base/ge_two.txt
+cp "$S/lfquant.txt"  .../fixtures/lsd_custom_base/exists_quantified.txt
+cp "$S/lfadd.txt"    .../fixtures/lsd_custom_base/addition_three_track.txt
+cp "$S/lfforall.txt" .../fixtures/lsd_custom_base/forall_open.txt
+
+# A second run, for the `def`-then-reuse case.
+cat > "Command Files/lsdfib_capture2.txt" <<'CMD'
+def lfge2d "?lsd_fib x >= 2";
+eval lfusedef "?lsd_fib $lfge2d(y) & y < 5";
+CMD
+java -jar target/Walnut-all.jar lsdfib_capture2.txt < /dev/null
+cp "Session/<timestamp2>/Automata Library/lfusedef.txt" \
+   .../fixtures/lsd_custom_base/def_then_reuse.txt
+```
+
+The four closed cases (`lfclosed`/`lfclosedtrue`/`lfinffalse`/`lfinftrue`) produce no `.txt`
+fixture — they print `____` then `FALSE`/`TRUE`/`FALSE`/`TRUE` on stdout, and the test checks
+those verdicts directly against `Automaton::fa::is_true_automaton()`, the same convention the
+`u11closed` and `lsdclosed` entries above use. The command files and `Session/<timestamp>/`
+directories were deleted from the `walnut-java` checkout afterward.
+
+The alphabetical-track-order and `totalize(0)` notes from the `fixtures/lsd/` entry apply
+here too (`lfadd` is three-track). One additional step is specific to this directory: every
+fixture's header says `lsd_fib`, so it must be read with
+`wr_io::reader::read_automaton_txt_with_custom_bases` against a directory holding
+`msd_fib.txt`/`msd_fib_addition.txt` — plain `read_automaton_txt` rejects a custom-base
+header with `ReadError::UnsupportedNumeration`.

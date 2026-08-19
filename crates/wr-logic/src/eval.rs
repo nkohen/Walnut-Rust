@@ -192,6 +192,41 @@
 //! section). [`tests::lsd_numeration_evaluates_end_to_end`] is the flipped regression
 //! test — it used to assert the rejection and now asserts the computed language.
 //!
+//! ### Addendum (2026-08-19): the scope is now `lsd` **custom bases** too, not just `lsd_k`
+//!
+//! L1's positive coverage was deliberately `lsd_k` only — plain bases, which this crate
+//! constructs programmatically. Two later items added FAST-tier coverage of the rest of
+//! the surface, and both found **no divergence from real `walnut-java`**, so this is a
+//! coverage addendum, not a behavior change; no production logic in `wr-core`/`wr-logic`
+//! was modified for either (only new tests, fixtures, and this doc):
+//!
+//! * **`I` over `lsd_k`** — `tests/differential/tests/infinite_quantifier.rs` plus
+//!   `crate::token`'s `infinite_quantifier_*` unit tests. (`I` never routes through
+//!   [`wr_core::quantify`] at all — it is
+//!   [`wr_core::logicalops::remove_leading_zeros`] + [`wr_core::infinite::infinite`] —
+//!   so L1 neither touched nor tested it.)
+//! * **`∃` / closed `∀` / open `∀` / `I` over a real CUSTOM base's `lsd` direction** —
+//!   `tests/differential/tests/lsd_custom_base.rs`, seven cases over `lsd_fib`
+//!   (Zeckendorf, read lsd-first), all through `wr-cli`'s real `eval`/`def` including a
+//!   `.txt` round trip and a `def`-then-`$token` reuse, each compared against captured
+//!   real `walnut-java` output. **Correction:** an earlier draft of this note claimed `∃`/
+//!   open `∀` over `lsd_fib` had never been exercised at all — false; Java's own gated-slow
+//!   Tier-1 corpus already covers both (e.g. fixtures 65/110-115/135), passing. What this
+//!   file actually adds is FAST-tier presence, plus the two pieces the golden corpus
+//!   genuinely doesn't cover: `I` over a custom base, and `def`-then-`$token` reuse over
+//!   one. This is still a materially different composition from `lsd_k`: `lsd_fib` has no
+//!   `Custom Bases/lsd_fib*.txt` files on either engine, so its adder exists only by
+//!   language-reversing `msd_fib_addition.txt`
+//!   ([`wr_core::numsys::CustomBaseCandidates::resolve`]), and it carries an `all_reps`
+//!   valid-representation restriction that no plain base has. That file's module docs
+//!   carry the mutation matrix showing which of its cases catch what (and are explicit
+//!   about which mutations the gated-slow golden corpus would also catch).
+//!
+//! So "`lsd` composes end-to-end" now has FAST-tier coverage of custom bases and all three
+//! quantifiers, not only `lsd_k` with `∃`/closed `∀` — the custom-base `∃`/open-`∀` result
+//! itself was already known from the golden corpus; `I` and `def`-reuse are the genuinely
+//! new results.
+//!
 //! # `LoggableError for ActError`
 //!
 //! [`wr_core::logging::LoggableError`] is the seam `Logging::print_truncated_stack_trace`
