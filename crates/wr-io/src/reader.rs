@@ -115,24 +115,25 @@
 //!   (`AutomatonReader.java:165`, which sizes `{0,0,1}` at 2, not 3). All four were
 //!   confirmed against `Walnut-all.jar` before and after.
 //!
-//! # Known remaining gap: line SPLITTING (not fixed, deliberately)
+//! # Line SPLITTING (closed — was a known gap)
 //!
 //! Everything above is about how a line is *classified* once it exists. How the file is
-//! *cut into* lines is a separate rule, and there this port is **not** faithful: both
-//! readers iterate `str::lines()`, which breaks on `\n` only (stripping one trailing
-//! `\r`), whereas `AutomatonReader` reads through `BufferedReader.readLine()`, which
-//! treats `\n`, `\r`, **and** `\r\n` each as a terminator. So a file that separates its
-//! lines with a lone `\r` — classic Mac OS 9 line endings, and nothing this decade
-//! produces — is one giant line to this reader and several lines to Walnut. (That is
-//! `BufferedReader`'s own three-terminator set, which is itself narrower than the *regex*
-//! line-terminator set the NEL/LS/PS handling in [`parse_methods::parse_true_false`] and
-//! [`parse_methods::is_comment_line`] is about; the two notions are independent.)
+//! *cut into* lines is a separate rule: `AutomatonReader` reads through
+//! `BufferedReader.readLine()`, which treats `\n`, `\r`, **and** `\r\n` each as a
+//! terminator (`\r\n` counting as ONE terminator, not two empty lines). Both readers here
+//! used to run plain `str::lines()` instead, which only recognizes `\n` (stripping one
+//! preceding `\r`), so a file that separated its lines with a lone `\r` — classic Mac OS 9
+//! line endings, and nothing this decade produces — read as one giant line here instead of
+//! several. (That is `BufferedReader`'s own three-terminator set, which is itself narrower
+//! than the *regex* line-terminator set the NEL/LS/PS handling in
+//! [`parse_methods::parse_true_false`] and [`parse_methods::is_comment_line`] is about;
+//! the two notions are independent.)
 //!
-//! Left as-is on purpose: `\r`-only files do not occur in Walnut's corpus, no fixture or
-//! fuzz finding has ever reached it, and closing it means replacing `lines()` with a
-//! hand-rolled splitter in both readers plus every line-number computation that hangs off
-//! them. Recorded here so a future reader does not mistake the line-*classification*
-//! fidelity documented above for full line-*splitting* fidelity.
+//! Closed by [`split_lines_java`], a hand-rolled `BufferedReader.readLine()`-equivalent
+//! splitter used at every `.lines()` call site in both readers (and in [`read_comments`]).
+//! Line-number reporting (`i + 1` off each splitter's `.enumerate()`) is unaffected by the
+//! swap — both readers only ever computed line numbers that way, so the change is a pure
+//! representation swap, not a new code path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -619,7 +620,7 @@ fn read_automaton_str_impl(
     in_progress: &mut BTreeSet<String>,
     ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, ReadError> {
-    let mut lines = content.lines().enumerate();
+    let mut lines = split_lines_java(content).into_iter().enumerate();
     let (_, header_line) = lines
         .by_ref()
         .find(|(_, l)| !should_skip(l))
@@ -889,6 +890,55 @@ fn read_automaton_str_impl(
 /// against `Walnut-all.jar`).
 fn should_skip(line: &str) -> bool {
     parse_methods::is_whitespace_line(line) || parse_methods::is_comment_line(line)
+}
+
+/// A faithful port of `BufferedReader.readLine()`'s line-*splitting* rule (as distinct
+/// from the line-*classification* rules documented on [`should_skip`] and in this
+/// module's own docs): `\n`, `\r`, and `\r\n` each terminate a line, `\r\n` counts as ONE
+/// terminator (not two empty lines), a terminator-less final line is still returned, and
+/// a file that ends exactly on a terminator does not produce a trailing empty line —
+/// mirroring `readLine`'s "no more input" -> `null` behavior. Both readers used to run
+/// `str::lines()` instead, which only recognizes `\n` (optionally preceded by a `\r` it
+/// strips) — see this module's "Known remaining gap" doc section, now closed by this
+/// function; every call site below replaces `content.lines()` with
+/// `split_lines_java(content)`.
+///
+/// Byte-level splitting is safe here even though `content` is `&str`: `\n` (0x0A) and
+/// `\r` (0x0D) never appear as part of a multi-byte UTF-8 sequence (those are always
+/// `>= 0x80`), so every split point this function computes is on a UTF-8 char boundary.
+fn split_lines_java(content: &str) -> Vec<&str> {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'\n' => {
+                out.push(&content[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                out.push(&content[start..i]);
+                // `\r\n` is a single terminator: swallow a following `\n`, if present.
+                i += if i + 1 < len && bytes[i + 1] == b'\n' {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    // The "final line ending is optional" case: leftover, unterminated content at EOF is
+    // still a line. If `start == len` the file ended exactly on a terminator (or was
+    // empty), which `readLine` does NOT turn into a trailing empty-string line.
+    if start < len {
+        out.push(&content[start..len]);
+    }
+    out
 }
 
 /// `RichAlphabet.determineAlphabetSize` (`RichAlphabet.java:60-66`), called from
@@ -1411,7 +1461,7 @@ pub fn read_transducer_from_str(content: &str) -> Result<TransducerData, ReadErr
 /// names threaded in (a real path from [`read_transducer_txt`], [`STRING_ADDRESS`] from
 /// the in-memory entry point).
 fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerData, ReadError> {
-    let mut lines = content.lines().enumerate();
+    let mut lines = split_lines_java(content).into_iter().enumerate();
     let (_, header_line) = lines
         .by_ref()
         .find(|(_, l)| !should_skip(l))
@@ -1574,7 +1624,7 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
 pub fn read_comments<P: AsRef<Path>>(path: P) -> Result<String, ReadError> {
     let content = std::fs::read_to_string(path)?;
     let mut out = String::new();
-    for line in content.lines() {
+    for line in split_lines_java(&content) {
         if parse_methods::is_comment_line(line) {
             out.push_str(line);
             out.push('\n');
@@ -3195,5 +3245,113 @@ mod tests {
             let ok = read_automaton_from_str("#x\nmsd_2\n0 0\n0 -> 0\n").unwrap();
             assert_eq!(ok.alphabet, vec![vec![0, 1]]);
         }
+    }
+
+    // --- split_lines_java (line-SPLITTING fidelity, closing the module's former "Known
+    // remaining gap") ------------------------------------------------------------------
+
+    #[test]
+    fn split_lines_java_matches_bufferedreader_readline_on_each_terminator_kind() {
+        // Plain `\n`.
+        assert_eq!(split_lines_java("a\nb\nc"), vec!["a", "b", "c"]);
+        // Plain `\r` (the gap this closes: old `str::lines()` treated this whole string as
+        // one line).
+        assert_eq!(split_lines_java("a\rb\rc"), vec!["a", "b", "c"]);
+        // `\r\n` is ONE terminator, not two lines (an empty one from the `\r`, then
+        // another from the `\n`).
+        assert_eq!(split_lines_java("a\r\nb\r\nc"), vec!["a", "b", "c"]);
+        // Mixed, in one file -- real Java's `readLine` handles a file that switches
+        // conventions mid-stream with no special casing, and so does this.
+        assert_eq!(split_lines_java("a\nb\rc\r\nd"), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn split_lines_java_trailing_terminator_edge_cases() {
+        // A trailing terminator does NOT produce an extra empty final line -- matches
+        // `readLine` returning `null` once nothing is left, not `""`.
+        assert_eq!(split_lines_java("a\nb\n"), vec!["a", "b"]);
+        assert_eq!(split_lines_java("a\rb\r"), vec!["a", "b"]);
+        assert_eq!(split_lines_java("a\r\nb\r\n"), vec!["a", "b"]);
+        // An unterminated final line IS still returned (`readLine`'s "final line ending is
+        // optional").
+        assert_eq!(split_lines_java("a\nb"), vec!["a", "b"]);
+        // Two terminators back to back (of any kind) produce a genuine empty line between
+        // them, not a merge.
+        assert_eq!(split_lines_java("a\n\nb"), vec!["a", "", "b"]);
+        assert_eq!(split_lines_java("a\r\rb"), vec!["a", "", "b"]);
+        // `\r` immediately followed by `\r\n` (three terminators in a row, the middle one
+        // lone): the lone `\r` does NOT reach forward and swallow the unrelated `\r\n`
+        // pair that follows it.
+        assert_eq!(split_lines_java("a\r\r\nb"), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn split_lines_java_empty_and_terminator_only_content() {
+        assert_eq!(split_lines_java(""), Vec::<&str>::new());
+        assert_eq!(split_lines_java("\n"), vec![""]);
+        assert_eq!(split_lines_java("\r"), vec![""]);
+        assert_eq!(split_lines_java("\r\n"), vec![""]);
+    }
+
+    /// The end-to-end version of the gap: a lone-`\r`-delimited automaton file used to be
+    /// one giant unparseable line (`MalformedHeader`, since the whole file content landed
+    /// in the header-parse slot); now it reads identically to the same content with `\n`.
+    #[test]
+    fn read_automaton_from_str_accepts_lone_cr_line_endings() {
+        let lf = "{0, 1} \n\n0 1\n0 -> 0\n1 -> 0\n";
+        let cr = "{0, 1} \r\r0 1\r0 -> 0\r1 -> 0\r";
+        let a_lf = read_automaton_from_str(lf).unwrap();
+        let a_cr = read_automaton_from_str(cr).unwrap();
+        assert_eq!(a_lf.alphabet, a_cr.alphabet);
+        assert_eq!(a_lf.msd, a_cr.msd);
+        assert_eq!(format!("{:?}", a_lf.fa), format!("{:?}", a_cr.fa));
+    }
+
+    /// Same closure, for the transducer reader's independent `.lines()` call site.
+    #[test]
+    fn read_transducer_from_str_accepts_lone_cr_line_endings() {
+        let lf = "{0, 1}\n\n0\n0 -> 0 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 1\n1 -> 0 / 0\n";
+        let cr = "{0, 1}\r\r0\r0 -> 0 / 0\r1 -> 1 / 1\r\r1\r0 -> 1 / 1\r1 -> 0 / 0\r";
+        let t_lf = read_transducer_from_str(lf).unwrap();
+        let t_cr = read_transducer_from_str(cr).unwrap();
+        assert_eq!(format!("{t_lf:?}"), format!("{t_cr:?}"));
+    }
+
+    /// Same closure, for [`read_comments`]'s independent `.lines()` call site.
+    #[test]
+    fn read_comments_collects_comments_across_lone_cr_line_endings() {
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-comments-cr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("commented_cr.txt");
+        std::fs::write(
+            &path,
+            "# first comment\rmsd_2\r\r0 0\r# a mid-file comment\r0 -> 0\r1 -> 0\r#trailing, no space\r",
+        )
+        .unwrap();
+        let comments = read_comments(&path).unwrap();
+        assert_eq!(
+            comments,
+            "# first comment\n# a mid-file comment\n#trailing, no space"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Line-number reporting stays correct once splitting runs through
+    /// [`split_lines_java`] instead of `str::lines()` -- the `\r`-only mirror of
+    /// `content_after_a_trivial_line_is_a_conflict_not_a_silent_ignore`, same expected
+    /// (1-based) line number.
+    #[test]
+    fn line_numbers_stay_correct_with_lone_cr_line_endings() {
+        let dir =
+            std::env::temp_dir().join(format!("wr-io-test-conflict-cr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conflict_cr.txt");
+        std::fs::write(&path, "true\r{0, 1}\r\r0 1\r").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::FileHasConflict { line: 2, .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
