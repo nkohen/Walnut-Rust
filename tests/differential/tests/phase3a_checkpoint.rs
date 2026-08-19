@@ -635,7 +635,7 @@ fn reg_over_a_custom_base_number_system_matches_real_walnut() {
         "msd_fib_addition.txt",
     );
 
-    let tc = reg(&session, "msd_fib ", "0*1", "fib_reg")
+    let tc = reg(&session, &mut Logging::new(), "msd_fib ", "0*1", "fib_reg")
         .unwrap_or_else(|e| panic!("reg over msd_fib must build, got {e}"));
     let a = tc.automaton_pairs()[0].automaton().unwrap().clone();
     // Same U23 review-fix property as `custom_base_relational_comparison_matches_real_walnut`,
@@ -659,13 +659,20 @@ fn reg_over_a_custom_base_number_system_matches_real_walnut() {
 fn reg_then_alphabet_pipeline_matches_real_walnut() {
     let (session, dir) = temp_session("reg-then-alphabet");
 
-    let base_tc = reg(&session, "{0,1,2,3} ", "(0|1|2|3)*", "baseR")
-        .unwrap_or_else(|e| panic!("reg baseR must build, got {e}"));
+    let base_tc = reg(
+        &session,
+        &mut Logging::new(),
+        "{0,1,2,3} ",
+        "(0|1|2|3)*",
+        "baseR",
+    )
+    .unwrap_or_else(|e| panic!("reg baseR must build, got {e}"));
     let base_a = base_tc.automaton_pairs()[0].automaton().unwrap().clone();
     assert_equivalent_to_fixture(base_a, "baseR", false, "baseR (pre-restriction)");
 
     let restricted_tc = alphabet_command(
         &session,
+        &mut Logging::new(),
         "alphabet baseR_restricted {0,1} $baseR",
         Some("{0,1} "),
         false,

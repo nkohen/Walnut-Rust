@@ -80,9 +80,10 @@
 use std::rc::Rc;
 
 use wr_core::automaton::Automaton;
+use wr_core::logging::Logging;
 use wr_core::numsys::{normalize_number_system_token, NumberSystem};
 use wr_core::util::{remove_duplicates, try_parse_int, NumberFormatError};
-use wr_core::word_automaton::minimize_self_with_output;
+use wr_core::word_automaton::minimize_self_with_output_with_ctx;
 use wr_logic::predicate_env::{PredicateEnv, PredicateEnvError};
 
 use crate::automaton_output::write_automata;
@@ -313,10 +314,17 @@ fn match_set_token(
 /// out-parameters. `env` resolves named number-system tokens (`NumberSystem
 /// .getComputeIfAbsent`); a `{…}` literal set never touches it, matching Java's `NS.add
 /// (null)` for that branch.
+///
+/// `logging` is the caller's real, already-`configure_for_command`-d [`Logging`] --
+/// `alphabet`/`reg` are not `eval`/`def` commands, but real Walnut's `::`-suffix support
+/// is universal (`Prover.parseSetup`'s `Logging.configureForCommand` runs for every
+/// command), and `env.number_system` can itself construct-and-log a fresh custom base
+/// on first use (`PredicateEnv::number_system`'s own doc comment).
 #[allow(clippy::type_complexity)]
 pub fn determine_alphabets_and_ns(
     list_of_alphabets: &str,
     env: &dyn PredicateEnv,
+    logging: &mut Logging,
 ) -> Result<(Vec<Option<Rc<NumberSystem>>>, Vec<Vec<i32>>), AlphabetError> {
     let units: Vec<u16> = list_of_alphabets.encode_utf16().collect();
     let mut ns = Vec::new();
@@ -326,10 +334,8 @@ pub fn determine_alphabets_and_ns(
         match try_match_alphabet_token(&units, i)? {
             Some((AlphabetToken::NumberSystem(text), end)) => {
                 let base = normalize_number_system_token(Some(&text));
-                // Not an `eval`/`def` command (see `combine_command`'s matching note in
-                // `automaton_ops.rs`) -- a throwaway logger.
                 let resolved = env
-                    .number_system(&base, &mut wr_core::logging::Logging::new())
+                    .number_system(&base, logging)
                     .map_err(AlphabetError::NumberSystem)?;
                 alphabets.push(resolved.get_alphabet().to_vec());
                 ns.push(Some(resolved));
@@ -376,12 +382,22 @@ pub(crate) fn all_reps_from_ns(
 /// List<List<Integer>> alphabet)` (`Automaton.java:184-226`). Mutates `automaton` in
 /// place (`copy(M)`, the final statement of the Java method).
 ///
-/// Java's `Logging.indent()`/`logMessage`/`dedent()` calls throughout are not ported,
-/// matching every other `wr-core`/`wr-cli` call site so far (`crate::product`'s "Progress
-/// logging not ported" note) -- `crate::logging`'s context is not threaded into this call
-/// graph yet.
+/// `logging` is the caller's real, already-`configure_for_command`-d [`Logging`],
+/// threaded into every call this function already makes to an already-`Logging`-aware
+/// primitive (`minimize_self_with_output_with_ctx`/`determinize_and_minimize_with_ctx`/
+/// `apply_all_representations_with_output`, bracketed with `indent`/`dedent` exactly as
+/// Java brackets the last of those, `:218-220`) -- no longer a throwaway one.
+///
+/// **Still not ported**: the two `logMessage` calls Java's `setAlphabet` makes directly
+/// (`"setting alphabet to " + nsNames` before the clone, guarded by
+/// `Logging.shouldPrintDetails()`; `"set alphabet complete:" + …ms` at the very end,
+/// unconditional) — those are net-new log lines this function has never emitted, not an
+/// existing throwaway-logger call site, so wiring them up is out of scope for this pass
+/// (which threads the caller's real `Logging` into already-instrumented primitives, not
+/// adds new instrumentation). Left as a known, honestly-documented gap.
 pub fn set_alphabet(
     automaton: &mut Automaton,
+    logging: &mut Logging,
     is_dfao: bool,
     number_systems: &[Option<Rc<NumberSystem>>],
     alphabet: Vec<Vec<i32>>,
@@ -431,18 +447,19 @@ pub fn set_alphabet(
 
     // `:210-214`.
     if is_dfao {
-        minimize_self_with_output(&mut m);
+        minimize_self_with_output_with_ctx(&mut m, None, logging);
     } else {
-        m.determinize_and_minimize();
+        m.determinize_and_minimize_with_ctx(None, logging);
     }
 
     // `M.forceCanonize();` (`:216`).
     m.force_canonize();
 
-    // `M.applyAllRepresentationsWithOutput();` (`:219`). Java's own `Logging.indent()`/
-    // `logMessage`/`dedent()` calls throughout `setAlphabet` are not ported (see this
-    // function's docs), so this is a throwaway logger, not a real one.
-    m.apply_all_representations_with_output(&mut wr_core::logging::Logging::new());
+    // `Logging.indent(); M.applyAllRepresentationsWithOutput(); Logging.dedent();`
+    // (`:218-220`).
+    logging.indent();
+    m.apply_all_representations_with_output(logging);
+    logging.dedent();
 
     // `copy(M);` (`:222`).
     *automaton = m;
@@ -468,6 +485,7 @@ pub fn set_alphabet(
 /// .determineAlphabetsAndNS` call has no such guard.
 pub fn alphabet_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     list_of_alphabets: Option<&str>,
     is_dfao: bool,
@@ -480,7 +498,8 @@ pub fn alphabet_command(
         )
     })?;
 
-    let (ns, alphabets) = determine_alphabets_and_ns(list_of_alphabets, session.predicate_env())?;
+    let (ns, alphabets) =
+        determine_alphabets_and_ns(list_of_alphabets, session.predicate_env(), logging)?;
 
     // `Automaton M = new Automaton(ProverHelper.determineInLibrary(isDFAO, inFileName));`
     // (`:20`).
@@ -491,7 +510,7 @@ pub fn alphabet_command(
         .map_err(AlphabetError::Read)?;
 
     // `M.setAlphabet(isDFAO, NS, alphabets);` (`:23`).
-    set_alphabet(&mut automaton, is_dfao, &ns, alphabets)?;
+    set_alphabet(&mut automaton, logging, is_dfao, &ns, alphabets)?;
 
     // `M.writeAutomata(s, ProverHelper.determineOutLibrary(isDFAO), newName, false);`
     // (`:25`) -- note the hardcoded `false`, see this module's docs.
@@ -513,7 +532,8 @@ mod tests {
     #[test]
     fn a_literal_set_alphabet_resolves_to_no_number_system() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("{0,1} ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("{0,1} ", &env, &mut Logging::new()).unwrap();
         assert!(ns.iter().all(Option::is_none));
         assert_eq!(ns.len(), 1);
         assert_eq!(alphabets, vec![vec![0, 1]]);
@@ -522,7 +542,8 @@ mod tests {
     #[test]
     fn a_set_with_signs_and_whitespace_and_duplicates_parses_and_dedupes() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("{ -1, +2 , 2, 3 } ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("{ -1, +2 , 2, 3 } ", &env, &mut Logging::new()).unwrap();
         assert!(ns.iter().all(Option::is_none));
         assert_eq!(ns.len(), 1);
         assert_eq!(alphabets, vec![vec![-1, 2, 3]]);
@@ -537,18 +558,21 @@ mod tests {
     #[test]
     fn a_set_element_that_overflows_i32_reports_instead_of_panicking() {
         let env = InMemoryPredicateEnv::new();
-        let err = determine_alphabets_and_ns("{8888888800} ", &env).unwrap_err();
+        let err =
+            determine_alphabets_and_ns("{8888888800} ", &env, &mut Logging::new()).unwrap_err();
         assert!(matches!(err, AlphabetError::NumberFormat(_)));
         assert_eq!(err.to_string(), "For input string: \"8888888800\"");
         // i32::MAX itself is still an ordinary alphabet element.
-        let (_, alphabets) = determine_alphabets_and_ns("{2147483647} ", &env).unwrap();
+        let (_, alphabets) =
+            determine_alphabets_and_ns("{2147483647} ", &env, &mut Logging::new()).unwrap();
         assert_eq!(alphabets, vec![vec![i32::MAX]]);
     }
 
     #[test]
     fn a_named_number_system_resolves_through_the_env_and_carries_its_alphabet() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("msd_3 ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("msd_3 ", &env, &mut Logging::new()).unwrap();
         assert_eq!(alphabets, vec![vec![0, 1, 2]]);
         assert!(ns[0]
             .as_ref()
@@ -558,7 +582,8 @@ mod tests {
     #[test]
     fn bare_msd_normalizes_to_msd_2() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("msd ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("msd ", &env, &mut Logging::new()).unwrap();
         assert_eq!(alphabets, vec![vec![0, 1]]);
         assert_eq!(ns[0].as_ref().unwrap().name(), "msd_2");
     }
@@ -566,7 +591,8 @@ mod tests {
     #[test]
     fn lsd_without_underscore_normalizes_like_java() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("lsd4 ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("lsd4 ", &env, &mut Logging::new()).unwrap();
         assert_eq!(alphabets, vec![vec![0, 1, 2, 3]]);
         assert!(ns[0].as_ref().is_some_and(|n| !n.is_msd()));
     }
@@ -574,7 +600,8 @@ mod tests {
     #[test]
     fn multiple_tracks_parse_in_order_mixing_sets_and_number_systems() {
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("msd_2 {0,1,2} lsd_2 ", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("msd_2 {0,1,2} lsd_2 ", &env, &mut Logging::new()).unwrap();
         assert_eq!(ns.len(), 3);
         assert!(ns[0].is_some());
         assert!(ns[1].is_none());
@@ -587,7 +614,8 @@ mod tests {
         // The pattern's trailing `\s+` is mandatory; without it Java's `find()` never
         // matches this token anywhere in the string.
         let env = InMemoryPredicateEnv::new();
-        let (ns, alphabets) = determine_alphabets_and_ns("{0,1}", &env).unwrap();
+        let (ns, alphabets) =
+            determine_alphabets_and_ns("{0,1}", &env, &mut Logging::new()).unwrap();
         assert!(ns.is_empty());
         assert!(alphabets.is_empty());
     }
@@ -595,7 +623,7 @@ mod tests {
     #[test]
     fn an_unresolvable_number_system_reports_a_number_system_error() {
         let env = InMemoryPredicateEnv::new();
-        let err = determine_alphabets_and_ns("msd_neg_2 ", &env).unwrap_err();
+        let err = determine_alphabets_and_ns("msd_neg_2 ", &env, &mut Logging::new()).unwrap_err();
         assert!(matches!(err, AlphabetError::NumberSystem(_)));
     }
 
@@ -632,15 +660,28 @@ mod tests {
     #[test]
     fn set_alphabet_rejects_a_track_count_mismatch_against_the_automaton() {
         let mut a = one_track_over_four_digits();
-        let err =
-            set_alphabet(&mut a, false, &[None, None], vec![vec![0, 1], vec![0, 1]]).unwrap_err();
+        let err = set_alphabet(
+            &mut a,
+            &mut Logging::new(),
+            false,
+            &[None, None],
+            vec![vec![0, 1], vec![0, 1]],
+        )
+        .unwrap_err();
         assert!(matches!(err, AlphabetError::Walnut(m) if m.contains("input automaton")));
     }
 
     #[test]
     fn set_alphabet_rejects_an_alphabet_ns_length_mismatch() {
         let mut a = one_track_over_four_digits();
-        let err = set_alphabet(&mut a, false, &[None, None], vec![vec![0, 1]]).unwrap_err();
+        let err = set_alphabet(
+            &mut a,
+            &mut Logging::new(),
+            false,
+            &[None, None],
+            vec![vec![0, 1]],
+        )
+        .unwrap_err();
         assert!(matches!(err, AlphabetError::Walnut(m) if m.contains("number systems")));
     }
 
@@ -650,7 +691,14 @@ mod tests {
     #[test]
     fn set_alphabet_prunes_transitions_outside_the_new_alphabet() {
         let mut a = one_track_over_four_digits();
-        set_alphabet(&mut a, false, &[None], vec![vec![0, 1]]).unwrap();
+        set_alphabet(
+            &mut a,
+            &mut Logging::new(),
+            false,
+            &[None],
+            vec![vec![0, 1]],
+        )
+        .unwrap();
 
         assert_eq!(a.alphabet, vec![vec![0, 1]]);
         // Only digits 0 and 1 can reach acceptance now; the automaton must still accept
@@ -677,7 +725,14 @@ mod tests {
     fn set_alphabet_installs_the_new_number_systems_msd_direction() {
         let ns2 = Rc::new(NumberSystem::new("lsd_2").unwrap());
         let mut a = one_track_over_four_digits();
-        set_alphabet(&mut a, false, &[Some(Rc::clone(&ns2))], vec![vec![0, 1]]).unwrap();
+        set_alphabet(
+            &mut a,
+            &mut Logging::new(),
+            false,
+            &[Some(Rc::clone(&ns2))],
+            vec![vec![0, 1]],
+        )
+        .unwrap();
         assert_eq!(a.msd, vec![Some(false)]);
     }
 
@@ -714,7 +769,7 @@ mod tests {
     #[test]
     fn set_alphabet_preserves_dfao_outputs_through_the_is_dfao_branch() {
         let mut a = one_track_word_automaton_over_four_digits();
-        set_alphabet(&mut a, true, &[None], vec![vec![0, 1]]).unwrap();
+        set_alphabet(&mut a, &mut Logging::new(), true, &[None], vec![vec![0, 1]]).unwrap();
 
         assert_eq!(a.alphabet, vec![vec![0, 1]]);
         let sym0 = a.encode(&[0]);

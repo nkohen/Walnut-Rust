@@ -26,6 +26,7 @@ use wr_cli::reg::reg;
 use wr_cli::session::Session;
 use wr_core::automaton::Automaton;
 use wr_core::equiv::automaton_language_equivalent;
+use wr_core::logging::Logging;
 
 fn fixture(sub: &str, name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{sub}/{name}.txt"))
@@ -130,7 +131,7 @@ fn reg_command_round_trips_through_the_string_alphabet_declaration() {
     let (session, dir) = temp_session("reg-corpus");
     for (name, alphabets, baseexp) in reg_corpus_subset() {
         let decl = alphabet_declaration_string(&alphabets);
-        let tc = reg(&session, &decl, baseexp, name).unwrap_or_else(|e| {
+        let tc = reg(&session, &mut Logging::new(), &decl, baseexp, name).unwrap_or_else(|e| {
             panic!("{name} (`{baseexp}`, decl `{decl}`) must build via wr_cli::reg::reg, got {e}")
         });
         let a = tc.automaton_pairs()[0].automaton().unwrap().clone();
@@ -151,7 +152,7 @@ fn reg_command_resolves_named_number_systems() {
         ("u16_set", "{0,1,2} ", "1*"),
     ];
     for (name, decl, baseexp) in cases {
-        let tc = reg(&session, decl, baseexp, name)
+        let tc = reg(&session, &mut Logging::new(), decl, baseexp, name)
             .unwrap_or_else(|e| panic!("{name} (`{baseexp}`) must build, got {e}"));
         let a = tc.automaton_pairs()[0].automaton().unwrap().clone();
         assert_equivalent_to_fixture(a, &fixture("reg", name), name);
@@ -178,6 +179,7 @@ fn alphabet_command_restricts_digits_and_prunes_transitions() {
 
     let tc = alphabet_command(
         &session,
+        &mut Logging::new(),
         "alphabet baseC_restricted msd_2 $baseC",
         Some("msd_2 "),
         false,
@@ -208,6 +210,7 @@ fn alphabet_command_converts_named_number_systems_to_a_literal_set() {
 
     let tc = alphabet_command(
         &session,
+        &mut Logging::new(),
         "alphabet baseB_asSet {0,1} {0,1} $baseB",
         Some("{0,1} {0,1} "),
         false,

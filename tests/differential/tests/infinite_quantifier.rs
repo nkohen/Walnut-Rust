@@ -75,6 +75,7 @@ use std::path::PathBuf;
 
 use wr_cli::reg::reg;
 use wr_cli::session::Session;
+use wr_core::logging::Logging;
 use wr_logic::predicate_env::InMemoryPredicateEnv;
 
 /// Runs `predicate` through the Rust pipeline and asserts it collapses to the given
@@ -180,9 +181,15 @@ fn infinite_quantifier_mixed_numeration_system_matches_real_walnut_output() {
     let (session, dir) = temp_session("mixed-ns");
 
     let build_mixr = || {
-        let mut a = reg(&session, "lsd_2 msd_2 ", "[0,0]*[1,1]", "mixr")
-            .expect("reg must build the mixed-NS automaton")
-            .automaton_pairs()[0]
+        let mut a = reg(
+            &session,
+            &mut Logging::new(),
+            "lsd_2 msd_2 ",
+            "[0,0]*[1,1]",
+            "mixr",
+        )
+        .expect("reg must build the mixed-NS automaton")
+        .automaton_pairs()[0]
             .automaton()
             .expect("reg's TestCase must carry the built automaton")
             .clone();

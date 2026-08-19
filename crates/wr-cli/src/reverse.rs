@@ -3,14 +3,29 @@
 
 //! `Main/Commands/Reverse.java` (21 LOC) — U23, batch A. A thin dispatch over two
 //! already-ported primitives, chosen by the command's own `$`-flag: a genuine word
-//! automaton (DFAO) reverses through [`wr_core::word_automaton::reverse_with_output`],
-//! a plain predicate automaton through [`wr_core::logicalops::reverse`]. Both always pass
-//! `true` for the "reverse the msd/lsd direction too" flag (`Reverse.reverseCommand`
-//! itself never varies it), matching Java's own two call sites exactly.
+//! automaton (DFAO) reverses through
+//! [`wr_core::word_automaton::reverse_with_output_with_ctx`], a plain predicate automaton
+//! through [`wr_core::logicalops::reverse_with_ctx`]. Both always pass `true` for the
+//! "reverse the msd/lsd direction too" flag (`Reverse.reverseCommand` itself never varies
+//! it), matching Java's own two call sites exactly.
+//!
+//! # `Logging`, not a `DeterminizeContext`
+//!
+//! Both primitives log (`reversing:`/`reversed:`, plus the `Minimizing:`/`Minimized:`
+//! pair from the `determinizeAndMinimize` inside them), and Java's
+//! `Prover.parseSetup` -> `Logging.configureForCommand` is universal rather than
+//! `eval`/`def`-specific, so `reverse rv $A;::` really does print detail text in real
+//! Walnut — confirmed live against `target/Walnut-all.jar`. This command therefore
+//! receives the caller's real, already-`configure_for_command`-d [`Logging`] (`Prover`'s
+//! `self.logging`) rather than the throwaway one the plain `reverse_with_output`/
+//! `reverse` wrappers construct internally. No
+//! [`wr_core::determinize::DeterminizeContext`] is threaded (`None` at each call) —
+//! matching every other non-`eval`/`def` command, per U32's scoping.
 
 use wr_core::automaton::Automaton;
-use wr_core::logicalops::reverse as reverse_predicate;
-use wr_core::word_automaton::reverse_with_output;
+use wr_core::logging::Logging;
+use wr_core::logicalops::reverse_with_ctx as reverse_predicate_with_ctx;
+use wr_core::word_automaton::reverse_with_output_with_ctx;
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_output::write_automata;
@@ -52,6 +67,7 @@ impl From<std::io::Error> for ReverseError {
 /// for the same established convention).
 pub fn reverse_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     in_file_name: &str,
     is_dfao: bool,
@@ -65,10 +81,10 @@ pub fn reverse_command(
 
     if is_dfao {
         // `WordAutomaton.reverseWithOutput(M, true);` (`:13`).
-        reverse_with_output(&mut m, true);
+        reverse_with_output_with_ctx(&mut m, true, None, logging);
     } else {
         // `AutomatonLogicalOps.reverse(M, true);` (`:15`).
-        reverse_predicate(&mut m, true);
+        reverse_predicate_with_ctx(&mut m, true, None, logging);
     }
 
     let out_library = determine_out_library(session.paths(), is_dfao);
@@ -133,7 +149,15 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut a, dir.join("Automata Library").join("A.txt"))
             .unwrap();
 
-        let tc = reverse_command(&session, "reverse c $A;", "A.txt", false, "c").unwrap();
+        let tc = reverse_command(
+            &session,
+            &mut Logging::new(),
+            "reverse c $A;",
+            "A.txt",
+            false,
+            "c",
+        )
+        .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[1, 0]), "reverse of \"01\" is \"10\"");
         assert!(!c.fa.accepts_word(&[0, 1]));
@@ -152,7 +176,15 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut a, dir.join("Word Automata Library").join("A.txt"))
             .unwrap();
 
-        let tc = reverse_command(&session, "reverse c A;", "A.txt", true, "c").unwrap();
+        let tc = reverse_command(
+            &session,
+            &mut Logging::new(),
+            "reverse c A;",
+            "A.txt",
+            true,
+            "c",
+        )
+        .unwrap();
         assert!(tc.automaton_pairs()[0].automaton().is_some());
         assert!(dir.join("Word Automata Library").join("c.txt").is_file());
         fs::remove_dir_all(&dir).ok();
@@ -161,7 +193,15 @@ mod tests {
     #[test]
     fn reverse_propagates_a_missing_file_read_error() {
         let (session, dir) = temp_session("missing");
-        let err = reverse_command(&session, "reverse c $A;", "A.txt", false, "c").unwrap_err();
+        let err = reverse_command(
+            &session,
+            &mut Logging::new(),
+            "reverse c $A;",
+            "A.txt",
+            false,
+            "c",
+        )
+        .unwrap_err();
         assert!(matches!(err, ReverseError::Read(_)));
         fs::remove_dir_all(&dir).ok();
     }

@@ -4,16 +4,32 @@
 //! `Main/Prover.java`'s inline `minimizeCommand` (`:712-722`), `fixLeadZeroCommand`
 //! (`:747-753`), `fixTrailZeroCommand` (`:756-762`) — U23, batch A. Three read-mutate-write
 //! triples, each over a single already-ported primitive:
-//! [`wr_core::word_automaton::minimize_self_with_output`],
-//! [`wr_core::logicalops::fix_leading_zeros_problem`],
+//! [`wr_core::word_automaton::minimize_self_with_output_with_ctx`],
+//! [`wr_core::logicalops::fix_leading_zeros_problem_with_ctx`],
 //! [`wr_core::logicalops::fix_trailing_zeros_problem`]. Grouped into one module (rather
 //! than three) because, unlike the `Main/Commands/*.java` files, these never had their
 //! own Java class or file to begin with — they are inline `Prover` methods, and this
 //! module is their equally small Rust home.
+//!
+//! # `Logging`, not a `DeterminizeContext`
+//!
+//! All three commands now receive the caller's real, already-`configure_for_command`-d
+//! [`Logging`] (`Prover`'s `self.logging`) rather than a throwaway one — Java's
+//! `AutomatonLogicalOps.fixLeadingZerosProblem`/`fixTrailingZerosProblem` and
+//! `WordAutomaton.minimizeSelfWithOutput` (via `minimizeWithOutput`'s
+//! `determinizeAndMinimize()`/`AutomatonLogicalOps.combine` calls) all log through
+//! Java's global static `Logging`, so `minimize x A;::`/`fixleadzero x A;::`/
+//! `fixtrailzero x A;::` all really do print detail text in real Walnut, same as every
+//! other command (`Prover.parseSetup`'s `Logging.configureForCommand` is universal, not
+//! `eval`/`def`-specific). No [`wr_core::determinize::DeterminizeContext`] is threaded
+//! here (`None` at each `_with_ctx` call) — matching every other non-`eval`/`def` site
+//! this pass touched, none of which threads `[strategy …]`/`[export …]` metacommand
+//! state either; that remains scoped to the `eval`/`def` path per U32.
 
-use wr_core::logicalops::{fix_leading_zeros_problem, fix_trailing_zeros_problem};
+use wr_core::logging::Logging;
+use wr_core::logicalops::{fix_leading_zeros_problem_with_ctx, fix_trailing_zeros_problem};
 use wr_core::numsys::TXT_EXTENSION;
-use wr_core::word_automaton::minimize_self_with_output;
+use wr_core::word_automaton::minimize_self_with_output_with_ctx;
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_ops::read_from_automata_library;
@@ -54,6 +70,7 @@ impl From<std::io::Error> for SimpleTransformError {
 /// `getWriteAddressForWordsLibrary` exactly.
 pub fn minimize_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name: &str,
     new_name: &str,
@@ -67,7 +84,7 @@ pub fn minimize_command(
         .map_err(SimpleTransformError::Read)?;
 
     // `WordAutomaton.minimizeSelfWithOutput(M);` (`:718`).
-    minimize_self_with_output(&mut m);
+    minimize_self_with_output_with_ctx(&mut m, None, logging);
 
     write_automata(
         session,
@@ -83,6 +100,7 @@ pub fn minimize_command(
 /// `Prover.fixLeadZeroCommand(String s)` (`Prover.java:747-753`).
 pub fn fix_lead_zero_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name: &str,
     new_name: &str,
@@ -91,7 +109,7 @@ pub fn fix_lead_zero_command(
         read_from_automata_library(session, old_name).map_err(SimpleTransformError::Read)?;
 
     // `AutomatonLogicalOps.fixLeadingZerosProblem(M);` (`:750`).
-    fix_leading_zeros_problem(&mut m);
+    fix_leading_zeros_problem_with_ctx(&mut m, None, logging);
 
     write_automata(
         session,
@@ -107,6 +125,7 @@ pub fn fix_lead_zero_command(
 /// `Prover.fixTrailZeroCommand(String s)` (`Prover.java:756-762`).
 pub fn fix_trail_zero_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name: &str,
     new_name: &str,
@@ -114,10 +133,8 @@ pub fn fix_trail_zero_command(
     let mut m =
         read_from_automata_library(session, old_name).map_err(SimpleTransformError::Read)?;
 
-    // `AutomatonLogicalOps.fixTrailingZerosProblem(M);` (`:759`). Not an `eval`/`def`
-    // command (see `combine_command`'s matching note in `automaton_ops.rs`) -- a
-    // throwaway logger.
-    fix_trailing_zeros_problem(&mut m, &mut wr_core::logging::Logging::new());
+    // `AutomatonLogicalOps.fixTrailingZerosProblem(M);` (`:759`).
+    fix_trailing_zeros_problem(&mut m, logging);
 
     write_automata(
         session,
@@ -195,7 +212,8 @@ mod tests {
         let mut a = non_minimal_contains_one();
         wr_io::writer::write_automaton_txt(&mut a, &path).unwrap();
 
-        let tc = minimize_command(&session, "minimize c A;", "A", "c").unwrap();
+        let tc =
+            minimize_command(&session, &mut Logging::new(), "minimize c A;", "A", "c").unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.q <= 2, "states 1 and 2 are language-equivalent");
         assert!(c.fa.accepts_word(&[0, 1, 0]));
@@ -228,7 +246,8 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut a, dir.join("Automata Library").join("A.txt"))
             .unwrap();
 
-        let tc = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c").unwrap();
+        let tc = fix_lead_zero_command(&session, &mut Logging::new(), "fixleadzero c A;", "A", "c")
+            .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[1]));
         assert!(c.fa.accepts_word(&[0, 1]));
@@ -270,7 +289,9 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut a, dir.join("Automata Library").join("A.txt"))
             .unwrap();
 
-        let tc = fix_trail_zero_command(&session, "fixtrailzero c A;", "A", "c").unwrap();
+        let tc =
+            fix_trail_zero_command(&session, &mut Logging::new(), "fixtrailzero c A;", "A", "c")
+                .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[1, 0]), "\"10\" stays accepted");
         assert!(
@@ -355,8 +376,9 @@ mod tests {
         assert_eq!(operand.fa.q, 3, "the read must keep the unreachable states");
         let zero = operand.determine_zero();
 
-        let tc = fix_trail_zero_command(&session, "fixtrailzero c A;", "A", "c")
-            .expect("fixtrailzero must succeed on this well-formed (if untrimmed) operand");
+        let tc =
+            fix_trail_zero_command(&session, &mut Logging::new(), "fixtrailzero c A;", "A", "c")
+                .expect("fixtrailzero must succeed on this well-formed (if untrimmed) operand");
         let c = tc.automaton_pairs()[0].automaton().unwrap();
 
         // The exact quirky table, as real walnut-java writes it.
@@ -588,7 +610,7 @@ mod tests {
                     .expect("the file was just written by this test");
                 let zero = operand.determine_zero();
 
-                let lead = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c")
+                let lead = fix_lead_zero_command(&session, &mut Logging::new(), "fixleadzero c A;", "A", "c")
                     .expect("fixleadzero must succeed on a well-formed operand");
                 let lead = lead.automaton_pairs()[0].automaton().unwrap().clone();
                 for w in all_words_up_to_four() {
@@ -613,7 +635,7 @@ mod tests {
                     );
                 }
 
-                let trail = fix_trail_zero_command(&session, "fixtrailzero d A;", "A", "d")
+                let trail = fix_trail_zero_command(&session, &mut Logging::new(), "fixtrailzero d A;", "A", "d")
                     .expect("fixtrailzero must succeed on a well-formed operand");
                 let trail = trail.automaton_pairs()[0].automaton().unwrap().clone();
                 for w in all_words_up_to_four() {
@@ -668,7 +690,9 @@ mod tests {
     fn fix_lead_zero_command_propagates_a_missing_file_read_error() {
         let (session, dir) = temp_session("missing");
         let _guard = TempDirGuard(dir.clone());
-        let err = fix_lead_zero_command(&session, "fixleadzero c A;", "A", "c").unwrap_err();
+        let err =
+            fix_lead_zero_command(&session, &mut Logging::new(), "fixleadzero c A;", "A", "c")
+                .unwrap_err();
         assert!(matches!(err, SimpleTransformError::Read(_)));
         fs::remove_dir_all(&dir).ok();
     }

@@ -41,6 +41,48 @@
 //! `msd_2` one silently produced a mixed-numeration result where real Walnut refuses with
 //! `"Automata must have the same number system(s)."`.
 //!
+//! # The throwaway-logger history, and the five log lines that were never ported
+//!
+//! Every command here takes the caller's real, already-`configure_for_command`-d
+//! [`Logging`] (`Prover`'s `self.logging`). They used to construct their own throwaway
+//! `Logging::new()` instead, on the mistaken theory that `::`-suffixed detail printing is
+//! an `eval`/`def` feature — it is not: `Prover.parseSetup`'s `Logging.configureForCommand`
+//! runs for *every* command, so `union u A B;::` genuinely prints detail text in real
+//! Walnut (confirmed live against `target/Walnut-all.jar`; the transcripts live in
+//! `tests/differential/tests/cli_command_logging.rs`).
+//!
+//! Two rounds were needed. The first rerouted `combine_command`'s `combine` call and
+//! `union_or_intersect`'s `or`/`and` calls; adversarial review then found that
+//! [`concat_pair`] and [`star`] still called the plain, non-`_with_ctx`
+//! `Automaton::determinize_and_minimize()` — which throws away a `Logging` it constructs
+//! internally — on lines directly *between* two correct uses of the caller's own logger.
+//!
+//! Separately, five direct `Logging.logMessage` calls in these commands' own Java sources
+//! had never been ported at all (a missing-instrumentation gap, not a misrouted-logger
+//! one), and are now:
+//!
+//! | Java | Line | Rust |
+//! |---|---|---|
+//! | `Union.java:76` | `computed =>:Q states - Tms` | [`union_or_intersect`] |
+//! | `Concat.java:54` | `concatenated =>:Q states - Tms` | [`concat_command`] |
+//! | `Concat.java:61` | `concat: Q state automaton with Q state automaton` | [`concat_pair`] |
+//! | `Concat.java:80` | `concat complete: Q states - Tms` | [`concat_pair`] |
+//! | `Star.java:23`/`:33` | `star: …` / `star complete: …` | [`star`] |
+//!
+//! Each `timeBefore` is captured at Java's exact statement — for the two folds that means
+//! *before* the operand is read from the library, so the reported duration includes that
+//! read; for `concat_pair`/`star` it means before the announcement line. An
+//! `Instant::now()` plus `elapsed().as_millis()` stands in for
+//! `System.currentTimeMillis()` deltas (`PORTING.md`'s standing ruling); the wall-clock
+//! digits are the one thing the differential tests deliberately do not compare.
+//!
+//! No [`wr_core::determinize::DeterminizeContext`] is threaded here (`None` at each
+//! `_with_ctx` call) — `[strategy …]`/`[export …]` metacommand state remains scoped to
+//! the `eval`/`def` path per U32, which is why `Determinizing [#n, strategy: S]` is still
+//! absent from these commands' output. That gap is documented in
+//! `tests/differential/tests/cli_command_logging.rs`'s module docs and pinned by a
+//! negative assertion there.
+//!
 //! # Panics recovered at this boundary
 //!
 //! `combine` reaches `wr-core` guards that replicate Java `WalnutException`s as `assert!`s;
@@ -220,9 +262,13 @@ fn ns_differs(a: &Automaton, b: &Automaton) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `Combine.combineCommand(String s, String combineAutomata, String combineName)`
-/// (`Combine.java:27-65`).
+/// (`Combine.java:27-65`). `logging` is the caller's real, already-
+/// `configure_for_command`-d [`Logging`] (`Prover`'s `self.logging`) -- see this
+/// module's "throwaway logger" history note above for why this used to be a
+/// `Logging::new()` constructed here instead.
 pub fn combine_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     combine_automata: &str,
     combine_name: &str,
@@ -262,22 +308,11 @@ pub fn combine_command(
     // different arity, or with the same variable declared over different alphabets — and
     // Java catches the resulting `WalnutException` in `Prover.dispatch`, prints it, and
     // keeps the REPL alive. See `crate::walnut_exception::catch_walnut_panic`.
-    // A throwaway logger, not the caller's real one. NOTE this is a genuine, documented
-    // gap, not "out of scope by design": real Walnut's `::` suffix works on EVERY
-    // command via `Prover.parseSetup`'s universal `Logging.configureForCommand`, not just
-    // `eval`/`def` -- so `combine c A B;::` really does print detailed logs in real
-    // Walnut. This port's `wr-cli` dispatch does not yet thread a real `Logging` (with
-    // the command's own `:`/`::`-derived `configure_for_command` state) into non-`eval`/
-    // `def` commands at all, so even a correctly-instrumented `wr-core` primitive (as
-    // `combine` now is) has nothing real to log into here. Wiring that up is a
-    // `Prover`-dispatch-wide follow-up, not specific to `combine`.
+    //
+    // `logging` is the caller's real, already-`configure_for_command`-d `Logging` (see
+    // this function's own doc comment) -- no longer a throwaway one.
     let mut c = crate::walnut_exception::catch_walnut_panic(|| {
-        combine(
-            &first,
-            subautomata,
-            &outputs,
-            &mut wr_core::logging::Logging::new(),
-        )
+        combine(&first, subautomata, &outputs, logging)
     })
     .map_err(AutomatonOpsError::Walnut)?;
 
@@ -312,15 +347,21 @@ enum UnionOrIntersect {
 /// `Union.unionOrIntersect(Automaton automaton, List<String> automataNames, String op)`
 /// (`Union.java:51-79`) — shared by [`union_command`] and [`intersect_command`], exactly
 /// as Java's own `Intersect.intersect` calls `Union.unionOrIntersect` directly
-/// (`Intersect.java:36`) rather than duplicating the fold.
+/// (`Intersect.java:36`) rather than duplicating the fold. `logging` is the caller's
+/// real, already-`configure_for_command`-d [`Logging`], threaded down from
+/// [`union_command`]/[`intersect_command`] -- see [`combine_command`]'s matching note.
 fn union_or_intersect(
     session: &Session,
+    logging: &mut Logging,
     automaton: Automaton,
     automata_names: &[String],
     op: UnionOrIntersect,
 ) -> Result<Automaton, AutomatonOpsError> {
     let mut first = automaton;
     for name in automata_names {
+        // `long timeBefore = System.currentTimeMillis();` (`:54`) -- captured BEFORE the
+        // operand is read, so the reported duration includes the library read.
+        let time_before = std::time::Instant::now();
         let mut n = read_from_automata_library(session, name).map_err(AutomatonOpsError::Read)?;
 
         // `NumberSystem.isNSDiffering(N.getNS(), first.getNS(), N.richAlphabet.getA(),
@@ -335,13 +376,20 @@ fn union_or_intersect(
         first.random_label();
         n.label = first.label.clone();
 
-        // Not an `eval`/`def` command -- a throwaway logger (see `combine_command`'s
-        // matching note above).
-        let mut logging = wr_core::logging::Logging::new();
         first = match op {
-            UnionOrIntersect::Union => or(&mut first, &mut n, &mut logging).into_automaton(),
-            UnionOrIntersect::Intersect => and(&first, &n, &mut logging).into_automaton(),
+            UnionOrIntersect::Union => or(&mut first, &mut n, logging).into_automaton(),
+            UnionOrIntersect::Intersect => and(&first, &n, logging).into_automaton(),
         };
+
+        // `Logging.logMessage(COMPUTED + " =>:" + first.fa.getQ() + " states - " +
+        // (timeAfter - timeBefore) + "ms");` (`:76`) -- once per fold iteration, at
+        // indent 0 (neither `or` nor `and` leaves the indent raised).
+        logging.log_message(&format!(
+            "{} =>:{} states - {}ms",
+            wr_core::logging::COMPUTED,
+            first.fa.q,
+            time_before.elapsed().as_millis()
+        ));
     }
     Ok(first)
 }
@@ -349,6 +397,7 @@ fn union_or_intersect(
 /// `Union.union(String s, String unionAutomata, String unionName)` (`Union.java:22-41`).
 pub fn union_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     union_automata: &str,
     union_name: &str,
@@ -363,7 +412,7 @@ pub fn union_command(
     let first =
         read_from_automata_library(session, &first_name).map_err(AutomatonOpsError::Read)?;
 
-    let mut c = union_or_intersect(session, first, &names, UnionOrIntersect::Union)?;
+    let mut c = union_or_intersect(session, logging, first, &names, UnionOrIntersect::Union)?;
 
     write_automata(
         session,
@@ -380,6 +429,7 @@ pub fn union_command(
 /// (`Intersect.java:21-40`).
 pub fn intersect_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     intersect_automata: &str,
     intersect_name: &str,
@@ -394,7 +444,7 @@ pub fn intersect_command(
     let first =
         read_from_automata_library(session, &first_name).map_err(AutomatonOpsError::Read)?;
 
-    let mut c = union_or_intersect(session, first, &names, UnionOrIntersect::Intersect)?;
+    let mut c = union_or_intersect(session, logging, first, &names, UnionOrIntersect::Intersect)?;
 
     write_automata(
         session,
@@ -418,6 +468,16 @@ fn concat_pair(
     other: &Automaton,
     logging: &mut Logging,
 ) -> Result<Automaton, AutomatonOpsError> {
+    // `long timeBefore = System.currentTimeMillis();` (`:60`) and `Logging.logMessage(
+    // "concat: " + automaton.fa.getQ() + " state automaton with " + other.fa.getQ() +
+    // " state automaton");` (`:61`) -- both BEFORE the number-system guard, so a
+    // mismatched pair still logs this opening line before erroring out.
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "concat: {} state automaton with {} state automaton",
+        automaton.fa.q, other.fa.q
+    ));
+
     // `NumberSystem.isNSDiffering(other.getNS(), automaton.getNS(),
     // automaton.richAlphabet.getA(), other.richAlphabet.getA())` (`:64`) -- note Java's
     // own argument order pairs `other`'s NS names with `automaton`'s alphabet; harmless,
@@ -437,8 +497,20 @@ fn concat_pair(
     Fa::concat_states(&other.fa, &mut n.fa, original_q);
 
     n.normalize_number_systems(logging);
-    n.determinize_and_minimize();
+    // `N.determinizeAndMinimize();` (`:75`) -- the caller's real `Logging`, so its own
+    // `indent()`-bracketed `Trimmed to:`/`Minimizing:`/`Minimized:` lines actually reach
+    // the session's detail log (they were being thrown away in a `Logging::new()` the
+    // plain, non-`_with_ctx` method constructs internally).
+    n.determinize_and_minimize_with_ctx(None, logging);
     n.apply_all_representations(logging);
+
+    // `Logging.logMessage("concat complete: " + N.fa.getQ() + " states - " + (timeAfter -
+    // timeBefore) + "ms");` (`:80`).
+    logging.log_message(&format!(
+        "concat complete: {} states - {}ms",
+        n.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     Ok(n)
 }
 
@@ -463,8 +535,18 @@ pub fn concat_command(
         read_from_automata_library(session, &first_name).map_err(AutomatonOpsError::Read)?;
 
     for name in iter {
+        // `long timeBefore = System.currentTimeMillis();` (`:48`), before the read.
+        let time_before = std::time::Instant::now();
         let n = read_from_automata_library(session, &name).map_err(AutomatonOpsError::Read)?;
         c = concat_pair(c, &n, logging)?;
+
+        // `Logging.logMessage("concatenated =>:" + first.fa.getQ() + " states - " +
+        // (timeAfter - timeBefore) + "ms");` (`:54`), once per fold iteration.
+        logging.log_message(&format!(
+            "concatenated =>:{} states - {}ms",
+            c.fa.q,
+            time_before.elapsed().as_millis()
+        ));
     }
 
     write_automata(
@@ -484,12 +566,27 @@ pub fn concat_command(
 
 /// `Star.star(Automaton automaton)` (`Star.java:21-36`).
 fn star(automaton: &Automaton, logging: &mut Logging) -> Automaton {
+    // `long timeBefore = System.currentTimeMillis();` (`:22`) and
+    // `Logging.logMessage("star: " + automaton.fa.getQ() + " state automaton");` (`:23`).
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!("star: {} state automaton", automaton.fa.q));
+
     let mut n = automaton.clone();
     Fa::star_states(&automaton.fa, &mut n.fa);
     n.normalize_number_systems(logging);
     n.force_canonize();
-    n.determinize_and_minimize();
+    // `N.determinizeAndMinimize();` (`:30`) -- see [`concat_pair`]'s matching note for
+    // why this is the `_with_ctx` form with the caller's real `Logging`.
+    n.determinize_and_minimize_with_ctx(None, logging);
     n.apply_all_representations(logging);
+
+    // `Logging.logMessage("star complete: " + N.fa.getQ() + " states - " + (timeAfter -
+    // timeBefore) + "ms");` (`:33`).
+    logging.log_message(&format!(
+        "star complete: {} states - {}ms",
+        n.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     n
 }
 
@@ -598,7 +695,8 @@ mod tests {
     #[test]
     fn combine_rejects_an_empty_automata_list() {
         let (session, dir) = temp_session("combine-empty");
-        let err = combine_command(&session, "combine c;", "", "c").unwrap_err();
+        let err =
+            combine_command(&session, &mut Logging::new(), "combine c;", "", "c").unwrap_err();
         assert!(matches!(err, AutomatonOpsError::Walnut(_)));
         assert_eq!(
             err.to_string(),
@@ -612,7 +710,14 @@ mod tests {
         let (session, dir) = temp_session("combine-single");
         write_library_automaton(&dir, "A", contains_one());
 
-        let tc = combine_command(&session, "combine c A=7;", " A=7 ", "c").unwrap();
+        let tc = combine_command(
+            &session,
+            &mut Logging::new(),
+            "combine c A=7;",
+            " A=7 ",
+            "c",
+        )
+        .unwrap();
         let a = tc.automaton_pairs()[0].automaton().unwrap();
         // Every state that used to be accepting (output 1) now outputs 7; the whole
         // thing must still accept exactly the same LANGUAGE (a word containing a 1).
@@ -639,7 +744,8 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_zero);
         write_library_automaton(&dir, "B", accepts_one);
 
-        let tc = union_command(&session, "union c A B;", " A B ", "c").unwrap();
+        let tc =
+            union_command(&session, &mut Logging::new(), "union c A B;", " A B ", "c").unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[0]));
         assert!(c.fa.accepts_word(&[1]));
@@ -655,7 +761,14 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_one_a);
         write_library_automaton(&dir, "B", accepts_one_b);
 
-        let tc = intersect_command(&session, "intersect c A B;", " A B ", "c").unwrap();
+        let tc = intersect_command(
+            &session,
+            &mut Logging::new(),
+            "intersect c A B;",
+            " A B ",
+            "c",
+        )
+        .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(c.fa.accepts_word(&[1]));
         assert!(!c.fa.accepts_word(&[0]));
@@ -752,7 +865,8 @@ mod tests {
         write_library_automaton(&dir, "A", msd_a);
         write_library_automaton(&dir, "B", lsd_b);
 
-        let err = union_command(&session, "union c A B;", " A B ", "c").unwrap_err();
+        let err =
+            union_command(&session, &mut Logging::new(), "union c A B;", " A B ", "c").unwrap_err();
         assert_eq!(
             err.to_string(),
             "Automata must have the same number system(s)."
@@ -789,7 +903,14 @@ mod tests {
         fs::write(lib.join("FIB.txt"), "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
         fs::write(lib.join("TWO.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
 
-        let err = union_command(&session, "union c FIB TWO;", " FIB TWO ", "c").unwrap_err();
+        let err = union_command(
+            &session,
+            &mut Logging::new(),
+            "union c FIB TWO;",
+            " FIB TWO ",
+            "c",
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "Automata must have the same number system(s)."
@@ -802,7 +923,14 @@ mod tests {
         // ...and the same-base pairing still goes through, so the guard is not merely
         // rejecting everything.
         fs::write(lib.join("TWO2.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
-        union_command(&session, "union d TWO TWO2;", " TWO TWO2 ", "d").unwrap();
+        union_command(
+            &session,
+            &mut Logging::new(),
+            "union d TWO TWO2;",
+            " TWO TWO2 ",
+            "d",
+        )
+        .unwrap();
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -816,8 +944,14 @@ mod tests {
         fs::write(lib.join("FIB.txt"), "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
         fs::write(lib.join("TWO.txt"), "msd_2\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
 
-        let err =
-            intersect_command(&session, "intersect c FIB TWO;", " FIB TWO ", "c").unwrap_err();
+        let err = intersect_command(
+            &session,
+            &mut Logging::new(),
+            "intersect c FIB TWO;",
+            " FIB TWO ",
+            "c",
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "Automata must have the same number system(s)."
@@ -850,8 +984,14 @@ mod tests {
         let (session, dir) = temp_session("combine-overflow");
         write_library_automaton(&dir, "A", contains_one());
 
-        let err = combine_command(&session, "combine c A=99999999999;", " A=99999999999 ", "c")
-            .unwrap_err();
+        let err = combine_command(
+            &session,
+            &mut Logging::new(),
+            "combine c A=99999999999;",
+            " A=99999999999 ",
+            "c",
+        )
+        .unwrap_err();
         assert!(matches!(err, AutomatonOpsError::NumberFormat(_)));
         assert_eq!(err.to_string(), "For input string: \"99999999999\"");
         assert!(
@@ -885,7 +1025,14 @@ mod tests {
         );
         write_library_automaton(&dir, "P2", two_track);
 
-        let err = combine_command(&session, "combine c A P2;", " A P2 ", "c").unwrap_err();
+        let err = combine_command(
+            &session,
+            &mut Logging::new(),
+            "combine c A P2;",
+            " A P2 ",
+            "c",
+        )
+        .unwrap_err();
         assert!(matches!(err, AutomatonOpsError::Walnut(_)));
         assert!(
             err.to_string().contains("crossProduct"),

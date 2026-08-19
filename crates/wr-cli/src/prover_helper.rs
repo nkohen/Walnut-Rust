@@ -27,7 +27,8 @@ use std::io::{self, Write};
 
 use wr_core::automaton::Automaton;
 use wr_core::infinite::{infinite, InfiniteError};
-use wr_core::logicalops::{remove_leading_zeros, RemoveLeadingZerosError};
+use wr_core::logging::Logging;
+use wr_core::logicalops::{remove_leading_zeros_with_ctx, RemoveLeadingZerosError};
 use wr_io::writer::{export_automaton_to_ba, write_automaton_gv, BaWriteError};
 
 use wr_logic::predicate_env::PredicateEnvError;
@@ -198,13 +199,26 @@ pub fn clear_screen_to(stdout: &mut dyn Write) {
 /// `Automaton.readAutomatonFromFile`, which appends `.txt` and resolves it against the
 /// Automata Library (`Automaton.java:148-150`), and then re-uses the same string as the
 /// automaton's display name in the printed line.
-pub fn inf_from_address(session: &Session, address: &str) -> Result<bool, ProverHelperError> {
-    inf_from_address_to(session, address, &mut io::stdout())
+pub fn inf_from_address(
+    session: &Session,
+    logging: &mut Logging,
+    address: &str,
+) -> Result<bool, ProverHelperError> {
+    inf_from_address_to(session, logging, address, &mut io::stdout())
 }
 
 /// As [`inf_from_address`], with an injectable sink.
+///
+/// `logging` is the caller's real, already-`configure_for_command`-d [`Logging`]
+/// (`Prover`'s `self.logging`), not a throwaway one:
+/// `AutomatonLogicalOps.removeLeadingZeros` logs its own `removing leading zeros for:`/
+/// `removed:` pair through Java's global static `Logging`, and `Prover.parseSetup`'s
+/// `Logging.configureForCommand` is universal rather than `eval`/`def`-specific, so
+/// `inf A;::` really does print those two lines in real Walnut -- confirmed live against
+/// `target/Walnut-all.jar`.
 pub fn inf_from_address_to(
     session: &Session,
+    logging: &mut Logging,
     address: &str,
     stdout: &mut dyn Write,
 ) -> Result<bool, ProverHelperError> {
@@ -218,7 +232,7 @@ pub fn inf_from_address_to(
     // accepted values" (`:50-52`).
     m.random_label();
     let labels = m.label.clone();
-    let m = remove_leading_zeros(&m, &labels)?;
+    let m = remove_leading_zeros_with_ctx(&m, &labels, None, logging)?;
     inf_from_automaton_to(address, &m, stdout)
 }
 
@@ -419,14 +433,15 @@ mod tests {
             .unwrap();
 
         let mut out: Vec<u8> = Vec::new();
-        assert!(inf_from_address_to(&session, "lt", &mut out).unwrap());
+        assert!(inf_from_address_to(&session, &mut Logging::new(), "lt", &mut out).unwrap());
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn inf_from_address_reports_a_missing_file() {
         let (session, dir) = temp_session("infmissing");
-        let err = inf_from_address_to(&session, "nope", &mut io::sink()).unwrap_err();
+        let err = inf_from_address_to(&session, &mut Logging::new(), "nope", &mut io::sink())
+            .unwrap_err();
         assert!(err.to_string().starts_with("File does not exist: "));
         fs::remove_dir_all(&dir).ok();
     }

@@ -78,7 +78,8 @@
 use std::io::{self, Write};
 
 use wr_core::automaton::{Automaton, AutomatonDFA};
-use wr_core::logicalops::{remove_leading_zeros, RemoveLeadingZerosError};
+use wr_core::logging::Logging;
+use wr_core::logicalops::{remove_leading_zeros_with_ctx, RemoveLeadingZerosError};
 use wr_core::search::shortest_witness_word_int;
 use wr_logic::predicate_env::PredicateEnvError;
 
@@ -167,14 +168,20 @@ impl From<io::Error> for TestError {
 /// [`test_command_to`] with the `Prover`'s own sink, and so should any future caller;
 /// this form exists only to keep `Test.testCommand`'s zero-argument-sink signature
 /// traceable.
-pub fn test_command(session: &Session, test_name: &str, needed: i32) -> Result<bool, TestError> {
-    test_command_to(session, test_name, needed, &mut io::stdout())
+pub fn test_command(
+    session: &Session,
+    logging: &mut Logging,
+    test_name: &str,
+    needed: i32,
+) -> Result<bool, TestError> {
+    test_command_to(session, logging, test_name, needed, &mut io::stdout())
 }
 
 /// As [`test_command`], with an injectable sink for the console output — the same seam
 /// `crate::prover_helper`'s `_to` functions use.
 pub fn test_command_to(
     session: &Session,
+    logging: &mut Logging,
     test_name: &str,
     needed: i32,
     stdout: &mut dyn Write,
@@ -190,7 +197,7 @@ pub fn test_command_to(
     // nothing but the track labels.
     let mut m = AutomatonDFA::from(automaton).into_automaton();
 
-    let accepted = find_accepted(&mut m, needed)?;
+    let accepted = find_accepted(&mut m, logging, needed)?;
 
     // `if (accepted.size() < needed) { System.out.println(...); }` (`:25-27`).
     if (accepted.len() as i64) < needed as i64 {
@@ -222,7 +229,11 @@ pub const MAX_NEEDED: i32 = 1_000_000;
 /// diverge from that, so the labelling is applied in place here too. (Java's own only
 /// production caller, `testCommand`, uses a local variable and cannot observe it; a
 /// direct Rust caller can, exactly as a direct Java caller can.)
-pub fn find_accepted(a: &mut Automaton, needed: i32) -> Result<Vec<String>, TestError> {
+pub fn find_accepted(
+    a: &mut Automaton,
+    logging: &mut Logging,
+    needed: i32,
+) -> Result<Vec<String>, TestError> {
     if needed <= 0 {
         return Ok(Vec::new());
     }
@@ -251,7 +262,7 @@ pub fn find_accepted(a: &mut Automaton, needed: i32) -> Result<Vec<String>, Test
     {
         return Err(TestError::NonDeterministicO);
     }
-    let m = remove_leading_zeros(a, &labels)?;
+    let m = remove_leading_zeros_with_ctx(a, &labels, None, logging)?;
 
     let mut accepted = Vec::with_capacity(needed);
     let mut previous: Option<Vec<i32>> = None;
@@ -421,7 +432,7 @@ mod tests {
     #[test]
     fn find_accepted_throws_on_unmaterialized_true_automaton() {
         let mut a = Automaton::true_false(true);
-        let err = find_accepted(&mut a, 3).unwrap_err();
+        let err = find_accepted(&mut a, &mut Logging::new(), 3).unwrap_err();
         assert!(matches!(err, TestError::UnmaterializedTrueAutomaton));
         assert_eq!(
             err.to_string(),
@@ -432,7 +443,10 @@ mod tests {
     #[test]
     fn find_accepted_empty_on_false_automaton() {
         let mut a = Automaton::true_false(false);
-        assert_eq!(find_accepted(&mut a, 3).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 3).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -440,8 +454,14 @@ mod tests {
         // `needed <= 0` short-circuits before the TRUE automaton's TRUE_FALSE check would
         // ever run -- so this must NOT error, unlike `find_accepted(&true_automaton, 3)`.
         let mut a = Automaton::true_false(true);
-        assert_eq!(find_accepted(&mut a, 0).unwrap(), Vec::<String>::new());
-        assert_eq!(find_accepted(&mut a, -5).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 0).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), -5).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     // --- the two port-specific guards: the `pub`-API panic screen and the resource cap ---
@@ -467,7 +487,7 @@ mod tests {
         };
         let mut a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
         assert!(a.is_fao() && !a.fa.is_deterministic(), "sanity");
-        let err = find_accepted(&mut a, 1).unwrap_err();
+        let err = find_accepted(&mut a, &mut Logging::new(), 1).unwrap_err();
         assert!(matches!(err, TestError::NonDeterministicO));
         assert_eq!(err.to_string(), "NFAOs are not supported..");
     }
@@ -477,7 +497,7 @@ mod tests {
         // `Vec::with_capacity(i32::MAX as usize)` is a ~51GB allocation, which Rust
         // ABORTS (unlike Java's catchable OutOfMemoryError). See `MAX_NEEDED`.
         let mut a = accept_everything_automaton();
-        let err = find_accepted(&mut a, i32::MAX).unwrap_err();
+        let err = find_accepted(&mut a, &mut Logging::new(), i32::MAX).unwrap_err();
         assert!(matches!(
             err,
             TestError::NeededTooLarge { needed: i32::MAX }
@@ -485,7 +505,7 @@ mod tests {
         assert!(err.to_string().contains("1000000"), "{err}");
         // The boundary itself is accepted (it just runs, so only check it isn't rejected).
         assert!(matches!(
-            find_accepted(&mut a, MAX_NEEDED + 1),
+            find_accepted(&mut a, &mut Logging::new(), MAX_NEEDED + 1),
             Err(TestError::NeededTooLarge { .. })
         ));
     }
@@ -516,14 +536,23 @@ mod tests {
     #[test]
     fn find_accepted_stops_when_the_language_is_exhausted_rather_than_looping() {
         let mut a = finite_two_word_automaton();
-        assert_eq!(find_accepted(&mut a, 5).unwrap(), vec!["0", "1"]);
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 5).unwrap(),
+            vec!["0", "1"]
+        );
     }
 
     #[test]
     fn find_accepted_returns_exactly_what_is_asked_for_when_enough_exists() {
         let mut a = finite_two_word_automaton();
-        assert_eq!(find_accepted(&mut a, 1).unwrap(), vec!["0"]);
-        assert_eq!(find_accepted(&mut a, 2).unwrap(), vec!["0", "1"]);
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 1).unwrap(),
+            vec!["0"]
+        );
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 2).unwrap(),
+            vec!["0", "1"]
+        );
     }
 
     #[test]
@@ -532,7 +561,7 @@ mod tests {
         // `removeLeadingZeros` rebinding is local. Pin that this port does the same.
         let mut a = finite_two_word_automaton();
         a.label = Vec::new();
-        find_accepted(&mut a, 1).unwrap();
+        find_accepted(&mut a, &mut Logging::new(), 1).unwrap();
         assert_eq!(a.label, vec!["0".to_string()]);
     }
 
@@ -556,7 +585,10 @@ mod tests {
             true_false: None,
         };
         let mut a = Automaton::new(fa, vec![vec![0]], vec!["x".to_string()], vec![None]);
-        assert_eq!(find_accepted(&mut a, 3).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 3).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     /// A single-track, explicit-alphabet (`msd: None`, not an arithmetic `msd_2` track)
@@ -591,7 +623,10 @@ mod tests {
         let mut a = accept_everything_automaton();
         let expected: Vec<&str> =
             vec!["0", "1", "00", "01", "10", "11", "000", "001", "010", "011"];
-        assert_eq!(find_accepted(&mut a, 10).unwrap(), expected);
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 10).unwrap(),
+            expected
+        );
     }
 
     // --- the `removeLeadingZeros` pre-pass (`Test.java:43`), the one part of
@@ -610,7 +645,10 @@ mod tests {
         let mut a = accept_everything_automaton();
         a.msd = vec![Some(true)];
         let expected: Vec<&str> = vec!["1", "10", "11", "100", "101", "110", "111", "1000"];
-        assert_eq!(find_accepted(&mut a, 8).unwrap(), expected);
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 8).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -628,9 +666,18 @@ mod tests {
         let read = || {
             AutomatonDFA::from(wr_io::reader::read_automaton_txt(&path).unwrap()).into_automaton()
         };
-        assert_eq!(find_accepted(&mut read(), 0).unwrap(), Vec::<String>::new());
-        assert_eq!(find_accepted(&mut read(), 1).unwrap(), vec!["101"]);
-        assert_eq!(find_accepted(&mut read(), 2).unwrap(), vec!["101", "1010"]);
+        assert_eq!(
+            find_accepted(&mut read(), &mut Logging::new(), 0).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            find_accepted(&mut read(), &mut Logging::new(), 1).unwrap(),
+            vec!["101"]
+        );
+        assert_eq!(
+            find_accepted(&mut read(), &mut Logging::new(), 2).unwrap(),
+            vec!["101", "1010"]
+        );
     }
 
     // --- find_accepted: multi-track (bracket-preserving) formatting, mirrors
@@ -658,7 +705,7 @@ mod tests {
             vec!["x".to_string(), "y".to_string()],
             vec![None, None],
         );
-        let accepted = find_accepted(&mut a, 2).unwrap();
+        let accepted = find_accepted(&mut a, &mut Logging::new(), 2).unwrap();
         assert_eq!(accepted.len(), 2);
         for s in &accepted {
             assert!(s.starts_with('[') && s.ends_with(']'), "{s}");
@@ -669,7 +716,7 @@ mod tests {
         // `walnut-java` output for this automaton.
         assert_eq!(accepted, vec!["[0, 0]", "[1, 0]"]);
         assert_eq!(
-            find_accepted(&mut a, 4).unwrap(),
+            find_accepted(&mut a, &mut Logging::new(), 4).unwrap(),
             vec!["[0, 0]", "[1, 0]", "[0, 1]", "[1, 1]"]
         );
     }
@@ -694,7 +741,10 @@ mod tests {
             true_false: None,
         };
         let mut a = Automaton::new(fa, vec![vec![-1, 0, 10]], vec!["x".to_string()], vec![None]);
-        assert_eq!(find_accepted(&mut a, 3).unwrap(), vec!["[-1]", "0", "[10]"]);
+        assert_eq!(
+            find_accepted(&mut a, &mut Logging::new(), 3).unwrap(),
+            vec!["[-1]", "0", "[10]"]
+        );
     }
 
     // --- test_command_to: end to end through Session, mirrors
@@ -710,7 +760,8 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        let ok = test_command_to(&session, "finiteTwoWord", 5, &mut out).unwrap();
+        let ok =
+            test_command_to(&session, &mut Logging::new(), "finiteTwoWord", 5, &mut out).unwrap();
         assert!(!ok, "only 2 inputs exist; asking for 5 must report false");
         let printed = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -719,7 +770,8 @@ mod tests {
         );
 
         let mut out2 = Vec::new();
-        let ok2 = test_command_to(&session, "finiteTwoWord", 1, &mut out2).unwrap();
+        let ok2 =
+            test_command_to(&session, &mut Logging::new(), "finiteTwoWord", 1, &mut out2).unwrap();
         assert!(ok2, "asking for no more than what's accepted returns true");
         let printed2 = String::from_utf8(out2).unwrap();
         assert_eq!(printed2, "0\n", "no shortfall message when needed is met");

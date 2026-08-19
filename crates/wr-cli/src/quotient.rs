@@ -6,6 +6,7 @@
 //! [`wr_core::logicalops::right_quotient`]/[`wr_core::logicalops::left_quotient`].
 
 use wr_core::automaton::Automaton;
+use wr_core::logging::Logging;
 use wr_core::logicalops::{left_quotient, right_quotient};
 use wr_logic::predicate_env::PredicateEnvError;
 
@@ -106,20 +107,25 @@ fn read_pair(
 /// `right_quotient`'s third parameter (`skip_subset_check`) is hardcoded `false` here,
 /// matching Java's own `AutomatonLogicalOps.rightQuotient(M1, M2, false)` call — the real,
 /// non-`skip` subset-alphabet guard runs.
+///
+/// `logging` is the caller's real, already-`configure_for_command`-d
+/// [`Logging`] (`Prover`'s `self.logging`) — `rightquo`/`leftquo` are not `eval`/`def`
+/// commands, but real Walnut's `::`-suffix support is universal (`Prover.parseSetup`'s
+/// `Logging.configureForCommand` runs for every command, not just `eval`/`def`), so a
+/// throwaway `Logging::new()` here used to silently discard `rightquo x A B;::`'s detail
+/// text.
 pub fn right_quotient_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name1: &str,
     old_name2: &str,
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    // Not an `eval`/`def` command (see `combine_command`'s matching note in
-    // `automaton_ops.rs`) -- a throwaway logger.
-    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
-        right_quotient(&m1, &m2, false, &mut wr_core::logging::Logging::new())
-    })
-    .map_err(QuotientError::from_panic)?;
+    let mut c =
+        crate::walnut_exception::catch_walnut_panic(|| right_quotient(&m1, &m2, false, logging))
+            .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,
@@ -132,21 +138,18 @@ pub fn right_quotient_command(
 }
 
 /// `Quotient.leftQuotient(String s, String oldName1, String oldName2, String newName)`
-/// (`Quotient.java:17-23`).
+/// (`Quotient.java:17-23`). `logging` — see [`right_quotient_command`]'s matching note.
 pub fn left_quotient_command(
     session: &Session,
+    logging: &mut Logging,
     s: &str,
     old_name1: &str,
     old_name2: &str,
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    // Not an `eval`/`def` command (see `combine_command`'s matching note in
-    // `automaton_ops.rs`) -- a throwaway logger.
-    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
-        left_quotient(&m1, &m2, &mut wr_core::logging::Logging::new())
-    })
-    .map_err(QuotientError::from_panic)?;
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| left_quotient(&m1, &m2, logging))
+        .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,
@@ -238,7 +241,15 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_zero_one());
         write_library_automaton(&dir, "B", single_symbol_automaton(1));
 
-        let tc = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap();
+        let tc = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(
             c.fa.accepts_word(&[0]),
@@ -258,7 +269,15 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_zero_one());
         write_library_automaton(&dir, "B", single_symbol_automaton(0));
 
-        let tc = left_quotient_command(&session, "leftquo c A B;", "A", "B", "c").unwrap();
+        let tc = left_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "leftquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap();
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         assert!(
             c.fa.accepts_word(&[1]),
@@ -300,7 +319,15 @@ mod tests {
         write_library_automaton(&dir, "A", single_symbol_automaton(1));
         write_library_automaton(&dir, "B", wider_alphabet_automaton());
 
-        let err = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap_err();
+        let err = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap_err();
         assert!(matches!(err, QuotientError::Walnut(_)));
         assert_eq!(err.to_string(), RIGHT_QUOTIENT_SUBSET_MESSAGE);
         assert!(
@@ -322,7 +349,15 @@ mod tests {
         write_library_automaton(&dir, "A", single_symbol_automaton(1));
         write_library_automaton(&dir, "B", wider_alphabet_automaton());
 
-        let err = left_quotient_command(&session, "leftquo c A B;", "A", "B", "c").unwrap_err();
+        let err = left_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "leftquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap_err();
         assert!(
             matches!(err, QuotientError::Walnut(_) | QuotientError::Runtime(_)),
             "must be a recovered error, not a process-killing panic; got {err:?}"
@@ -340,7 +375,15 @@ mod tests {
         write_library_automaton(&dir, "A", accepts_zero_one());
         write_library_automaton(&dir, "B", single_symbol_automaton(1));
 
-        let right = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap();
+        let right = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap();
         let c = right.automaton_pairs()[0].automaton().unwrap();
         assert!(
             c.fa.accepts_word(&[0]),
@@ -349,7 +392,15 @@ mod tests {
 
         // Swapping the operands is a genuinely different question ("strip '01' off the
         // right of '1'"), whose answer is the empty language -- so it does NOT accept "0".
-        let swapped = right_quotient_command(&session, "rightquo d B A;", "B", "A", "d").unwrap();
+        let swapped = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo d B A;",
+            "B",
+            "A",
+            "d",
+        )
+        .unwrap();
         let d = swapped.automaton_pairs()[0].automaton().unwrap();
         assert!(
             !d.fa.accepts_word(&[0]),
@@ -362,7 +413,15 @@ mod tests {
     fn right_quotient_propagates_a_missing_file_read_error() {
         let (session, dir) = temp_session("missing");
         write_library_automaton(&dir, "A", accepts_zero_one());
-        let err = right_quotient_command(&session, "rightquo c A B;", "A", "B", "c").unwrap_err();
+        let err = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo c A B;",
+            "A",
+            "B",
+            "c",
+        )
+        .unwrap_err();
         assert!(matches!(err, QuotientError::Read(_)));
         fs::remove_dir_all(&dir).ok();
     }

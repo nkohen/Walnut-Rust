@@ -1188,7 +1188,13 @@ impl Prover {
                 let caps = match_or_fail(&patterns().combine, s, COMBINE)?;
                 let automata = group(&caps, s, GROUP_COMBINE_AUTOMATA).unwrap_or("");
                 let name = group(&caps, s, GROUP_COMBINE_NAME).unwrap_or("");
-                Ok(Some(combine_command(&self.session, s, automata, name)?))
+                Ok(Some(combine_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    automata,
+                    name,
+                )?))
             }
             // `:489-491` -> `Concat.concat`
             CONCAT => {
@@ -1233,6 +1239,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_FIXLEADZERO_NEW_NAME).unwrap_or("");
                 Ok(Some(fix_lead_zero_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     old_name,
                     new_name,
@@ -1245,6 +1252,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_FIXTRAILZERO_NEW_NAME).unwrap_or("");
                 Ok(Some(fix_trail_zero_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     old_name,
                     new_name,
@@ -1271,7 +1279,13 @@ impl Prover {
                 let caps = match_or_fail(&patterns().intersect, s, INTERSECT)?;
                 let automata = group(&caps, s, GROUP_INTERSECT_AUTOMATA).unwrap_or("");
                 let name = group(&caps, s, GROUP_INTERSECT_NAME).unwrap_or("");
-                Ok(Some(intersect_command(&self.session, s, automata, name)?))
+                Ok(Some(intersect_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    automata,
+                    name,
+                )?))
             }
             // `:523-525` -> `Join.joinCommand`
             JOIN => Ok(Some(self.join_command(s)?)),
@@ -1283,6 +1297,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_QUO_NEW_NAME).unwrap_or("");
                 Ok(Some(left_quotient_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     old_name1,
                     old_name2,
@@ -1312,6 +1327,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_MINIMIZE_NEW_NAME).unwrap_or("");
                 Ok(Some(minimize_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     old_name,
                     new_name,
@@ -1348,6 +1364,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_REVERSE_NEW_NAME).unwrap_or("");
                 Ok(Some(reverse_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     &in_file_name,
                     is_dfao,
@@ -1362,6 +1379,7 @@ impl Prover {
                 let new_name = group(&caps, s, GROUP_QUO_NEW_NAME).unwrap_or("");
                 Ok(Some(right_quotient_command(
                     &self.session,
+                    &mut self.logging,
                     s,
                     old_name1,
                     old_name2,
@@ -1410,7 +1428,13 @@ impl Prover {
                 let needed: i32 = needed_str
                     .parse()
                     .map_err(|_| ProverError::NumberFormat(needed_str.to_string()))?;
-                test_command_to(&self.session, test_name, needed, &mut self.out)?;
+                test_command_to(
+                    &self.session,
+                    &mut self.logging,
+                    test_name,
+                    needed,
+                    &mut self.out,
+                )?;
                 Ok(None)
             }
             // `:568-570` -> `Transducer.transduceNonDeterministic`
@@ -1420,7 +1444,13 @@ impl Prover {
                 let caps = match_or_fail(&patterns().union, s, UNION)?;
                 let automata = group(&caps, s, GROUP_UNION_AUTOMATA).unwrap_or("");
                 let name = group(&caps, s, GROUP_UNION_NAME).unwrap_or("");
-                Ok(Some(union_command(&self.session, s, automata, name)?))
+                Ok(Some(union_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    automata,
+                    name,
+                )?))
             }
             // `:574` -- unreachable from `dispatch` (the name was already checked against
             // `RE_FOR_THE_LIST_OF_CMDS`), but ported verbatim.
@@ -1519,7 +1549,13 @@ impl Prover {
             .to_string();
         let regexp = group(&caps, s, R_REGEXP).unwrap_or("").to_string();
         let name = group(&caps, s, R_NAME).unwrap_or("").to_string();
-        Ok(reg(&self.session, &list_of_alphabets, &regexp, &name)?)
+        Ok(reg(
+            &self.session,
+            &mut self.logging,
+            &list_of_alphabets,
+            &regexp,
+            &name,
+        )?)
     }
 
     /// `Prover.transduceCommand(String)` (`:693-704`).
@@ -1562,6 +1598,7 @@ impl Prover {
             .to_string();
         Ok(alphabet_command(
             &self.session,
+            &mut self.logging,
             s,
             list_of_alphabets.as_deref(),
             is_dfao,
@@ -1616,7 +1653,12 @@ impl Prover {
     fn inf_command(&mut self, s: &str) -> Result<bool, ProverError> {
         let caps = match_or_fail(&patterns().inf, s, INF)?;
         let name = group(&caps, s, GROUP_INF_NAME).unwrap_or("");
-        Ok(inf_from_address_to(&self.session, name, &mut self.out)?)
+        Ok(inf_from_address_to(
+            &self.session,
+            &mut self.logging,
+            name,
+            &mut self.out,
+        )?)
     }
 
     /// `Prover.joinCommand(String)` (`:677-680`) -> `Join.joinCommand`.
@@ -1644,6 +1686,7 @@ impl Prover {
         let old_name = group(&caps, s, GROUP_CONVERT_OLD_NAME).unwrap_or("");
         Ok(convert_command(
             &self.session,
+            &mut self.logging,
             s,
             new_dollar_sign,
             new_name,

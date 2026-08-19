@@ -90,6 +90,7 @@ impl From<std::io::Error> for ConvertError {
 #[allow(clippy::too_many_arguments)]
 pub fn convert_command(
     session: &Session,
+    logging: &mut wr_core::logging::Logging,
     s: &str,
     new_dollar_sign: &str,
     new_name: &str,
@@ -123,15 +124,12 @@ pub fn convert_command(
 
     // `AutomatonLogicalOps.convertNS(M, m.group(GROUP_CONVERT_MSD_OR_LSD).equals(
     //  NumberSystem.MSD), Integer.parseInt(m.group(GROUP_CONVERT_BASE)));` (`:739-741`).
-    // `convert` is not an `eval`/`def` command (see `combine_command`'s matching note in
-    // `automaton_ops.rs`) -- a throwaway logger.
-    convert_ns(
-        &mut m,
-        msd_or_lsd == numsys::MSD,
-        base_value,
-        &mut wr_core::logging::Logging::new(),
-    )
-    .map_err(ConvertError::Convert)?;
+    // `convert` is not an `eval`/`def` command, but real Walnut's `::`-suffix support is
+    // universal (`Prover.parseSetup`'s `Logging.configureForCommand` runs for every
+    // command) -- `logging` is the caller's real, already-configured `Logging`, not a
+    // throwaway one.
+    convert_ns(&mut m, msd_or_lsd == numsys::MSD, base_value, logging)
+        .map_err(ConvertError::Convert)?;
 
     // `M.writeAutomata(s, ProverHelper.determineOutLibrary(newIsDFAO), m.group(
     //  GROUP_CONVERT_NEW_NAME), true);` (`:743`) -- the trailing `true` is a hardcoded
@@ -174,7 +172,18 @@ mod tests {
     fn convert_rejects_dfao_into_function() {
         let (session, dir) = temp_session("dfao-guard");
         // No automaton needs to actually exist -- the guard fires before any read.
-        let err = convert_command(&session, "", "$", "out", "msd", "4", "", "in").unwrap_err();
+        let err = convert_command(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "",
+            "$",
+            "out",
+            "msd",
+            "4",
+            "",
+            "in",
+        )
+        .unwrap_err();
         assert!(matches!(err, ConvertError::DfaoIntoFunction));
         assert_eq!(
             err.to_string(),
@@ -223,7 +232,18 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut a, dir.join("Automata Library").join("lt.txt"))
             .unwrap();
 
-        let tc = convert_command(&session, "", "$", "lt4", "msd", "4", "$", "lt").unwrap();
+        let tc = convert_command(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "",
+            "$",
+            "lt4",
+            "msd",
+            "4",
+            "$",
+            "lt",
+        )
+        .unwrap();
         let converted = tc.automaton_pairs()[0].automaton().unwrap();
         assert_eq!(converted.alphabet, vec![vec![0, 1, 2, 3]]);
         assert!(dir.join("Result").join("lt4.txt").is_file());
@@ -279,6 +299,7 @@ mod tests {
 
         let err = convert_command(
             &session,
+            &mut wr_core::logging::Logging::new(),
             "",
             "$",
             "out",

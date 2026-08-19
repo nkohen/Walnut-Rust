@@ -77,14 +77,21 @@ impl From<std::io::Error> for RegError {
 /// `Alphabet.alphabetCommand` (`crate::alphabet::alphabet_command`), `Reg.reg` performs
 /// no null/empty check before calling `determineAlphabetsAndNS` — ported faithfully,
 /// i.e. this function does not add one either.
+///
+/// `logging` is the caller's real, already-`configure_for_command`-d
+/// [`wr_core::logging::Logging`] — threaded through to
+/// [`determine_alphabets_and_ns`]'s own `PredicateEnv::number_system` call, which can
+/// itself construct-and-log a fresh custom base on first use.
 pub fn reg(
     session: &Session,
+    logging: &mut wr_core::logging::Logging,
     list_of_alphabets: &str,
     baseexp: &str,
     reg_name: &str,
 ) -> Result<TestCase, RegError> {
     // `Alphabet.determineAlphabetsAndNS(listOfAlphabets, NS, alphabets);` (`Reg.java:20`).
-    let (ns, alphabets) = determine_alphabets_and_ns(list_of_alphabets, session.predicate_env())?;
+    let (ns, alphabets) =
+        determine_alphabets_and_ns(list_of_alphabets, session.predicate_env(), logging)?;
 
     // `String regex = determineEncodedRegex(baseexp, M.richAlphabet);` (`Reg.java:29`) --
     // `M.richAlphabet.getA()` is exactly `alphabets` here (see this module's docs on why
@@ -162,7 +169,14 @@ mod tests {
     #[test]
     fn reg_over_a_literal_set_alphabet_builds_and_writes_the_automaton() {
         let (session, dir) = temp_session("literal-set");
-        let tc = reg(&session, "{0,1} ", "0*1", "r").unwrap();
+        let tc = reg(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "{0,1} ",
+            "0*1",
+            "r",
+        )
+        .unwrap();
 
         assert_eq!(tc.automaton_pairs().len(), 1);
         let a = tc.automaton_pairs()[0].automaton().unwrap();
@@ -179,7 +193,14 @@ mod tests {
     #[test]
     fn reg_over_a_named_number_system_installs_its_msd_direction() {
         let (session, dir) = temp_session("named-ns");
-        let tc = reg(&session, "lsd_3 ", "0*1", "r").unwrap();
+        let tc = reg(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "lsd_3 ",
+            "0*1",
+            "r",
+        )
+        .unwrap();
         let a = tc.automaton_pairs()[0].automaton().unwrap();
         assert_eq!(a.alphabet, vec![vec![0, 1, 2]]);
         assert_eq!(a.msd, vec![Some(false)]);
@@ -189,7 +210,14 @@ mod tests {
     #[test]
     fn reg_multi_track_matches_the_vector_regex_dialect() {
         let (session, dir) = temp_session("multi-track");
-        let tc = reg(&session, "{0,1} {0,1} ", "[0,0][1,1]*", "r").unwrap();
+        let tc = reg(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "{0,1} {0,1} ",
+            "[0,0][1,1]*",
+            "r",
+        )
+        .unwrap();
         let a = tc.automaton_pairs()[0].automaton().unwrap();
         assert_eq!(a.alphabet.len(), 2);
         fs::remove_dir_all(&dir).ok();
@@ -198,7 +226,14 @@ mod tests {
     #[test]
     fn reg_propagates_a_regex_parse_error() {
         let (session, dir) = temp_session("parse-error");
-        let err = reg(&session, "{0,1} ", "0|", "r").unwrap_err();
+        let err = reg(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "{0,1} ",
+            "0|",
+            "r",
+        )
+        .unwrap_err();
         assert!(matches!(err, RegError::Regex(_)));
         fs::remove_dir_all(&dir).ok();
     }
@@ -206,7 +241,14 @@ mod tests {
     #[test]
     fn reg_propagates_an_unresolvable_number_system() {
         let (session, dir) = temp_session("bad-ns");
-        let err = reg(&session, "msd_neg_2 ", "0*", "r").unwrap_err();
+        let err = reg(
+            &session,
+            &mut wr_core::logging::Logging::new(),
+            "msd_neg_2 ",
+            "0*",
+            "r",
+        )
+        .unwrap_err();
         assert!(matches!(err, RegError::Alphabet(_)));
         fs::remove_dir_all(&dir).ok();
     }
