@@ -625,3 +625,93 @@ a regression test pinning `subset_construction`'s exact output structure on an
 unsorted/duplicated destination list, added after adversarial review found the sort+dedup
 invariant had no clean-failure tripwire, only a hang). Full numbers, the checkpoint's profile
 breakdown, and the reproduction commands are in `benches/STATUS.md`'s new §U34.
+
+**U28 (retroactive numbering — the Phase 3b `per-act()` `Logging` gap `wr_logic::eval`'s own
+docs flagged since U27, but which never actually landed "before Phase 3b's U27" as that note
+claimed it must — closed now, 2026-08-17, after U29-U34) complete.** Plan at
+`~/.claude/plans/frosty-tumbling-nectarine.md` (outside this repo), adversarially reviewed
+before execution. Threaded `&mut Logging` into every `Token::act`/`Operator::act`/`Word::act`/
+`Function::act` body (`wr-logic`) and into every `wr-core`-level construction primitive they
+call (`product`/`determinize`/`minimize`/`quantify`/`logicalops`/`numsys`/`word_automaton`) —
+the actual per-`act()` COMPUTING/COMPUTED/quantifying/Minimizing/Determinizing detail Java logs
+that this port had only ever logged the top-level per-operator state-count summary for. Went
+through the full implementer → two-independent-adversarial-reviewer → fixer loop, several
+rounds, plus extensive live-jar verification (a throwaway `CaptureLog.java` driver, this
+project's `phase0-artifacts/CAPTURE.md` convention) rather than hand-deriving expected text.
+
+Two real findings along the way, both logged:
+- **WB-041** (new): `RelationalOperator.act`, `LogicalOperator.actQuantifier`, and
+  `Operator.andThenQuantifyIfArithmetic` all call `Logging.indent()` unconditionally but
+  `dedent()` only on success, leaking `+1` indent into whatever logs next after a failing
+  operation — a genuine Walnut (Java) log-text-only quirk (the decision procedure itself is
+  unaffected), invisible to any fixture since both engines' integration-test harnesses reset
+  indent per fixture. Ported verbatim (the same `?`-skips-`dedent()` shape at `wr-logic`'s
+  three matching call sites), not fixed.
+- **WB-039 widened**: the same `Logging.disablePrint()`/`enablePrint()` non-save/restore bug
+  U32 had already logged for its `[strategy …]`/`[export …]` index-instability consequence
+  turned out to have a second, independent consequence for LOG TEXT — `disablePrint`/
+  `enablePrint` gate whether `NumberSystem`-internal `and`/`quantify` construction logging is
+  visible at all (`Logging.logMessage`'s full `printEnabled && printDetails` gate, not just
+  console output — an earlier draft of this unit's own docs had this backwards and was
+  corrected after a live-jar capture proved it). `wr_core::numsys`'s query-time construction
+  methods (`comparison_const_b`, `arithmetic_const_a`/`b`/`c`, `constant`, `multiplication`,
+  `division`) now call `Logging::disable_print`/`enable_print` at Java's exact bracket
+  placements, which — because both are plain non-nesting field writes, matching Java's own
+  buggy `static boolean` — naturally reproduces the leak rather than requiring it to be
+  specially emulated.
+
+**Round 1's "6 of 9 closed, 3 unfixable" conclusion was itself wrong, and a second
+adversarial-review round (both live-jar-verified) is why it didn't ship that way.** After
+round 1 (375, 376, 377, 378, 628, 637 closed; 379/383/660 written off as one shared
+"warm-vs-cold `NumberSystem` cache" harness limitation), two fresh reviewers — different
+models from the author and from each other, given only the diff — independently found the
+same set of real, live-reproduced gaps this port's own "CLOSED" claim had missed:
+`wr_core::logicalops::reverse` and `remove_leading_zeros` were missing their own Java logging
+pairs and indent brackets entirely; the word⊗word arithmetic arm was missing an
+`indent`/`dedent` bracket; `quantify_helper`'s new `Trimmed to:` line could fire where Java's
+never would; and — the big one — `wr_core::product::cross_product` was simply missing Java's
+own `computing cross product:` line (a separate call site from `crossProductAndMinimize`'s
+own, which this port already had). One reviewer also caught that the "379 needs a warm cache"
+claim rested on a misread diff-context window, not the fixture's actual first line.
+
+Fixing the `cross_product` gap closed **660** outright — it was never a cache issue. Chasing
+the corrected 379 evidence found a real distinction: `PredicateEnv` has two number-system
+lookups with different caching contracts (`number_system`, memoized; `fresh_number_system`,
+Java's `Function` constructor calling `new NumberSystem(name)` directly, deliberately
+unmemoized). The FIRST fix built from that distinction — a throwaway `Logging` at
+`number_system`'s three call sites, keeping `fresh_number_system` real — closed 379 (and kept
+375-378 closed) by construction-time coincidence. Also added, from the same review round: a
+genuinely missing `Logging.disablePrint()`/`enablePrint()` bracket in `NumberSystem`'s own
+constructor; `right_quotient`/`left_quotient`'s own missing logging (currently latent —
+`wr-cli` still hasn't wired real `Logging` into non-`eval`/`def` commands, a separately-scoped
+follow-up); and a corrected `totalize` doc comment that had falsely claimed `reverse` was one
+of its callers.
+
+**That throwaway fix was then reverted, after a THIRD adversarial-review pass — verifying
+round 2's own fixes — found it was the wrong call, not a shortcut worth keeping.** The
+reviewers pointed out the throwaway made a genuinely fresh, single-query Walnut session (the
+normal case for a real user's very first `eval` in a new session, real or ported — equally
+cold either way) log LESS than real Walnut actually would, purely to make this harness's
+specific cold-start artifact match fixtures captured deep inside Java's own already-warm
+fixture-generation session. That is backwards from `CLAUDE.md`'s own Prime Directive —
+fidelity to real Walnut, not to one test harness's quirk. `number_system` now threads the
+caller's real `Logging` again (unconditionally, same as `fresh_number_system`), and **375-379
+join 383 as one honestly-documented, understood harness limitation** — a genuine
+warm-vs-cold `NumberSystem` session-cache mismatch between this harness (fresh `Prover` per
+fixture, always cold) and Java's own continuous, long-running fixture-generation session
+(warm by the time these particular fixtures ran). `wr_logic::predicate`'s
+`Predicate::tokenize_and_compute_post_order` docs, `wr_logic::eval`'s module docs, and
+`tests/golden/tests/golden_corpus.rs`'s `KNOWN_DIVERGENCES` entries for 375-379/383 have the
+full three-round account; `tests/golden/STATUS.md` §1b is the narrative version.
+
+**Golden corpus: 580/586 pass (99.0%)**, up from 577/586 — 0 timeouts, 0 not-run, both
+automaton AND text compared for all six remaining divergences (genuinely text-only, not a
+hidden automaton regression). **This is a smaller number than the 585/586 an intermediate
+round reported, and that is the correct, honest result, not a regression to explain away** —
+the extra five "passes" were bought by making production code quieter than real Walnut on a
+path real users can actually hit. A 5,000-query differential-gen spot check (fresh seed)
+against the real jar: 0 divergences. All three fuzz targets re-smoke-tested after every
+round's fixes (hundreds of thousands of executions, 0 crashes). `cargo test --workspace`
+green throughout; `fmt`/`clippy` clean (workspace and `fuzz/`'s own toolchain, both of which
+needed the same signature threading this unit did everywhere else it touched a
+determinization/logging call site).

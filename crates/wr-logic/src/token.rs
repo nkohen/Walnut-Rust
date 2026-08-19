@@ -925,9 +925,13 @@ impl Operator {
 /// including [`Expression::Word`], whose analogous cleanup its callers do inline instead
 /// (`and` with `word.M`, then `quantify` over `word.identifiersToQuantify`).
 ///
-/// `Logging.indent()`/`dedent()` around the body are not ported (see this section's
-/// header). Java's `quantify(M, a.identifier)` is the single-`String` overload
-/// (`AutomatonQuantification.java:16-19`), which is just `quantify(A, Set.of(label))`.
+/// `Logging.indent()`/`dedent()` (`Operator.java:151/156`) bracket the WHOLE body
+/// unconditionally — even the no-op (non-`Arithmetic`) case, which is why a failure
+/// inside `quantify` here leaks `+1` indent into the next command's log (the same
+/// indent-leak-on-failure quirk `RelationalOperator.act`/`actQuantifier` have; see
+/// `docs/WALNUT-BUGS.md`'s WB-041). Java's `quantify(M, a.identifier)` is the single-`String`
+/// overload (`AutomatonQuantification.java:16-19`), which is just `quantify(A,
+/// Set.of(label))`.
 ///
 /// `pub(crate)`, matching Java's package-private `static` — its only callers are the two
 /// `act()` bodies below, and U10's `LogicalOperator.act` does not use it either.
@@ -935,12 +939,21 @@ pub(crate) fn and_then_quantify_if_arithmetic(
     a: &Expression,
     m: Automaton,
     ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    logging: &mut wr_core::logging::Logging,
 ) -> Result<Automaton, ActError> {
+    logging.indent();
     if let Expression::Arithmetic(ae) = a {
-        let mut m = and(&m, &ae.m).into_automaton();
-        quantify_with_ctx(&mut m, &BTreeSet::from([ae.identifier.clone()]), ctx)?;
+        let mut m = and(&m, &ae.m, logging).into_automaton();
+        quantify_with_ctx(
+            &mut m,
+            &BTreeSet::from([ae.identifier.clone()]),
+            ctx,
+            logging,
+        )?;
+        logging.dedent();
         return Ok(m);
     }
+    logging.dedent();
     Ok(m)
 }
 
@@ -1111,8 +1124,9 @@ impl Operator {
         &self,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
-        self.act_with_ctx(fresh, stack, None)
+        self.act_with_ctx(fresh, stack, None, logging)
     }
 
     /// [`Operator::act`] with an explicit [`DeterminizeContext`] — see [`Token::act_with_ctx`].
@@ -1121,10 +1135,13 @@ impl Operator {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         match self.kind {
-            OperatorKind::Relational(opp) => return self.act_relational(opp, stack, ctx),
-            OperatorKind::Arithmetic(opp) => return self.act_arithmetic(opp, fresh, stack, ctx),
+            OperatorKind::Relational(opp) => return self.act_relational(opp, stack, ctx, logging),
+            OperatorKind::Arithmetic(opp) => {
+                return self.act_arithmetic(opp, fresh, stack, ctx, logging)
+            }
             OperatorKind::LeftParen | OperatorKind::RightParen => return Ok(()),
             _ => {}
         }
@@ -1134,7 +1151,7 @@ impl Operator {
 
         // `if (this.isNegation(op) || op.equals(Operator.REVERSE))` (`:65-68`).
         if matches!(self.kind, OperatorKind::Negate | OperatorKind::Reverse) {
-            return self.act_negation_or_reverse(stack, ctx);
+            return self.act_negation_or_reverse(stack, ctx, logging);
         }
         // `if (op.equals(EXISTS) || op.equals(FORALL) || op.equals(INFINITE))` (`:69-72`).
         if matches!(
@@ -1143,7 +1160,7 @@ impl Operator {
                 | OperatorKind::Forall { .. }
                 | OperatorKind::Infinite { .. }
         ) {
-            return self.act_quantifier(stack, ctx);
+            return self.act_quantifier(stack, ctx, logging);
         }
 
         let b = stack.pop().expect("validated arity above");
@@ -1170,21 +1187,31 @@ impl Operator {
             }
         };
 
+        // `Logging.logAndPrint(COMPUTING + " " + a + op + b)` (`:78`), THEN `indent()`
+        // (`:79`) -- only on this (both-`AutomatonExpression`) success path; the
+        // `invalidDualOperators` branch above logs nothing, since it already returned.
+        logging.log_and_print(&format!("computing {a_display}{op}{b_display}"));
+        logging.indent();
+
         // `String opString = "(" + a + op + b + ")";` (`:80`) — built BEFORE the operands
         // are consumed, and parenthesized, unlike `RelationalOperator`'s bare `a + op + b`.
         let op_string = format!("({a_display}{op}{b_display})");
         let m = match self.kind {
-            OperatorKind::And => and(&a.m, &b.m),
-            OperatorKind::Or => or(&mut a.m, &mut b.m),
-            OperatorKind::Xor => xor(&mut a.m, &mut b.m),
-            OperatorKind::Imply => imply(&mut a.m, &mut b.m),
-            OperatorKind::Iff => iff(&mut a.m, &mut b.m),
+            OperatorKind::And => and(&a.m, &b.m, logging),
+            OperatorKind::Or => or(&mut a.m, &mut b.m, logging),
+            OperatorKind::Xor => xor(&mut a.m, &mut b.m, logging),
+            OperatorKind::Imply => imply(&mut a.m, &mut b.m, logging),
+            OperatorKind::Iff => iff(&mut a.m, &mut b.m, logging),
             _ => unreachable!("`default -> throw` (`:91`): every other kind returned above"),
         };
         stack.push(Expression::Automaton(AutomatonExpression::new(
             op_string,
             m.into_automaton(),
         )));
+        // `Logging.dedent()` (`:95`), THEN `Logging.logAndPrint(COMPUTED + " " + a + op +
+        // b)` (`:96`) -- same bare (unparenthesized) text as the COMPUTING line.
+        logging.dedent();
+        logging.log_and_print(&format!("computed {a_display}{op}{b_display}"));
         Ok(())
     }
 
@@ -1212,6 +1239,7 @@ impl Operator {
         &self,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         let a = stack.pop().expect("validated arity above");
         let op = &self.op_text;
@@ -1226,6 +1254,10 @@ impl Operator {
         }
         // `op + a` (`:111`), read off `a`'s untouched `expressionInString`.
         let string_value = format!("{op}{a}");
+        // `Logging.logAndPrint(COMPUTING + " " + op + a)` (`:105`), THEN `indent()`
+        // (`:106`) -- only on this (AutomatonExpression) success path.
+        logging.log_and_print(&format!("computing {string_value}"));
+        logging.indent();
         let Expression::Automaton(ae) = a else {
             unreachable!("checked immediately above")
         };
@@ -1233,15 +1265,21 @@ impl Operator {
         match self.kind {
             // `AutomatonLogicalOps.reverse(a.M, true)` (`:107-108`) — mutates in place and
             // returns void.
-            OperatorKind::Reverse => reverse_with_ctx(&mut m, true, ctx),
+            OperatorKind::Reverse => reverse_with_ctx(&mut m, true, ctx, logging),
             // `a.M = AutomatonLogicalOps.not(a.M.asDFA())` (`:109-110`).
-            OperatorKind::Negate => m = not(m.as_dfa_with_ctx(ctx)).into_automaton(),
+            OperatorKind::Negate => {
+                m = not(m.as_dfa_with_ctx(ctx, logging), logging).into_automaton()
+            }
             _ => unreachable!("only the two unary kinds reach this method"),
         }
         stack.push(Expression::Automaton(AutomatonExpression::new(
-            string_value,
+            string_value.clone(),
             m,
         )));
+        // `Logging.dedent()` (`:112`), THEN `Logging.logAndPrint(COMPUTED + " " + op + a)`
+        // (`:113`).
+        logging.dedent();
+        logging.log_and_print(&format!("computed {string_value}"));
         Ok(())
     }
 
@@ -1295,6 +1333,7 @@ impl Operator {
         &self,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         let mut ctx = ctx;
         let op = &self.op_text;
@@ -1304,6 +1343,15 @@ impl Operator {
         let mut temp = reverse_stack_n(self.arity, stack);
         let mut m: Option<Automaton> = None;
         let mut identifiers_to_quantify: Vec<String> = Vec::new();
+
+        // `Logging.logAndPrint(COMPUTING + " quantifier " + op)` (`:123`), THEN
+        // `indent()` (`:124`) -- BEFORE the loop, using the BARE operator letter
+        // (`"E"`/`"A"`/`"I"`), not the parenthesized `stringValue` under construction.
+        // The whole loop (including the quantify/not/removeLeadingZeros/infinite calls)
+        // sits inside this bracket; a failure partway through leaks the indent, matching
+        // `RelationalOperator.act`'s same quirk (see `docs/WALNUT-BUGS.md`).
+        logging.log_and_print(&format!("computing quantifier {op}"));
+        logging.indent();
 
         for i in 0..self.arity {
             let operand = temp
@@ -1340,19 +1388,27 @@ impl Operator {
                             &mut automaton,
                             &label_set(&identifiers_to_quantify),
                             ctx.as_deref_mut(),
+                            logging,
                         )?;
                     }
                     OperatorKind::Forall { .. } => {
                         // `// A == ~ E ~` (`:145-148`).
-                        automaton =
-                            not(automaton.as_dfa_with_ctx(ctx.as_deref_mut())).into_automaton();
+                        automaton = not(
+                            automaton.as_dfa_with_ctx(ctx.as_deref_mut(), logging),
+                            logging,
+                        )
+                        .into_automaton();
                         quantify_with_ctx(
                             &mut automaton,
                             &label_set(&identifiers_to_quantify),
                             ctx.as_deref_mut(),
+                            logging,
                         )?;
-                        automaton =
-                            not(automaton.as_dfa_with_ctx(ctx.as_deref_mut())).into_automaton();
+                        automaton = not(
+                            automaton.as_dfa_with_ctx(ctx.as_deref_mut(), logging),
+                            logging,
+                        )
+                        .into_automaton();
                     }
                     OperatorKind::Infinite { .. } => {
                         // `// op == I` (`:150-153`).
@@ -1360,6 +1416,7 @@ impl Operator {
                             &automaton,
                             &identifiers_to_quantify,
                             ctx.as_deref_mut(),
+                            logging,
                         )?;
                         // Java: `String infReg = Infinite.infinite(...); M = new
                         // Automaton(!infReg.isEmpty());` — the `""`-means-finite sentinel
@@ -1375,6 +1432,11 @@ impl Operator {
         }
 
         string_value.push(')');
+        // `Logging.dedent()` (`:159`), THEN `Logging.logAndPrint(COMPUTED + " quantifier "
+        // + stringValue)` (`:160`) -- unlike COMPUTING, this uses the FULL parenthesized
+        // `stringValue`, e.g. `"computed quantifier (E k ...)"`.
+        logging.dedent();
+        logging.log_and_print(&format!("computed quantifier {string_value}"));
         stack.push(Expression::Automaton(AutomatonExpression::new(
             string_value,
             m.expect("arity >= 1, so the last iteration always assigned M"),
@@ -1409,20 +1471,25 @@ impl Operator {
         opp: RelationalOp,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
-        let mut ctx = ctx;
         // `super.validateArity(S)` (`:88`).
         self.validate_arity(stack.len())?;
         let ns = self.number_system();
-        let mut b = stack.pop().expect("validated arity above");
-        let mut a = stack.pop().expect("validated arity above");
+        let b = stack.pop().expect("validated arity above");
+        let a = stack.pop().expect("validated arity above");
         let op = &self.op_text;
 
         // ---- 0: constant folding (`:92-95`) --------------------------------
         // No automaton and no `NumberSystem` involved: `new Automaton(boolean)` is Java's
         // TRUE/FALSE automaton constructor. Note the comparison runs at FULL BigInteger
         // width (`getConstantValue` never narrows), so a literal far outside `int` still
-        // folds exactly.
+        // folds exactly. This arm returns BEFORE `Logging.logAndPrint(COMPUTING ...)`
+        // (`:96`), so a constant-folded comparison logs NOTHING at all -- unlike every
+        // other arm below, which are all inside the COMPUTING/indent/.../dedent/COMPUTED
+        // bracket (`:96-176`), including the final `invalidDualOperators` error arm --
+        // which is BEFORE `dedent()`, so a failing relational op leaks `+1` indent into
+        // the next command's log (`docs/WALNUT-BUGS.md`'s WB-041).
         if is_constant_expression(&a) && is_constant_expression(&b) {
             let truth = opp.compare_big_int(&get_constant_value(&a), &get_constant_value(&b));
             stack.push(Expression::Automaton(AutomatonExpression::new(
@@ -1431,7 +1498,42 @@ impl Operator {
             )));
             return Ok(());
         }
+        // `a`/`b`'s display text is captured up front (`Expression::to_string` reads
+        // `expressionInString`, which no arm below mutates -- the same "captured before
+        // consumption" pattern this file already uses for the binary-connective log
+        // lines), so the COMPUTED line can still report it after `a`/`b` are moved into
+        // the body below.
+        let (a_display, b_display) = (a.to_string(), b.to_string());
+        logging.log_and_print(&format!("computing {a_display}{op}{b_display}"));
+        logging.indent();
+        let result = self.act_relational_body(opp, a, b, ns, ctx, logging);
+        let (string_value, m) = result?;
+        logging.dedent();
+        logging.log_and_print(&format!("computed {a_display}{op}{b_display}"));
+        stack.push(Expression::Automaton(AutomatonExpression::new(
+            string_value,
+            m,
+        )));
+        Ok(())
+    }
 
+    /// The body of [`Self::act_relational`]'s COMPUTING/COMPUTED bracket (arms 1-8 of
+    /// `RelationalOperator.act`, `RelationalOperator.java:99-174`) — factored out so the
+    /// logging bracket in the caller doesn't have to be repeated at all seven early
+    /// returns (and the one error arm) this used to have. Returns the display string and
+    /// result automaton rather than pushing directly, so the caller can log COMPUTED
+    /// (which needs the final state count) and push in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn act_relational_body(
+        &self,
+        opp: RelationalOp,
+        mut a: Expression,
+        mut b: Expression,
+        ns: &wr_core::numsys::NumberSystem,
+        mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<(String, Automaton), ActError> {
+        let op = &self.op_text;
         // ---- 1: word vs arithmetic/variable (`:99-134`) ---------------------
         if (matches!(a, Expression::Word(_)) && is_arithmetic_or_variable(&b))
             || (is_arithmetic_or_variable(&a) && matches!(b, Expression::Word(_)))
@@ -1456,40 +1558,39 @@ impl Operator {
             // the list itself is never mutated here, in either language.
             for o in word.word_automaton.fa.o.clone() {
                 let mut n = word.word_automaton.clone();
-                compare_word_automaton_with_ctx(&mut n, o, RelationalOp::Equal, ctx.as_deref_mut());
+                compare_word_automaton_with_ctx(
+                    &mut n,
+                    o,
+                    RelationalOp::Equal,
+                    ctx.as_deref_mut(),
+                    logging,
+                );
                 let mut c = if reverse {
-                    ns.comparison_const_b(identifier, &BigInt::from(o), opp)?
+                    ns.comparison_const_b(identifier, &BigInt::from(o), opp, logging)?
                 } else {
-                    ns.comparison_const_a(&BigInt::from(o), identifier, opp)?
+                    ns.comparison_const_a(&BigInt::from(o), identifier, opp, logging)?
                 };
-                let n = imply(&mut n, &mut c).into_automaton();
-                m = and(&m, &n).into_automaton();
+                let n = imply(&mut n, &mut c, logging).into_automaton();
+                m = and(&m, &n, logging).into_automaton();
             }
-            m = and(&m, &word.m).into_automaton();
+            m = and(&m, &word.m, logging).into_automaton();
             quantify_with_ctx(
                 &mut m,
                 &label_set(&word.identifiers_to_quantify),
                 ctx.as_deref_mut(),
+                logging,
             )?;
-            m = and_then_quantify_if_arithmetic(arith_expr, m, ctx.as_deref_mut())?;
+            m = and_then_quantify_if_arithmetic(arith_expr, m, ctx.as_deref_mut(), logging)?;
             // WB-023: `word.toString()`, NOT `a + op + b` like every sibling arm.
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                word_expr.to_string(),
-                m,
-            )));
-            return Ok(());
+            return Ok((word_expr.to_string(), m));
         }
 
         // ---- 2: arithmetic/variable vs arithmetic/variable (`:135-140`) -----
         if is_arithmetic_or_variable(&a) && is_arithmetic_or_variable(&b) {
-            let mut m = ns.comparison(identifier_of(&a), identifier_of(&b), opp);
-            m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut())?;
-            m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut())?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                format!("{a}{op}{b}"),
-                m,
-            )));
-            return Ok(());
+            let mut m = ns.comparison(identifier_of(&a), identifier_of(&b), opp, logging);
+            m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut(), logging)?;
+            m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut(), logging)?;
+            return Ok((format!("{a}{op}{b}"), m));
         }
 
         // ---- 3: constant vs arithmetic/variable (`:141-146`) ----------------
@@ -1497,16 +1598,12 @@ impl Operator {
             let identifier = identifier_of(&b);
             let m = match &a {
                 Expression::NumberLiteral(ne) => {
-                    ns.comparison_const_a(ne.value(), identifier, opp)?
+                    ns.comparison_const_a(ne.value(), identifier, opp, logging)?
                 }
-                _ => ns.comparison_const_a(&get_constant_value(&a), identifier, opp)?,
+                _ => ns.comparison_const_a(&get_constant_value(&a), identifier, opp, logging)?,
             };
-            let m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut())?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                format!("{a}{op}{b}"),
-                m,
-            )));
-            return Ok(());
+            let m = and_then_quantify_if_arithmetic(&b, m, ctx.as_deref_mut(), logging)?;
+            return Ok((format!("{a}{op}{b}"), m));
         }
 
         // ---- 4: arithmetic/variable vs constant (`:147-152`) ----------------
@@ -1514,16 +1611,12 @@ impl Operator {
             let identifier = identifier_of(&a);
             let m = match &b {
                 Expression::NumberLiteral(ne) => {
-                    ns.comparison_const_b(identifier, ne.value(), opp)?
+                    ns.comparison_const_b(identifier, ne.value(), opp, logging)?
                 }
-                _ => ns.comparison_const_b(identifier, &get_constant_value(&b), opp)?,
+                _ => ns.comparison_const_b(identifier, &get_constant_value(&b), opp, logging)?,
             };
-            let m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut())?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                format!("{a}{op}{b}"),
-                m,
-            )));
-            return Ok(());
+            let m = and_then_quantify_if_arithmetic(&a, m, ctx.as_deref_mut(), logging)?;
+            return Ok((format!("{a}{op}{b}"), m));
         }
 
         // ---- 5: word vs word (`:153-159`) -----------------------------------
@@ -1534,26 +1627,24 @@ impl Operator {
             // Java passes the raw symbol string here (`compareWordAutomata(…, op)`), which
             // `ProductStrategies` immediately maps back through `RELATIONAL_OPERATORS` —
             // i.e. to exactly `opp`. Passing `opp` skips a lossless round trip.
-            let mut m = compare_word_automata(&aw.word_automaton, &bw.word_automaton, opp);
-            m = and(&m, &aw.m).into_automaton();
-            m = and(&m, &bw.m).into_automaton();
+            let mut m = compare_word_automata(&aw.word_automaton, &bw.word_automaton, opp, logging);
+            m = and(&m, &aw.m, logging).into_automaton();
+            m = and(&m, &bw.m, logging).into_automaton();
             // Two separate `quantify` calls, not one merged set — each one re-runs the
             // leading-zero fixup. Ported as-is (`:157-158`).
             quantify_with_ctx(
                 &mut m,
                 &label_set(&aw.identifiers_to_quantify),
                 ctx.as_deref_mut(),
+                logging,
             )?;
             quantify_with_ctx(
                 &mut m,
                 &label_set(&bw.identifiers_to_quantify),
                 ctx.as_deref_mut(),
+                logging,
             )?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                string_value,
-                m,
-            )));
-            return Ok(());
+            return Ok((string_value, m));
         }
 
         // ---- 6: word vs constant (`:160-165`) -------------------------------
@@ -1569,18 +1660,21 @@ impl Operator {
             // Mutates `a.wordAutomaton` IN PLACE (`compareWordAutomaton` returns void);
             // `a` is discarded right after, so the aliasing Java's `Automaton M =
             // a.wordAutomaton` sets up is unobservable.
-            compare_word_automaton_with_ctx(&mut aw.word_automaton, k, opp, ctx.as_deref_mut());
-            let mut m = and(&aw.word_automaton, &aw.m).into_automaton();
+            compare_word_automaton_with_ctx(
+                &mut aw.word_automaton,
+                k,
+                opp,
+                ctx.as_deref_mut(),
+                logging,
+            );
+            let mut m = and(&aw.word_automaton, &aw.m, logging).into_automaton();
             quantify_with_ctx(
                 &mut m,
                 &label_set(&aw.identifiers_to_quantify),
                 ctx.as_deref_mut(),
+                logging,
             )?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                string_value,
-                m,
-            )));
-            return Ok(());
+            return Ok((string_value, m));
         }
 
         // ---- 7: constant vs word (`:166-171`) -------------------------------
@@ -1597,14 +1691,16 @@ impl Operator {
                 k,
                 opp.reverse_operator(),
                 ctx.as_deref_mut(),
+                logging,
             );
-            let mut m = and(&bw.word_automaton, &bw.m).into_automaton();
-            quantify_with_ctx(&mut m, &label_set(&bw.identifiers_to_quantify), ctx)?;
-            stack.push(Expression::Automaton(AutomatonExpression::new(
-                string_value,
-                m,
-            )));
-            return Ok(());
+            let mut m = and(&bw.word_automaton, &bw.m, logging).into_automaton();
+            quantify_with_ctx(
+                &mut m,
+                &label_set(&bw.identifiers_to_quantify),
+                ctx,
+                logging,
+            )?;
+            return Ok((string_value, m));
         }
 
         // ---- else (`:172-174`) ----------------------------------------------
@@ -1627,6 +1723,7 @@ impl Operator {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         self.validate_arity(stack.len())?;
         let b = stack.pop().expect("validated arity above");
@@ -1639,9 +1736,9 @@ impl Operator {
             .into());
         }
         if opp == ArithmeticOp::UnaryNegative {
-            self.process_unary_operator(b, fresh, stack, ctx)
+            self.process_unary_operator(b, fresh, stack, ctx, logging)
         } else {
-            self.process_binary_operator(opp, b, fresh, stack, ctx)
+            self.process_binary_operator(opp, b, fresh, stack, ctx, logging)
         }
     }
 
@@ -1658,6 +1755,7 @@ impl Operator {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         let mut ctx = ctx;
         let ns = self.number_system();
@@ -1699,6 +1797,7 @@ impl Operator {
                     ArithmeticOp::Minus,
                     false,
                     ctx.as_deref_mut(),
+                    logging,
                 )?;
             }
             // The expression string is NOT updated, so `_T[i]` still displays as `T[i]`.
@@ -1706,16 +1805,28 @@ impl Operator {
             return Ok(());
         }
 
-        // Arithmetic / variable: `b + c = 0` with a fresh `c` standing for `-b`.
+        // Arithmetic / variable: `b + c = 0` with a fresh `c` standing for `-b`. No
+        // `indent()`/`dedent()` of its own around this whole method (unlike the binary
+        // operator below) -- `Logging.logAndPrint(COMPUTING ...)` (`:119`) is logged
+        // AFTER `M` is already built (Java's own, slightly unusual ordering), and only
+        // `and_then_quantify_if_arithmetic`'s OWN bracket indents anything.
         let c = fresh.next_identifier();
-        let m =
-            ns.arithmetic_const_c(identifier_of(&b), &c, &BigInt::from(0), ArithmeticOp::Plus)?;
-        let m = and_then_quantify_if_arithmetic(&b, m, ctx)?;
+        let m = ns.arithmetic_const_c(
+            identifier_of(&b),
+            &c,
+            &BigInt::from(0),
+            ArithmeticOp::Plus,
+            logging,
+        )?;
+        logging.log_and_print(&format!("computing {op}{b}"));
+        let m = and_then_quantify_if_arithmetic(&b, m, ctx, logging)?;
+        let string_value = format!("({op}{b})");
         stack.push(Expression::Arithmetic(ArithmeticExpression::new(
-            format!("({op}{b})"),
+            string_value,
             m,
             c,
         )));
+        logging.log_and_print(&format!("computed {op}{b}"));
         Ok(())
     }
 
@@ -1742,6 +1853,7 @@ impl Operator {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         let mut ctx = ctx;
         let ns = self.number_system();
@@ -1769,8 +1881,13 @@ impl Operator {
                     &bw.word_automaton,
                     opp,
                     ctx.as_deref_mut(),
+                    logging,
                 );
-                aw.m = and(&aw.m, &bw.m).into_automaton();
+                // `Logging.indent(); a.M = AutomatonLogicalOps.and(a.M, b.M);
+                // Logging.dedent();` (`ArithmeticOperator.java:132-134`).
+                logging.indent();
+                aw.m = and(&aw.m, &bw.m, logging).into_automaton();
+                logging.dedent();
                 aw.identifiers_to_quantify
                     .extend(bw.identifiers_to_quantify.iter().cloned());
             }
@@ -1796,6 +1913,7 @@ impl Operator {
                     opp,
                     true,
                     ctx.as_deref_mut(),
+                    logging,
                 )?;
             }
             stack.push(a);
@@ -1817,6 +1935,7 @@ impl Operator {
                     opp,
                     false,
                     ctx.as_deref_mut(),
+                    logging,
                 )?;
             }
             stack.push(b);
@@ -1845,6 +1964,12 @@ impl Operator {
         let c = fresh.next_identifier();
         let m: Automaton;
 
+        // `Logging.logAndPrint(COMPUTING + " " + a + op + b)` (`:157`) -- logged BEFORE
+        // the arm 4/5 split, so it fires even on the zero-multiplication short-circuits
+        // inside arm 5 below (which then return WITHOUT ever logging COMPUTED -- a real
+        // asymmetry, ported verbatim, not a bug in this port).
+        logging.log_and_print(&format!("computing {a}{op}{b}"));
+
         // ---- 4: a word is still involved (`:158-198`) ------------------------
         // `a instanceof WordExpression || ((a is arith|var) && b instanceof
         // WordExpression)` — Java's `&&`-binds-tighter grouping. Reachable for
@@ -1863,33 +1988,45 @@ impl Operator {
             let word = as_word(word_expr);
             let identifier = identifier_of(arith_expr);
 
+            // `Logging.indent()` (`:176`) -- only on this word-involved arm; arm 5 below
+            // has no bracket of its own (its own `and_then_quantify_if_arithmetic` calls
+            // still indent/dedent internally, just not this method's own level).
+            logging.indent();
             let mut acc = Automaton::true_false(true);
             for o in word.word_automaton.fa.o.clone() {
                 let mut n = word.word_automaton.clone();
-                compare_word_automaton_with_ctx(&mut n, o, RelationalOp::Equal, ctx.as_deref_mut());
+                compare_word_automaton_with_ctx(
+                    &mut n,
+                    o,
+                    RelationalOp::Equal,
+                    ctx.as_deref_mut(),
+                    logging,
+                );
                 let mut cc = if o == 0 && opp == ArithmeticOp::Mult {
                     // `0 * anything = 0`, asserted directly on `c` — this is the ONLY
                     // conjunct that never mentions `arithmetic.identifier`, i.e. WB-003's
                     // "the other operand is never bound or validated" short-circuit, in
                     // its per-word-output form.
-                    let mut k = ns.get_constant(&BigInt::from(0))?;
+                    let mut k = ns.get_constant(&BigInt::from(0), logging)?;
                     k.bind(vec![c.clone()]);
                     k
                 } else if reverse {
-                    ns.arithmetic_const_b(identifier, &BigInt::from(o), &c, opp)?
+                    ns.arithmetic_const_b(identifier, &BigInt::from(o), &c, opp, logging)?
                 } else {
-                    ns.arithmetic_const_a(&BigInt::from(o), identifier, &c, opp)?
+                    ns.arithmetic_const_a(&BigInt::from(o), identifier, &c, opp, logging)?
                 };
-                let n = imply(&mut n, &mut cc).into_automaton();
-                acc = and(&acc, &n).into_automaton();
+                let n = imply(&mut n, &mut cc, logging).into_automaton();
+                acc = and(&acc, &n, logging).into_automaton();
             }
-            acc = and(&acc, &word.m).into_automaton();
+            acc = and(&acc, &word.m, logging).into_automaton();
             quantify_with_ctx(
                 &mut acc,
                 &label_set(&word.identifiers_to_quantify),
                 ctx.as_deref_mut(),
+                logging,
             )?;
-            m = and_then_quantify_if_arithmetic(arith_expr, acc, ctx.as_deref_mut())?;
+            m = and_then_quantify_if_arithmetic(arith_expr, acc, ctx.as_deref_mut(), logging)?;
+            logging.dedent();
         } else {
             // ---- 5: no word operand (`:200-231`) -----------------------------
             // Exactly one of `a`/`b` may be a constant here (arm 3 consumed the
@@ -1907,7 +2044,7 @@ impl Operator {
                     )));
                     return Ok(());
                 }
-                ns.arithmetic_const_a(ne.value(), identifier_of(&b), &c, opp)?
+                ns.arithmetic_const_a(ne.value(), identifier_of(&b), &c, opp, logging)?
             } else if let Expression::AlphabetLetter(ae) = &a {
                 if ae.constant == 0 && opp == ArithmeticOp::Mult {
                     stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
@@ -1917,7 +2054,13 @@ impl Operator {
                     )));
                     return Ok(());
                 }
-                ns.arithmetic_const_a(&BigInt::from(ae.constant), identifier_of(&b), &c, opp)?
+                ns.arithmetic_const_a(
+                    &BigInt::from(ae.constant),
+                    identifier_of(&b),
+                    &c,
+                    opp,
+                    logging,
+                )?
             } else if let Expression::NumberLiteral(ne) = &b {
                 if ne.is_zero() && opp == ArithmeticOp::Mult {
                     stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
@@ -1927,7 +2070,7 @@ impl Operator {
                     )));
                     return Ok(());
                 }
-                ns.arithmetic_const_b(identifier_of(&a), ne.value(), &c, opp)?
+                ns.arithmetic_const_b(identifier_of(&a), ne.value(), &c, opp, logging)?
             } else if let Expression::AlphabetLetter(ae) = &b {
                 if ae.constant == 0 && opp == ArithmeticOp::Mult {
                     stack.push(Expression::NumberLiteral(NumberLiteralExpression::new(
@@ -1937,19 +2080,28 @@ impl Operator {
                     )));
                     return Ok(());
                 }
-                ns.arithmetic_const_b(identifier_of(&a), &BigInt::from(ae.constant), &c, opp)?
+                ns.arithmetic_const_b(
+                    identifier_of(&a),
+                    &BigInt::from(ae.constant),
+                    &c,
+                    opp,
+                    logging,
+                )?
             } else {
                 ns.arithmetic(identifier_of(&a), identifier_of(&b), &c, opp)?
             };
-            let built = and_then_quantify_if_arithmetic(&a, built, ctx.as_deref_mut())?;
-            m = and_then_quantify_if_arithmetic(&b, built, ctx)?;
+            let built = and_then_quantify_if_arithmetic(&a, built, ctx.as_deref_mut(), logging)?;
+            m = and_then_quantify_if_arithmetic(&b, built, ctx, logging)?;
         }
 
+        let string_value = format!("({a}{op}{b})");
         stack.push(Expression::Arithmetic(ArithmeticExpression::new(
-            format!("({a}{op}{b})"),
+            string_value,
             m,
             c,
         )));
+        // `Logging.logAndPrint(COMPUTED + " " + a + op + b)` (`:233`).
+        logging.log_and_print(&format!("computed {a}{op}{b}"));
         Ok(())
     }
 }
@@ -2151,16 +2303,15 @@ impl Word {
         &self.name
     }
 
-    /// `Word.act(Stack<Expression> S)` (`:50-79`). `Logging.logAndPrint` calls are not
-    /// ported (Ruling 4 in `predicate_env.rs`: the logging context is threaded by U11's
-    /// executor, not grown piecemeal per `act()`), and the Java `expression == null`
-    /// branch has no Rust equivalent (an [`Expression`] can never be null).
+    /// `Word.act(Stack<Expression> S)` (`:50-79`). The Java `expression == null` branch
+    /// has no Rust equivalent (an [`Expression`] can never be null).
     pub fn act(
         &self,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
-        self.act_with_ctx(fresh, stack, None)
+        self.act_with_ctx(fresh, stack, None, logging)
     }
 
     /// [`Word::act`] with an explicit [`DeterminizeContext`] — see
@@ -2173,6 +2324,7 @@ impl Word {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         let _ = ctx;
         // `super.validateArity(S, "word ", " indices")` (`Token.java:56-58`).
@@ -2194,6 +2346,11 @@ impl Word {
         }
 
         let mut string_value = self.name.clone();
+        // `Logging.logAndPrint(COMPUTING + " " + stringValue + "[...]")` (`:54`) --
+        // logged BEFORE the loop, using the bare name (`stringValue` hasn't had any
+        // `[index]` appended to it yet), unlike the COMPUTED line at the end. No
+        // indent()/dedent() bracket in this method.
+        logging.log_and_print(&format!("computing {string_value}[...]"));
         let mut identifiers: Vec<String> = Vec::new();
         let mut quantify: Vec<String> = Vec::new();
         let mut m = Automaton::true_false(true);
@@ -2207,16 +2364,23 @@ impl Word {
             match &expression {
                 Expression::Variable(ve) => {
                     let ns = track_number_system(&word_automaton, i);
-                    m = ve.act(fresh, ns.as_ref(), &mut identifiers, m, &mut quantify)?;
+                    m = ve.act(
+                        fresh,
+                        ns.as_ref(),
+                        &mut identifiers,
+                        m,
+                        &mut quantify,
+                        logging,
+                    )?;
                 }
                 Expression::Arithmetic(ae) => {
-                    m = ae.act(&mut identifiers, m, &mut quantify);
+                    m = ae.act(&mut identifiers, m, &mut quantify, logging);
                 }
                 Expression::NumberLiteral(ne) => {
-                    m = ne.act(fresh, &mut identifiers, &mut quantify, m)?;
+                    m = ne.act(fresh, &mut identifiers, &mut quantify, m, logging)?;
                 }
                 Expression::Automaton(ae) => {
-                    m = ae.act(&self.name, i, m, &mut identifiers)?;
+                    m = ae.act(&self.name, i, m, &mut identifiers, logging)?;
                 }
                 // `AlphabetLetterExpression`/`WordExpression`: the Java `else` arm,
                 // `expression.act("argument " + (i + 1) + " of function " + this)` --
@@ -2230,6 +2394,9 @@ impl Word {
             }
         }
         word_automaton.bind(identifiers);
+        // `Logging.logAndPrint(COMPUTED + " " + stringValue)` (`:78`) -- the FULL
+        // string, with every `[index]` appended, unlike the COMPUTING line above.
+        logging.log_and_print(&format!("computed {string_value}"));
         stack.push(Expression::Word(Box::new(WordExpression::new(
             string_value,
             word_automaton,
@@ -2315,8 +2482,9 @@ impl Function {
         &self,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
-        self.act_with_ctx(fresh, stack, None)
+        self.act_with_ctx(fresh, stack, None, logging)
     }
 
     /// [`Function::act`] with an explicit [`DeterminizeContext`] — see
@@ -2327,6 +2495,7 @@ impl Function {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         // `super.validateArity(S, "function ", " arguments")` (`Token.java:56-58`).
         if stack.len() < self.arity {
@@ -2342,6 +2511,15 @@ impl Function {
         for _ in 0..self.arity {
             temp.push(stack.pop().expect("validated arity above"));
         }
+        // `Function.act` logs COMPUTING before the argument list is even built --
+        // `stringValue = this + "("` at this point, so the logged text is literally
+        // `"computing NAME(...)"` (`:63-64`), not the full call. `stringValue` only
+        // grows to the real argument list afterward (`:72`).
+        logging.log_and_print(&format!(
+            "{} {}(...)",
+            wr_core::logging::COMPUTING,
+            self.name
+        ));
         // `Function.act`'s OWN second pop loop (`:69-71`), unlike `Word.act`'s single
         // pass over `temp`: `expressions` is read TWICE below (once to build
         // `stringValue`, once for the type-dispatch loop), so it must be a plain,
@@ -2366,16 +2544,23 @@ impl Function {
         for (i, expression) in expressions.iter().enumerate() {
             match expression {
                 Expression::Variable(ve) => {
-                    m = ve.act(fresh, Some(&self.ns), &mut identifiers, m, &mut quantify)?;
+                    m = ve.act(
+                        fresh,
+                        Some(&self.ns),
+                        &mut identifiers,
+                        m,
+                        &mut quantify,
+                        logging,
+                    )?;
                 }
                 Expression::Arithmetic(ae) => {
-                    m = ae.act(&mut identifiers, m, &mut quantify);
+                    m = ae.act(&mut identifiers, m, &mut quantify, logging);
                 }
                 Expression::NumberLiteral(ne) => {
-                    m = ne.act(fresh, &mut identifiers, &mut quantify, m)?;
+                    m = ne.act(fresh, &mut identifiers, &mut quantify, m, logging)?;
                 }
                 Expression::Automaton(ae) => {
-                    m = ae.act(&self.name, i, m, &mut identifiers)?;
+                    m = ae.act(&self.name, i, m, &mut identifiers, logging)?;
                 }
                 // See `Word::act`'s matching arm docs -- same base-class fallback,
                 // same verbatim (if imprecise for a genuinely-word argument) wording.
@@ -2387,14 +2572,21 @@ impl Function {
 
         let mut bound = self.automaton.clone();
         bound.bind(identifiers);
-        let mut anded = and(&bound, &m).into_automaton();
+        // `Logging.indent(); A = AutomatonLogicalOps.and(A, M);
+        // AutomatonQuantification.quantify(A, quantify); Logging.dedent();`
+        // (`:91-94`) -- a failing `quantify` skips the `dedent()`, the same
+        // indent-leak-on-failure quirk already noted elsewhere in this file.
+        logging.indent();
+        let mut anded = and(&bound, &m, logging).into_automaton();
         let quantify_set: BTreeSet<String> = quantify.into_iter().collect();
-        quantify_with_ctx(&mut anded, &quantify_set, ctx)?;
+        quantify_with_ctx(&mut anded, &quantify_set, ctx, logging)?;
+        logging.dedent();
 
         stack.push(Expression::Automaton(AutomatonExpression::new(
-            string_value,
+            string_value.clone(),
             anded,
         )));
+        logging.log_and_print(&format!("{} {}", wr_core::logging::COMPUTED, string_value));
         Ok(())
     }
 }
@@ -2470,8 +2662,9 @@ impl Token {
         &self,
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
-        self.act_with_ctx(fresh, stack, None)
+        self.act_with_ctx(fresh, stack, None, logging)
     }
 
     /// [`Token::act`] with an explicit [`DeterminizeContext`] — Walnut's
@@ -2494,14 +2687,15 @@ impl Token {
         fresh: &mut FreshIdentifiers,
         stack: &mut Vec<Expression>,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), ActError> {
         match self {
             Token::Variable(t) => t.act(stack),
             Token::NumberLiteral(t) => t.act(stack),
             Token::AlphabetLetter(t) => t.act(stack),
-            Token::Operator(op) => return op.act_with_ctx(fresh, stack, ctx),
-            Token::Word(w) => return w.act_with_ctx(fresh, stack, ctx),
-            Token::Function(f) => return f.act_with_ctx(fresh, stack, ctx),
+            Token::Operator(op) => return op.act_with_ctx(fresh, stack, ctx, logging),
+            Token::Word(w) => return w.act_with_ctx(fresh, stack, ctx, logging),
+            Token::Function(f) => return f.act_with_ctx(fresh, stack, ctx, logging),
         }
         Ok(())
     }
@@ -3281,7 +3475,11 @@ mod tests {
         let mut stack = Vec::new();
         let mut fresh = FreshIdentifiers::new();
         Token::Variable(Variable::new(0, "x"))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
@@ -3296,7 +3494,11 @@ mod tests {
         let mut fresh = FreshIdentifiers::new();
         let n = ns("msd_2");
         Token::NumberLiteral(NumberLiteral::new(0, BigInt::from(7), Rc::clone(&n)))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
@@ -3313,7 +3515,11 @@ mod tests {
         let mut stack = Vec::new();
         let mut fresh = FreshIdentifiers::new();
         Token::AlphabetLetter(AlphabetLetter::new(0, -1))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack.len(), 1);
         match &stack[0] {
@@ -3332,14 +3538,22 @@ mod tests {
         let mut stack = Vec::new();
         let mut fresh = FreshIdentifiers::new();
         let err = Token::Operator(Operator::logical_connective(0, "&"))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "operator & requires 2 operands");
 
         for paren in [Operator::left_paren(0), Operator::right_paren(0)] {
             let mut stack = Vec::new();
             Token::Operator(paren)
-                .act(&mut fresh, &mut stack)
+                .act(
+                    &mut fresh,
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
                 .expect("parentheses never reach an operand stack");
             assert!(stack.is_empty());
         }
@@ -3387,7 +3601,13 @@ mod tests {
             Expression::Variable(VariableExpression::new("a")),
             Expression::Variable(VariableExpression::new("b")),
         ];
-        Token::Word(word).act(&mut fresh, &mut stack).unwrap();
+        Token::Word(word)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack[0].to_string(), "T[a][b]");
         match &stack[0] {
@@ -3434,7 +3654,11 @@ mod tests {
             Expression::Variable(VariableExpression::new("b")),
         ];
         Token::Function(Box::new(func))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack.len(), 1);
         // WB-020: the double closing paren is Java's own text, ported verbatim.
@@ -3447,7 +3671,13 @@ mod tests {
         let word = Word::new(0, "T", stub_word_automaton(), 2).unwrap();
         let mut fresh = FreshIdentifiers::new();
         let mut stack = vec![Expression::Variable(VariableExpression::new("a"))];
-        let err = Token::Word(word).act(&mut fresh, &mut stack).unwrap_err();
+        let err = Token::Word(word)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .unwrap_err();
         assert_eq!(err.to_string(), "word T requires 2 indices");
 
         let func = Function::new(
@@ -3460,7 +3690,11 @@ mod tests {
         .unwrap();
         let mut stack = vec![Expression::Variable(VariableExpression::new("a"))];
         let err = Token::Function(Box::new(func))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "function phi requires 2 arguments");
     }
@@ -3686,7 +3920,7 @@ mod tests {
         fresh: &mut FreshIdentifiers,
         mut stack: Vec<Expression>,
     ) -> Expression {
-        op.act(fresh, &mut stack)
+        op.act(fresh, &mut stack, &mut wr_core::logging::Logging::new())
             .unwrap_or_else(|e| panic!("act failed: {e}"));
         assert_eq!(stack.len(), 1, "act must leave exactly one operand");
         stack.pop().unwrap()
@@ -3907,7 +4141,11 @@ mod tests {
             Expression::Automaton(AutomatonExpression::new("y=2", Automaton::true_false(true))),
         ];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -3923,7 +4161,11 @@ mod tests {
         let operator = Operator::relational(0, "<", Rc::clone(&n));
         let mut stack = vec![variable("x")];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "operator < requires 2 operands");
         assert_eq!(stack.len(), 1, "a failed act must not consume the stack");
@@ -4016,7 +4258,11 @@ mod tests {
         let operator = Operator::arithmetic(0, "/", Rc::clone(&n));
         let mut stack = vec![number_literal(5, &n), number_literal(0, &n)];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4128,7 +4374,11 @@ mod tests {
         let mut stack = vec![variable("x"), variable("y")];
 
         Operator::arithmetic(0, "+", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(fresh.issued(), 1, "`x+y` mints exactly one temporary");
         let temporary = match &stack[0] {
@@ -4140,7 +4390,11 @@ mod tests {
 
         stack.push(variable("z"));
         Operator::relational(0, "=", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack.len(), 1);
         let m = as_automaton_expression(stack.pop().unwrap()).m;
@@ -4185,18 +4439,30 @@ mod tests {
         let mut fresh = FreshIdentifiers::new();
         let mut stack = vec![variable("x"), variable("y")];
         Operator::arithmetic(0, "+", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         stack.push(variable("w"));
         Operator::arithmetic(0, "+", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(fresh.issued(), 2);
         assert_eq!(stack[0].to_string(), "((x+y)+w)");
 
         stack.push(variable("z"));
         Operator::relational(0, "=", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         let m = as_automaton_expression(stack.pop().unwrap()).m;
         let mut labels = m.label.clone();
@@ -4226,12 +4492,20 @@ mod tests {
         let mut fresh = FreshIdentifiers::new();
         let mut stack = vec![variable("x"), number_literal(1, &n)];
         Operator::arithmetic(0, "+", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(stack[0].to_string(), "(x+1)");
         stack.push(variable("z"));
         Operator::relational(0, "=", Rc::clone(&n))
-            .act(&mut fresh, &mut stack)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         let m = as_automaton_expression(stack.pop().unwrap()).m;
         let mut labels = m.label.clone();
@@ -4253,7 +4527,13 @@ mod tests {
             number_literal(3, &ns("msd_2")),
             word_expression("T[i]", thue_morse("i")),
         ] {
-            let out = and_then_quantify_if_arithmetic(&operand, m.clone(), None).unwrap();
+            let out = and_then_quantify_if_arithmetic(
+                &operand,
+                m.clone(),
+                None,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .unwrap();
             assert_eq!(out.label, m.label);
             assert_eq!(out.fa.q, m.fa.q);
             assert_eq!(out.fa.o, m.fa.o);
@@ -4519,7 +4799,11 @@ mod tests {
             Expression::Automaton(AutomatonExpression::new("y=1", Automaton::true_false(true))),
         ];
         let err = plus
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -4533,7 +4817,11 @@ mod tests {
             variable("x"),
         ];
         let err = plus
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -4555,7 +4843,11 @@ mod tests {
             big_literal(huge.clone(), &n),
         ];
         let err = eq
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -4571,7 +4863,11 @@ mod tests {
             big_literal(huge.clone(), &n),
         ];
         let err = plus
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -4667,7 +4963,13 @@ mod tests {
         for (operator, expected) in cases {
             let mut fresh = FreshIdentifiers::new();
             let mut stack = vec![variable("x"), variable("y")];
-            let err = operator.act(&mut fresh, &mut stack).unwrap_err();
+            let err = operator
+                .act(
+                    &mut fresh,
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
+                .unwrap_err();
             assert_eq!(err.to_string(), expected, "for {operator}");
             assert_eq!(fresh.issued(), 0);
         }
@@ -4675,7 +4977,13 @@ mod tests {
         for operator in [Operator::left_paren(0), Operator::right_paren(0)] {
             let mut fresh = FreshIdentifiers::new();
             let mut stack = vec![variable("x"), variable("y")];
-            operator.act(&mut fresh, &mut stack).unwrap();
+            operator
+                .act(
+                    &mut fresh,
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
+                .unwrap();
             assert_eq!(stack.len(), 2, "{operator} must never touch the stack");
         }
     }
@@ -4692,7 +5000,11 @@ mod tests {
         let n = ns("msd_2");
         let mut stack = vec![a, b];
         Operator::relational(0, op, n)
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .expect("building the test operand must not fail");
         stack.pop().unwrap()
     }
@@ -4833,7 +5145,11 @@ mod tests {
         let operator = Operator::logical_connective(0, "&");
         let mut stack = vec![lt_const("x", 5)];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "operator & requires 2 operands");
         assert_eq!(stack.len(), 1, "a failed act must not consume the stack");
@@ -4911,7 +5227,11 @@ mod tests {
             let operator = Operator::logical_connective(0, symbol);
             let mut stack: Vec<Expression> = Vec::new();
             let err = operator
-                .act(&mut FreshIdentifiers::new(), &mut stack)
+                .act(
+                    &mut FreshIdentifiers::new(),
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
                 .unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -5161,7 +5481,11 @@ mod tests {
         let operator = Operator::quantifier(0, "A", 2);
         let mut stack = vec![variable("x"), lt_const("y", 3), lt_const("y", 5)];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "operator A requires a list of 2 variables");
         assert!(
@@ -5172,7 +5496,11 @@ mod tests {
         let operator = Operator::quantifier(0, "E", 1);
         let mut stack = vec![variable("x"), variable("y")];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -5185,7 +5513,11 @@ mod tests {
         let operator = Operator::quantifier(0, "E", 2);
         let mut stack = vec![variable("x"), lt_const("x", 5)];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(err.to_string(), "operator E requires 3 operands");
         assert_eq!(stack.len(), 2);
@@ -5201,7 +5533,11 @@ mod tests {
             let operator = Operator::quantifier(0, symbol, 1);
             let mut stack = vec![variable("nope"), lt_const("x", 5)];
             let err = operator
-                .act(&mut FreshIdentifiers::new(), &mut stack)
+                .act(
+                    &mut FreshIdentifiers::new(),
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
                 .unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -5238,7 +5574,11 @@ mod tests {
         let operator = Operator::quantifier(0, "I", 1);
         let mut stack = vec![variable("x"), trivially_true()];
         let err = operator
-            .act(&mut FreshIdentifiers::new(), &mut stack)
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err.to_string(),
@@ -5260,7 +5600,11 @@ mod tests {
         let mut stack: Vec<Expression> = Vec::new();
         for token in p.post_order() {
             token
-                .act(&mut fresh, &mut stack)
+                .act(
+                    &mut fresh,
+                    &mut stack,
+                    &mut wr_core::logging::Logging::new(),
+                )
                 .unwrap_or_else(|e| panic!("evaluating {predicate:?} failed: {e}"));
         }
         assert_eq!(

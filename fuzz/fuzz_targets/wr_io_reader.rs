@@ -248,7 +248,12 @@ fn exercise_downstream(mut automaton: wr_core::automaton::Automaton) {
         let mut crossed = automaton.clone();
         crossed.sort_label();
         let op = wr_core::product::BooleanOp::And;
-        let _ = wr_core::product::cross_product(&crossed, &crossed, |a, b| op.combine(a, b));
+        let _ = wr_core::product::cross_product(
+            &crossed,
+            &crossed,
+            |a, b| op.combine(a, b),
+            &mut wr_core::logging::Logging::new(),
+        );
     }
 
     // The load-time determinize path (and nearly every command's closing step).

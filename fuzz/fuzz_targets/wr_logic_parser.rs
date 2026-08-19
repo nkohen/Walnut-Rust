@@ -101,7 +101,11 @@ fn declared_base(name: &str) -> Option<u32> {
 }
 
 impl PredicateEnv for BoundedEnv {
-    fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
+    fn number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<Rc<NumberSystem>, PredicateEnvError> {
         if declared_base(name).is_some_and(|b| b > MAX_BASE) {
             // Shaped as the same error an undefined base produces, so the tokenizer sees
             // an outcome it already has a code path for — this filter must not introduce
@@ -111,7 +115,7 @@ impl PredicateEnv for BoundedEnv {
                 source: NumSysError::NotDefined(name.to_string()),
             });
         }
-        self.inner.number_system(name)
+        self.inner.number_system(name, logging)
     }
 
     fn word_with_ctx(

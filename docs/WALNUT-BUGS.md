@@ -2092,6 +2092,33 @@ bug costs a silent wrong answer somewhere downstream.
   `multiplication`'s non-recursing `n == 2` branch) and 637-641/659/660 all avoid the `constant()`
   leak (`@1`/`=1` go through `constant(1)`, which does not recurse). Nothing else in this port is
   affected either, since the counter has no consumer besides the two metacommands.
+- **A second, LOG-TEXT consequence — ported verbatim (U28, 2026-08-17), unlike the index
+  aspect above.** The same root bug also gates whether `and`/`quantify`'s own internal
+  "computing &"/"quantifying"/"fixing leading zeros" lines (`Logging.logMessage`, gated on
+  `printEnabled && printDetails` — not `logAndPrint`, which ignores `printEnabled`) show up
+  in `commandLog`/`detailedLog` at all, independent of the `[strategy …]`/`[export …]`
+  index question above (a `DeterminizeContext` concern) — `numsys` never receives one
+  either way, so that decision is unaffected. Once `wr-logic`'s U28 unit started threading
+  the caller's real `Logging` into `numsys`'s query-time construction methods (needed to
+  close the `details*` golden fixtures' per-`act()` logging gap — see
+  `wr_logic::eval`'s module docs), the choice of whether to replicate `disablePrint`/
+  `enablePrint`'s non-nesting bug came up again, this time for log text rather than
+  indices. **Decision: port it verbatim**, unlike the index case — `wr_core::logging::
+  Logging::disable_print`/`enable_print` are plain, non-nesting field writes (matching
+  Java's own non-save/restore `static boolean printEnabled` exactly), called at the exact
+  same `NumberSystem` call sites Java does (`apply_comparison`'s `negate` branch,
+  `comparison_const_b`'s `NOT_EQUAL`/general-case final `and`+`quantify`, all three
+  `arithmetic_const_*`'s final `and`+`quantify`, and the whole bodies of `constant`/
+  `multiplication`/`division`) — so the leak reproduces itself automatically, not through
+  special-cased emulation. Verified against the real jar that the leak does NOT actually
+  fire in any of the nine `details*` golden fixtures (their session/library state keeps
+  the relevant sub-constants warm-cached from earlier commands, so a nested bracket never
+  triggers for them) — but a cold-cache case (a fresh `NumberSystem`, e.g. a brand-new
+  session's first constant `≥ 2` needing genuine floor/ceil recursion, such as `?msd_2
+  x<5 & x>1`'s `constant(5)` recursing through `constant(2)`/`constant(3)`) does show the
+  leak, matched byte-for-byte (after `CLAUDE.md`'s standard timing normalization) against
+  a real-jar capture in
+  `wr_logic::eval::tests::command_log_matches_real_walnut_including_deep_per_act_logging`.
 - **Upstream:** not filed. The Java-side fix is mechanical: make `disablePrint`/`enablePrint`
   save-and-restore (return the previous value / take it back), or replace the pair with a
   try-with-resources scope object, so nesting composes.
@@ -2144,6 +2171,54 @@ bug costs a silent wrong answer somewhere downstream.
   canonize a `clone()`, or (better, since `exportAutomata` is called from a hot dispatcher) drop
   the `canonize()` and accept the un-permuted state numbering in the `.gv`, which is a rendering
   detail.
+
+---
+
+## WB-041 — three `Token`/`Operator` `act()` bodies call `Logging.indent()` unconditionally but `Logging.dedent()` only on success, leaking `+1` indent into whatever logs next after a failing relational/quantifier/arithmetic-operand operation
+
+- **Where:** `Main/EvalComputations/Token/RelationalOperator.java:97` (`indent()`) / `:175`
+  (`dedent()`, reached only if the whole `if`/`else if` chain at `:99-174` returns normally — in
+  particular NOT reached from the final `else`'s `throw WalnutException.invalidDualOperators(...)`
+  at `:173`, nor from any exception `ns.comparison`/`andThenQuantifyIfArithmetic`/
+  `AutomatonQuantification.quantify` can throw from inside that block); `LogicalOperator.java:124`
+  (`indent()`) / `:159` (`dedent()`, `actQuantifier`'s own equivalent — not reached from either
+  `WalnutException` thrown inside the loop at `:134`/`:140`); `Operator.java:151` (`indent()`) /
+  `:156` (`dedent()`, `andThenQuantifyIfArithmetic`'s own bracket — not reached if the `and`/
+  `quantify` call inside its `if` throws).
+- **What:** all three follow the same shape: `Logging.indent();` unconditionally, then a body that
+  can throw (a `WalnutException` for a malformed query, or any propagated failure from the
+  automaton primitives it calls), then `Logging.dedent();` reached only on the non-throwing path.
+  `Logging.indentCount` is a plain `static int`, incremented/decremented with no try/finally and no
+  save-restore — so a thrown exception leaves it one higher than it was on entry. Nothing in
+  `Prover`'s command dispatch resets it except `Logging.resetIndent()`, which real Walnut's
+  `EvalDef.evalDefCommand`/`computeHeadless` never call (only `IntegrationTest`'s own harness does,
+  once per fixture, which is why this is invisible in the golden corpus — see below). In an
+  interactive REPL session, a query that hits one of these three throwing paths permanently
+  deepens every subsequent command's logged indentation by one level, with no way to reset it
+  short of a fresh session.
+- **Consequence:** purely a log-TEXT artifact — the returned automaton and the decision-procedure
+  result are unaffected; nothing here changes what a query *means*, only how deeply indented its
+  (and every later command's) `commandLog`/`detailedLog`/console output is. Real Walnut's own
+  `IntegrationTest` harness resets `indentCount` to `0` before every fixture (`resetIndent()`, "useful
+  for integration tests" per `Logging.java`'s own comment), and this port's Tier-1 golden harness
+  does the equivalent (a fresh `Prover`/`Logging` per fixture) — so no fixture in the corpus can
+  observe the leak; a `def`/`eval` sequence with an error command followed by a passing one, in the
+  SAME session, would.
+- **Found:** Phase 3b's U28 (2026-08-17), porting the per-`act()` `Logging` calls this file's own
+  section documents — implementing the ported `act_relational`/`act_quantifier`/
+  `and_then_quantify_if_arithmetic` bodies surfaced the same unconditional-`indent`/success-only-
+  `dedent` shape at all three call sites while transcribing Java's control flow line-for-line.
+- **Rust port:** **diverged is not the right word — ported verbatim.** `wr_logic::token`'s
+  `act_relational`, `act_quantifier`, and `and_then_quantify_if_arithmetic` each call
+  `logging.indent()` unconditionally and `logging.dedent()` only past a `?` that can early-return
+  (an `Err` from the body they wrap skips it, exactly as Java's exception does), reproducing the
+  leak exactly. No test asserts the ported leak by name (asserting a bug is easy to get backwards
+  and easy to silently "fix" later without noticing) but none of Tier 1-4 can observe it either,
+  for the same `resetIndent`-equivalent reason real Walnut's own suite can't — this port's
+  `wr-golden`/`wr-cli` test harnesses reset per fixture/test the same way.
+- **Upstream:** not filed. The Java-side fix is mechanical: wrap each body in try/finally with the
+  `dedent()` in the `finally`, or (matching WB-039's suggested fix for the same class of bug) a
+  try-with-resources scope object.
 
 ---
 

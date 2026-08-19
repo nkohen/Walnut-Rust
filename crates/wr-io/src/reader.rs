@@ -846,8 +846,20 @@ fn read_automaton_str_impl(
     if !automaton.fa.is_deterministic() {
         automaton.fa = trim(&automaton.fa);
         let initial: BTreeSet<usize> = [automaton.fa.q0].into_iter().collect();
-        wr_core::determinize::determinize(&mut automaton, &initial, ctx)
-            .map_err(ReadError::Determinize)?;
+        // A throwaway `Logging`: no real caller of this branch currently needs the
+        // DETERMINIZING/DETERMINIZED text it would produce (a genuinely nondeterministic
+        // library `.txt` file, loaded mid-`::`-suffixed query -- not exercised by any
+        // known golden `details` fixture). If a future caller needs it, thread a real
+        // handle through from `wr-cli`'s `Session`/`Prover` the same way `numsys.rs`
+        // deliberately does NOT (this site is a genuine gap, not a `disablePrint`-style
+        // deliberate silence).
+        wr_core::determinize::determinize(
+            &mut automaton,
+            &initial,
+            ctx,
+            &mut wr_core::logging::Logging::new(),
+        )
+        .map_err(ReadError::Determinize)?;
         automaton.fa = minimize(&automaton.fa)?;
     }
 
@@ -1245,7 +1257,20 @@ fn load_custom_base(
             less_than,
             all_representations,
         };
-        Ok(NumberSystem::with_custom_base_files(name, files)?)
+        // A throwaway logger, not the caller's real one: this path is a LIBRARY FILE's own
+        // header declaring a custom base (`$name(...)` referenced directly in a predicate
+        // resolves through `wr_logic::predicate_env::PredicateEnv` instead, which DOES
+        // thread a real `Logging` here -- see `wr_core::numsys::NumberSystem::
+        // with_custom_base_files`'s docs). Wiring one through this call site too would mean
+        // threading `&mut Logging` through the whole `AutomatonReader`/`CustomBaseResolver`
+        // call graph; no known fixture's `details` output depends on a header-declared
+        // custom base's construction-time `apply_all_representations` logging, so this is a
+        // documented, narrow gap rather than a silent one.
+        Ok(NumberSystem::with_custom_base_files(
+            name,
+            files,
+            &mut wr_core::logging::Logging::new(),
+        )?)
     })();
     in_progress.remove(name);
     result

@@ -123,7 +123,15 @@ pub fn convert_command(
 
     // `AutomatonLogicalOps.convertNS(M, m.group(GROUP_CONVERT_MSD_OR_LSD).equals(
     //  NumberSystem.MSD), Integer.parseInt(m.group(GROUP_CONVERT_BASE)));` (`:739-741`).
-    convert_ns(&mut m, msd_or_lsd == numsys::MSD, base_value).map_err(ConvertError::Convert)?;
+    // `convert` is not an `eval`/`def` command (see `combine_command`'s matching note in
+    // `automaton_ops.rs`) -- a throwaway logger.
+    convert_ns(
+        &mut m,
+        msd_or_lsd == numsys::MSD,
+        base_value,
+        &mut wr_core::logging::Logging::new(),
+    )
+    .map_err(ConvertError::Convert)?;
 
     // `M.writeAutomata(s, ProverHelper.determineOutLibrary(newIsDFAO), m.group(
     //  GROUP_CONVERT_NEW_NAME), true);` (`:743`) -- the trailing `true` is a hardcoded

@@ -326,8 +326,10 @@ pub fn determine_alphabets_and_ns(
         match try_match_alphabet_token(&units, i)? {
             Some((AlphabetToken::NumberSystem(text), end)) => {
                 let base = normalize_number_system_token(Some(&text));
+                // Not an `eval`/`def` command (see `combine_command`'s matching note in
+                // `automaton_ops.rs`) -- a throwaway logger.
                 let resolved = env
-                    .number_system(&base)
+                    .number_system(&base, &mut wr_core::logging::Logging::new())
                     .map_err(AlphabetError::NumberSystem)?;
                 alphabets.push(resolved.get_alphabet().to_vec());
                 ns.push(Some(resolved));
@@ -437,8 +439,10 @@ pub fn set_alphabet(
     // `M.forceCanonize();` (`:216`).
     m.force_canonize();
 
-    // `M.applyAllRepresentationsWithOutput();` (`:219`).
-    m.apply_all_representations_with_output();
+    // `M.applyAllRepresentationsWithOutput();` (`:219`). Java's own `Logging.indent()`/
+    // `logMessage`/`dedent()` calls throughout `setAlphabet` are not ported (see this
+    // function's docs), so this is a throwaway logger, not a real one.
+    m.apply_all_representations_with_output(&mut wr_core::logging::Logging::new());
 
     // `copy(M);` (`:222`).
     *automaton = m;

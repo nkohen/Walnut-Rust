@@ -532,7 +532,13 @@ pub struct Predicate {
 impl Predicate {
     /// `Predicate(String predicate)` (`:112-114`): `this(MSD_2, predicate, 0)`.
     pub fn new(env: &dyn PredicateEnv, predicate: &str) -> Result<Predicate, LexError> {
-        Predicate::with_context(env, MSD_2, predicate, 0)
+        Predicate::with_context(
+            env,
+            MSD_2,
+            predicate,
+            0,
+            &mut wr_core::logging::Logging::new(),
+        )
     }
 
     /// [`Predicate::new`] with the enclosing command's [`DeterminizeContext`].
@@ -549,8 +555,9 @@ impl Predicate {
         env: &dyn PredicateEnv,
         predicate: &str,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Predicate, LexError> {
-        Predicate::with_context_and_ctx(env, MSD_2, predicate, 0, ctx)
+        Predicate::with_context_and_ctx(env, MSD_2, predicate, 0, ctx, logging)
     }
 
     /// `Predicate(String defaultNumberSystem, String predicate, int realStartingPosition)`
@@ -567,6 +574,7 @@ impl Predicate {
         default_number_system: &str,
         predicate: &str,
         real_starting_position: usize,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Predicate, LexError> {
         Predicate::with_context_and_ctx(
             env,
@@ -574,6 +582,7 @@ impl Predicate {
             predicate,
             real_starting_position,
             None,
+            logging,
         )
     }
 
@@ -585,6 +594,7 @@ impl Predicate {
         predicate: &str,
         real_starting_position: usize,
         ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Predicate, LexError> {
         let mut p = Predicate {
             predicate: predicate.to_string(),
@@ -601,7 +611,7 @@ impl Predicate {
         if p.predicate.bytes().all(is_java_whitespace) {
             return Ok(p);
         }
-        p.tokenize_and_compute_post_order(env, ctx)?;
+        p.tokenize_and_compute_post_order(env, ctx, logging)?;
         Ok(p)
     }
 
@@ -664,10 +674,37 @@ impl Predicate {
     /// `<=` (relational); `T[i]` (word) before `T` (variable); `$f(`/`#m(` before the bare
     /// `(`; `@5` (alphabet letter) is only reached because `@` is not a digit, so the
     /// number-literal pattern above it cannot match first.
+    ///
+    /// `logging` reaches [`Self::put_word`]/[`Self::put_function`] AND the THREE
+    /// `env.number_system(&current_number_system, …)` calls below unchanged — this
+    /// function's own real `Logging`, when the caller supplies one.
+    ///
+    /// **A real, cold-vs-warm-session divergence exists here, and is deliberately NOT
+    /// papered over by giving this call site a throwaway.** `PredicateEnv::number_system`
+    /// is a MEMOIZED lookup (unlike [`PredicateEnv::fresh_number_system`], `put_function`'s
+    /// own genuinely unmemoized one — Java's `new NumberSystem(name)` in `Function`'s
+    /// constructor, always reconstructs, session-state-independent) — it only actually
+    /// builds a `NumberSystem` the first time a given name is referenced in a session, so
+    /// its (real, correctly-threaded — see
+    /// `wr_core::numsys::NumberSystem::with_custom_base_files`'s docs) construction-time
+    /// logging fires only on a COLD reference, exactly as Java's own `numberSystemHash`
+    /// (a JVM-lifetime static) does. A throwaway here was tried (2026-08-17) specifically
+    /// to make this port's Tier-1 golden harness — which dispatches every fixture through
+    /// a fresh `Prover`, always cold — match fixtures whose real captures came from deep
+    /// inside Java's own long-running, already-warm fixture-generation session. That was
+    /// the WRONG fix: it made a genuinely fresh, single-query session (the normal way a
+    /// real user's first `eval` in a new session behaves) log LESS than real Walnut would,
+    /// purely to flatter a test harness's own cold-start artifact — backwards from
+    /// `CLAUDE.md`'s Prime Directive (fidelity to real Walnut, not to a specific fixture
+    /// capture). Reverted; the resulting golden-corpus divergences on fixtures 375-378
+    /// are honestly recorded in `tests/golden/tests/golden_corpus.rs`'s
+    /// `KNOWN_DIVERGENCES`, in the same category as fixture 383's pre-existing entry, not
+    /// hidden by weakening production behavior.
     fn tokenize_and_compute_post_order(
         &mut self,
         env: &dyn PredicateEnv,
         mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<(), LexError> {
         let p = patterns();
         // `Stack<String> numberSystems` (`:149-151`): the bottom entry is the default,
@@ -722,7 +759,7 @@ impl Predicate {
                 // `NumberSystem.getComputeIfAbsent(currentNumberSystem)` (`:178`) -- the
                 // number system is resolved HERE, at token-construction time, not at
                 // `act()` time, and against whatever `?ns` directive is currently in scope.
-                let ns = env.number_system(&current_number_system)?;
+                let ns = env.number_system(&current_number_system, logging)?;
                 let op = Operator::relational(self.position(op_span.start), op_str, ns);
                 Token::Operator(op).push_onto(&mut self.post_order, &mut self.operator_stack)?;
                 index = whole.end;
@@ -732,7 +769,7 @@ impl Predicate {
                 let whole = caps.get_match().expect("matched").range();
                 let op_span = caps.get_group_by_name("op").expect("group `op` matched");
                 let op_str = self.predicate[op_span.range()].to_string();
-                let ns = env.number_system(&current_number_system)?;
+                let ns = env.number_system(&current_number_system, logging)?;
                 let op = Operator::arithmetic(self.position(op_span.start), op_str, ns);
                 Token::Operator(op).push_onto(&mut self.post_order, &mut self.operator_stack)?;
                 index = whole.end;
@@ -750,6 +787,7 @@ impl Predicate {
                     &caps,
                     false,
                     ctx.as_deref_mut(),
+                    logging,
                 )?;
             } else if let Some(caps) = find_at(&p.word_with_delimiter, &self.predicate, index) {
                 // `:193-196`
@@ -759,8 +797,14 @@ impl Predicate {
                     });
                 }
                 last_token_was_operator = false;
-                index =
-                    self.put_word(env, &current_number_system, &caps, true, ctx.as_deref_mut())?;
+                index = self.put_word(
+                    env,
+                    &current_number_system,
+                    &caps,
+                    true,
+                    ctx.as_deref_mut(),
+                    logging,
+                )?;
             } else if let Some(caps) = find_at(&p.function, &self.predicate, index) {
                 // `:197-200`
                 if !last_token_was_operator {
@@ -769,8 +813,13 @@ impl Predicate {
                     });
                 }
                 last_token_was_operator = false;
-                index =
-                    self.put_function(env, &current_number_system, &caps, ctx.as_deref_mut())?;
+                index = self.put_function(
+                    env,
+                    &current_number_system,
+                    &caps,
+                    ctx.as_deref_mut(),
+                    logging,
+                )?;
             } else if let Some(caps) = find_at(&p.macro_call, &self.predicate, index) {
                 // `:201-203`. QUIRK, ported verbatim: unlike the word and function arms
                 // above, this one never sets `lastTokenWasOperator = false` on its own
@@ -810,7 +859,7 @@ impl Predicate {
                 let num_span = caps.get_group_by_name("num").expect("group `num` matched");
                 let text = self.predicate[num_span.range()].to_string();
                 // Same eager `getComputeIfAbsent` as the operator arms (`:213`).
-                let ns = env.number_system(&current_number_system)?;
+                let ns = env.number_system(&current_number_system, logging)?;
                 let t = Token::NumberLiteral(NumberLiteral::new(
                     self.position(num_span.start),
                     parse_big_integer(&text),
@@ -964,6 +1013,7 @@ impl Predicate {
         caps: &Captures,
         with_delimiter: bool,
         mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<usize, LexError> {
         let name_span = caps
             .get_group_by_name("name")
@@ -1004,6 +1054,7 @@ impl Predicate {
                         index_text,
                         self.position(starting_position),
                         ctx.as_deref_mut(),
+                        logging,
                     )?);
                     // `:305-311` -- a chained index (`T[i][j]`)?
                     if let Some(next) = find_at(&patterns().left_bracket, &text, i + 1) {
@@ -1063,6 +1114,7 @@ impl Predicate {
         default_number_system: &str,
         caps: &Captures,
         mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<usize, LexError> {
         let name_span = caps
             .get_group_by_name("name")
@@ -1083,6 +1135,7 @@ impl Predicate {
                 &arg.text,
                 self.position(arg.start_pos),
                 ctx.as_deref_mut(),
+                logging,
             )?);
         }
 
@@ -1118,7 +1171,7 @@ impl Predicate {
         // `Session`. Calling `wr_core::numsys::NumberSystem::new` directly here — which has
         // no file access by design — silently restricted every `$name(…)` call to plain
         // `msd_k`/`lsd_k` bases; see that method's docs.
-        let ns = env.fresh_number_system(default_number_system)?;
+        let ns = env.fresh_number_system(default_number_system, logging)?;
 
         // `:485-487`: `new Function(defaultNumberSystem, realStartingPosition +
         // matcher.start(1), matcher.group(1), A, arguments.size())`.
@@ -2091,16 +2144,37 @@ mod tests {
     /// `realStartingPosition` is added to ordinary token/error positions.
     #[test]
     fn real_starting_position_offsets_reported_positions() {
-        let e = Predicate::with_context(&env(), MSD_2, "(a=1", 100).unwrap_err();
+        let e = Predicate::with_context(
+            &env(),
+            MSD_2,
+            "(a=1",
+            100,
+            &mut wr_core::logging::Logging::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.to_string(), "unbalanced parenthesis: char at 100");
-        let e = Predicate::with_context(&env(), MSD_2, "%", 100).unwrap_err();
+        let e = Predicate::with_context(
+            &env(),
+            MSD_2,
+            "%",
+            100,
+            &mut wr_core::logging::Logging::new(),
+        )
+        .unwrap_err();
         assert_eq!(e.to_string(), "Undefined token: char at 100");
     }
 
     /// The default number system is honored for a nested predicate.
     #[test]
     fn default_number_system_is_honored() {
-        let p = Predicate::with_context(&env(), "lsd_3", "a=1", 0).unwrap();
+        let p = Predicate::with_context(
+            &env(),
+            "lsd_3",
+            "a=1",
+            0,
+            &mut wr_core::logging::Logging::new(),
+        )
+        .unwrap();
         assert_eq!(p.to_string(), "a:1:=_lsd_3");
         assert_eq!(p.default_number_system(), "lsd_3");
     }
@@ -2111,7 +2185,14 @@ mod tests {
     /// start(1)`. Ported verbatim, so this test asserts the *defective* values.
     #[test]
     fn quantifier_token_positions_omit_real_starting_position_wb015() {
-        let p = Predicate::with_context(&env(), MSD_2, " Ex (x=1)", 100).unwrap();
+        let p = Predicate::with_context(
+            &env(),
+            MSD_2,
+            " Ex (x=1)",
+            100,
+            &mut wr_core::logging::Logging::new(),
+        )
+        .unwrap();
         // post-order: x (quantified variable), x, 1, =, E
         let positions: Vec<usize> = p
             .post_order()
@@ -2695,8 +2776,12 @@ mod tests {
     }
 
     impl PredicateEnv for CountingMacroEnv<'_> {
-        fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
-            self.inner.number_system(name)
+        fn number_system(
+            &self,
+            name: &str,
+            logging: &mut wr_core::logging::Logging,
+        ) -> Result<Rc<NumberSystem>, PredicateEnvError> {
+            self.inner.number_system(name, logging)
         }
         fn word_with_ctx(
             &self,

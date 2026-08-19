@@ -401,6 +401,32 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     })
 }
 
+/// [`minimize`], bracketed in `FA.justMinimize`'s own `Minimizing:`/`Minimized:` logging
+/// (`FA.java:576-588`) — see [`crate::logging::Logging`]'s docs for the format. Java's
+/// `justMinimize` is called from (at least) five independent Rust call sites
+/// (`logicalops::just_minimize`, `Automaton::determinize_and_minimize_with_ctx`/
+/// `_from_with_ctx`, `product::cross_product_and_minimize`, `determinize::brzozowski`),
+/// every one of which logs unconditionally in Java — this wrapper exists so the pair
+/// isn't duplicated five times.
+///
+/// The space differs between the two messages and is not a typo: `MINIMIZING + ": "` vs
+/// `MINIMIZED + ":"` (no space) — both port verbatim.
+pub fn minimize_with_logging(
+    fa: &Fa,
+    logging: &mut crate::logging::Logging,
+) -> Result<Fa, MinimizeError> {
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!("{}: {} states.", crate::logging::MINIMIZING, fa.q));
+    let result = minimize(fa)?;
+    logging.log_message(&format!(
+        "{}:{} states - {}ms.",
+        crate::logging::MINIMIZED,
+        result.q,
+        time_before.elapsed().as_millis()
+    ));
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

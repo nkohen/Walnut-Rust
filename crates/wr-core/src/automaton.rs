@@ -147,9 +147,10 @@ pub(crate) fn dispatch_determinize(
     a: &mut Automaton,
     initial: &BTreeSet<usize>,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) {
     let had_ctx = ctx.is_some();
-    if let Err(e) = crate::determinize::determinize(a, initial, ctx) {
+    if let Err(e) = crate::determinize::determinize(a, initial, ctx, logging) {
         assert!(had_ctx, "{NO_CONTEXT_CANNOT_FAIL}");
         match e {
             crate::determinize::DeterminizeError::DfaoWithNonScStrategy(_) => {
@@ -365,6 +366,146 @@ pub struct Automaton {
     ///
     /// [`Morphism::to_word_automaton`]: crate::morphism::Morphism::to_word_automaton
     pub(crate) canonized: bool,
+    /// **Not a Java field — models Java's `instanceof AutomatonDFA` runtime-class check**,
+    /// the same "quirk-replicating flag" shape as [`Automaton::canonized`] above (same
+    /// justification for living here rather than on [`Fa`]: only the sites enumerated
+    /// below ever consult it).
+    ///
+    /// # Why this exists: `AutomatonDFA.from`'s trivial branch is provenance-dependent, not state-dependent
+    ///
+    /// `AutomatonDFA.from` (`AutomatonDFA.java:74-85`) has TWO branches for a TRUE_FALSE
+    /// argument, and Java picks between them by the argument's **runtime class**, not by
+    /// anything in its `fa` fields:
+    ///
+    /// ```java
+    /// if (automaton instanceof AutomatonDFA dfa) { dfa.requireDfaStorage(); return dfa; }    // preserve
+    /// if (automaton.fa.isTRUE_FALSE_AUTOMATON()) { return new AutomatonDFA(...); }            // fresh, Q=0
+    /// ```
+    ///
+    /// Since `and`/`or`/`xor`/`imply`/`iff`/`not` all *return* `AutomatonDFA`, and Java's
+    /// object identity survives reassignment to an `Automaton`-declared variable, any value
+    /// that has ever passed through one of those functions keeps runtime class
+    /// `AutomatonDFA` from then on — so `M.asDFA()` on such a value takes the FIRST branch
+    /// and preserves whatever stale `q`/`o`/`d`
+    /// `AutomatonQuantification.quantify`'s all-tracks-quantified early return left behind
+    /// (`FA.clear()` empties `o`/`d` but never touches `q`). A value that was NEVER wrapped
+    /// in `AutomatonDFA` — e.g. `NumberSystem`'s cached `lessThan`/`equality` automata,
+    /// built via plain `new Automaton()` (`equality`/`lexicographicLessThan`,
+    /// `NumberSystem.java:404/420`, both routing through the shared `initBasicAutomaton`
+    /// helper at `:607-610`) — takes the SECOND branch and gets a genuinely fresh, `q ==
+    /// 0` trivial automaton instead.
+    ///
+    /// An earlier version of this port's `AutomatonDFA::from` ported only the second
+    /// branch's own body in isolation (always discard) and, in a first attempt to fix the
+    /// resulting logging divergence, over-corrected to always preserve — a two-round
+    /// adversarial review (both rounds independently verified against the real
+    /// `walnut-java` CLI) found live counterexamples on each side: `?msd_2 Ax (x >= 5)`
+    /// needs preserve (`4 states`, reachable via `not`'s `AutomatonDFA` return type), while
+    /// `?msd_2 ~(E x,y x=y)` needs fresh (`0 states`, `x=y`'s automaton is a plain
+    /// `NumberSystem`-cached value that was never `AutomatonDFA`-wrapped) — so neither
+    /// unconditional choice can match Java on both. Rust's `AutomatonDFA` has no
+    /// object-identity analogue to `instanceof`: once a value is unwrapped back to a plain
+    /// `Automaton` (which every call site here does, via
+    /// [`AutomatonDFA::into_automaton`]), there is no other trace of "this was previously
+    /// `AutomatonDFA`-typed". This field IS that trace, threaded explicitly instead.
+    ///
+    /// # Where it is SET
+    ///
+    /// Java has (at least — see below) six call shapes that construct
+    /// `new AutomatonDFA(...)`: `AutomatonDFA.java:21`/`:31`/`:48`/`:64`,
+    /// `ProductStrategies.crossProductAndMinimize`'s own `:226`, and
+    /// `AutomatonLogicalOps.removeLeadingZerosHelper`'s null-number-system arm
+    /// (`:381-383`). Three route through this crate's [`AutomatonDFA::from`]/
+    /// `from_with_ctx` already ([`AutomatonDFA::from_regex_over_alphabet`]/
+    /// [`AutomatonDFA::from_encoded_regex`] in `regex.rs`, `wr-io`'s DFA reader,
+    /// [`crate::product::cross_product_and_minimize`]), so no separate site needs to set
+    /// the field for those. The rest each need their own explicit set — found one at a
+    /// time across three adversarial-review rounds, which is itself the reason this
+    /// section no longer claims to be an exhaustive list (an earlier version claimed
+    /// "the only two," then "the only three"; each was wrong):
+    ///
+    /// * [`AutomatonDFA::true_false`] — Java's `new AutomatonDFA(boolean)`.
+    /// * [`AutomatonDFA::require_dfa_storage_with_ctx`]'s non-trivial tail — Java's
+    ///   `(AutomatonDFA) automaton.cloneFields(new AutomatonDFA())` inside `from`'s own
+    ///   non-trivial branch (`:82-84`). [`AutomatonDFA::from_with_ctx`]'s trivial branch
+    ///   consults the field on its ALREADY-set-or-not input rather than setting it, per the
+    ///   two Java branches described above.
+    /// * `crate::numsys::NumberSystem::make_constant` — Java's `NumberSystem.makeConstant`
+    ///   (`:1068-1078`) is `new AutomatonDFA(regex, ...)`, but this port substitutes a
+    ///   hand-built `Fa` for the un-ported `BricsConverter` regex path (see that method's
+    ///   own docs) and constructs it via plain `Automaton::new` — so it must set the flag
+    ///   by hand (live jar divergence: `?msd_2 ~(E x x=1)`).
+    /// * `crate::logicalops`'s `remove_leading_zeros_helper`'s null-number-system arm —
+    ///   Java's `new AutomatonDFA(true)` (the sixth construction shape above), currently
+    ///   unobservable (a fresh trivial value has `q == 0` regardless, and the flag
+    ///   reconverges at the first later `as_dfa`), fixed for consistency anyway.
+    ///
+    /// # Where it must be PRESERVED — the harder half, where this fix repeatedly broke down
+    ///
+    /// Java's in-place mutation and `cloneFields`/`copy(...)`-style field copies never
+    /// change an object's runtime class — but several functions in this crate port that
+    /// shape as a **whole-struct rebuild-and-reassign**
+    /// (`let mut x = Automaton::new(...); ...; *target = x;`), and `Automaton::new`
+    /// always starts a fresh value at `dfa_typed: false`. Left alone, each of these
+    /// silently resets or corrupts the flag on every value that passes through. This is
+    /// the class of bug three separate adversarial-review rounds kept finding one more
+    /// instance of — treat the list below as "confirmed so far," not "complete":
+    ///
+    /// * [`crate::quantify::quantify_helper`]'s general (non-early-return) path rebuilds
+    ///   the projected automaton from scratch, then must copy the ORIGINAL value's
+    ///   `dfa_typed` across before overwriting — `AutomatonQuantification.quantifyHelper`
+    ///   mutates its argument in place, so Java's class survives the projection. Live jar
+    ///   divergence: `?msd_2 ~(E x x>=5)`.
+    /// * [`Automaton::apply_all_representations`]/`apply_all_representations_with_output`'s
+    ///   `*self = k` (Java: `copy(K)`, fields-only, never reassigns `this`'s class) must
+    ///   copy `self`'s OWN `dfa_typed` onto `k` before the assignment, in EITHER direction
+    ///   — `and`'s result is always DFA-typed (would wrongly SET a false flag) and
+    ///   `cross_product`'s is always plain (would wrongly CLEAR a true one). Live jar
+    ///   divergence on a custom base: `?msd_fib ~(E x,y x<y)`.
+    /// * [`crate::word_automaton::minimize_self_with_output_with_ctx`]'s `*word_a = n`
+    ///   (Java: `wordA.copy(N)`) — same shape as the bullet above. Currently unreachable
+    ///   (every real caller feeds a value that is plain-typed in Java too), fixed
+    ///   defensively once this pattern's recurrence rate became clear.
+    ///
+    /// Any future function that rebuilds an `Automaton` from scratch and assigns it over
+    /// an existing binding (`*a = ...`, `*self = ...`) needs the same check: does Java's
+    /// equivalent mutate in place / copy fields only, or does it construct genuinely
+    /// fresh? Only the latter should leave `dfa_typed` at the new value's default —
+    /// and given the history above, audit this on sight rather than assuming a new
+    /// whole-struct-reassign site is fine by default.
+    ///
+    /// # `#[derive(Clone)]` — its stale-`q` preservation is LOAD-BEARING for `as_dfa`, not incidental
+    ///
+    /// Starts `false` in [`Automaton::new`]/[`Automaton::true_false`] (Java's plain
+    /// `new Automaton(...)` constructors, whose runtime class is never `AutomatonDFA`) and
+    /// is propagated by `#[derive(Clone)]` like every other field here — correct for every
+    /// NON-trivial automaton, since Java's `Automaton.cloneFields`/`clone()` never reassign
+    /// `this`'s class either.
+    ///
+    /// For a TRIVIAL automaton the reasoning is more subtle, and an earlier version of
+    /// this doc got it backwards. `Automaton::as_dfa`/`as_dfa_with_ctx`
+    /// (`AutomatonDFA::from(self.clone())`) DO clone — this is exactly the FORALL
+    /// branch's second `M.asDFA()` call this whole field exists for, so it is a reachable,
+    /// common path, not a corner case. Java's `Automaton.asDFA()` (`Automaton.java:156-158`)
+    /// is `AutomatonDFA.from(this)` — **no clone at all**, aliasing the same object. So the
+    /// port's `as_dfa` and Java's `asDFA()` are not doing the same sequence of operations;
+    /// they only end up equivalent because this crate's derived `Clone` preserves a
+    /// trivial value's stale `q` where Java's own `Automaton.clone()`/`AutomatonDFA.clone()`
+    /// (`Automaton.java:125-130`, `AutomatonDFA.java:101-104`) would reset it to a fresh
+    /// `q == 0` object. **Do not "fix" `Clone` to match Java's `clone()` here** — that
+    /// would break every jar-verified preserve case (e.g. `Ax x>=5` → `4 states`) at the
+    /// `as_dfa` clone inside `not`'s call graph.
+    ///
+    /// The GENUINE remaining gap is Java's OWN explicit `.clone()` calls on a
+    /// possibly-trivial value (as opposed to `asDFA()`'s aliasing) — Java resets `q` there
+    /// and this port's derived `Clone` does not. The one call site found:
+    /// `AutomatonLogicalOps.removeLeadingZeros`'s empty-label-list arm
+    /// (`AutomatonLogicalOps.java:344-347`, `A.clone()`), reachable only via a
+    /// zero-variable `I` quantifier — already lower-priority per this port's own
+    /// `I`-over-lsd backlog note, not exercised by any current test, and not proven to be
+    /// actually observable (its result is immediately discarded into `Infinite`'s own
+    /// fresh-trivial construction on both engines).
+    pub(crate) dfa_typed: bool,
 }
 
 impl Automaton {
@@ -398,6 +539,7 @@ impl Automaton {
             encoder,
             label_sorted: false,
             canonized: false,
+            dfa_typed: false,
         }
     }
 
@@ -419,6 +561,7 @@ impl Automaton {
             encoder: Vec::new(),
             label_sorted: false,
             canonized: false,
+            dfa_typed: false,
         }
     }
 
@@ -927,10 +1070,8 @@ impl Automaton {
     ///   use re-binds it before reading it.
     ///
     /// `Logging.logAndPrint("Applying valid representation #i")`/`indent`/`dedent`
-    /// (`:262-265`) are not ported, matching the rest of `wr-core`: `crate::logging`'s
-    /// context is not threaded into the automaton engine's call sites yet (see
-    /// `crate::product`'s "Progress logging not ported" note).
-    pub fn apply_all_representations(&mut self) {
+    /// (`:261-264`) bracket each restricted track's fold-in below.
+    pub fn apply_all_representations(&mut self, logging: &mut crate::logging::Logging) {
         self.debug_assert_track_invariant();
         let flag = self.determine_random_label();
         // `None` == "K is still `this`" (Java's alias).
@@ -941,13 +1082,25 @@ impl Automaton {
             };
             let mut n = (*n).clone();
             n.bind(vec![self.label[i].clone()]);
+            logging.log_and_print(&format!("Applying valid representation #{i}"));
+            logging.indent();
             let current: &Automaton = k.as_ref().unwrap_or(&*self);
-            k = Some(crate::logicalops::and(current, &n).into_automaton());
+            k = Some(crate::logicalops::and(current, &n, logging).into_automaton());
+            logging.dedent();
         }
         if flag {
             self.unlabel();
         }
-        if let Some(k) = k {
+        if let Some(mut k) = k {
+            // `copy(K)` (`Automaton.java:312-318`) copies FIELDS into `this`; it never
+            // reassigns `this`'s own runtime class -- so `self`'s `dfa_typed` (Java's
+            // class) survives this call regardless of what `and`'s result carries. `k`
+            // came out of `and`, which is always `AutomatonDFA`-typed, so naively
+            // assigning `*self = k` would wrongly set `dfa_typed = true` on a `self` that
+            // was never `AutomatonDFA` in Java. Found by adversarial review (live jar
+            // divergence on a custom base's cached comparison automata) — see
+            // `Automaton::dfa_typed`'s docs.
+            k.dfa_typed = self.dfa_typed;
             *self = k; // `copy(K)`
         }
     }
@@ -972,7 +1125,7 @@ impl Automaton {
     /// Java's two callers are `Automaton.setAlphabet` and `AutomatonLogicalOps.combine`.
     /// `wr-cli`'s `alphabet::set_alphabet` (Phase 3a U16) is now this crate's first real
     /// caller; `combine`'s is still out of scope (needs `Prover.COMBINE`'s product mode).
-    pub fn apply_all_representations_with_output(&mut self) {
+    pub fn apply_all_representations_with_output(&mut self, logging: &mut crate::logging::Logging) {
         self.debug_assert_track_invariant();
         let flag = self.determine_random_label();
         let mut k: Option<Automaton> = None;
@@ -983,18 +1136,23 @@ impl Automaton {
             let mut n = (*n).clone();
             n.bind(vec![self.label[i].clone()]);
             // `Prover.IF_OTHER_OP`, and against `this` -- not against `k`.
-            k = Some(crate::product::cross_product(&*self, &n, |a_p, m_q| {
-                if m_q != 0 {
-                    a_p
-                } else {
-                    0
-                }
-            }));
+            k = Some(crate::product::cross_product(
+                &*self,
+                &n,
+                |a_p, m_q| if m_q != 0 { a_p } else { 0 },
+                logging,
+            ));
         }
         if flag {
             self.unlabel();
         }
-        if let Some(k) = k {
+        if let Some(mut k) = k {
+            // `copy(K)` never reassigns `this`'s runtime class -- see the identical note
+            // in `apply_all_representations` above. `k` here comes out of
+            // `crate::product::cross_product`, which is always plain (never
+            // `AutomatonDFA`-typed), so this direction would wrongly CLEAR a `dfa_typed`
+            // `self` was carrying if left unfixed.
+            k.dfa_typed = self.dfa_typed;
             *self = k; // `copy(K)`
         }
     }
@@ -1072,9 +1230,9 @@ impl Automaton {
         if !switch_ns {
             return;
         }
-        self.determinize_and_minimize();
+        self.determinize_and_minimize_with_ctx(None, logging);
         self.force_canonize();
-        self.apply_all_representations_with_output();
+        self.apply_all_representations_with_output(logging);
         // `// always print this` (`:177`) — `Logging.logMessage(true, …)`.
         logging.log_message_with(true, ALPHABET_CHANGED_WARNING);
     }
@@ -1512,7 +1670,7 @@ impl Automaton {
     /// `CLAUDE.md`'s mechanical-port rule — NOT fixed here by adding an unconditional
     /// trim, which would be an undeclared behavioral divergence from `Automaton.java`.
     pub fn determinize_and_minimize(&mut self) {
-        self.determinize_and_minimize_with_ctx(None);
+        self.determinize_and_minimize_with_ctx(None, &mut crate::logging::Logging::new());
     }
 
     /// [`Automaton::determinize_and_minimize`] with an explicit
@@ -1542,17 +1700,26 @@ impl Automaton {
     pub fn determinize_and_minimize_with_ctx(
         &mut self,
         ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut crate::logging::Logging,
     ) {
+        // `Logging.indent()` (`Automaton.java:384`) — brackets the WHOLE method,
+        // dedented at the end; the `IntSet` overload below has no such bracket (Java's
+        // own "logging is backwards" comment on that one).
+        logging.indent();
         if !self.fa.is_deterministic() {
             // Working with an NFA. Let's trim, then determinize from {q0}.
+            let old_q = self.fa.q;
             self.fa = crate::trim::trim(&self.fa);
+            if old_q != self.fa.q {
+                logging.log_message(&format!("Trimmed to: {} states.", self.fa.q));
+            }
             let initial: BTreeSet<usize> = [self.fa.q0].into_iter().collect();
-            dispatch_determinize(self, &initial, ctx);
+            dispatch_determinize(self, &initial, ctx, logging);
         }
         // `FA.justMinimize`'s `convertNFAtoDFA()` call is a storage-representation
         // optimization only (see `fa.rs` module docs: this crate always uses one
         // unified NFA-shaped table) — not replicated.
-        self.fa = crate::minimize::minimize(&self.fa).expect(
+        self.fa = crate::minimize::minimize_with_logging(&self.fa, logging).expect(
             "minimize's only OTHER precondition (determinism) always holds here -- the \
              already-deterministic branch above skips reachability trimming, so WB-001 \
              (docs/WALNUT-BUGS.md) is reachable, faithfully, not a panic",
@@ -1560,6 +1727,7 @@ impl Automaton {
         // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- see
         // `Automaton::canonized`'s doc comment on why this is manual here.
         self.canonized = false;
+        logging.dedent();
     }
 
     /// `Automaton.determinizeAndMinimize(IntSet qqq)` (`Automaton.java:403-406`) — the
@@ -1568,7 +1736,11 @@ impl Automaton {
     /// necessarily a singleton). Unlike the no-arg overload, this is unconditional —
     /// Java's version has no `!isDeterministic` guard either.
     pub fn determinize_and_minimize_from(&mut self, initial: &BTreeSet<usize>) {
-        self.determinize_and_minimize_from_with_ctx(initial, None);
+        self.determinize_and_minimize_from_with_ctx(
+            initial,
+            None,
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     /// [`Automaton::determinize_and_minimize_from`] with an explicit
@@ -1580,9 +1752,12 @@ impl Automaton {
         &mut self,
         initial: &BTreeSet<usize>,
         ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut crate::logging::Logging,
     ) {
-        dispatch_determinize(self, initial, ctx);
-        self.fa = crate::minimize::minimize(&self.fa).expect(
+        // No `indent()`/`dedent()` bracket here -- Java's own "Technically, the logging
+        // is backwards" comment (`Automaton.java:400-401`) on this exact overload.
+        dispatch_determinize(self, initial, ctx, logging);
+        self.fa = crate::minimize::minimize_with_logging(&self.fa, logging).expect(
             "subset_construction's output is always deterministic and q0-reachable -- \
              minimize's documented preconditions",
         );
@@ -1625,8 +1800,9 @@ impl Automaton {
     pub fn as_dfa_with_ctx(
         &self,
         ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut crate::logging::Logging,
     ) -> AutomatonDFA {
-        AutomatonDFA::from_with_ctx(self.clone(), ctx)
+        AutomatonDFA::from_with_ctx(self.clone(), ctx, logging)
     }
 }
 
@@ -1667,7 +1843,10 @@ impl AutomatonDFA {
     /// `requireDfaStorage()` (a trivial automaton is vacuously deterministic); so does
     /// this.
     pub fn true_false(truth: bool) -> Self {
-        AutomatonDFA(Automaton::true_false(truth))
+        let mut automaton = Automaton::true_false(truth);
+        // `new AutomatonDFA(...)` — see `Automaton::dfa_typed`'s docs.
+        automaton.dfa_typed = true;
+        AutomatonDFA(automaton)
     }
 
     /// `AutomatonDFA.requireDfaStorage` (`AutomatonDFA.java:87-98`), including its
@@ -1683,8 +1862,25 @@ impl AutomatonDFA {
     fn require_dfa_storage_with_ctx(
         mut automaton: Automaton,
         ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut crate::logging::Logging,
     ) -> Automaton {
         if automaton.fa.is_true_false_automaton() {
+            // Unreachable via this function's one call site: `from_with_ctx` already
+            // special-cases trivial inputs before ever calling here (per `Automaton::
+            // dfa_typed`'s docs, that's where the `instanceof`-vs-fresh branch is decided
+            // — a caller reaching this branch with `dfa_typed` unset would mean some
+            // earlier invariant was violated). The debug-only assert makes that loud in a
+            // debug build; the unconditional set below is belt-and-suspenders for release
+            // builds regardless of the assert's outcome — Java's `requireDfaStorage` is
+            // itself a method ONLY callable on an already-`AutomatonDFA` receiver, so
+            // setting the flag here is strictly more faithful than leaving it as the
+            // caller happened to provide it.
+            debug_assert!(
+                automaton.dfa_typed,
+                "require_dfa_storage_with_ctx received a trivial automaton that skipped \
+                 AutomatonDFA::from_with_ctx's dfa_typed decision"
+            );
+            automaton.dfa_typed = true;
             return automaton;
         }
         if !automaton.fa.is_deterministic() {
@@ -1693,7 +1889,7 @@ impl AutomatonDFA {
                 // in the original, not a typo introduced here).
                 panic!("NFAOs are not supported..");
             }
-            automaton.determinize_and_minimize_with_ctx(ctx);
+            automaton.determinize_and_minimize_with_ctx(ctx, logging);
         }
         // `fa.convertNFAtoDFA()` (`FA.java:700-706`) is NOT a pure storage-representation
         // optimization — an earlier version of this comment claimed that, which an
@@ -1709,21 +1905,34 @@ impl AutomatonDFA {
             automaton.fa.is_deterministic(),
             "Unexpected NFA instead of DFA."
         );
+        // `(AutomatonDFA) automaton.cloneFields(new AutomatonDFA())` — the non-trivial
+        // branch of `AutomatonDFA.from` (`:82-84`) constructs a genuine `new AutomatonDFA()`
+        // and copies fields into it, so the RESULT's runtime class is `AutomatonDFA` even
+        // though the argument's wasn't. See `Automaton::dfa_typed`'s docs.
+        automaton.dfa_typed = true;
         automaton
     }
 
-    /// `AutomatonDFA.from` (`AutomatonDFA.java:74-85`). The `instanceof AutomatonDFA`
-    /// short-circuit doesn't apply: the input here is always a plain [`Automaton`],
-    /// never already an `AutomatonDFA` (Rust's type system rules that call shape out).
-    /// The `isTRUE_FALSE_AUTOMATON` short-circuit (`:79-81`) IS ported as of U0, and
-    /// faithfully returns a FRESH trivial automaton rather than the argument — Java's
-    /// `new AutomatonDFA(automaton.fa.isTRUE_AUTOMATON())` discards any stale
-    /// `Q`/alphabet the argument was carrying (the shape `Automaton.clear()` leaves
-    /// behind, see `crate::fa`'s module docs). Same for
-    /// [`Automaton::as_dfa`]/`Automaton.clone()`'s trivial branch (`:102-104`), which
-    /// route through here.
+    /// `AutomatonDFA.from` (`AutomatonDFA.java:74-85`).
+    ///
+    /// # The trivial branch: preserve or rebuild depends on provenance, not state
+    ///
+    /// Java's `from` has TWO branches for a TRUE_FALSE argument, dispatched on the
+    /// argument's *runtime class*, not on anything in its `fa` fields:
+    ///
+    /// ```java
+    /// if (automaton instanceof AutomatonDFA dfa) { dfa.requireDfaStorage(); return dfa; }   // :75-78 preserve
+    /// if (automaton.fa.isTRUE_FALSE_AUTOMATON()) { return new AutomatonDFA(...); }           // :79-81 fresh, Q=0
+    /// ```
+    ///
+    /// [`Automaton::dfa_typed`] is this port's explicit stand-in for that runtime-class
+    /// check (see its own docs for the full mechanism and the two live counterexamples —
+    /// one needing preserve, one needing fresh — that an earlier, unconditional version of
+    /// this function got wrong in each direction, caught by adversarial review run against
+    /// the real `walnut-java` CLI). This function's trivial branch now branches on it
+    /// exactly where Java branches on `instanceof`.
     pub fn from(automaton: Automaton) -> Self {
-        Self::from_with_ctx(automaton, None)
+        Self::from_with_ctx(automaton, None, &mut crate::logging::Logging::new())
     }
 
     /// [`AutomatonDFA::from`] with an explicit
@@ -1732,11 +1941,17 @@ impl AutomatonDFA {
     pub fn from_with_ctx(
         automaton: Automaton,
         ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut crate::logging::Logging,
     ) -> Self {
         if automaton.fa.is_true_false_automaton() {
+            if automaton.dfa_typed {
+                // `instanceof AutomatonDFA` (`:75-78`) — same object, same stale fields.
+                return AutomatonDFA(automaton);
+            }
+            // `isTRUE_FALSE_AUTOMATON` (`:79-81`) — `new AutomatonDFA(...)`, genuinely fresh.
             return AutomatonDFA::true_false(automaton.fa.is_true_automaton());
         }
-        AutomatonDFA(Self::require_dfa_storage_with_ctx(automaton, ctx))
+        AutomatonDFA(Self::require_dfa_storage_with_ctx(automaton, ctx, logging))
     }
 
     /// Borrows the wrapped, guaranteed-deterministic [`Automaton`].
@@ -2722,10 +2937,12 @@ mod tests {
         Automaton::true_false(true).bind(Vec::new());
     }
 
-    #[test]
-    fn as_dfa_returns_a_fresh_trivial_dfa_discarding_stale_fields() {
-        // `AutomatonDFA.from`'s `:79-81` branch. Built from the stale-`q` shape so the
-        // "fresh, not a copy" part is observable.
+    /// Builds a stale-`q` trivial `Automaton` the way `AutomatonQuantification.quantify`'s
+    /// all-tracks-quantified early return does: a real automaton, then `fa.true_false` set
+    /// and `clear()`'d (which empties `o`/`d`/`alphabet`/`label` but never touches `q`).
+    /// `dfa_typed` is left at whatever `a` already carries — the caller sets it before or
+    /// after, matching whichever Java call shape the test is pinning.
+    fn stale_q_trivial_automaton() -> Automaton {
         let mut a = Automaton::new(
             trivial_fa(2),
             vec![vec![0, 1]],
@@ -2735,11 +2952,49 @@ mod tests {
         a.fa.true_false = Some(false);
         a.clear();
         assert_eq!(a.fa.q, 1, "sanity: the input carries a stale q");
+        a
+    }
+
+    #[test]
+    fn as_dfa_on_an_already_dfa_typed_trivial_automaton_preserves_stale_fields() {
+        // `AutomatonDFA.from`'s `instanceof AutomatonDFA` branch (`:75-78`): Java returns
+        // the SAME object, so any stale `q` a value carries from having already been
+        // `AutomatonDFA`-typed (e.g. the output of `not`/`and`/`or`/etc.) survives. This is
+        // the branch `LogicalOperator.actQuantifier`'s `FORALL` case takes on its second
+        // `M.asDFA()` call, since `M` there is always `not()`'s own return value — the
+        // concrete divergence this closes: `crates/wr-logic/src/eval.rs`'s
+        // `forall_closed_formula_...` test. See `Automaton::dfa_typed`'s docs for the full
+        // mechanism, including the live counterexample (below) that this test's own
+        // one-sided predecessor missed.
+        let mut a = stale_q_trivial_automaton();
+        a.dfa_typed = true;
 
         let dfa = a.as_dfa();
         assert!(dfa.automaton().is_true_false_automaton());
         assert!(!dfa.automaton().is_true_automaton());
-        assert_eq!(dfa.automaton().fa.q, 0, "rebuilt, not copied");
+        assert_eq!(dfa.automaton().fa.q, 1, "preserved, not rebuilt");
+    }
+
+    #[test]
+    fn as_dfa_on_a_never_dfa_typed_trivial_automaton_rebuilds_fresh() {
+        // `AutomatonDFA.from`'s `isTRUE_FALSE_AUTOMATON` branch (`:79-81`): a value that
+        // was NEVER `AutomatonDFA`-typed in Java (e.g. `NumberSystem`'s cached
+        // `lessThan`/`equality` automata, built via plain `new Automaton()`) gets a
+        // genuinely fresh `q == 0` automaton — real Walnut logs `?msd_2 ~(E x,y x=y)` as
+        // `0 states`, not the stale count. An earlier, unconditional version of this port's
+        // `AutomatonDFA::from` (a first attempt at fixing the `FORALL` divergence above)
+        // got exactly this case wrong — this test is what a same-shaped regression would
+        // now fail, where the removed `..._discarding_stale_fields` test (which built its
+        // input the same way but never set `dfa_typed`) would not have caught it, since it
+        // was rewritten to assert the OTHER branch's outcome on this same never-DFA-typed
+        // input.
+        let a = stale_q_trivial_automaton();
+        assert!(!a.dfa_typed, "sanity: never wrapped in AutomatonDFA");
+
+        let dfa = a.as_dfa();
+        assert!(dfa.automaton().is_true_false_automaton());
+        assert!(!dfa.automaton().is_true_automaton());
+        assert_eq!(dfa.automaton().fa.q, 0, "rebuilt fresh, not copied");
     }
 
     #[test]
@@ -2806,7 +3061,7 @@ mod tests {
     fn apply_all_representations_is_a_total_no_op_when_no_track_is_restricted() {
         let before = universal_tracks(&["x", "y"], 1);
         let mut after = before.clone();
-        after.apply_all_representations();
+        after.apply_all_representations(&mut crate::logging::Logging::new());
         assert_eq!(after.fa.q, before.fa.q);
         assert_eq!(after.fa.o, before.fa.o);
         assert_eq!(after.fa.d, before.fa.d);
@@ -2819,7 +3074,7 @@ mod tests {
     fn apply_all_representations_intersects_the_restricted_track_only() {
         let mut a = universal_tracks(&["x", "y"], 1);
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
-        a.apply_all_representations();
+        a.apply_all_representations(&mut crate::logging::Logging::new());
 
         // Track `x` is restricted, track `y` is not: `(11, **)` is rejected, `(**, 11)` is not.
         let word = |xs: &[i32], ys: &[i32]| -> Vec<i32> {
@@ -2840,7 +3095,7 @@ mod tests {
             Some(Rc::new(no_adjacent_ones("ignored"))),
             Some(Rc::new(no_adjacent_ones("ignored"))),
         ]);
-        a.apply_all_representations();
+        a.apply_all_representations(&mut crate::logging::Logging::new());
         let word = |xs: &[i32], ys: &[i32]| -> Vec<i32> {
             xs.iter()
                 .zip(ys.iter())
@@ -2855,6 +3110,39 @@ mod tests {
         assert!(!a.fa.accepts_word(&word(&[1, 1], &[0, 1])));
     }
 
+    /// `copy(K)` (`Automaton.java:312-318`) copies fields only, never `this`'s runtime
+    /// class — so `dfa_typed` must survive `apply_all_representations` regardless of
+    /// what `K` (built via `and`, always `AutomatonDFA`-typed in Java) carries. Mutation-
+    /// verified by adversarial review: the whole workspace test suite passed even with
+    /// the preserving line deleted, because every `msd_2` test has an empty `all_reps`
+    /// and never exercises this function's `K`-building branch at all — this is the
+    /// direct `wr-core`-level test that closes that gap (a real, jar-confirmed divergence
+    /// on `msd_fib`-class custom bases: `?msd_fib ~(E x,y x<y)` logs `0 states` in real
+    /// Walnut, `6` without this preservation, since the cached `lessThan`/`equality`
+    /// automata `NumberSystem` restricts via `apply_all_representations` are plain, not
+    /// `AutomatonDFA`-typed, in Java).
+    #[test]
+    fn apply_all_representations_preserves_dfa_typed_like_javas_copy() {
+        let mut restricted = universal_tracks(&["x", "y"], 1);
+        restricted.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        restricted.dfa_typed = false;
+        restricted.apply_all_representations(&mut crate::logging::Logging::new());
+        assert!(
+            !restricted.dfa_typed,
+            "self was plain (Java: this.getClass() != AutomatonDFA) -- `and`'s DFA-typed \
+             K must not leak the flag onto it"
+        );
+
+        let mut already_dfa_typed = universal_tracks(&["x", "y"], 1);
+        already_dfa_typed.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        already_dfa_typed.dfa_typed = true;
+        already_dfa_typed.apply_all_representations(&mut crate::logging::Logging::new());
+        assert!(
+            already_dfa_typed.dfa_typed,
+            "self was already AutomatonDFA-typed -- copy(K) must not clear it"
+        );
+    }
+
     /// `determineRandomLabel`/`unlabel`'s exact interplay (`Automaton.java:252-270`), ported
     /// verbatim including the part that looks like an oversight: `unlabel()` runs BEFORE
     /// `copy(K)`, so when at least one restriction was applied it is overwritten and the
@@ -2865,7 +3153,7 @@ mod tests {
         let mut nothing = universal_tracks(&["x", "y"], 1);
         nothing.unlabel();
         assert!(!nothing.is_bound());
-        nothing.apply_all_representations();
+        nothing.apply_all_representations(&mut crate::logging::Logging::new());
         assert!(
             !nothing.is_bound(),
             "still unbound, nothing was copied over it"
@@ -2875,7 +3163,7 @@ mod tests {
         let mut applied = universal_tracks(&["x", "y"], 1);
         applied.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
         applied.unlabel();
-        applied.apply_all_representations();
+        applied.apply_all_representations(&mut crate::logging::Logging::new());
         assert_eq!(
             applied.label,
             vec!["0", "1"],
@@ -2895,7 +3183,7 @@ mod tests {
             Some(Rc::new(no_adjacent_ones("ignored"))),
             Some(Rc::new(no_adjacent_ones("ignored"))),
         ]);
-        a.apply_all_representations_with_output();
+        a.apply_all_representations_with_output(&mut crate::logging::Logging::new());
 
         assert!(
             a.fa.o.contains(&7),
@@ -2914,6 +3202,38 @@ mod tests {
         assert!(
             a.fa.accepts_word(&word(&[1, 1], &[0, 1])),
             "the first track's restriction is discarded -- combines with `this`, not `K`"
+        );
+    }
+
+    /// The `_with_output` sibling of
+    /// [`apply_all_representations_preserves_dfa_typed_like_javas_copy`] above — genuinely
+    /// distinct code, not a duplicate: `K` here comes from
+    /// [`crate::product::cross_product`] (Java's raw `ProductStrategies.crossProduct`),
+    /// not `and`, so this is the direction that would wrongly CLEAR a true flag rather
+    /// than wrongly SET a false one. **Found genuinely untested by round-4 adversarial
+    /// review** — mutation-verified: deleting the preserving line in
+    /// `apply_all_representations_with_output` passed the entire workspace test suite
+    /// (including the sibling test above, which only exercises the OTHER function) until
+    /// this test was added.
+    #[test]
+    fn apply_all_representations_with_output_preserves_dfa_typed_like_javas_copy() {
+        let mut a = universal_tracks(&["x", "y"], 7);
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        a.dfa_typed = true;
+        a.apply_all_representations_with_output(&mut crate::logging::Logging::new());
+        assert!(
+            a.dfa_typed,
+            "copy(K) never reassigns the receiver's own runtime class, even though K \
+             itself (built via plain cross_product) is never DFA-typed"
+        );
+
+        let mut b = universal_tracks(&["x", "y"], 7);
+        b.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+        assert!(!b.dfa_typed, "sanity: fresh test fixtures start plain");
+        b.apply_all_representations_with_output(&mut crate::logging::Logging::new());
+        assert!(
+            !b.dfa_typed,
+            "a plain self must not spuriously become DFA-typed either"
         );
     }
 

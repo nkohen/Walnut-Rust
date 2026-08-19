@@ -139,8 +139,8 @@ use std::time::{Duration, Instant};
 
 use support::{
     build_session_tree, compare_messages, corpus_root, deferred_otf_strategy, global_library_names,
-    load_expected, load_fixtures, transitively_dropped, walnut_java_dir, Excluded, Expected,
-    Fixture, PathRewrite, PRELUDE,
+    load_expected, load_fixtures, strip_construction_recordings, transitively_dropped,
+    walnut_java_dir, Excluded, Expected, Fixture, PathRewrite, PRELUDE,
 };
 use wr_cli::prover::Prover;
 use wr_cli::session::Session;
@@ -402,73 +402,83 @@ fn halted_outcome(halt: &Halt, id: usize, command: &str) -> Option<Outcome> {
 /// Before that check existed, matching was by id alone, and exactly that regression would
 /// have reported green.
 const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
-    // -- root cause 1: `details` log-text fidelity (see tests/golden/STATUS.md §1) --------
+    // -- root cause 1 (CLOSED, U28, 2026-08-17): `details` per-`act()`/`wr-core` logging --
     //
-    // Every STATE COUNT in these fixtures already matches real Walnut exactly,
-    // pre-minimization ones included. What is missing is log LINES: the `computing X`/
-    // `computed X` pairs that Java emits from inside each token's `act()` body, and every
-    // `wr-core`-level line (`computing cross product:N states`, `Minimizing: N states.`,
-    // `Determinizing [#k, strategy: SC]`, `quantifying:N states`, …).
+    // 628 and 637 used to live here — every STATE COUNT already matched real Walnut
+    // exactly, pre-minimization ones included; only log LINES were missing (the
+    // `computing X`/`computed X` pairs Java emits from inside each token's `act()` body, and
+    // every `wr-core`-level line: `computing cross product:N states`, `Minimizing: N
+    // states.`, `Determinizing [#k, strategy: SC]`, `quantifying:N states`, …). Closed by
+    // threading `&mut Logging` through every `act()` body (`wr-logic`) and through
+    // `wr-core`'s product/determinize/minimize/quantify/numsys call sites — see
+    // `wr_logic::eval`'s module docs ("Per-`act()` `Logging` calls — CLOSED (U28)") for the
+    // full account, including a real, verified WB-039 (`docs/WALNUT-BUGS.md`) instance this
+    // closure surfaced along the way (a `NumberSystem`-internal `disablePrint`/`enablePrint`
+    // non-nesting leak) and a corrected understanding of what `disablePrint`/`enablePrint`
+    // actually gate (an earlier draft of that doc section had this backwards).
     //
-    // Both are pre-existing, explicitly documented deferrals — `wr-logic`'s `eval.rs`
-    // module docs ("DEFERRED GAP: the per-`act()` `Logging` calls are NOT ported", which
-    // itself says the gap "must land before Phase 3b's U27") and `wr-core`'s `product.rs`
-    // ("Progress logging not ported"). Closing them means threading `&mut Logging` through
-    // every `act()` body AND through `wr-core`'s product/determinize/minimize/quantify call
-    // sites: a follow-up unit, not a harness concern.
-    (
-        375,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    (
-        376,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    (
-        377,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    (
-        378,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    (
-        379,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
+    // -- root cause 1b (CLOSED for 375-379, still open for 383) -----------------------
+    //
+    // 375, 376, 377, 378 and 379 used to live here as one bucket: a genuine warm-vs-cold
+    // `PredicateEnv::number_system` session-cache mismatch between this harness (a fresh
+    // `Prover` per fixture, always cold) and Java's own fixture-generation run (one
+    // continuous, long-lived session, warm by the time these particular fixtures ran). A
+    // throwaway `Logging` at `number_system`'s call sites was tried once (2026-08-17) to
+    // make this harness's cold fixtures match Java's warm captures — and reverted, because
+    // it made a genuinely fresh, single-query session (the normal case for a real user's
+    // first `eval`) log LESS than real Walnut actually would, purely to flatter this one
+    // harness's own cold-start artifact.
+    //
+    // The real fix (2026-08-19) doesn't touch what gets logged at all: it identifies EXACTLY
+    // which lines `number_system`'s (memoized-lookup-only) cold construction produced during
+    // THIS fixture's own run — via `wr_core::logging::Logging::construction_recordings`, a
+    // pure side-channel tap with no Java analogue, bracketing only that one call site (see
+    // `session.rs`'s `PredicateEnv::number_system` impl) — and the golden-corpus comparator
+    // (`support::strip_construction_recordings`) removes exactly that verbatim, exact-match
+    // text before comparing, the same way `PathRewrite` removes exactly the harness's own
+    // temp-directory strings. **Read the nuance, not just the headline**: a recorded span is
+    // copied from the very call that wrote it, so it always matches ITSELF — a bug that
+    // changed what construction logs would be stripped just as cleanly as correct text is.
+    // What this DOES still guarantee is that a bug in QUERY-COMPUTATION text (the `~`/`=>`/`A`
+    // handlers' own `apply_all_representations` calls, never inside a recorded span) stays
+    // fully, byte-for-byte compared — and it never touches `fresh_number_system` (the
+    // UNMEMOIZED `$name(…)`/`Function`-token sibling, whose construction genuinely reruns on
+    // every call in real Java too, warm or cold, so its logging is real signal — 379's own
+    // `$fibmr(…)` calls are exactly this case, and the first version of this fix wrongly
+    // stripped them too before being narrowed to `number_system` only). Verifying construction
+    // ITSELF logs the right thing is `wr-core`'s job, not this comparator's — see
+    // `NumberSystem::with_custom_base_files`'s own pinned-line-sequence test. 375-379 now pass
+    // cleanly, both automaton and text.
+    //
+    // 383 stays open. It is a genuinely DIFFERENT cache than the one the fix above reaches —
+    // not merely "the hardest member of the same bucket" — so it does not benefit: building the
+    // constant `>= 2` in `n23=10` recursively triggers WB-039's `disablePrint`/`enablePrint`
+    // non-nesting leak from an internal `and`/`quantify` call, and this port's gating is
+    // verified byte-for-byte correct against a COLD-session real-jar capture of the same
+    // query, leak included — but 383's original recorded fixture text was captured from
+    // Java's WARM session, which this harness's fresh-`Prover`-per-fixture design cannot
+    // reproduce without sharing `NumberSystem`-cache state across fixtures (a genuine harness
+    // redesign, not attempted). See `wr_logic::eval`'s module docs and this file's own
+    // `tests/golden/STATUS.md` §1b for the full account.
     (
         383,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
+        "details: WB-039 `disablePrint`/`enablePrint` leak during recursive constant \
+         construction, captured from Java's WARM session — see the comment above this list \
+         and `tests/golden/STATUS.md` §1b for the full account. Both automata match; only \
+         the log text differs. NOT the same root cause as 375-379 (closed) — see comment.",
     ),
-    (
-        628,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    // 637 and 660 joined this list the moment `[strategy …]`/`[export …]` were wired through
-    // to `wr_core::determinize` — before that they were not compared at all (they were the
-    // whole of the old `Excluded::MetacommandNotWired` class). They are the same root cause,
-    // not a new one, and specifically NOT a metacommand failure:
-    //
-    //   * 637's `[strategy 6 BRZ]` demonstrably takes effect. Its sixth determinization is a
-    //     1,790-state NFA that does not finish inside this harness's 60s cap under `SC`; with
-    //     the metacommand wired the whole fixture completes in well under a second, exactly as
-    //     real Walnut does (130ms). Its `details` expectation additionally spells
-    //     `Determinizing [#6, strategy: Brzozowski]` — a log LINE this port does not emit yet,
-    //     which is the same gap 375-379/383/628 have.
-    //   * 660's `[export 1 BA]` writes its `_pre` dump; Java's export is a side-effecting file
-    //     write that never touches the returned automaton, so it cannot affect this comparison
-    //     either way.
-    //
-    // Both now compare their AUTOMATON too (the `details` check no longer short-circuits —
-    // see `fold_failures`), and both pass it; only the log text differs.
-    (
-        637,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
-    (
-        660,
-        "details: per-act()/wr-core logging not threaded (wr-logic eval.rs DEFERRED GAP)",
-    ),
+    // 637 and 660 joined and left this bucket in the same unit (U28): both were excluded
+    // until `[strategy …]`/`[export …]` were wired through to `wr_core::determinize` (the
+    // old `Excluded::MetacommandNotWired` class), then joined the log-text-only
+    // KNOWN_DIVERGENCES bucket once that landed. 660 initially looked like the same
+    // warm/cold `NumberSystem`-cache limitation as 383 — it wasn't: an independent
+    // adversarial review (round 2, live-jar-verified) found the real cause was
+    // `wr_core::product::cross_product` missing Java's own `computing cross product:` line
+    // (`ProductStrategies.crossProduct`'s `printAndUpdateIndex` call, `:214` — a SEPARATE
+    // call site from `crossProductAndMinimize`'s own, which this port already had). Fixed
+    // by adding it to `cross_product` itself (careful not to double-log through
+    // `cross_product_and_minimize_dfa`'s delegation — see `cross_product_unlogged`'s docs);
+    // 660 now passes cleanly, both automaton and text.
     // -- root cause 2 (CLOSED): `transduce` over a reversed (lsd) custom-base DFAO --------
     //
     // 532/533/534 used to live here: `test531 = reverse F` is an `lsd_fib` DFAO, so
@@ -922,6 +932,7 @@ impl FixtureJob {
                     &self.expected,
                     &actual,
                     &self.rewrite,
+                    prover.logging().construction_recordings(),
                     &mut notes,
                 ),
             },
@@ -1283,6 +1294,7 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
         &expected_with_gv(&only_zero),
         &actual(),
         &rewrite,
+        &[],
         &mut notes,
     );
     assert!(
@@ -1305,6 +1317,7 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
         &expected_with_gv(&everything),
         &actual(),
         &rewrite,
+        &[],
         &mut notes,
     );
     assert!(
@@ -1326,6 +1339,7 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
         },
         &actual(),
         &rewrite,
+        &[],
         &mut notes,
     );
     assert!(
@@ -1390,6 +1404,7 @@ fn compare_test_case(
     expected: &Expected,
     actual: &TestCase,
     rewrite: &PathRewrite,
+    construction_recordings: &[Vec<String>],
     notes: &mut Vec<String>,
 ) -> Verdict {
     if !expected.error.is_empty() {
@@ -1485,10 +1500,22 @@ fn compare_test_case(
 
     // 3. details (`:946`). `rewrite` maps this harness's own throwaway library directories
     // back to the ones `walnut-java` recorded — see [`PathRewrite`] for why that is the one
-    // extra normalization and why it cannot hide a port defect.
+    // extra normalization and why it cannot hide a port defect. `strip_construction_recordings`
+    // is the second and only other one — see its own docs for the more nuanced safety property
+    // it actually has (it cannot mask a bug in QUERY-COMPUTATION text, but is not independent
+    // verification of construction's OWN text — that's `wr-core`'s job).
+    //
+    // Strip runs on the RAW `actual.details()`, before `rewrite` — recorded spans are read
+    // straight out of `Logging` and were never path-rewritten, so stripping after rewriting
+    // would desync a construction line that happened to contain a session/home path (not
+    // reachable today, since construction only logs `Applying valid representation`/`and`
+    // output, but the ordering itself should not depend on that staying true).
     if let Err(why) = compare_messages(
         &expected.details,
-        &rewrite.apply(actual.details()),
+        &rewrite.apply(&strip_construction_recordings(
+            actual.details(),
+            construction_recordings,
+        )),
         "details",
     ) {
         failures.push((FailedHalf::Text, why));

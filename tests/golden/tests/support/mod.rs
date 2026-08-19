@@ -621,6 +621,76 @@ impl PathRewrite {
     }
 }
 
+/// Strips exactly the lines `wr_core::logging::Logging::construction_recordings` says were
+/// produced by building a custom base's `NumberSystem` cold, during this fixture's own
+/// dispatch — see that method's module docs for the recording mechanism, and
+/// `tests/golden/STATUS.md` §1b for why this text has no counterpart to compare against at
+/// all: Java's own fixture-generation run built these custom bases once, early, in one
+/// continuous session, so every later fixture's *capture* reflects an already-warm cache.
+/// This harness gives every fixture a fresh `Prover` (deliberately, for isolation/timeout
+/// safety), so a fixture that is the first in ITS session to reference a given custom base
+/// logs construction-time text Java's capture never shows.
+///
+/// **This cannot mask a bug in the QUERY-COMPUTATION text, but it is NOT independent
+/// verification that construction's OWN text is correct — read both halves of that claim.**
+/// It never inspects `s`'s content to decide what to remove — it removes only the exact,
+/// verbatim lines the production `Logging` instance reports it actually emitted from inside
+/// `NumberSystem::with_custom_base_files` during this run, a value this function reads out,
+/// never computes or guesses. A `~`/`=>`/`A` handler's own `apply_all_representations` call
+/// on a query automaton mid-computation (as opposed to during `NumberSystem` construction)
+/// is never included in a recording, so a real bug in the count, order, or content of THOSE
+/// lines is still compared byte-for-byte, exactly as if this function did not exist. **But a
+/// recorded span always matches itself** — it is copied from the very same call that wrote
+/// `s`'s copy of that text — so a bug that changes what construction itself logs (a wrong
+/// track count, a cross-wired restriction file) removes its own, equally-wrong text just as
+/// cleanly as correct text. That verification is `wr_core::numsys`'s job, not this
+/// function's — see `NumberSystem::with_custom_base_files`'s own test module for the
+/// regression test that exists specifically to cover it (`wr_core::logging::Logging`'s
+/// module docs make the same point). What IS still true: if a recorded span doesn't appear
+/// as a contiguous run starting at the beginning of a line in `s` — e.g. the recording
+/// mechanism itself desyncs from what actually got appended to `detailed_log` — the removal
+/// for that one span is simply a no-op; the diff below then reports whatever is genuinely
+/// different instead of a removal papering over it.
+///
+/// Matches are anchored to line starts (position 0, or immediately after a `\n`) rather than
+/// any byte offset: a plain substring search could match a recorded line against the SUFFIX
+/// of a longer, more deeply indented line elsewhere in `s` (indentation is literal leading
+/// spaces — a shallow-indented recorded line can be a byte-for-byte suffix of a
+/// deeper-indented, textually unrelated one), which would remove a partial line and glue its
+/// leftover prefix onto whatever follows.
+pub fn strip_construction_recordings(s: &str, recordings: &[Vec<String>]) -> String {
+    let mut out = s.to_string();
+    for span in recordings {
+        if span.is_empty() {
+            continue;
+        }
+        let burst = format!("{}\n", span.join("\n"));
+        if let Some(pos) = find_at_line_start(&out, &burst) {
+            out.replace_range(pos..pos + burst.len(), "");
+        }
+    }
+    out
+}
+
+/// The first occurrence of `needle` in `haystack` that starts a line — byte 0, or
+/// immediately after a `\n` — never mid-line. See [`strip_construction_recordings`]'s docs
+/// for why a plain `str::find` is not safe here. `\n` is always exactly one byte, so `i + 1`
+/// is always a valid `char` boundary to slice at.
+fn find_at_line_start(haystack: &str, needle: &str) -> Option<usize> {
+    if haystack.starts_with(needle) {
+        return Some(0);
+    }
+    for (i, byte) in haystack.bytes().enumerate() {
+        if byte == b'\n' {
+            let start = i + 1;
+            if haystack[start..].starts_with(needle) {
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
 /// `IntegrationTest.assertEqualMessages(expected, actual)` (`:968-990`) as a `Result` rather
 /// than a JUnit assertion: `Ok(())` when the two normalize equal, otherwise a diff message
 /// built the same way Java's failure message is (`findFirstDifferingIndex`, `:992-1013`).
@@ -1159,5 +1229,118 @@ mod tests {
             identifiers("join test448 test444[a][b] test444[a][b];"),
             vec!["join", "test448", "test444", "a", "b"]
         );
+    }
+
+    // -- strip_construction_recordings -----------------------------------------
+
+    #[test]
+    fn a_recorded_burst_is_removed_verbatim_from_wherever_it_appears() {
+        let actual = "Applying valid representation #0\nApplying valid representation #1\ncomputing j<i\ncomputed j<i\n";
+        let recordings = vec![vec![
+            "Applying valid representation #0".to_string(),
+            "Applying valid representation #1".to_string(),
+        ]];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            "computing j<i\ncomputed j<i\n"
+        );
+    }
+
+    #[test]
+    fn a_span_that_does_not_appear_verbatim_is_left_completely_alone() {
+        // Simulates a hypothetical regression in what construction logs: the recorded span
+        // no longer matches what actually appears (e.g. a wrong track count changed the
+        // content). The removal must be a silent no-op here, not a partial/fuzzy match —
+        // otherwise a real construction-time bug could be hidden instead of surfaced by the
+        // ordinary text diff.
+        let actual = "Applying valid representation #0\ncomputing j<i\n";
+        let recordings = vec![vec![
+            "Applying valid representation #0".to_string(),
+            "Applying valid representation #1".to_string(), // never actually appears
+        ]];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            actual,
+            "an unmatched span must not remove anything, partially or otherwise"
+        );
+    }
+
+    #[test]
+    fn only_one_occurrence_is_removed_per_recorded_span() {
+        // If the exact same burst genuinely occurred twice, only as many copies as were
+        // actually recorded are removed -- this can never remove MORE than construction
+        // really produced, only ever exactly that much.
+        let actual = "X\nX\nkeep\n";
+        let recordings = vec![vec!["X".to_string()]];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            "X\nkeep\n"
+        );
+    }
+
+    #[test]
+    fn multiple_spans_are_each_removed_in_order() {
+        let actual = "first\nmiddle\nsecond a\nsecond b\ntail\n";
+        let recordings = vec![
+            vec!["first".to_string()],
+            vec!["second a".to_string(), "second b".to_string()],
+        ];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            "middle\ntail\n"
+        );
+    }
+
+    #[test]
+    fn no_recordings_is_a_complete_no_op() {
+        let actual = "computing j<i\ncomputed j<i\n";
+        assert_eq!(strip_construction_recordings(actual, &[]), actual);
+    }
+
+    #[test]
+    fn empty_spans_are_ignored_rather_than_matching_everything() {
+        // An empty `Vec<String>` joins to "", so the reconstructed burst is `"\n"` (a single
+        // newline) -- which WOULD otherwise match at position 0 (an empty string is a prefix
+        // of every string) and delete the first newline in `actual`, silently merging its
+        // first two lines into one. Must be skipped explicitly, not handled by luck.
+        let actual = "computing j<i\n";
+        let recordings = vec![vec![]];
+        assert_eq!(strip_construction_recordings(actual, &recordings), actual);
+    }
+
+    #[test]
+    fn a_mid_line_suffix_match_is_never_removed() {
+        // A shallow-indented recorded line can be a byte-for-byte SUFFIX of a deeper-indented,
+        // textually unrelated line elsewhere in `actual` (indentation is literal leading
+        // spaces). A plain substring search would match mid-line here and corrupt a genuine
+        // divergence into a differently-wrong string instead of leaving it fully visible.
+        let actual = "  computing &:2 states\nreal content\n";
+        let recordings = vec![vec!["computing &:2 states".to_string()]];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            actual,
+            "a match that does not start at a line boundary must never be removed"
+        );
+    }
+
+    #[test]
+    fn a_line_start_match_is_still_removed_even_when_a_mid_line_decoy_precedes_it() {
+        let actual = "  computing &:2 states\ncomputing &:2 states\nreal content\n";
+        let recordings = vec![vec!["computing &:2 states".to_string()]];
+        assert_eq!(
+            strip_construction_recordings(actual, &recordings),
+            "  computing &:2 states\nreal content\n",
+            "the genuine line-start match must still be found and removed, skipping the decoy"
+        );
+    }
+
+    #[test]
+    fn a_computation_time_occurrence_outside_any_recorded_span_is_never_touched() {
+        // The whole point of the mechanism: text that merely LOOKS like construction noise,
+        // but was never reported as a recorded span, must never be removed. This is what
+        // keeps a real wrong-track-count/cross-wired-restriction bug (mid-query, not during
+        // `NumberSystem` construction) fully visible to the ordinary text diff.
+        let actual = "Applying valid representation #0\nApplying valid representation #1\n";
+        assert_eq!(strip_construction_recordings(actual, &[]), actual);
     }
 }

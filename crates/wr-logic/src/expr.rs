@@ -323,6 +323,7 @@ impl AutomatonExpression {
         i: usize,
         acc: Automaton,
         identifiers: &mut Vec<String>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Automaton, ExprError> {
         if self.m.get_arity() != 1 {
             return Err(ExprError::AutomatonArgumentWrongArity {
@@ -337,7 +338,12 @@ impl AutomatonExpression {
             });
         }
         identifiers.push(self.m.label[0].clone());
-        Ok(and(&acc, &self.m).into_automaton())
+        // `Logging.indent()`/`dedent()` (`AutomatonExpression.java:40/42`) bracket the
+        // `and` call -- no text of their own, matching every sibling `act` in this file.
+        logging.indent();
+        let result = and(&acc, &self.m, logging).into_automaton();
+        logging.dedent();
+        Ok(result)
     }
 }
 
@@ -374,9 +380,13 @@ impl ArithmeticExpression {
         identifiers: &mut Vec<String>,
         acc: Automaton,
         quantify: &mut Vec<String>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Automaton {
         identifiers.push(self.identifier.clone());
-        let result = and(&acc, &self.m).into_automaton();
+        // `Logging.indent()`/`dedent()` (`ArithmeticExpression.java:34/38`) -- no text.
+        logging.indent();
+        let result = and(&acc, &self.m, logging).into_automaton();
+        logging.dedent();
         quantify.push(self.identifier.clone());
         result
     }
@@ -424,6 +434,7 @@ impl VariableExpression {
         identifiers: &mut Vec<String>,
         acc: Automaton,
         quantify: &mut Vec<String>,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Automaton, ExprError> {
         if !identifiers.contains(&self.identifier) {
             identifiers.push(self.identifier.clone());
@@ -437,7 +448,13 @@ impl VariableExpression {
             eq.bind(vec![self.identifier.clone(), new_identifier.clone()]);
             quantify.push(new_identifier.clone());
             identifiers.push(new_identifier);
-            Ok(and(&acc, &eq).into_automaton())
+            // `Logging.indent()`/`dedent()` (`VariableExpression.java:43/45`) -- only on
+            // this (repeated-identifier) branch, matching Java's own placement inside the
+            // `else`.
+            logging.indent();
+            let result = and(&acc, &eq, logging).into_automaton();
+            logging.dedent();
+            Ok(result)
         }
     }
 }
@@ -524,22 +541,26 @@ impl NumberLiteralExpression {
     /// mutability, which is exactly the signature this needed — so it lands here rather than
     /// leaving a doc comment claiming a blocker that no longer exists.
     ///
-    /// `t.getUniqueString()` becomes `fresh.next_identifier()` (Ruling 4), and
-    /// `Logging.indent()`/`dedent()` around the `and` are not ported, both matching every
-    /// sibling `act` in this file.
+    /// `t.getUniqueString()` becomes `fresh.next_identifier()` (Ruling 4).
+    /// `Logging.indent()`/`dedent()` around the `and` (`NumberLiteralExpression.java:67/69`)
+    /// bracket it, no text of their own, matching every sibling `act` in this file.
     pub fn act(
         &self,
         fresh: &mut FreshIdentifiers,
         identifiers: &mut Vec<String>,
         quantify: &mut Vec<String>,
         acc: Automaton,
+        logging: &mut wr_core::logging::Logging,
     ) -> Result<Automaton, ExprError> {
-        let mut constant = self.base.get_constant(&self.value)?;
+        let mut constant = self.base.get_constant(&self.value, logging)?;
         let id = fresh.next_identifier();
         constant.bind(vec![id.clone()]);
         identifiers.push(id.clone());
         quantify.push(id);
-        Ok(and(&acc, &constant).into_automaton())
+        logging.indent();
+        let result = and(&acc, &constant, logging).into_automaton();
+        logging.dedent();
+        Ok(result)
     }
 }
 
@@ -761,7 +782,13 @@ mod tests {
         let ae = AutomatonExpression::new("phi", labeled_automaton(&["a", "b"]));
         let mut identifiers = vec![];
         let err = ae
-            .act("phi", 0, Automaton::true_false(true), &mut identifiers)
+            .act(
+                "phi",
+                0,
+                Automaton::true_false(true),
+                &mut identifiers,
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err,
@@ -787,7 +814,13 @@ mod tests {
 
         let ae = AutomatonExpression::new("phi", a);
         let err = ae
-            .act("phi", 1, Automaton::true_false(true), &mut vec![])
+            .act(
+                "phi",
+                1,
+                Automaton::true_false(true),
+                &mut vec![],
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap_err();
         assert_eq!(
             err,
@@ -814,7 +847,15 @@ mod tests {
         let acc = accepts_everything_automaton("y");
         let ae = AutomatonExpression::new("phi", own.clone());
         let mut identifiers = vec![];
-        let result = ae.act("phi", 0, acc.clone(), &mut identifiers).unwrap();
+        let result = ae
+            .act(
+                "phi",
+                0,
+                acc.clone(),
+                &mut identifiers,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .unwrap();
         assert_eq!(identifiers, vec!["y".to_string()]);
         assert!(!result.is_true_false_automaton());
         assert_eq!(result.get_arity(), own.get_arity());
@@ -860,7 +901,12 @@ mod tests {
         let ae = ArithmeticExpression::new("a+b", own.clone(), "x");
         let mut identifiers = vec![];
         let mut quantify = vec![];
-        let result = ae.act(&mut identifiers, acc.clone(), &mut quantify);
+        let result = ae.act(
+            &mut identifiers,
+            acc.clone(),
+            &mut quantify,
+            &mut wr_core::logging::Logging::new(),
+        );
         assert_eq!(identifiers, vec!["x".to_string()]);
         assert_eq!(quantify, vec!["x".to_string()]);
 
@@ -901,6 +947,7 @@ mod tests {
                 &mut identifiers,
                 &mut quantify,
                 Automaton::true_false(true),
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
 
@@ -932,6 +979,7 @@ mod tests {
                 &mut identifiers,
                 &mut quantify,
                 Automaton::true_false(true),
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
         let second = also_five
@@ -940,6 +988,7 @@ mod tests {
                 &mut identifiers,
                 &mut quantify,
                 Automaton::true_false(true),
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
         assert_eq!(fresh.issued(), 2, "each act mints its own name");
@@ -959,6 +1008,7 @@ mod tests {
                 &mut vec![],
                 &mut vec![],
                 Automaton::true_false(true),
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap_err();
         assert_eq!(err.to_string(), "negative constant -1");
@@ -980,6 +1030,7 @@ mod tests {
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
         assert_eq!(identifiers, vec!["a".to_string()]);
@@ -1009,6 +1060,7 @@ mod tests {
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
         assert_eq!(identifiers, vec!["a".to_string()]);
@@ -1029,6 +1081,7 @@ mod tests {
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap();
         assert_eq!(fresh.issued(), 1);
@@ -1058,6 +1111,7 @@ mod tests {
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
+                &mut wr_core::logging::Logging::new(),
             )
             .unwrap_err();
         assert_eq!(

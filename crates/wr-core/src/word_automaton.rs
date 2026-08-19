@@ -78,7 +78,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 /// [`Automaton::determinize_and_minimize`] call collapses states that became
 /// equivalent once output was restricted to `0`/`1`.
 pub fn compare_word_automaton(word_a: &mut Automaton, o: i32, op: RelationalOp) {
-    compare_word_automaton_with_ctx(word_a, o, op, None);
+    compare_word_automaton_with_ctx(word_a, o, op, None, &mut crate::logging::Logging::new());
 }
 
 /// [`compare_word_automaton`] with an explicit
@@ -94,13 +94,32 @@ pub fn compare_word_automaton_with_ctx(
     o: i32,
     op: RelationalOp,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) {
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} ({}) against {}:{} states",
+        crate::logging::COMPARING,
+        op.symbol(),
+        o,
+        word_a.fa.q
+    ));
+    logging.indent();
     for p in 0..word_a.fa.q {
         let out_p = word_a.fa.o[p];
         word_a.fa.set_output_if_equal(p, op.compare(out_p, o));
     }
     // As of now, this is *not* a word automaton.
-    word_a.determinize_and_minimize_with_ctx(ctx);
+    word_a.determinize_and_minimize_with_ctx(ctx, logging);
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} ({}) against {}:{} states - {}ms",
+        crate::logging::COMPARED,
+        op.symbol(),
+        o,
+        word_a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
 }
 
 /// `WordAutomaton.compareWordAutomata(Automaton, Automaton, String)`
@@ -113,10 +132,31 @@ pub fn compare_word_automata(
     word_a: &Automaton,
     word_b: &Automaton,
     op: RelationalOp,
+    logging: &mut crate::logging::Logging,
 ) -> Automaton {
-    let m = product::cross_product_and_minimize(word_a, word_b, |a_out, b_out| {
-        i32::from(op.compare(a_out, b_out))
-    });
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} ({}):{} states - {} states",
+        crate::logging::COMPARING,
+        op.symbol(),
+        word_a.fa.q,
+        word_b.fa.q
+    ));
+    logging.indent();
+    let m = product::cross_product_and_minimize(
+        word_a,
+        word_b,
+        |a_out, b_out| i32::from(op.compare(a_out, b_out)),
+        logging,
+    );
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} ({}):{} states - {}ms",
+        crate::logging::COMPARED,
+        op.symbol(),
+        m.automaton().fa.q,
+        time_before.elapsed().as_millis()
+    ));
     m.into_automaton()
 }
 
@@ -132,7 +172,14 @@ pub fn apply_word_arith_operator(
     op: ArithmeticOp,
     reverse: bool,
 ) -> Result<(), NumSysError> {
-    apply_word_arith_operator_with_ctx(word_a, o, op, reverse, None)
+    apply_word_arith_operator_with_ctx(
+        word_a,
+        o,
+        op,
+        reverse,
+        None,
+        &mut crate::logging::Logging::new(),
+    )
 }
 
 /// [`apply_word_arith_operator`] with an explicit
@@ -146,7 +193,16 @@ pub fn apply_word_arith_operator_with_ctx(
     op: ArithmeticOp,
     reverse: bool,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<(), NumSysError> {
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} operator ({}):{} states",
+        crate::logging::APPLYING,
+        op.symbol(),
+        word_a.fa.q
+    ));
+    logging.indent();
     for p in 0..word_a.fa.q {
         let this_p = word_a.fa.o[p];
         word_a.fa.o[p] = if reverse {
@@ -155,7 +211,15 @@ pub fn apply_word_arith_operator_with_ctx(
             op.arith(o, this_p)?
         };
     }
-    minimize_self_with_output_with_ctx(word_a, ctx);
+    minimize_self_with_output_with_ctx(word_a, ctx, logging);
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} operator ({}):{} states - {}ms",
+        crate::logging::APPLIED,
+        op.symbol(),
+        word_a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     Ok(())
 }
 
@@ -165,7 +229,13 @@ pub fn apply_word_arith_operator_with_ctx(
 /// overflow case) — see this module's docs on fallibility for why this is a faithful
 /// port of Java's own uncaught-exception-through-the-BFS behavior, not a shortcut.
 pub fn apply_word_operator(word_a: &Automaton, word_b: &Automaton, op: ArithmeticOp) -> Automaton {
-    apply_word_operator_with_ctx(word_a, word_b, op, None)
+    apply_word_operator_with_ctx(
+        word_a,
+        word_b,
+        op,
+        None,
+        &mut crate::logging::Logging::new(),
+    )
 }
 
 /// [`apply_word_operator`] with an explicit
@@ -176,12 +246,36 @@ pub fn apply_word_operator_with_ctx(
     word_b: &Automaton,
     op: ArithmeticOp,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Automaton {
-    let n = product::cross_product(word_a, word_b, |a_out, b_out| {
-        op.arith(a_out, b_out)
-            .unwrap_or_else(|e| panic!("WordAutomaton::apply_word_operator: {e}"))
-    });
-    minimize_with_output_with_ctx(&n, ctx)
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} operator ({}):{} states - {} states",
+        crate::logging::APPLYING,
+        op.symbol(),
+        word_a.fa.q,
+        word_b.fa.q
+    ));
+    logging.indent();
+    let n = product::cross_product(
+        word_a,
+        word_b,
+        |a_out, b_out| {
+            op.arith(a_out, b_out)
+                .unwrap_or_else(|e| panic!("WordAutomaton::apply_word_operator: {e}"))
+        },
+        logging,
+    );
+    let n = minimize_with_output_with_ctx(&n, ctx, logging);
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} operator ({}):{} states - {}ms",
+        crate::logging::APPLIED,
+        op.symbol(),
+        n.fa.q,
+        time_before.elapsed().as_millis()
+    ));
+    n
 }
 
 /// `WordAutomaton.reverseWithOutput(Automaton, boolean)` (`WordAutomaton.java:109-192`)
@@ -221,9 +315,38 @@ pub fn apply_word_operator_with_ctx(
 /// concrete reachable counterexample found; every real word automaton is total), so not
 /// logged as a separate `WALNUT-BUGS.md` entry.
 pub fn reverse_with_output(word_a: &mut Automaton, reverse_msd: bool) {
+    reverse_with_output_with_ctx(
+        word_a,
+        reverse_msd,
+        None,
+        &mut crate::logging::Logging::new(),
+    );
+}
+
+/// [`reverse_with_output`] with an explicit
+/// [`crate::determinize::DeterminizeContext`] and the caller's real
+/// [`crate::logging::Logging`] — Java's own `REVERSING`/`REVERSED` pair +
+/// `indent()`/`dedent()` bracket (`WordAutomaton.java:114-115`, `:189-191`) around the
+/// WHOLE method, including `minimizeSelfWithOutput`'s own subtree (which gets NO
+/// separate bracket here — it is already inside this one). Note the message text has a
+/// SPACE after the colon (`REVERSING + ": "`), unlike `AutomatonLogicalOps.reverse`'s
+/// `REVERSING + ":"` (no space) — both ported verbatim, not unified.
+pub fn reverse_with_output_with_ctx(
+    word_a: &mut Automaton,
+    reverse_msd: bool,
+    ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
+) {
     if word_a.fa.is_true_false_automaton() {
         return;
     }
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{}: {} states",
+        crate::logging::REVERSING,
+        word_a.fa.q
+    ));
+    logging.indent();
 
     let added_dead_state = word_a.fa.add_distinguished_dead_state();
 
@@ -289,13 +412,21 @@ pub fn reverse_with_output(word_a: &mut Automaton, reverse_msd: bool) {
         logicalops::flip_ns(word_a);
     }
 
-    minimize_self_with_output(word_a);
+    minimize_self_with_output_with_ctx(word_a, ctx, logging);
 
     if added_dead_state {
         // note: word_a is deterministic
         logicalops::remove_states_with_output_rebuild(&mut word_a.fa, min_output);
         word_a.force_canonize();
     }
+
+    logging.dedent();
+    logging.log_message(&format!(
+        "{}: {} states - {}ms",
+        crate::logging::REVERSED,
+        word_a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
 }
 
 /// `WordAutomaton.uncombine(Automaton, List<Integer>)` (`WordAutomaton.java:200-209`) —
@@ -320,7 +451,7 @@ pub fn uncombine(word_a: &Automaton, outputs: &[i32]) -> Vec<Automaton> {
 /// applies), and recombining via [`crate::logicalops::combine`]. If the uncombined
 /// automata are each minimal, the recombined DFAO is minimal too.
 pub fn minimize_with_output(word_a: &Automaton) -> Automaton {
-    minimize_with_output_with_ctx(word_a, None)
+    minimize_with_output_with_ctx(word_a, None, &mut crate::logging::Logging::new())
 }
 
 /// [`minimize_with_output`] with an explicit
@@ -332,17 +463,18 @@ pub fn minimize_with_output(word_a: &Automaton) -> Automaton {
 pub fn minimize_with_output_with_ctx(
     word_a: &Automaton,
     mut ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Automaton {
     let mut outputs = word_a.fa.o.clone();
     remove_duplicates(&mut outputs);
     let mut subautomata = uncombine(word_a, &outputs);
     for subautomaton in subautomata.iter_mut() {
         // These are *not* word automata.
-        subautomaton.determinize_and_minimize_with_ctx(ctx.as_deref_mut());
+        subautomaton.determinize_and_minimize_with_ctx(ctx.as_deref_mut(), logging);
     }
     let mut n = subautomata.remove(0);
     let label = n.label.clone(); // We keep the old labels, since they are replaced in combine.
-    n = logicalops::combine(&n, subautomata, &outputs);
+    n = logicalops::combine(&n, subautomata, &outputs, logging);
     n.label = label;
     n
 }
@@ -350,9 +482,18 @@ pub fn minimize_with_output_with_ctx(
 /// `WordAutomaton.minimizeSelfWithOutput(Automaton)` (`WordAutomaton.java:231-234`).
 /// `Automaton.copy(N)`'s Java role (a full field-by-field overwrite) is exactly Rust
 /// move-assignment here — see `automaton.rs`'s own module docs on why this crate never
-/// needs to port Java's manual `clone`/`copy` boilerplate.
+/// needs to port Java's manual `clone`/`copy` boilerplate. **Except one field**: `copy`
+/// copies FIELDS only and never reassigns `this`'s own runtime class, but
+/// [`crate::automaton::Automaton::dfa_typed`] is not a Java field this crate's plain
+/// move-assignment naturally preserves — `n` here comes from `minimize_with_output_with_ctx`
+/// → `logicalops::combine`, whose own result is plain-typed whenever the DFAO has ≥2
+/// distinct output values (`combine`'s own docs). Explicitly carried across, matching
+/// every other `copy(...)`-shaped site — see `Automaton::dfa_typed`'s docs. Currently
+/// latent (every real call site here feeds a value that is plain-typed in Java too, so
+/// this line is a no-op today), fixed defensively per that field's own warning that this
+/// exact bug class recurs at every whole-struct-reassignment site.
 pub fn minimize_self_with_output(word_a: &mut Automaton) {
-    minimize_self_with_output_with_ctx(word_a, None);
+    minimize_self_with_output_with_ctx(word_a, None, &mut crate::logging::Logging::new());
 }
 
 /// [`minimize_self_with_output`] with an explicit
@@ -361,8 +502,10 @@ pub fn minimize_self_with_output(word_a: &mut Automaton) {
 pub fn minimize_self_with_output_with_ctx(
     word_a: &mut Automaton,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) {
-    let n = minimize_with_output_with_ctx(word_a, ctx);
+    let mut n = minimize_with_output_with_ctx(word_a, ctx, logging);
+    n.dfa_typed = word_a.dfa_typed;
     *word_a = n;
 }
 
@@ -441,7 +584,12 @@ mod tests {
     fn compare_word_automata_less_than_two_single_state_automata() {
         let a = word_automaton(0, &[3], &[[0, 0]]);
         let b = word_automaton(0, &[5], &[[0, 0]]);
-        let m = compare_word_automata(&a, &b, RelationalOp::LessThan);
+        let m = compare_word_automata(
+            &a,
+            &b,
+            RelationalOp::LessThan,
+            &mut crate::logging::Logging::new(),
+        );
         assert!(m.fa.accepts_word(&[]));
     }
 
@@ -449,7 +597,12 @@ mod tests {
     fn compare_word_automata_equal_is_false_for_distinct_constants() {
         let a = word_automaton(0, &[3], &[[0, 0]]);
         let b = word_automaton(0, &[5], &[[0, 0]]);
-        let m = compare_word_automata(&a, &b, RelationalOp::Equal);
+        let m = compare_word_automata(
+            &a,
+            &b,
+            RelationalOp::Equal,
+            &mut crate::logging::Logging::new(),
+        );
         assert!(!m.fa.accepts_word(&[]));
     }
 
@@ -607,6 +760,24 @@ mod tests {
             word_output(&a, &[1]),
             9,
             "the second state's output (reached via symbol 1 from q0) must also be preserved"
+        );
+    }
+
+    /// `Automaton.copy(N)` (`Automaton.java:312-318`) copies fields only, never `this`'s
+    /// runtime class — so `dfa_typed` must survive `minimize_self_with_output` exactly
+    /// like every other field, even though `combine`'s own internal result (two distinct
+    /// outputs here, `3` and `9`, so it takes the plain-`crossProduct` branch) is not
+    /// itself DFA-typed. Currently unreachable from any real call site (see this
+    /// function's own docs), added per adversarial review's "fix the bug class, not just
+    /// the one live instance" finding.
+    #[test]
+    fn minimize_self_with_output_preserves_dfa_typed_like_javas_copy() {
+        let mut a = word_automaton(0, &[3, 9], &[[0, 1], [1, 0]]);
+        a.dfa_typed = true;
+        minimize_self_with_output(&mut a);
+        assert!(
+            a.dfa_typed,
+            "copy(N) never reassigns the receiver's own runtime class"
         );
     }
 }

@@ -148,7 +148,7 @@
 use crate::automaton::Automaton;
 use crate::fa::Fa;
 use crate::logicalops::{and, not, reverse};
-use crate::quantify::{quantify, QuantifyError};
+use crate::quantify::{quantify_with_ctx, QuantifyError};
 use num_bigint::{BigInt, Sign};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -517,6 +517,21 @@ pub enum RelationalOp {
 }
 
 impl RelationalOp {
+    /// `RelationalOperator.Ops.getSymbol()` (`RelationalOperator.java:46-51`) — needed
+    /// back for `WordAutomaton.compareWordAutomaton`/`compareWordAutomata`'s
+    /// `COMPARING`/`COMPARED` log text (`WordAutomaton.java:29,52`), which builds its
+    /// message from this exact string.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            RelationalOp::Equal => "=",
+            RelationalOp::NotEqual => "!=",
+            RelationalOp::LessThan => "<",
+            RelationalOp::GreaterThan => ">",
+            RelationalOp::LessEqThan => "<=",
+            RelationalOp::GreaterEqThan => ">=",
+        }
+    }
+
     /// `RelationalOperator.reverseOperator` (`RelationalOperator.java:213-221`) — the
     /// relation with its operands swapped.
     pub fn reverse_operator(self) -> RelationalOp {
@@ -1164,7 +1179,15 @@ impl NumberSystem {
     /// did before U5. Callers that CAN read `Custom Bases/` (i.e. `wr-io`/`wr-cli`) use
     /// [`NumberSystem::with_custom_base_files`] instead.
     pub fn new(name: &str) -> Result<NumberSystem, NumSysError> {
-        Self::with_custom_base_files(name, CustomBaseFiles::default())
+        // `CustomBaseFiles::default()` never resolves an all-representations file, so the
+        // one construction-time site that needs a real `Logging` (see
+        // `with_custom_base_files`'s docs) is unreachable from this path -- a throwaway is
+        // always correct here, not a narrowing.
+        Self::with_custom_base_files(
+            name,
+            CustomBaseFiles::default(),
+            &mut crate::logging::Logging::new(),
+        )
     }
 
     /// `NumberSystem(String name)` (`:132-163`) in full, with the three file loads lifted
@@ -1199,6 +1222,7 @@ impl NumberSystem {
     pub fn with_custom_base_files(
         name: &str,
         files: CustomBaseFiles,
+        logging: &mut crate::logging::Logging,
     ) -> Result<NumberSystem, NumSysError> {
         let msd_or_lsd = determine_msd_or_lsd(name)?;
         // `isMsd = msdOrLsd.equals(MSD)` (`:136`) -- anything that is not EXACTLY
@@ -1209,6 +1233,15 @@ impl NumberSystem {
             return Err(NumSysError::UnsupportedNegativeBase(name.to_string()));
         }
         let base = determine_base(name);
+
+        // `Logging.disablePrint()` (`:140`), matching Java's own — see
+        // `NumberSystem::apply_comparison`'s docs on why `disable_print`/`enable_print`
+        // are faithfully non-nesting (WB-039). Brackets the WHOLE rest of the
+        // constructor, including the nested `disablePrint()` right before
+        // `applyAllRepresentations` below (`:151`, a real no-op re-assignment in Java,
+        // ported as the same redundant call) and the single `enablePrint()` at the end
+        // (`:158`), unconditional whether or not an all-representations file was found.
+        logging.disable_print();
 
         let mut addition =
             Self::set_addition_automaton(name, base, is_msd, files.addition.resolve())?;
@@ -1239,17 +1272,22 @@ impl NumberSystem {
                 // method's doc comment for the `all_reps` half, deliberately left empty.
                 n.msd = vec![Some(is_msd); n.alphabet.len()];
                 let n = Rc::new(n);
+                // `Logging.disablePrint()` (`:151`) -- redundant with the one above (no
+                // intervening `enablePrint()`), ported as the same no-op re-assignment.
+                logging.disable_print();
                 // `addition.applyAllRepresentations(); lessThan...; equality...` (`:153-155`).
                 // Java reaches the automaton via each track's `NumberSystem` (= `this`,
                 // installed by the two setters above and by `initBasicAutomaton`); here the
                 // per-track handle is installed explicitly.
                 for a in [&mut addition, &mut less_than, &mut equality] {
                     a.set_all_reps(vec![Some(Rc::clone(&n)); a.alphabet.len()]);
-                    a.apply_all_representations();
+                    a.apply_all_representations(logging);
                 }
                 Some(n)
             }
         };
+        // `Logging.enablePrint()` (`:158`).
+        logging.enable_print();
 
         Ok(NumberSystem {
             name: name.to_string(),
@@ -1456,7 +1494,10 @@ impl NumberSystem {
     /// with new adder/comparator automata — and is what
     /// `NumberSystemTest.testMSDFlip`'s assertions are actually about.
     pub fn flip(&self) -> Result<NumberSystem, NumSysError> {
-        self.flip_with_custom_base_files(CustomBaseFiles::default())
+        self.flip_with_custom_base_files(
+            CustomBaseFiles::default(),
+            &mut crate::logging::Logging::new(),
+        )
     }
 
     /// [`NumberSystem::flip`] for a custom base: the caller supplies the FLIPPED name's
@@ -1470,11 +1511,12 @@ impl NumberSystem {
     pub fn flip_with_custom_base_files(
         &self,
         files: CustomBaseFiles,
+        logging: &mut crate::logging::Logging,
     ) -> Result<NumberSystem, NumSysError> {
         let msd_or_lsd = determine_msd_or_lsd(&self.name)?;
         let base = determine_base(&self.name);
         let new_name = format!("{}_{}", if msd_or_lsd == MSD { LSD } else { MSD }, base);
-        NumberSystem::with_custom_base_files(&new_name, files)
+        NumberSystem::with_custom_base_files(&new_name, files, logging)
     }
 
     /// `NumberSystem.validateNeg(BigInteger)` (`:1026-1028`), with the `!isNeg` half
@@ -1491,12 +1533,24 @@ impl NumberSystem {
     // -----------------------------------------------------------------------
 
     /// `NumberSystem.applyComparison` (`:656-665`).
+    ///
+    /// `logging` is the caller's REAL context, not a throwaway — see this module's docs
+    /// on why `NumberSystem` construction is NOT structurally silent. The `negate` arm's
+    /// `not(...)` is wrapped in `disable_print()`/`enable_print()`, exactly mirroring
+    /// Java's `Logging.disablePrint(); result = AutomatonLogicalOps.not(...); \
+    /// Logging.enablePrint();` (`:659-661`) — including WB-039's non-save/restore quirk:
+    /// [`crate::logging::Logging::disable_print`]/[`enable_print`] are plain field writes
+    /// (`self.print_enabled = false`/`true`), same as Java's `static boolean
+    /// printEnabled`, so a NESTED bracket (reached if `not`'s own call graph recurses
+    /// into more `NumberSystem` construction) leaks exactly like Java's — not emulated
+    /// specially, just an honest consequence of porting the same non-nesting primitive.
     fn apply_comparison(
         base: &Automaton,
         a: &str,
         b: &str,
         reverse_operands: bool,
         negate: bool,
+        logging: &mut crate::logging::Logging,
     ) -> Automaton {
         let mut result = base.clone();
         result.bind(if reverse_operands {
@@ -1505,7 +1559,9 @@ impl NumberSystem {
             names(&[a, b])
         });
         if negate {
-            result = not(result.as_dfa()).into_automaton();
+            logging.disable_print();
+            result = not(result.as_dfa(), logging).into_automaton();
+            logging.enable_print();
         }
         result
     }
@@ -1516,16 +1572,32 @@ impl NumberSystem {
     /// Note the pairing: `>=` is `!(a < b)` (operands NOT swapped, negated) while `<=`
     /// is `!(b < a)` (operands swapped AND negated). Java's own javadoc warns the
     /// resulting input order is not guaranteed to be `(a,b)`.
-    pub fn comparison(&self, a: &str, b: &str, op: RelationalOp) -> Automaton {
+    pub fn comparison(
+        &self,
+        a: &str,
+        b: &str,
+        op: RelationalOp,
+        logging: &mut crate::logging::Logging,
+    ) -> Automaton {
         match op {
-            RelationalOp::LessThan => Self::apply_comparison(&self.less_than, a, b, false, false),
-            RelationalOp::GreaterThan => Self::apply_comparison(&self.less_than, a, b, true, false),
-            RelationalOp::Equal => Self::apply_comparison(&self.equality, a, b, false, false),
-            RelationalOp::NotEqual => Self::apply_comparison(&self.equality, a, b, false, true),
-            RelationalOp::GreaterEqThan => {
-                Self::apply_comparison(&self.less_than, a, b, false, true)
+            RelationalOp::LessThan => {
+                Self::apply_comparison(&self.less_than, a, b, false, false, logging)
             }
-            RelationalOp::LessEqThan => Self::apply_comparison(&self.less_than, a, b, true, true),
+            RelationalOp::GreaterThan => {
+                Self::apply_comparison(&self.less_than, a, b, true, false, logging)
+            }
+            RelationalOp::Equal => {
+                Self::apply_comparison(&self.equality, a, b, false, false, logging)
+            }
+            RelationalOp::NotEqual => {
+                Self::apply_comparison(&self.equality, a, b, false, true, logging)
+            }
+            RelationalOp::GreaterEqThan => {
+                Self::apply_comparison(&self.less_than, a, b, false, true, logging)
+            }
+            RelationalOp::LessEqThan => {
+                Self::apply_comparison(&self.less_than, a, b, true, true, logging)
+            }
         }
     }
 
@@ -1539,28 +1611,38 @@ impl NumberSystem {
     /// `EQUAL`/`NOT_EQUAL` short-circuit on the constant automaton itself; every other
     /// relation binds the constant to the fresh name `"new " + a` (Java's comment:
     /// "this way, we make sure B != a"), intersects with the two-variable comparison,
-    /// and quantifies that name away.
+    /// and quantifies that name away. The `NOT_EQUAL`/general-case final `and`+`quantify`
+    /// is bracketed in `disable_print()`/`enable_print()`, matching Java's own
+    /// `Logging.disablePrint(); M = and(M, N); quantify(M, B); Logging.enablePrint();`
+    /// (`:715-719`) — see [`Self::apply_comparison`]'s docs for why this is a faithful
+    /// port, not a suppression this crate invented.
     pub fn comparison_const_b(
         &self,
         a: &str,
         b: &BigInt,
         op: RelationalOp,
+        logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(b)?;
         let b_name = format!("new {a}");
-        let mut n = self.get_constant(b)?;
+        let mut n = self.get_constant(b, logging)?;
         if op == RelationalOp::Equal {
             n.bind(names(&[a]));
             return Ok(n);
         }
         if op == RelationalOp::NotEqual {
             n.bind(names(&[a]));
-            return Ok(not(n.as_dfa()).into_automaton());
+            logging.disable_print();
+            let result = not(n.as_dfa(), logging).into_automaton();
+            logging.enable_print();
+            return Ok(result);
         }
         n.bind(names(&[&b_name]));
-        let m = self.comparison(a, &b_name, op);
-        let mut m = and(&m, &n).into_automaton();
-        quantify(&mut m, &label_set(&[&b_name]))?;
+        let m = self.comparison(a, &b_name, op, logging);
+        logging.disable_print();
+        let mut m = and(&m, &n, logging).into_automaton();
+        quantify_with_ctx(&mut m, &label_set(&[&b_name]), None, logging)?;
+        logging.enable_print();
         Ok(m)
     }
 
@@ -1571,9 +1653,10 @@ impl NumberSystem {
         a: &BigInt,
         b: &str,
         op: RelationalOp,
+        logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(a)?;
-        self.comparison_const_b(b, a, op.reverse_operator())
+        self.comparison_const_b(b, a, op.reverse_operator(), logging)
     }
 
     // -----------------------------------------------------------------------
@@ -1619,15 +1702,16 @@ impl NumberSystem {
         b: &BigInt,
         c: &str,
         op: ArithmeticOp,
+        logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(b)?;
         if op == ArithmeticOp::Mult {
-            let mut n = self.get_multiplication(b)?;
+            let mut n = self.get_multiplication(b, logging)?;
             n.bind(names(&[a, c]));
             return Ok(n);
         }
         if op == ArithmeticOp::Div {
-            let mut n = self.get_division(b)?;
+            let mut n = self.get_division(b, logging)?;
             n.bind(names(&[a, c]));
             return Ok(n);
         }
@@ -1635,11 +1719,13 @@ impl NumberSystem {
         // Java: `String B = a + c;` -- "this way we make sure that B is not equal to a
         // or c" (string CONCATENATION, not addition).
         let b_name = format!("{a}{c}");
-        let mut n = self.get_constant(b)?;
+        let mut n = self.get_constant(b, logging)?;
         n.bind(names(&[&b_name]));
         let m = self.arithmetic(a, &b_name, c, op)?;
-        let mut m = and(&m, &n).into_automaton();
-        quantify(&mut m, &label_set(&[&b_name]))?;
+        logging.disable_print();
+        let mut m = and(&m, &n, logging).into_automaton();
+        quantify_with_ctx(&mut m, &label_set(&[&b_name]), None, logging)?;
+        logging.enable_print();
         Ok(m)
     }
 
@@ -1655,10 +1741,11 @@ impl NumberSystem {
         b: &str,
         c: &str,
         op: ArithmeticOp,
+        logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(a)?;
         if op == ArithmeticOp::Mult {
-            let mut n = self.get_multiplication(a)?;
+            let mut n = self.get_multiplication(a, logging)?;
             n.bind(names(&[b, c]));
             return Ok(n);
         }
@@ -1667,11 +1754,13 @@ impl NumberSystem {
         }
 
         let a_name = format!("{b}{c}");
-        let mut n = self.get_constant(a)?;
+        let mut n = self.get_constant(a, logging)?;
         n.bind(names(&[&a_name]));
         let m = self.arithmetic(&a_name, b, c, op)?;
-        let mut m = and(&m, &n).into_automaton();
-        quantify(&mut m, &label_set(&[&a_name]))?;
+        logging.disable_print();
+        let mut m = and(&m, &n, logging).into_automaton();
+        quantify_with_ctx(&mut m, &label_set(&[&a_name]), None, logging)?;
+        logging.enable_print();
         Ok(m)
     }
 
@@ -1686,6 +1775,7 @@ impl NumberSystem {
         b: &str,
         c: &BigInt,
         op: ArithmeticOp,
+        logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(c)?;
         if op == ArithmeticOp::Mult || op == ArithmeticOp::Div {
@@ -1695,11 +1785,13 @@ impl NumberSystem {
         // Java's comment here says "this way we make sure that A is not equal to a or
         // b" while naming the variable `C` -- a stale copy-paste, preserved as-is.
         let c_name = format!("{a}{b}");
-        let mut n = self.get_constant(c)?;
+        let mut n = self.get_constant(c, logging)?;
         n.bind(names(&[&c_name]));
         let m = self.arithmetic(a, b, &c_name, op)?;
-        let mut m = and(&m, &n).into_automaton();
-        quantify(&mut m, &label_set(&[&c_name]))?;
+        logging.disable_print();
+        let mut m = and(&m, &n, logging).into_automaton();
+        quantify_with_ctx(&mut m, &label_set(&[&c_name]), None, logging)?;
+        logging.enable_print();
         Ok(m)
     }
 
@@ -1729,8 +1821,12 @@ impl NumberSystem {
     /// clones per call and changes nothing observable — every internal caller already went
     /// through the `get_*` wrappers, never through `constant`/`multiplication`/`division`
     /// directly (verified across all call sites, in both engines).
-    pub fn get_constant(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        self.constant(n)
+    pub fn get_constant(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
+        self.constant(n, logging)
     }
 
     /// `NumberSystem.getMultiplication(BigInteger n)` (`:648-650`) — two inputs,
@@ -1741,15 +1837,23 @@ impl NumberSystem {
     /// section) and are not ported — the `BigInteger` forms below are the live ones,
     /// reached from `arithmetic` with a `MULT`/`DIV` operator.
     /// `&self` as of U5 — see [`NumberSystem::get_constant`].
-    pub fn get_multiplication(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        self.multiplication(n)
+    pub fn get_multiplication(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
+        self.multiplication(n, logging)
     }
 
     /// `NumberSystem.getDivision(BigInteger n)` (`:640-642`) — two inputs, accepting
     /// iff the second is one `n`th of the first.
     /// `&self` as of U5 — see [`NumberSystem::get_constant`].
-    pub fn get_division(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
-        self.division(n)
+    pub fn get_division(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
+        self.division(n, logging)
     }
 
     /// `NumberSystem.constant(BigInteger n)` (`:931-971`), memoized.
@@ -1769,7 +1873,11 @@ impl NumberSystem {
     /// [`NumberSystem::get_constant`]'s note on why, and the `constants_dynamic_table` doc
     /// comment for the borrow discipline the recursion below relies on (the lookup borrow
     /// is scoped and dropped before any recursive call; the insert takes a fresh one).
-    fn constant(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+    fn constant(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
         {
             let table = self.constants_dynamic_table.borrow();
@@ -1778,6 +1886,13 @@ impl NumberSystem {
             }
         }
 
+        // `Logging.disablePrint()` (`:936`), matching Java's own — see
+        // [`Self::apply_comparison`]'s docs on why `enable_print()`/`disable_print()` are
+        // faithfully non-nesting (WB-039): a cache-miss recursive call below
+        // ([`Self::get_constant`]) has its OWN matching bracket, so if IT recurses
+        // further, its `enable_print()` can re-enable printing for the remainder of
+        // THIS call's body — ported as-is, not specially emulated.
+        logging.disable_print();
         let (a, b, c) = ("a", "b", "c");
         let p = if *n == big(0) {
             self.make_zero()
@@ -1790,16 +1905,18 @@ impl NumberSystem {
             let floor_half = n / &two;
             let remainder = n % &two;
             let ceil_half = &floor_half + &remainder;
-            let mut m = self.get_constant(&floor_half)?;
+            let mut m = self.get_constant(&floor_half, logging)?;
             m.bind(names(&[a]));
-            let mut nn = self.get_constant(&ceil_half)?;
+            let mut nn = self.get_constant(&ceil_half, logging)?;
             nn.bind(names(&[b]));
             let p = self.arithmetic(a, b, c, ArithmeticOp::Plus)?;
-            let p = and(&p, &m).into_automaton();
-            let mut p = and(&p, &nn).into_automaton();
-            quantify(&mut p, &label_set(&[a, b]))?;
+            let p = and(&p, &m, logging).into_automaton();
+            let mut p = and(&p, &nn, logging).into_automaton();
+            quantify_with_ctx(&mut p, &label_set(&[a, b]), None, logging)?;
             p
         };
+        // `Logging.enablePrint()` (`:968`).
+        logging.enable_print();
 
         // Java stores here as well as inside `makeConstant` for the 0/1 cases -- a
         // harmless double `put` of the same value, ported as-is.
@@ -1889,6 +2006,15 @@ impl NumberSystem {
     fn make_constant(&self, fa: Fa, constant: i32) -> Automaton {
         let alphabet = self.get_alphabet().to_vec();
         let mut m = Automaton::new(fa, vec![alphabet], Vec::new(), vec![Some(self.is_msd)]);
+        // Java builds this via `new AutomatonDFA(...)` (see this method's own docs on the
+        // one substitution here) — runtime class `AutomatonDFA`, not plain `Automaton`.
+        // `Automaton::new` above defaults `dfa_typed` to `false`; set it explicitly so a
+        // later trivial collapse of a formula built on `x=0`/`x=1` (or the cache clone
+        // `get_constant` hands out — `AutomatonDFA.clone()` also preserves the class)
+        // takes `AutomatonDFA::from`'s preserve branch, matching Java. Found by
+        // adversarial review (live jar divergence: `?msd_2 ~(E x x=1)` logs `2 states` in
+        // Java, `0` here without this line) — see `Automaton::dfa_typed`'s docs.
+        m.dfa_typed = true;
         // `getNS().add(numSys)` (`AutomatonDFA.java:58`) attaches `this`, name included.
         m.set_ns_names(vec![Some(self.name.clone())]);
         m.determine_alphabet_size();
@@ -1916,7 +2042,11 @@ impl NumberSystem {
     /// mutated in a way that reaches back into `self.equality` or another memo entry,
     /// regardless of what future callers (e.g. a ported `applyAllRepresentations`) do
     /// with their own clone.
-    fn multiplication(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+    fn multiplication(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
         if *n == big(0) {
             return Err(NumSysError::MultiplicationByZero);
@@ -1930,6 +2060,9 @@ impl NumberSystem {
         let (a, b, c, d) = ("a", "b", "c", "d");
         let two = big(2);
 
+        // `Logging.disablePrint()` (`:983`) -- see [`Self::constant`]'s matching note on
+        // why this is faithfully non-nesting (WB-039), not specially emulated.
+        logging.disable_print();
         let p = if *n == big(1) {
             self.equality.clone()
         } else if *n == two {
@@ -1940,27 +2073,29 @@ impl NumberSystem {
         } else {
             // Java evaluates the doubler BEFORE the recursive `getMultiplication(k)`;
             // order preserved (it only affects track order, never the language).
-            let mut doubler = self.get_multiplication(&two)?;
+            let mut doubler = self.get_multiplication(&two, logging)?;
             let k = n / &two;
-            let mut m = self.get_multiplication(&k)?;
+            let mut m = self.get_multiplication(&k, logging)?;
             m.bind(names(&[a, b]));
 
             let mut p = if n % &two == big(0) {
                 doubler.bind(names(&[b, d]));
-                let mut p = and(&m, &doubler).into_automaton();
-                quantify(&mut p, &label_set(&[b]))?;
+                let mut p = and(&m, &doubler, logging).into_automaton();
+                quantify_with_ctx(&mut p, &label_set(&[b]), None, logging)?;
                 p
             } else {
                 doubler.bind(names(&[b, c]));
                 let p = self.arithmetic(c, a, d, ArithmeticOp::Plus)?;
-                let p = and(&p, &m).into_automaton();
-                let mut p = and(&p, &doubler).into_automaton();
-                quantify(&mut p, &label_set(&[b, c]))?;
+                let p = and(&p, &m, logging).into_automaton();
+                let mut p = and(&p, &doubler, logging).into_automaton();
+                quantify_with_ctx(&mut p, &label_set(&[b, c]), None, logging)?;
                 p
             };
             p.sort_label();
             p
         };
+        // `Logging.enablePrint()` (`:1021`).
+        logging.enable_print();
 
         self.multiplications_dynamic_table
             .borrow_mut()
@@ -1974,7 +2109,11 @@ impl NumberSystem {
     /// `a / n = b  <=>  Er,q  a = q + r & q = n*b & 0 <= r < n` (Java's own comment).
     /// The `n < 0` operand selections at `:1047-1048` are DELETED (unreachable after
     /// `validateNeg`), so the two range comparisons are always `r >= 0` and `r < n`.
-    fn division(&self, n: &BigInt) -> Result<Automaton, NumSysError> {
+    fn division(
+        &self,
+        n: &BigInt,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<Automaton, NumSysError> {
         self.validate_non_negative(n)?;
         if *n == big(0) {
             return Err(NumSysError::DivisionByZero);
@@ -1987,16 +2126,23 @@ impl NumberSystem {
         }
         let (a, b, r, q) = ("a", "b", "r", "q");
 
+        // `Logging.disablePrint()` (`:1039`) -- see [`Self::constant`]'s matching note.
+        // Note this bracket also covers the two `comparison(r, …)` calls below, each of
+        // which has its OWN matching bracket (`comparison_const_b`) -- another real
+        // WB-039 nesting site, ported as-is.
+        logging.disable_print();
         let m = self.arithmetic(q, r, a, ArithmeticOp::Plus)?;
-        let nn = self.arithmetic_const_a(n, b, q, ArithmeticOp::Mult)?;
-        let p1 = self.comparison_const_b(r, &big(0), RelationalOp::GreaterEqThan)?;
-        let p2 = self.comparison_const_b(r, n, RelationalOp::LessThan)?;
+        let nn = self.arithmetic_const_a(n, b, q, ArithmeticOp::Mult, logging)?;
+        let p1 = self.comparison_const_b(r, &big(0), RelationalOp::GreaterEqThan, logging)?;
+        let p2 = self.comparison_const_b(r, n, RelationalOp::LessThan, logging)?;
 
-        let p = and(&p1, &p2).into_automaton();
-        let rr = and(&m, &nn).into_automaton();
-        let mut rr = and(&rr, &p).into_automaton();
-        quantify(&mut rr, &label_set(&[q, r]))?;
+        let p = and(&p1, &p2, logging).into_automaton();
+        let rr = and(&m, &nn, logging).into_automaton();
+        let mut rr = and(&rr, &p, logging).into_automaton();
+        quantify_with_ctx(&mut rr, &label_set(&[q, r]), None, logging)?;
         rr.sort_label();
+        // `Logging.enablePrint()` (`:1055`).
+        logging.enable_print();
 
         self.divisions_dynamic_table
             .borrow_mut()
@@ -2226,7 +2372,9 @@ mod tests {
     #[test]
     fn lsd_one_constant() {
         let ns = NumberSystem::new("lsd_5").unwrap();
-        let one = ns.get_constant(&big(1)).unwrap();
+        let one = ns
+            .get_constant(&big(1), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_eq!(one.alphabet[0].len(), 5);
         assert_eq!(one.get_arity(), 1);
 
@@ -2249,7 +2397,9 @@ mod tests {
     fn constant_zero_is_the_all_zeros_language() {
         for name in ["msd_3", "lsd_3"] {
             let ns = NumberSystem::new(name).unwrap();
-            let zero = ns.get_constant(&big(0)).unwrap();
+            let zero = ns
+                .get_constant(&big(0), &mut crate::logging::Logging::new())
+                .unwrap();
             assert_eq!(zero.get_arity(), 1, "{name}");
             // the track alphabet was widened from the regex's {0,1} to the full base
             assert_eq!(zero.alphabet[0], vec![0, 1, 2], "{name}");
@@ -2261,6 +2411,33 @@ mod tests {
         }
     }
 
+    /// `NumberSystem.makeConstant` is Java's `new AutomatonDFA(...)` — DFA-typed by
+    /// construction (see that method's own docs on why this port substitutes a
+    /// hand-built automaton for the un-ported brics regex path, and must set
+    /// [`crate::automaton::Automaton::dfa_typed`] explicitly as a result). The direct
+    /// `wr-core`-level test for that fix; a mutation check confirms deleting the set
+    /// makes this fail (and, at the `wr-logic` layer, silently mislogs a negated
+    /// existential over a constant comparison's state count — see
+    /// `crates/wr-logic/src/eval.rs`'s
+    /// `negated_existential_over_a_cached_constant_...` test). `get_constant`'s cache
+    /// clone must carry it too, matching `AutomatonDFA.clone()`.
+    #[test]
+    fn get_constant_is_dfa_typed_like_javas_new_automaton_dfa() {
+        let ns = NumberSystem::new("msd_3").unwrap();
+        for n in [0, 1, 5] {
+            let c = ns
+                .get_constant(&BigInt::from(n), &mut crate::logging::Logging::new())
+                .unwrap();
+            assert!(c.dfa_typed, "get_constant({n})");
+            // Fetch it again -- `constants_dynamic_table`'s cache clone must also carry
+            // the flag, not just the first-built value.
+            let c2 = ns
+                .get_constant(&BigInt::from(n), &mut crate::logging::Logging::new())
+                .unwrap();
+            assert!(c2.dfa_typed, "get_constant({n}) (cached)");
+        }
+    }
+
     /// The msd counterpart of the test above (no Java analog: `NumberSystemTest` never
     /// checks `msd` `getConstant(1)` directly). Included so a `make_one` that ignored
     /// `is_msd` and always built `0*1` would fail SOMEWHERE — the lsd test above alone
@@ -2268,7 +2445,9 @@ mod tests {
     #[test]
     fn msd_one_constant_is_the_mirror_image() {
         let ns = NumberSystem::new("msd_5").unwrap();
-        let one = ns.get_constant(&big(1)).unwrap();
+        let one = ns
+            .get_constant(&big(1), &mut crate::logging::Logging::new())
+            .unwrap();
         assert!(accepts_tuples(&one, &single_track("1")));
         assert!(accepts_tuples(&one, &single_track("001")));
         assert!(!accepts_tuples(&one, &single_track("100")));
@@ -2403,8 +2582,14 @@ mod tests {
             NumSysError::OperatorTwoVariables("/")
         );
         assert_eq!(
-            ns.arithmetic_const_c("a", "b", &big(0), ArithmeticOp::Div)
-                .unwrap_err(),
+            ns.arithmetic_const_c(
+                "a",
+                "b",
+                &big(0),
+                ArithmeticOp::Div,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::OperatorTwoVariables("/")
         );
         // Unexpected operation.
@@ -2415,14 +2600,26 @@ mod tests {
         );
         // Division by zero.
         assert_eq!(
-            ns.arithmetic_const_b("a", &big(0), "c", ArithmeticOp::Div)
-                .unwrap_err(),
+            ns.arithmetic_const_b(
+                "a",
+                &big(0),
+                "c",
+                ArithmeticOp::Div,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::DivisionByZero
         );
         // Constants can't be divided by variables (`:857`).
         assert_eq!(
-            ns.arithmetic_const_a(&big(3), "b", "c", ArithmeticOp::Div)
-                .unwrap_err(),
+            ns.arithmetic_const_a(
+                &big(3),
+                "b",
+                "c",
+                ArithmeticOp::Div,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::ConstantDividedByVariable
         );
     }
@@ -2432,15 +2629,27 @@ mod tests {
     fn multiplication_of_two_variables_and_by_zero() {
         let ns = NumberSystem::new("msd_3").unwrap();
         assert_eq!(
-            ns.arithmetic_const_c("a", "b", &big(0), ArithmeticOp::Mult)
-                .unwrap_err(),
+            ns.arithmetic_const_c(
+                "a",
+                "b",
+                &big(0),
+                ArithmeticOp::Mult,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::OperatorTwoVariables("*")
         );
 
         let base2 = NumberSystem::new("msd_2").unwrap();
         assert_eq!(
             base2
-                .arithmetic_const_b("x", &big(0), "y", ArithmeticOp::Mult)
+                .arithmetic_const_b(
+                    "x",
+                    &big(0),
+                    "y",
+                    ArithmeticOp::Mult,
+                    &mut crate::logging::Logging::new()
+                )
                 .unwrap_err(),
             NumSysError::MultiplicationByZero
         );
@@ -2453,32 +2662,72 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
         let neg = big(-5);
         let expected = NumSysError::NegativeConstant("-5".to_string());
-        assert_eq!(ns.get_constant(&neg).unwrap_err(), expected);
-        assert_eq!(ns.get_multiplication(&neg).unwrap_err(), expected);
-        assert_eq!(ns.get_division(&neg).unwrap_err(), expected);
         assert_eq!(
-            ns.comparison_const_b("x", &neg, RelationalOp::LessThan)
+            ns.get_constant(&neg, &mut crate::logging::Logging::new())
                 .unwrap_err(),
             expected
         );
         assert_eq!(
-            ns.comparison_const_a(&neg, "x", RelationalOp::LessThan)
+            ns.get_multiplication(&neg, &mut crate::logging::Logging::new())
                 .unwrap_err(),
             expected
         );
         assert_eq!(
-            ns.arithmetic_const_b("x", &neg, "y", ArithmeticOp::Plus)
+            ns.get_division(&neg, &mut crate::logging::Logging::new())
                 .unwrap_err(),
             expected
         );
         assert_eq!(
-            ns.arithmetic_const_a(&neg, "x", "y", ArithmeticOp::Plus)
-                .unwrap_err(),
+            ns.comparison_const_b(
+                "x",
+                &neg,
+                RelationalOp::LessThan,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             expected
         );
         assert_eq!(
-            ns.arithmetic_const_c("x", "y", &neg, ArithmeticOp::Plus)
-                .unwrap_err(),
+            ns.comparison_const_a(
+                &neg,
+                "x",
+                RelationalOp::LessThan,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ns.arithmetic_const_b(
+                "x",
+                &neg,
+                "y",
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ns.arithmetic_const_a(
+                &neg,
+                "x",
+                "y",
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            ns.arithmetic_const_c(
+                "x",
+                "y",
+                &neg,
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             expected
         );
     }
@@ -2493,16 +2742,24 @@ mod tests {
     fn get_multiplication_and_get_division_hand_back_fresh_clones() {
         let ns = NumberSystem::new("msd_2").unwrap();
 
-        let mut times_three = ns.get_multiplication(&big(3)).unwrap();
+        let mut times_three = ns
+            .get_multiplication(&big(3), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_eq!(times_three.get_arity(), 2);
         times_three.fa.o[0] = 7; // corrupt the copy we hold
-        let again = ns.get_multiplication(&big(3)).unwrap();
+        let again = ns
+            .get_multiplication(&big(3), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_ne!(again.fa.o[0], 7, "the memoized automaton was aliased");
 
-        let mut divided_by_two = ns.get_division(&big(2)).unwrap();
+        let mut divided_by_two = ns
+            .get_division(&big(2), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_eq!(divided_by_two.get_arity(), 2);
         divided_by_two.fa.o[0] = 7;
-        let again = ns.get_division(&big(2)).unwrap();
+        let again = ns
+            .get_division(&big(2), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_ne!(again.fa.o[0], 7, "the memoized automaton was aliased");
     }
 
@@ -2602,7 +2859,9 @@ mod tests {
     #[test]
     fn base_two_constant_five_semantics() {
         let ns = NumberSystem::new("msd_2").unwrap();
-        let five = ns.get_constant(&big(5)).unwrap();
+        let five = ns
+            .get_constant(&big(5), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_eq!(five.get_arity(), 1);
 
         assert!(accepts_tuples(&five, &single_track("101"))); // 5
@@ -2617,7 +2876,13 @@ mod tests {
     fn multiplication_by_three_semantics() {
         let ns = NumberSystem::new("msd_2").unwrap();
         let times_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Mult)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Mult,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(times_three.get_arity(), 2);
 
@@ -2638,7 +2903,13 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
 
         let plus_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Plus)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(plus_three.get_arity(), 2);
         assert!(accepts_digits(&plus_three, &[("x", "001"), ("y", "100")])); // 1+3=4
@@ -2646,7 +2917,13 @@ mod tests {
         assert!(accepts_digits(&plus_three, &[("x", "000"), ("y", "011")])); // 0+3=3
 
         let minus_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Minus)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Minus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(accepts_digits(&minus_three, &[("x", "100"), ("y", "001")])); // 4-3=1
         assert!(!accepts_digits(&minus_three, &[("x", "001"), ("y", "100")])); // 1-3 != 4
@@ -2660,14 +2937,26 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
 
         let three_plus = ns
-            .arithmetic_const_a(&big(3), "x", "y", ArithmeticOp::Plus)
+            .arithmetic_const_a(
+                &big(3),
+                "x",
+                "y",
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(three_plus.get_arity(), 2);
         assert!(accepts_digits(&three_plus, &[("x", "001"), ("y", "100")])); // 3+1=4
         assert!(!accepts_digits(&three_plus, &[("x", "001"), ("y", "011")]));
 
         let three_minus = ns
-            .arithmetic_const_a(&big(3), "x", "y", ArithmeticOp::Minus)
+            .arithmetic_const_a(
+                &big(3),
+                "x",
+                "y",
+                ArithmeticOp::Minus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(three_minus.get_arity(), 2);
         assert!(accepts_digits(&three_minus, &[("x", "001"), ("y", "010")])); // 3-1=2
@@ -2686,7 +2975,13 @@ mod tests {
     fn constant_as_the_result() {
         let ns = NumberSystem::new("msd_2").unwrap();
         let sum_is_three = ns
-            .arithmetic_const_c("x", "y", &big(3), ArithmeticOp::Plus)
+            .arithmetic_const_c(
+                "x",
+                "y",
+                &big(3),
+                ArithmeticOp::Plus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(sum_is_three.get_arity(), 2);
         assert!(accepts_digits(&sum_is_three, &[("x", "01"), ("y", "10")])); // 1+2=3
@@ -2694,7 +2989,13 @@ mod tests {
         assert!(!accepts_digits(&sum_is_three, &[("x", "01"), ("y", "01")])); // 1+1!=3
 
         let diff_is_one = ns
-            .arithmetic_const_c("x", "y", &big(1), ArithmeticOp::Minus)
+            .arithmetic_const_c(
+                "x",
+                "y",
+                &big(1),
+                ArithmeticOp::Minus,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(accepts_digits(&diff_is_one, &[("x", "11"), ("y", "10")])); // 3-2=1
         assert!(!accepts_digits(&diff_is_one, &[("x", "10"), ("y", "11")])); // 2-3!=1
@@ -2708,7 +3009,13 @@ mod tests {
     fn division_by_three_semantics() {
         let ns = NumberSystem::new("msd_2").unwrap();
         let div_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Div)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Div,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(div_three.get_arity(), 2);
 
@@ -2735,7 +3042,13 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
         for n in [2u32, 3u32] {
             let div = ns
-                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Div)
+                .arithmetic_const_b(
+                    "x",
+                    &BigInt::from(n),
+                    "y",
+                    ArithmeticOp::Div,
+                    &mut crate::logging::Logging::new(),
+                )
                 .unwrap();
             for x in 0u32..12 {
                 for y in 0u32..12 {
@@ -2760,7 +3073,12 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
 
         let eq_five = ns
-            .comparison_const_b("x", &big(5), RelationalOp::Equal)
+            .comparison_const_b(
+                "x",
+                &big(5),
+                RelationalOp::Equal,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(eq_five.label, vec!["x".to_string()]);
         assert!(accepts_tuples(&eq_five, &single_track("101")));
@@ -2768,7 +3086,12 @@ mod tests {
         assert!(!accepts_tuples(&eq_five, &single_track("100")));
 
         let ne_five = ns
-            .comparison_const_b("x", &big(5), RelationalOp::NotEqual)
+            .comparison_const_b(
+                "x",
+                &big(5),
+                RelationalOp::NotEqual,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert_eq!(ne_five.label, vec!["x".to_string()]);
         assert!(!accepts_tuples(&ne_five, &single_track("101")));
@@ -2787,14 +3110,24 @@ mod tests {
         let ns = NumberSystem::new("msd_2").unwrap();
 
         let three_lt_x = ns
-            .comparison_const_a(&big(3), "x", RelationalOp::LessThan)
+            .comparison_const_a(
+                &big(3),
+                "x",
+                RelationalOp::LessThan,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(accepts_tuples(&three_lt_x, &single_track("100"))); // 3 < 4
         assert!(!accepts_tuples(&three_lt_x, &single_track("011"))); // 3 < 3 is false
         assert!(!accepts_tuples(&three_lt_x, &single_track("010"))); // 3 < 2 is false
 
         let x_lt_three = ns
-            .comparison_const_b("x", &big(3), RelationalOp::LessThan)
+            .comparison_const_b(
+                "x",
+                &big(3),
+                RelationalOp::LessThan,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(!accepts_tuples(&x_lt_three, &single_track("100"))); // 4 < 3 is false
         assert!(!accepts_tuples(&x_lt_three, &single_track("011"))); // 3 < 3 is false
@@ -2802,7 +3135,12 @@ mod tests {
 
         // GREATER_EQ_THAN with the constant on the left: `3 >= x`, i.e. x <= 3.
         let three_ge_x = ns
-            .comparison_const_a(&big(3), "x", RelationalOp::GreaterEqThan)
+            .comparison_const_a(
+                &big(3),
+                "x",
+                RelationalOp::GreaterEqThan,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(accepts_tuples(&three_ge_x, &single_track("011"))); // 3 >= 3
         assert!(accepts_tuples(&three_ge_x, &single_track("010"))); // 3 >= 2
@@ -2884,7 +3222,12 @@ mod tests {
             &[("a", "1000"), ("b", "1000"), ("c", "0100")]
         ));
 
-        let lt = ns.comparison("p", "q", RelationalOp::LessThan);
+        let lt = ns.comparison(
+            "p",
+            "q",
+            RelationalOp::LessThan,
+            &mut crate::logging::Logging::new(),
+        );
         // 2 < 3 : lsd "01" vs "11"
         assert!(accepts_digits(&lt, &[("p", "01"), ("q", "11")]));
         assert!(!accepts_digits(&lt, &[("p", "11"), ("q", "01")]));
@@ -2912,14 +3255,20 @@ mod tests {
     fn lsd_composed_constructions_compute_the_right_language() {
         let ns = NumberSystem::new("lsd_2").unwrap();
         // Non-composed: fine before L1 as well as after.
-        assert!(ns.get_constant(&big(0)).is_ok());
-        assert!(ns.get_constant(&big(1)).is_ok());
+        assert!(ns
+            .get_constant(&big(0), &mut crate::logging::Logging::new())
+            .is_ok());
+        assert!(ns
+            .get_constant(&big(1), &mut crate::logging::Logging::new())
+            .is_ok());
         assert!(ns.arithmetic("a", "b", "c", ArithmeticOp::Plus).is_ok());
 
         // --- getConstant(6): the recursive-halving case (6 = 3 + 3, 3 = 1 + 2, ...),
         // three levels of ∃-elimination deep, so every one of them ran the lsd fixup.
         // 6 is msd "110", i.e. lsd "011".
-        let six = ns.get_constant(&big(6)).unwrap();
+        let six = ns
+            .get_constant(&big(6), &mut crate::logging::Logging::new())
+            .unwrap();
         assert!(accepts_tuples(&six, &single_track("011")));
         // ... closed under TRAILING zeros (the lsd analogue of leading zeros).
         assert!(accepts_tuples(&six, &single_track("0110")));
@@ -2935,7 +3284,13 @@ mod tests {
 
         // --- multiplication: `y = 3x`, two tracks.
         let times_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Mult)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Mult,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         // x = 2 ("0100" lsd), y = 6 ("0110" lsd)
         assert!(accepts_digits(
@@ -2967,7 +3322,12 @@ mod tests {
         // --- comparison against a constant >= 2: `x >= 2`, the exact shape
         // `wr_logic::eval`'s own `?lsd_2 x >= 2` regression test evaluates.
         let ge_two = ns
-            .comparison_const_b("x", &big(2), RelationalOp::GreaterEqThan)
+            .comparison_const_b(
+                "x",
+                &big(2),
+                RelationalOp::GreaterEqThan,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         assert!(!accepts_tuples(&ge_two, &single_track("00"))); // 0
         assert!(!accepts_tuples(&ge_two, &single_track("10"))); // 1
@@ -2979,7 +3339,13 @@ mod tests {
         // --- division, the deepest composition here (`a/n = b` needs two extra
         // quantified variables plus two range comparisons).
         let div_three = ns
-            .arithmetic_const_b("x", &big(3), "y", ArithmeticOp::Div)
+            .arithmetic_const_b(
+                "x",
+                &big(3),
+                "y",
+                ArithmeticOp::Div,
+                &mut crate::logging::Logging::new(),
+            )
             .unwrap();
         // 6/3 = 2 : x = "0110" lsd (6), y = "0100" lsd (2)
         assert!(accepts_digits(&div_three, &[("x", "0110"), ("y", "0100")]));
@@ -3017,8 +3383,12 @@ mod tests {
 
             // getConstant(n), for n in the recursive-halving range.
             for n in 2u32..8 {
-                let cm = msd.get_constant(&BigInt::from(n)).unwrap();
-                let cl = lsd.get_constant(&BigInt::from(n)).unwrap();
+                let cm = msd
+                    .get_constant(&BigInt::from(n), &mut crate::logging::Logging::new())
+                    .unwrap();
+                let cl = lsd
+                    .get_constant(&BigInt::from(n), &mut crate::logging::Logging::new())
+                    .unwrap();
                 for m in 0u32..12 {
                     let Some(d) = msd_digits(m, base, width) else {
                         continue;
@@ -3041,10 +3411,22 @@ mod tests {
             // `y = n*x` and `x >= n`, the two other composed families.
             for n in 2u32..5 {
                 let mm = msd
-                    .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
+                    .arithmetic_const_b(
+                        "x",
+                        &BigInt::from(n),
+                        "y",
+                        ArithmeticOp::Mult,
+                        &mut crate::logging::Logging::new(),
+                    )
                     .unwrap();
                 let ml = lsd
-                    .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
+                    .arithmetic_const_b(
+                        "x",
+                        &BigInt::from(n),
+                        "y",
+                        ArithmeticOp::Mult,
+                        &mut crate::logging::Logging::new(),
+                    )
                     .unwrap();
                 for x in 0u32..6 {
                     for y in 0u32..12 {
@@ -3078,10 +3460,20 @@ mod tests {
                 }
 
                 let gm = msd
-                    .comparison_const_b("x", &BigInt::from(n), RelationalOp::GreaterEqThan)
+                    .comparison_const_b(
+                        "x",
+                        &BigInt::from(n),
+                        RelationalOp::GreaterEqThan,
+                        &mut crate::logging::Logging::new(),
+                    )
                     .unwrap();
                 let gl = lsd
-                    .comparison_const_b("x", &BigInt::from(n), RelationalOp::GreaterEqThan)
+                    .comparison_const_b(
+                        "x",
+                        &BigInt::from(n),
+                        RelationalOp::GreaterEqThan,
+                        &mut crate::logging::Logging::new(),
+                    )
                     .unwrap();
                 for x in 0u32..12 {
                     let Some(d) = msd_digits(x, base, width) else {
@@ -3183,7 +3575,7 @@ mod tests {
                 (RelationalOp::LessEqThan, x <= y),
                 (RelationalOp::GreaterEqThan, x >= y),
             ] {
-                let cmp = ns.comparison("p", "q", op);
+                let cmp = ns.comparison("p", "q", op, &mut crate::logging::Logging::new());
                 let word: Vec<Vec<i32>> = (0..width)
                     .map(|i| {
                         cmp.label
@@ -3254,7 +3646,7 @@ mod tests {
                 "lsd adder semantics, base {}", base
             );
 
-            let lt_lsd = lsd.comparison("p", "q", RelationalOp::LessThan);
+            let lt_lsd = lsd.comparison("p", "q", RelationalOp::LessThan, &mut crate::logging::Logging::new());
             let build2 = |a: &Automaton, rev: bool| -> Vec<Vec<i32>> {
                 (0..width)
                     .map(|i| {
@@ -3294,7 +3686,7 @@ mod tests {
         ) {
             let m = if exact { n } else { m_free };
             let ns = NumberSystem::new(&format!("msd_{base}")).unwrap();
-            let automaton = ns.get_constant(&BigInt::from(n)).unwrap();
+            let automaton = ns.get_constant(&BigInt::from(n), &mut crate::logging::Logging::new()).unwrap();
             let Some(md) = msd_digits(m, base, width) else { return Ok(()); };
             let word: Vec<Vec<i32>> = md.iter().map(|&d| vec![d]).collect();
             prop_assert_eq!(
@@ -3319,7 +3711,7 @@ mod tests {
             let base = 2u32;
             let ns = NumberSystem::new("msd_2").unwrap();
             let times_n = ns
-                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult)
+                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Mult, &mut crate::logging::Logging::new())
                 .unwrap();
             let width = 7;
             let (Some(xd), Some(yd)) = (msd_digits(x, base, width), msd_digits(y, base, width))
@@ -3365,7 +3757,7 @@ mod tests {
             let base = 2u32;
             let ns = NumberSystem::new("msd_2").unwrap();
             let over_n = ns
-                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Div)
+                .arithmetic_const_b("x", &BigInt::from(n), "y", ArithmeticOp::Div, &mut crate::logging::Logging::new())
                 .unwrap();
             let width = 7;
             let (Some(xd), Some(yd)) = (msd_digits(x, base, width), msd_digits(y, base, width))
@@ -3649,11 +4041,21 @@ mod tests {
                 complement: Some(msd_fib_all_representations()),
             },
         };
-        let lsd = NumberSystem::with_custom_base_files("lsd_fib", files).unwrap();
+        let lsd = NumberSystem::with_custom_base_files(
+            "lsd_fib",
+            files,
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         assert!(!lsd.is_msd());
         assert!(lsd.use_all_representations());
 
-        let msd = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let msd = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         // Reversing the lsd adder's language must give the msd one back, not leave it
         // unchanged (which is what a missing OR a doubled reverse would produce).
         let mut round_trip = lsd.addition().clone();
@@ -3675,18 +4077,61 @@ mod tests {
 
     // ------------------------------------------------- the constructor's own wiring
 
+    /// Pins the EXACT line sequence a cold `msd_fib` construction logs, via
+    /// `wr_core::logging::Logging`'s construction-recording tap
+    /// (`tests/golden`'s `strip_construction_recordings` relies on this text being
+    /// correct, not just present — see that mechanism's own docs for why it
+    /// otherwise provides zero independent verification of what construction
+    /// itself logs). Three `apply_all_representations` calls (addition: 3 tracks,
+    /// less_than: 2 tracks — programmatic fallback, `msd_fib` ships no
+    /// `_less_than` file — equality: 2 tracks), captured from the real
+    /// implementation, not hand-derived: a change to the track count, the digit
+    /// numbering, or the loop order for any of the three automata changes this
+    /// text, and this test is what would catch it.
+    #[test]
+    fn a_cold_msd_fib_construction_logs_exactly_these_seven_lines() {
+        let mut logging = crate::logging::Logging::new();
+        logging.configure_for_command(false, true);
+        logging.begin_construction_recording();
+        NumberSystem::with_custom_base_files("msd_fib", msd_fib_files(), &mut logging).unwrap();
+        logging.end_construction_recording();
+
+        assert_eq!(
+            logging.construction_recordings(),
+            [[
+                "Applying valid representation #0",
+                "Applying valid representation #1",
+                "Applying valid representation #2",
+                "Applying valid representation #0",
+                "Applying valid representation #1",
+                "Applying valid representation #0",
+                "Applying valid representation #1",
+            ]]
+        );
+    }
+
     /// End-to-end reproduction of real Walnut's answer to `eval x "?msd_fib x=x";`, which
     /// writes out exactly `Custom Bases/msd_fib.txt` (verified by running `walnut-java`'s
     /// CLI). That answer is only correct because the constructor applied the
     /// valid-representation restriction to `equality`.
     #[test]
     fn msd_fib_equality_is_exactly_the_valid_representation_language() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         assert!(ns.use_all_representations());
         assert_eq!(ns.get_alphabet(), &[0, 1]);
 
         // `?msd_fib x=x`: both tracks bound to the same name, so `bind` merges them.
-        let x_equals_x = ns.comparison("x", "x", RelationalOp::Equal);
+        let x_equals_x = ns.comparison(
+            "x",
+            "x",
+            RelationalOp::Equal,
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(x_equals_x.alphabet.len(), 1, "the two tracks merged");
         for word in [
             vec![],
@@ -3716,9 +4161,20 @@ mod tests {
     /// test for the same property at the primitive level.
     #[test]
     fn msd_fib_negation_stays_inside_the_valid_representations() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
-        let x_equals_x = ns.comparison("x", "x", RelationalOp::Equal);
-        let negated = not(x_equals_x.as_dfa()).into_automaton();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
+        let x_equals_x = ns.comparison(
+            "x",
+            "x",
+            RelationalOp::Equal,
+            &mut crate::logging::Logging::new(),
+        );
+        let negated =
+            not(x_equals_x.as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
         assert!(
             negated.is_empty(),
             "~(x=x) over a fully-restricted base is unsatisfiable"
@@ -3729,7 +4185,12 @@ mod tests {
     /// track, and it survives into everything derived from them.
     #[test]
     fn the_restriction_is_installed_on_every_track_and_propagates() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         for a in [ns.addition(), ns.less_than(), &ns.equality] {
             assert_eq!(a.all_reps.len(), a.alphabet.len());
             assert!(
@@ -3752,7 +4213,12 @@ mod tests {
     /// consumer re-`bind`s first, which is why it is harmless.
     #[test]
     fn the_constructor_leaves_the_defining_automata_numerically_labelled() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         assert_eq!(ns.addition().label, vec!["0", "1", "2"]);
         assert_eq!(ns.equality.label, vec!["0", "1"]);
         // Without any all-representations file, nothing runs and they stay unbound.
@@ -3766,10 +4232,20 @@ mod tests {
     /// built over `getAlphabet()` — and it, too, gets the restriction applied.
     #[test]
     fn a_missing_less_than_file_falls_back_to_lexicographic_over_the_loaded_alphabet() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         assert_eq!(ns.less_than().alphabet, vec![vec![0, 1], vec![0, 1]]);
         // 01 < 10 lexicographically; both are valid representations.
-        let lt = ns.comparison("x", "y", RelationalOp::LessThan);
+        let lt = ns.comparison(
+            "x",
+            "y",
+            RelationalOp::LessThan,
+            &mut crate::logging::Logging::new(),
+        );
         assert!(accepts_digits(&lt, &[("x", "01"), ("y", "10")]));
         assert!(!accepts_digits(&lt, &[("x", "10"), ("y", "01")]));
         // 011 is not a valid representation, so no comparison involving it holds.
@@ -3840,10 +4316,15 @@ mod tests {
     /// that dropped the restriction would accept `11`-words here.
     #[test]
     fn msd_fib_constants_are_exactly_the_valid_zeckendorf_representations() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         let words = all_binary_words(6);
         proptest!(ProptestConfig::with_cases(12), |(n in 0u32..13)| {
-            let constant = ns.get_constant(&BigInt::from(n)).unwrap();
+            let constant = ns.get_constant(&BigInt::from(n), &mut crate::logging::Logging::new()).unwrap();
             for word in &words {
                 prop_assert_eq!(
                     accepts_single_track_word(&constant, word),
@@ -3873,7 +4354,12 @@ mod tests {
     /// this file record.
     #[test]
     fn msd_fib_adder_computes_real_zeckendorf_addition() {
-        let ns = NumberSystem::with_custom_base_files("msd_fib", msd_fib_files()).unwrap();
+        let ns = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
         let plus = ns.arithmetic("p", "q", "r", ArithmeticOp::Plus).unwrap();
         let words: Vec<Vec<i32>> = all_binary_words(5)
             .into_iter()
@@ -3960,7 +4446,12 @@ mod tests {
             ..CustomBaseFiles::default()
         };
         assert_eq!(
-            NumberSystem::with_custom_base_files("msd_weird", files).unwrap_err(),
+            NumberSystem::with_custom_base_files(
+                "msd_weird",
+                files,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::AdditionInputCount("msd_weird".to_string())
         );
     }
@@ -3978,7 +4469,12 @@ mod tests {
             ..CustomBaseFiles::default()
         };
         assert_eq!(
-            NumberSystem::with_custom_base_files("msd_odd", files).unwrap_err(),
+            NumberSystem::with_custom_base_files(
+                "msd_odd",
+                files,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::AdditionAlphabetMissingOne("msd_odd".to_string())
         );
     }
@@ -3996,7 +4492,12 @@ mod tests {
             ..CustomBaseFiles::default()
         };
         assert_eq!(
-            NumberSystem::with_custom_base_files("msd_mix", files).unwrap_err(),
+            NumberSystem::with_custom_base_files(
+                "msd_mix",
+                files,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::AdditionAlphabetsDiffer("msd_mix".to_string())
         );
     }
@@ -4016,7 +4517,12 @@ mod tests {
             all_representations: CustomBaseCandidates::default(),
         };
         assert_eq!(
-            NumberSystem::with_custom_base_files("msd_fib", files).unwrap_err(),
+            NumberSystem::with_custom_base_files(
+                "msd_fib",
+                files,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::LessThanInputCount("msd_fib".to_string())
         );
     }
@@ -4037,7 +4543,12 @@ mod tests {
             all_representations: CustomBaseCandidates::default(),
         };
         assert_eq!(
-            NumberSystem::with_custom_base_files("msd_fib", files).unwrap_err(),
+            NumberSystem::with_custom_base_files(
+                "msd_fib",
+                files,
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
             NumSysError::LessThanAlphabetMismatch("msd_fib".to_string())
         );
     }
@@ -4059,7 +4570,12 @@ mod tests {
             // first, so the negative-base adder can never be layered under this module's
             // positive-base-only constructions.
             assert_eq!(
-                NumberSystem::with_custom_base_files(name, msd_fib_files()).unwrap_err(),
+                NumberSystem::with_custom_base_files(
+                    name,
+                    msd_fib_files(),
+                    &mut crate::logging::Logging::new()
+                )
+                .unwrap_err(),
                 NumSysError::UnsupportedNegativeBase(name.to_string()),
                 "{name}"
             );
@@ -4104,7 +4620,9 @@ mod tests {
         let ns = Rc::new(NumberSystem::new("msd_2").unwrap());
         assert!(ns.constants_dynamic_table.borrow().is_empty());
 
-        let first = ns.get_constant(&big(5)).unwrap();
+        let first = ns
+            .get_constant(&big(5), &mut crate::logging::Logging::new())
+            .unwrap();
         let after_first = ns.constants_dynamic_table.borrow().len();
         assert!(
             after_first > 1,
@@ -4113,7 +4631,9 @@ mod tests {
 
         // A second handle to the same instance -- no `&mut` anywhere, and no second cache.
         let alias = Rc::clone(&ns);
-        let second = alias.get_constant(&big(5)).unwrap();
+        let second = alias
+            .get_constant(&big(5), &mut crate::logging::Logging::new())
+            .unwrap();
         assert_eq!(
             ns.constants_dynamic_table.borrow().len(),
             after_first,
@@ -4128,9 +4648,13 @@ mod tests {
 
         // The other two tables, same shape (and `division` recurses through
         // `comparison_const_b`/`arithmetic_const_a`, exercising the nested-borrow case).
-        assert!(ns.get_multiplication(&big(3)).is_ok());
+        assert!(ns
+            .get_multiplication(&big(3), &mut crate::logging::Logging::new())
+            .is_ok());
         assert!(!ns.multiplications_dynamic_table.borrow().is_empty());
-        assert!(ns.get_division(&big(3)).is_ok());
+        assert!(ns
+            .get_division(&big(3), &mut crate::logging::Logging::new())
+            .is_ok());
         assert!(!ns.divisions_dynamic_table.borrow().is_empty());
     }
 
@@ -4144,22 +4668,27 @@ mod tests {
     fn a_rejected_lookup_leaves_the_cache_untouched() {
         let ns = NumberSystem::new("msd_2").unwrap();
         assert_eq!(
-            ns.get_constant(&big(-1)).unwrap_err(),
+            ns.get_constant(&big(-1), &mut crate::logging::Logging::new())
+                .unwrap_err(),
             NumSysError::NegativeConstant("-1".to_string())
         );
         assert_eq!(
-            ns.get_multiplication(&big(0)).unwrap_err(),
+            ns.get_multiplication(&big(0), &mut crate::logging::Logging::new())
+                .unwrap_err(),
             NumSysError::MultiplicationByZero
         );
         assert_eq!(
-            ns.get_division(&big(0)).unwrap_err(),
+            ns.get_division(&big(0), &mut crate::logging::Logging::new())
+                .unwrap_err(),
             NumSysError::DivisionByZero
         );
         assert!(ns.constants_dynamic_table.borrow().is_empty());
         assert!(ns.multiplications_dynamic_table.borrow().is_empty());
         assert!(ns.divisions_dynamic_table.borrow().is_empty());
         // Still usable afterwards -- i.e. nothing is stuck borrowed.
-        assert!(ns.get_constant(&big(3)).is_ok());
+        assert!(ns
+            .get_constant(&big(3), &mut crate::logging::Logging::new())
+            .is_ok());
     }
 
     /// Every ported `WalnutException` message, verbatim (`Display`, added in U5 for Tier 1's

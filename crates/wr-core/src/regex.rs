@@ -994,9 +994,14 @@ fn intersect_fa(a: &Fa, b: &Fa, alphabet_size: usize) -> Fa {
     for s in 0..alphabet_size {
         all_inputs[s * alphabet_size + s] = s as i32;
     }
-    cross_product_internal(a, b, alphabet_size, &all_inputs, |x, y| {
-        i32::from(x != 0 && y != 0)
-    })
+    cross_product_internal(
+        a,
+        b,
+        alphabet_size,
+        &all_inputs,
+        |x, y| i32::from(x != 0 && y != 0),
+        &mut crate::logging::Logging::new(),
+    )
 }
 
 /// Language complement of an NFA over the dense alphabet — determinize, totalize, flip
@@ -1191,6 +1196,14 @@ fn wrap_with_alphabet(regex: &[u16], internal: &[u16]) -> Vec<u16> {
 /// entry point: the alphabet must be a subset of `{0,…,9}`, each digit is its own
 /// character in the regex, and the resulting symbol is the digit's *index* in
 /// `alphabet` (so `reg r {2,4,1} "4*"` produces transitions on symbol 1, not 4).
+///
+/// **Not ported: `System.out.println("Converted from brics:" + …)` (`:43`).** A bare,
+/// un-`Logging`-routed console line — never reaches `commandLog`/`detailedLog`/
+/// `getDetails()`, so no `details`/`error` fixture, differential comparison, or fuzz
+/// target can observe it (same class of omission as `ProductStrategies`'s `Progress:`
+/// throttle lines, already noted in `product.rs`'s module docs). Confirmed live
+/// (2026-08-19, adversarial review round 2) that real Walnut does print it on stdout;
+/// documented here rather than silently dropped.
 ///
 /// Java's `keyMapper` drops any transition whose character is outside the alphabet
 /// (`alphabet.contains(digit) ? … : -1`); here that never arises, because a character

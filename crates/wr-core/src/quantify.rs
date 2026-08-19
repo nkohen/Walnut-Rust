@@ -155,7 +155,7 @@
 
 use crate::automaton::Automaton;
 use crate::logicalops::{fix_leading_zeros_problem_with_ctx, fix_trailing_zeros_problem};
-use crate::minimize::{minimize, MinimizeError};
+use crate::minimize::MinimizeError;
 use crate::numsys::determine_msd;
 use crate::trim::trim;
 use std::collections::{BTreeMap, BTreeSet};
@@ -195,7 +195,7 @@ impl From<MinimizeError> for QuantifyError {
 /// `a.fa` is a minimal (generally *partial* — `minimize` drops non-co-reachable states)
 /// DFA over the reduced alphabet, and state numbering bears no relation to Walnut's.
 pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
-    quantify_with_ctx(a, labels, None)
+    quantify_with_ctx(a, labels, None, &mut crate::logging::Logging::new())
 }
 
 /// [`quantify`] with an explicit [`crate::determinize::DeterminizeContext`] — Walnut's
@@ -216,8 +216,9 @@ pub fn quantify_with_ctx(
     a: &mut Automaton,
     labels: &BTreeSet<String>,
     mut ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<(), QuantifyError> {
-    quantify_helper(a, labels, ctx.as_deref_mut())?;
+    quantify_helper(a, labels, ctx.as_deref_mut(), logging)?;
 
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:39`): a trivial automaton has no
     // tracks and no numeration direction, so the fixup is skipped entirely. Note this
@@ -255,7 +256,7 @@ pub fn quantify_with_ctx(
             // be a single crate-wide decision (starting from `determinize_and_minimize`/
             // `determinize_and_minimize_from` in `automaton.rs`, U2), not a one-off fix
             // here.
-            fix_leading_zeros_problem_with_ctx(a, ctx);
+            fix_leading_zeros_problem_with_ctx(a, ctx, logging);
             Ok(())
         }
         Some(false) => {
@@ -303,7 +304,7 @@ pub fn quantify_with_ctx(
             // `fa.justMinimize()`, not `determinizeAndMinimize`), hence the unused `ctx`
             // here -- an lsd `quantify` costs one index, an msd one costs two.
             let _ = ctx;
-            fix_trailing_zeros_problem(a);
+            fix_trailing_zeros_problem(a, logging);
             Ok(())
         }
     }
@@ -315,6 +316,7 @@ fn quantify_helper(
     a: &mut Automaton,
     labels: &BTreeSet<String>,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<(), QuantifyError> {
     // Java: `if (labelsToQuantify.isEmpty() || A.getLabel() == null ||
     // A.getLabel().isEmpty()) return;` (`:50-52`) — note this precedes `validateLabels`,
@@ -330,6 +332,17 @@ fn quantify_helper(
             return Err(QuantifyError::NotFreeVariable(l.clone()));
         }
     }
+
+    // `logMessage(QUANTIFYING + ":" + Q + " states")` (`:56`) -- AFTER label validation,
+    // BEFORE the all-tracks-quantified check below, which is why a real Walnut query
+    // that fully quantifies its only track(s) logs `QUANTIFYING` but never its
+    // `QUANTIFIED` partner (`AutomatonQuantification.java:55-65`).
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{}:{} states",
+        crate::logging::QUANTIFYING,
+        a.fa.q
+    ));
 
     // Java: `if (labelsToQuantify.size() == A.richAlphabet.getA().size())` (`:60-65`) —
     // every track quantified, so the result is the TRUE automaton iff the language was
@@ -399,6 +412,15 @@ fn quantify_helper(
     projected.set_all_reps(new_all_reps);
     projected.set_ns_names(new_ns_names);
     projected.fa.alphabet_size = new_alphabet_size;
+    // `quantifyHelper` mutates `A` in place (`AutomatonQuantification.java:75-107`), so
+    // the object's Java runtime class survives the projection -- `AutomatonDFA.from`'s
+    // `instanceof` branch on a LATER trivial collapse of this same value depends on that
+    // surviving. `Automaton::new` above defaults `dfa_typed` to `false` (a fresh value),
+    // which would silently downgrade any DFA-typed input; carry the input's own value
+    // across instead, exactly as Java's in-place mutation would. Found by adversarial
+    // review (live jar divergence: `?msd_2 ~(E x x>=5)` logs `5 states` in Java, `0` here
+    // without this line) — see `Automaton::dfa_typed`'s docs for the full mechanism.
+    projected.dfa_typed = a.dfa_typed;
 
     // `permutation[old] = new` (`:83-85`): re-encode each decoded tuple minus the
     // quantified tracks. Many old symbols map to one new symbol — that collapse is the
@@ -475,13 +497,41 @@ fn quantify_helper(
     // accept/reject bits either way (see `crate::minimize`'s scope note, matching Java's
     // `ValmariDFA.minValmari`), so no `o > 1` survives this function whether the guard
     // fires or not.
+    // Two nested `indent()` calls, matching Java's own nesting exactly: `quantifyHelper`
+    // has its own `Logging.indent()`/`dedent()` bracket (`:103`/`:105`) around its call
+    // to `A.determinizeAndMinimize()`, which is ITSELF `Automaton.determinizeAndMinimize()`
+    // -- a method with its OWN separate `indent()`/`dedent()` bracket
+    // (`Automaton.java:383-397`, ported as `Automaton::determinize_and_minimize_with_ctx`).
+    // This function inlines that method's logic rather than calling it (see the
+    // unconditional-trim note below), so both brackets have to be reproduced by hand here
+    // -- confirmed against `details375.txt`: `Determinizing`/`Minimizing` sit TWO indent
+    // levels deeper than `quantifying`, not one.
+    logging.indent();
+    logging.indent();
     let was_deterministic = projected.fa.is_deterministic();
+    let old_q = projected.fa.q;
     projected.fa = trim(&projected.fa);
+    // `Logging.logMessage("Trimmed to: " + …)` sits INSIDE Java's `!isDeterministic`
+    // branch (`Automaton.java:385-391`), so a projection that stayed deterministic never
+    // logs this line even if the (here, unconditional — see the divergence note above)
+    // trim actually changed the state count. Gating the LOG on `!was_deterministic`
+    // preserves that, without touching the trim itself.
+    if !was_deterministic && old_q != projected.fa.q {
+        logging.log_message(&format!("Trimmed to: {} states.", projected.fa.q));
+    }
     if !was_deterministic {
         let initial: BTreeSet<usize> = [projected.fa.q0].into_iter().collect();
-        crate::automaton::dispatch_determinize(&mut projected, &initial, ctx);
+        crate::automaton::dispatch_determinize(&mut projected, &initial, ctx, logging);
     }
-    projected.fa = minimize(&projected.fa)?;
+    projected.fa = crate::minimize::minimize_with_logging(&projected.fa, logging)?;
+    logging.dedent();
+    logging.dedent();
+    logging.log_message(&format!(
+        "{}:{} states - {}ms",
+        crate::logging::QUANTIFIED,
+        projected.fa.q,
+        time_before.elapsed().as_millis()
+    ));
 
     *a = projected;
     Ok(())
@@ -544,6 +594,35 @@ mod tests {
         assert!(
             !a.fa.accepts_word(&word(&a, &[0])),
             "\"0\" alone must be rejected"
+        );
+    }
+
+    /// `AutomatonQuantification.quantifyHelper` mutates its argument in place
+    /// (`AutomatonQuantification.java:75-107`), so the Java runtime class of the input
+    /// survives the projection — [`crate::automaton::Automaton::dfa_typed`] must too,
+    /// even though `quantify_helper`'s general (non-early-return) path rebuilds a fresh
+    /// `Automaton` internally. This is the direct `wr-core`-level test for the fix; a
+    /// mutation check confirms deleting the preserving line makes this fail (and, at the
+    /// `wr-logic` layer, silently mislogs a fully-quantified negated comparison's state
+    /// count — see `crates/wr-logic/src/eval.rs`'s
+    /// `negated_existential_over_a_quantify_derived_comparison_...` test).
+    #[test]
+    fn quantify_preserves_dfa_typed_across_the_general_path_like_javas_in_place_mutation() {
+        let mut a = two_track_y_x();
+        a.dfa_typed = true;
+        quantify(&mut a, &labels(&["y"])).unwrap();
+        assert!(
+            a.dfa_typed,
+            "quantifyHelper mutates in place -- the Java runtime class (and hence this \
+             port's stand-in for it) must survive the projection"
+        );
+
+        let mut b = two_track_y_x();
+        assert!(!b.dfa_typed, "sanity: fresh test fixtures start plain");
+        quantify(&mut b, &labels(&["y"])).unwrap();
+        assert!(
+            !b.dfa_typed,
+            "a plain input must not spuriously become DFA-typed either"
         );
     }
 
@@ -953,14 +1032,14 @@ mod tests {
             phi in arb_self_looping_zero_two_track(4),
             x_digits in prop::collection::vec(0i32..2, 0..4),
         ) {
-            let not_phi = crate::logicalops::not(phi.as_dfa());
+            let not_phi = crate::logicalops::not(phi.as_dfa(), &mut crate::logging::Logging::new());
             let mut exists_not_phi = not_phi.into_automaton();
             quantify(&mut exists_not_phi, &labels(&["y"])).unwrap();
             // Structural sanity: the quantified track must actually be gone (a
             // `quantify` that silently no-op'd on projection would otherwise be
             // compared via a mis-encoded word instead of failing loudly).
             prop_assert_eq!(&exists_not_phi.label, &vec!["x".to_string()]);
-            let forall_phi = crate::logicalops::not(exists_not_phi.as_dfa());
+            let forall_phi = crate::logicalops::not(exists_not_phi.as_dfa(), &mut crate::logging::Logging::new());
 
             let word: Vec<i32> = x_digits
                 .iter()

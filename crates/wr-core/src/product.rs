@@ -207,6 +207,22 @@ impl BooleanOp {
         };
         i32::from(result)
     }
+
+    /// `LogicalOperator.AND`/`OR`/`XOR`/`IMPLY`/`IFF`'s literal symbol text — Java's
+    /// `friendlyOp` string, dropped everywhere else in this crate (see this module's own
+    /// docs: it carries no behavior beyond the method name once `BooleanOp` fixes the
+    /// output table per call site) but needed back for `AutomatonLogicalOps.
+    /// totalizeCrossProduct`'s `COMPUTING`/`COMPUTED` log text
+    /// (`AutomatonLogicalOps.java:112-126`), which Java builds from this exact string.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BooleanOp::And => "&",
+            BooleanOp::Or => "|",
+            BooleanOp::Xor => "^",
+            BooleanOp::Imply => "=>",
+            BooleanOp::Iff => "<=>",
+        }
+    }
 }
 
 /// `ProductStrategies.crossProductInternal` (`ProductStrategies.java:33-94`) — the
@@ -263,10 +279,12 @@ pub fn cross_product_internal<F>(
     axb_alphabet_size: usize,
     all_inputs_of_axb: &[i32],
     mut combine_output: F,
+    logging: &mut crate::logging::Logging,
 ) -> Fa
 where
     F: FnMut(i32, i32) -> i32,
 {
+    let time_before = std::time::Instant::now();
     let mut states_list: Vec<(usize, usize)> = vec![(a.q0, b.q0)];
     let mut states_hash: HashMap<(usize, usize), usize> = HashMap::new();
     states_hash.insert((a.q0, b.q0), 0);
@@ -330,6 +348,20 @@ where
         d.push(state_transitions);
         current_state += 1;
     }
+
+    // `Logging.logMessage(COMPUTED + " cross product:" + AxB.Q + " states - " + ms +
+    // "ms")` (`ProductStrategies.java:92-93`/`:160-161`) -- unconditional (gated only by
+    // `logMessage`'s own `printDetails` check, no `shouldPrintDetails()` wrapper), unlike
+    // the `computing cross product` line at this function's caller. Progress-throttle
+    // lines (`ProductStrategies.java:43-50`/`:116-123`) are deliberately NOT ported: both
+    // `IntegrationTest.assertEqualMessages` and this port's own golden harness strip
+    // `Progress:` lines before comparing, so no golden divergence can hinge on them.
+    logging.log_message(&format!(
+        "{} cross product:{} states - {}ms",
+        crate::logging::COMPUTED,
+        states_list.len(),
+        time_before.elapsed().as_millis()
+    ));
 
     Fa {
         true_false: None,
@@ -577,18 +609,75 @@ fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>)
 /// module docs). Java's `A.determineCombineOutVal(op)` (only ever non-trivial for
 /// `Prover.COMBINE`, see module docs) has no analog: `combine_output` already
 /// receives everything it needs directly from the two states' raw outputs.
-pub fn cross_product<F>(a: &Automaton, b: &Automaton, mut combine_output: F) -> Automaton
+///
+/// `printAndUpdateIndex(A.fa.getQ(), B.fa.getQ())` (`:214`) — the `computing cross
+/// product:` line — is THIS function's own, not `cross_product_internal`'s: Java's
+/// `crossProductAndMinimize` (the `AutomatonDFA` overload, ported as
+/// [`cross_product_and_minimize_dfa`]) does NOT call `crossProduct` at all, it is a
+/// separate, non-delegating implementation with its own `printAndUpdateIndex` call — see
+/// that function's own docs. Both call [`cross_product_from_basic`] directly (after their
+/// own `create_basic_automaton` + log), rather than one delegating to the other, to avoid
+/// double-logging.
+pub fn cross_product<F>(
+    a: &Automaton,
+    b: &Automaton,
+    mut combine_output: F,
+    logging: &mut crate::logging::Logging,
+) -> Automaton
 where
     F: FnMut(i32, i32) -> i32,
 {
-    let (mut axb, all_inputs_of_axb) = create_basic_automaton(a, b);
+    // `createBasicAutomaton` runs BEFORE `printAndUpdateIndex` in Java
+    // (`ProductStrategies.java:211-214`) — its "cannot be true/false automata"/
+    // alphabet-mismatch guards can panic, and Java logs nothing on that path, so this
+    // must run first too (see `cross_product_from_basic`'s docs; this mirrors
+    // `cross_product_and_minimize_dfa`'s own, already-correct ordering exactly).
+    let (axb_basic, all_inputs_of_axb) = create_basic_automaton(a, b);
+    if logging.should_print_details() {
+        logging.log_message(&format!(
+            "{} cross product:{} states - {} states",
+            crate::logging::COMPUTING,
+            a.fa.q,
+            b.fa.q
+        ));
+    }
+    cross_product_from_basic(
+        a,
+        b,
+        axb_basic,
+        &all_inputs_of_axb,
+        &mut combine_output,
+        logging,
+    )
+}
+
+/// [`cross_product`]'s tail, given an already-built [`create_basic_automaton`] result —
+/// split out so both [`cross_product`] and [`cross_product_and_minimize_dfa`] can call
+/// `create_basic_automaton` (whose "cannot be true/false automata"/alphabet-mismatch
+/// guards can panic) BEFORE their own `computing cross product:` line, matching Java's
+/// exact order in both `ProductStrategies.crossProduct` (`:211-214`) and
+/// `crossProductAndMinimize` (`:224-228`) — a naive `log-then-validate` ordering would leave a
+/// `computing cross product:` line in the buffer ahead of an error Java never logs it
+/// for.
+fn cross_product_from_basic<F>(
+    a: &Automaton,
+    b: &Automaton,
+    mut axb: Automaton,
+    all_inputs_of_axb: &[i32],
+    combine_output: &mut F,
+    logging: &mut crate::logging::Logging,
+) -> Automaton
+where
+    F: FnMut(i32, i32) -> i32,
+{
     let axb_alphabet_size = axb.fa.alphabet_size;
     axb.fa = cross_product_internal(
         &a.fa,
         &b.fa,
         axb_alphabet_size,
-        &all_inputs_of_axb,
-        &mut combine_output,
+        all_inputs_of_axb,
+        combine_output,
+        logging,
     );
     axb
 }
@@ -599,6 +688,7 @@ pub fn cross_product_and_minimize<F>(
     a: &Automaton,
     b: &Automaton,
     combine_output: F,
+    logging: &mut crate::logging::Logging,
 ) -> AutomatonDFA
 where
     F: FnMut(i32, i32) -> i32,
@@ -610,7 +700,7 @@ where
     // on the `eval` call graph (every operand reaching a boolean connective has already
     // been determinized/minimized); see `Automaton::as_dfa`'s docs for why it is a comment
     // rather than an assertion, and what to do if a caller can violate it.
-    cross_product_and_minimize_dfa(&a.as_dfa(), &b.as_dfa(), combine_output)
+    cross_product_and_minimize_dfa(&a.as_dfa(), &b.as_dfa(), combine_output, logging)
 }
 
 /// `ProductStrategies.crossProductAndMinimize(AutomatonDFA, AutomatonDFA, String)`
@@ -650,12 +740,38 @@ pub fn cross_product_and_minimize_dfa<F>(
     a: &AutomatonDFA,
     b: &AutomatonDFA,
     mut combine_output: F,
+    logging: &mut crate::logging::Logging,
 ) -> AutomatonDFA
 where
     F: FnMut(i32, i32) -> i32,
 {
-    let mut axb = cross_product(a.automaton(), b.automaton(), &mut combine_output);
-    axb.fa = crate::minimize::minimize(&axb.fa).expect(
+    // `createBasicAutomaton` runs BEFORE `printAndUpdateIndex` in Java
+    // (`ProductStrategies.java:225-227`) — its "cannot be true/false automata"/
+    // alphabet-mismatch guards can panic, and Java logs nothing on that path, so this
+    // must run first too (see `cross_product_from_basic`'s docs).
+    let (axb_basic, all_inputs_of_axb) = create_basic_automaton(a.automaton(), b.automaton());
+
+    // `printAndUpdateIndex` (`ProductStrategies.java:240-243`): `if
+    // (Logging.shouldPrintDetails()) { logMessage(COMPUTING + " cross product:" + aQ +
+    // " states - " + bQ + " states"); }` -- a real, explicit gate here (not just the
+    // callee's own internal no-op), matching Java exactly.
+    if logging.should_print_details() {
+        logging.log_message(&format!(
+            "{} cross product:{} states - {} states",
+            crate::logging::COMPUTING,
+            a.automaton().fa.q,
+            b.automaton().fa.q
+        ));
+    }
+    let mut axb = cross_product_from_basic(
+        a.automaton(),
+        b.automaton(),
+        axb_basic,
+        &all_inputs_of_axb,
+        &mut combine_output,
+        logging,
+    );
+    axb.fa = crate::minimize::minimize_with_logging(&axb.fa, logging).expect(
         "cross product of two deterministic automata is itself deterministic and \
          q0-reachable by construction (see module docs) -- minimize's preconditions \
          always hold here",
@@ -764,7 +880,14 @@ mod tests {
         // the BFS loop body runs exactly once.
         let a = one_state_fa(0, 0);
         let b = one_state_fa(0, 1);
-        let axb = cross_product_internal(&a, &b, 0, &[], |x, y| BooleanOp::And.combine(x, y));
+        let axb = cross_product_internal(
+            &a,
+            &b,
+            0,
+            &[],
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb.q, 1);
         assert_eq!(axb.q0, 0);
     }
@@ -775,17 +898,27 @@ mod tests {
         // truthiness differs -> 0.
         let a_false = one_state_fa(0, 0);
         let b_true = one_state_fa(0, 1);
-        let axb_differ = cross_product_internal(&a_false, &b_true, 0, &[], |x, y| {
-            BooleanOp::Iff.combine(x, y)
-        });
+        let axb_differ = cross_product_internal(
+            &a_false,
+            &b_true,
+            0,
+            &[],
+            |x, y| BooleanOp::Iff.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb_differ.q, 1);
         assert_eq!(axb_differ.o[0], 0);
 
         // case 2: both accepting -> truthiness matches -> 1.
         let a_true = one_state_fa(0, 1);
-        let axb_match = cross_product_internal(&a_true, &b_true, 0, &[], |x, y| {
-            BooleanOp::Iff.combine(x, y)
-        });
+        let axb_match = cross_product_internal(
+            &a_true,
+            &b_true,
+            0,
+            &[],
+            |x, y| BooleanOp::Iff.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb_match.q, 1);
         assert_eq!(axb_match.o[0], 1);
     }
@@ -823,7 +956,14 @@ mod tests {
         let a = fa_with_keys(&[-1]);
         let b = fa_with_keys(&[]);
         let table = [0, 1, 2, 3];
-        let axb = cross_product_internal(&a, &b, 4, &table, |x, y| BooleanOp::And.combine(x, y));
+        let axb = cross_product_internal(
+            &a,
+            &b,
+            4,
+            &table,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb.q, 1, "one reachable pair, no transitions taken");
         assert!(axb.d[0].is_empty());
     }
@@ -843,7 +983,8 @@ mod tests {
                 &b,
                 4,
                 &table,
-                |x, y| BooleanOp::Or.combine(x, y)
+                |x, y| BooleanOp::Or.combine(x, y),
+                &mut crate::logging::Logging::new(),
             ))
             .err(),
             Some("Index -2 out of bounds for length 4".to_string())
@@ -858,7 +999,8 @@ mod tests {
                 &b_also_corrupt,
                 4,
                 &table,
-                |x, y| BooleanOp::Or.combine(x, y)
+                |x, y| BooleanOp::Or.combine(x, y),
+                &mut crate::logging::Logging::new(),
             ))
             .err(),
             Some("Index -3 out of bounds for length 4".to_string())
@@ -878,7 +1020,8 @@ mod tests {
                 &b,
                 4,
                 &table,
-                |x, y| BooleanOp::Or.combine(x, y)
+                |x, y| BooleanOp::Or.combine(x, y),
+                &mut crate::logging::Logging::new(),
             ))
             .err(),
             Some("Index 4 out of bounds for length 4".to_string())
@@ -889,6 +1032,7 @@ mod tests {
             4,
             &table,
             |x, y| BooleanOp::Or.combine(x, y),
+            &mut crate::logging::Logging::new(),
         );
         assert_eq!(ok.d[0].get(&3), Some(&vec![0]), "index 3 is in bounds");
     }
@@ -928,7 +1072,12 @@ mod tests {
         // null-label case.
         let a = unbound_automaton();
         let b = bound_automaton(vec![vec![0, 1]], vec!["x".to_string()]);
-        let _ = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let _ = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -942,7 +1091,12 @@ mod tests {
         // (`aLabel == null || bLabel == null || ...`).
         let a = bound_automaton(vec![vec![0, 1]], vec!["x".to_string()]);
         let b = unbound_automaton();
-        let _ = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let _ = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -967,7 +1121,12 @@ mod tests {
         );
         a.label.push("n".to_string());
         let b = bound_automaton(vec![vec![0, 1]], vec!["x".to_string()]);
-        let _ = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let _ = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -975,7 +1134,12 @@ mod tests {
     fn cross_product_panics_when_shared_label_has_different_alphabets() {
         let a = bound_automaton(vec![vec![0, 1]], vec!["x".to_string()]);
         let b = bound_automaton(vec![vec![0, 1, 2]], vec!["x".to_string()]);
-        let _ = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let _ = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     // --- updateAxBFields' msd/NS-merge branch (ProductStrategies.java:306-307) ---
@@ -1002,7 +1166,12 @@ mod tests {
         // Some(true) -- AxB should inherit B's non-null value.
         let a = one_track_automaton(None);
         let b = one_track_automaton(Some(true));
-        let axb = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let axb = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb.msd, vec![Some(true)]);
     }
 
@@ -1013,7 +1182,12 @@ mod tests {
         // mutant that made the assignment unconditional would flip this.
         let a = one_track_automaton(Some(false));
         let b = one_track_automaton(Some(true));
-        let axb = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let axb = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(axb.msd, vec![Some(false)]);
     }
 
@@ -1072,7 +1246,12 @@ mod tests {
             vec![None],
         );
 
-        let axb = cross_product_and_minimize(&a, &b, |p, q| BooleanOp::And.combine(p, q));
+        let axb = cross_product_and_minimize(
+            &a,
+            &b,
+            |p, q| BooleanOp::And.combine(p, q),
+            &mut crate::logging::Logging::new(),
+        );
 
         assert_eq!(
             axb.automaton().label,
@@ -1107,7 +1286,7 @@ mod tests {
 
             let a = Automaton::new(even_ones_dfa(), vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
             let b = Automaton::new(ends_with_one_dfa(), vec![vec![0, 1]], vec!["y".to_string()], vec![None]);
-            let axb = cross_product(&a, &b, |p, q| BooleanOp::And.combine(p, q));
+            let axb = cross_product(&a, &b, |p, q| BooleanOp::And.combine(p, q), &mut crate::logging::Logging::new());
 
             prop_assert_eq!(&axb.label, &vec!["x".to_string(), "y".to_string()]);
             prop_assert_eq!(&axb.alphabet, &vec![vec![0, 1], vec![0, 1]]);
@@ -1168,7 +1347,12 @@ mod tests {
         assert_eq!(a.fa.alphabet_size, 2);
         assert_eq!(b.fa.alphabet_size, 4);
 
-        let axb = cross_product(&a, &b, |p, q| BooleanOp::And.combine(p, q));
+        let axb = cross_product(
+            &a,
+            &b,
+            |p, q| BooleanOp::And.combine(p, q),
+            &mut crate::logging::Logging::new(),
+        );
         for &x in &[0, 1] {
             for &y in &[0, 1, 2, 3] {
                 let sym = axb.encode(&[x, y]);
@@ -1210,7 +1394,12 @@ mod tests {
             vec!["x".to_string()],
             vec![None],
         );
-        let axb = cross_product_and_minimize(&a, &b, |p, q| BooleanOp::Imply.combine(p, q));
+        let axb = cross_product_and_minimize(
+            &a,
+            &b,
+            |p, q| BooleanOp::Imply.combine(p, q),
+            &mut crate::logging::Logging::new(),
+        );
 
         for word in [
             vec![],
@@ -1292,7 +1481,12 @@ mod tests {
             vec![None, None, None],
         );
 
-        let axb = cross_product(&a, &b, |x, y| BooleanOp::And.combine(x, y));
+        let axb = cross_product(
+            &a,
+            &b,
+            |x, y| BooleanOp::And.combine(x, y),
+            &mut crate::logging::Logging::new(),
+        );
 
         assert_eq!(
             axb.label,
@@ -1374,7 +1568,7 @@ mod tests {
             let a = Automaton::new(a_fa.clone(), vec![alphabet.clone()], vec!["x".to_string()], vec![None]);
             let b = Automaton::new(b_fa.clone(), vec![alphabet.clone()], vec!["x".to_string()], vec![None]);
 
-            let axb = cross_product_and_minimize(&a, &b, |p, q| BooleanOp::And.combine(p, q));
+            let axb = cross_product_and_minimize(&a, &b, |p, q| BooleanOp::And.combine(p, q), &mut crate::logging::Logging::new());
 
             // `minimize` only prunes states/transitions that are backward
             // co-reachable to acceptance (see `minimize.rs`'s module docs) -- it does
@@ -1474,7 +1668,7 @@ mod tests {
             ],
         );
 
-        let axb = cross_product(&a, &b, |p, q| p + q);
+        let axb = cross_product(&a, &b, |p, q| p + q, &mut crate::logging::Logging::new());
 
         assert_eq!(
             axb.fa.o,
@@ -1567,7 +1761,7 @@ mod tests {
         let a = traced_operand("x", vec![10, 20], vec![vec![(0, vec![0, 1])], vec![]]);
         let b = traced_operand("y", vec![1, 2], vec![vec![(0, vec![1, 0])], vec![]]);
 
-        let axb = cross_product(&a, &b, |p, q| p + q);
+        let axb = cross_product(&a, &b, |p, q| p + q, &mut crate::logging::Logging::new());
 
         assert_eq!(axb.fa.o, vec![tag(0, 0), tag(0, 1), tag(1, 1), tag(1, 0)]);
         assert_eq!(
@@ -1593,7 +1787,12 @@ mod tests {
     )]
     fn cross_product_rejects_a_trivial_first_operand() {
         let b = traced_operand("y", vec![1, 2], vec![vec![(0, vec![1])], vec![]]);
-        let _ = cross_product(&Automaton::true_false(true), &b, |p, q| p + q);
+        let _ = cross_product(
+            &Automaton::true_false(true),
+            &b,
+            |p, q| p + q,
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -1605,6 +1804,11 @@ mod tests {
         // automaton is vacuously `is_bound()` (0 labels, 0 tracks), so ordering the two
         // guards the other way round would report the wrong error here.
         let a = traced_operand("x", vec![10, 20], vec![vec![(0, vec![1])], vec![]]);
-        let _ = cross_product(&a, &Automaton::true_false(false), |p, q| p + q);
+        let _ = cross_product(
+            &a,
+            &Automaton::true_false(false),
+            |p, q| p + q,
+            &mut crate::logging::Logging::new(),
+        );
     }
 }

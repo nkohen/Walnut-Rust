@@ -262,9 +262,24 @@ pub fn combine_command(
     // different arity, or with the same variable declared over different alphabets — and
     // Java catches the resulting `WalnutException` in `Prover.dispatch`, prints it, and
     // keeps the REPL alive. See `crate::walnut_exception::catch_walnut_panic`.
-    let mut c =
-        crate::walnut_exception::catch_walnut_panic(|| combine(&first, subautomata, &outputs))
-            .map_err(AutomatonOpsError::Walnut)?;
+    // A throwaway logger, not the caller's real one. NOTE this is a genuine, documented
+    // gap, not "out of scope by design": real Walnut's `::` suffix works on EVERY
+    // command via `Prover.parseSetup`'s universal `Logging.configureForCommand`, not just
+    // `eval`/`def` -- so `combine c A B;::` really does print detailed logs in real
+    // Walnut. This port's `wr-cli` dispatch does not yet thread a real `Logging` (with
+    // the command's own `:`/`::`-derived `configure_for_command` state) into non-`eval`/
+    // `def` commands at all, so even a correctly-instrumented `wr-core` primitive (as
+    // `combine` now is) has nothing real to log into here. Wiring that up is a
+    // `Prover`-dispatch-wide follow-up, not specific to `combine`.
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
+        combine(
+            &first,
+            subautomata,
+            &outputs,
+            &mut wr_core::logging::Logging::new(),
+        )
+    })
+    .map_err(AutomatonOpsError::Walnut)?;
 
     // `C.writeAutomata(s, Session.getWriteAddressForWordsLibrary(), combineName, true);`
     // (`:63`).
@@ -320,9 +335,12 @@ fn union_or_intersect(
         first.random_label();
         n.label = first.label.clone();
 
+        // Not an `eval`/`def` command -- a throwaway logger (see `combine_command`'s
+        // matching note above).
+        let mut logging = wr_core::logging::Logging::new();
         first = match op {
-            UnionOrIntersect::Union => or(&mut first, &mut n).into_automaton(),
-            UnionOrIntersect::Intersect => and(&first, &n).into_automaton(),
+            UnionOrIntersect::Union => or(&mut first, &mut n, &mut logging).into_automaton(),
+            UnionOrIntersect::Intersect => and(&first, &n, &mut logging).into_automaton(),
         };
     }
     Ok(first)
@@ -420,7 +438,7 @@ fn concat_pair(
 
     n.normalize_number_systems(logging);
     n.determinize_and_minimize();
-    n.apply_all_representations();
+    n.apply_all_representations(logging);
     Ok(n)
 }
 
@@ -471,7 +489,7 @@ fn star(automaton: &Automaton, logging: &mut Logging) -> Automaton {
     n.normalize_number_systems(logging);
     n.force_canonize();
     n.determinize_and_minimize();
-    n.apply_all_representations();
+    n.apply_all_representations(logging);
     n
 }
 

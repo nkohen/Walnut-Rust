@@ -241,7 +241,9 @@ pub fn determinize(
     a: &mut Automaton,
     initial: &BTreeSet<usize>,
     ctx: Option<&mut (dyn DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<(), DeterminizeError> {
+    let time_before = std::time::Instant::now();
     let mut strategy = Strategy::Sc;
     if let Some(ctx) = ctx {
         // Java `:100-101`: the counter advances once per non-silent determinization,
@@ -258,8 +260,15 @@ pub fn determinize(
             is_fao,
         });
 
-        // Java `:111-112` logs `DETERMINIZING <outputName>: <Q> states` here. Not
-        // emitted yet -- see this module's docs.
+        // Java `:111-112` logs `DETERMINIZING <outputName>: <Q> states`, inside the
+        // `if (Logging.shouldPrintDetails())` block this whole arm already stands in
+        // for (`ctx.is_some()` IS that gate, per this module's own docs).
+        logging.log_message(&format!(
+            "{} {}: {} states",
+            crate::logging::DETERMINIZING,
+            strategy.output_name(automaton_index),
+            a.fa.q
+        ));
     }
 
     // Java `:115-119`.
@@ -270,7 +279,7 @@ pub fn determinize(
     // Java `:121-125`'s switch, minus the deferred OTF arm.
     a.fa = match strategy {
         Strategy::Sc => subset_construction(&a.fa, initial),
-        Strategy::Brz => brzozowski(&a.fa, initial)?,
+        Strategy::Brz => brzozowski(&a.fa, initial, logging)?,
     };
     // In Java this is a brand-new `FA` object, so its `canonized` memo is `false` by
     // construction; this port's flag lives on the `Automaton` wrapper and survives the
@@ -278,9 +287,15 @@ pub fn determinize(
     // the exhaustive list of sites that owe this.
     a.set_canonized(false);
 
-    // Java `:127-130` logs `DETERMINIZED: <Q> states - <ms>ms` here -- unlike the block
+    // Java `:127-130` logs `DETERMINIZED: <Q> states - <ms>ms` -- unlike the block
     // above, unconditionally (no `shouldPrintDetails` guard; `Logging.logMessage` does
-    // its own filtering). Not emitted yet, same reason.
+    // its own filtering, so a no-op call here is cheap and correct either way).
+    logging.log_message(&format!(
+        "{}: {} states - {}ms",
+        crate::logging::DETERMINIZED,
+        a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     Ok(())
 }
 
@@ -456,30 +471,55 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
 /// case — this function does NOT (matching Java, which throws
 /// `IndexOutOfBoundsException` at the equivalent spot): a 0-state `fa` with a
 /// non-empty `initial` panics inside [`crate::fa::Fa::reverse`].
-pub fn brzozowski(fa: &Fa, initial: &BTreeSet<usize>) -> Result<Fa, MinimizeError> {
+pub fn brzozowski(
+    fa: &Fa,
+    initial: &BTreeSet<usize>,
+    logging: &mut crate::logging::Logging,
+) -> Result<Fa, MinimizeError> {
     debug_assert!(
         fa.o.iter().all(|&o| o <= 1),
         "brzozowski: caller must reject DFAOs first, matching DeterminizationStrategies.\
          determinize's dispatcher-level guard (DeterminizationStrategies.java:115-118) \
          -- this function has no way to error cleanly on one itself"
     );
-    // Step 1 (`brzStep(fa, initialStates, SC, "Reverse")`): reverse, then SC.
+    // Step 1 (`brzStep(fa, initialStates, SC, "Reverse")`): reverse, then SC. `brzStep`
+    // (`DeterminizationStrategies.java:150-160`) has no indent/dedent of its own -- both
+    // log calls sit at whatever level the caller is already at. `strategy.name` is
+    // always `"SC"` here: Java's `Brz` passes `strategy.removeBrzozowski()`
+    // (`:140-141`) to the FIRST `brzStep` and a hardcoded `Strategy.SC` to the second
+    // (`:148`), and this port's `Strategy` enum already hard-codes the one mapping that
+    // survives the OTF cut (`BRZ -> SC`) -- see this module's own docs.
+    let time_before = std::time::Instant::now();
     let mut reversed = fa.clone();
     let new_initial = reversed.reverse(initial);
+    logging.log_message("Reverse -- Determinizing with strategy:SC.");
     let determinized = subset_construction(&reversed, &new_initial);
+    logging.log_message(&format!(
+        "Reverse: {} states - {}ms",
+        determinized.q,
+        time_before.elapsed().as_millis()
+    ));
 
     // `fa.justMinimize()`.
-    let minimized = crate::minimize::minimize(&determinized)?;
+    let minimized = crate::minimize::minimize_with_logging(&determinized, logging)?;
 
     // Step 2 (`brzStep(fa, IntSet.of(fa.getQ0()), SC, "Reverse of reverse")`): seed
     // with the NEW automaton's `q0` (Java's comment: "Note that initial state is now
     // q0" — i.e. after minimizing, re-seed from the minimized result's own `q0`, not
     // the original `initial` parameter), reverse again, then SC. No minimize after
     // this one (see doc comment above).
+    let time_before2 = std::time::Instant::now();
     let mut reversed_again = minimized.clone();
     let seed2: BTreeSet<usize> = [reversed_again.q0].into_iter().collect();
     let new_initial2 = reversed_again.reverse(&seed2);
-    Ok(subset_construction(&reversed_again, &new_initial2))
+    logging.log_message("Reverse of reverse -- Determinizing with strategy:SC.");
+    let result = subset_construction(&reversed_again, &new_initial2);
+    logging.log_message(&format!(
+        "Reverse of reverse: {} states - {}ms",
+        result.q,
+        time_before2.elapsed().as_millis()
+    ));
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -667,7 +707,7 @@ mod tests {
     fn brzozowski_matches_the_input_nfas_language_on_contains_one() {
         let nfa = contains_one_nfa();
         let initial: BTreeSet<usize> = [nfa.q0].into_iter().collect();
-        let brz = brzozowski(&nfa, &initial).unwrap();
+        let brz = brzozowski(&nfa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert!(brz.is_deterministic());
         for word in [vec![], vec![0, 0, 0], vec![1], vec![0, 1, 0], vec![1, 1, 1]] {
             assert_eq!(
@@ -687,7 +727,7 @@ mod tests {
         // property test below, pinning a concrete expected state count.
         let nfa = contains_one_nfa();
         let initial: BTreeSet<usize> = [nfa.q0].into_iter().collect();
-        let brz = brzozowski(&nfa, &initial).unwrap();
+        let brz = brzozowski(&nfa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert_eq!(brz.q, 2);
     }
 
@@ -710,7 +750,7 @@ mod tests {
             d: vec![d0, BTreeMap::new()],
         };
         let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
-        let brz = brzozowski(&fa, &initial).unwrap();
+        let brz = brzozowski(&fa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert!(brz.accepts_word(&[]), "empty word must be accepted");
         assert!(brz.accepts_word(&[0]), "\"0\" must be accepted");
         assert!(!brz.accepts_word(&[1]), "\"1\" must be rejected");
@@ -736,7 +776,7 @@ mod tests {
             d: vec![d0],
         };
         let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
-        let brz = brzozowski(&fa, &initial).unwrap();
+        let brz = brzozowski(&fa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert_eq!(brz.q, 1);
         assert!(brz.is_language_empty());
     }
@@ -775,7 +815,7 @@ mod tests {
             (fa, initial) in arb_fa_and_nonempty_seed(4, 2),
             word in prop::collection::vec(0i32..2, 0..5),
         ) {
-            let brz = brzozowski(&fa, &initial).unwrap();
+            let brz = brzozowski(&fa, &initial, &mut crate::logging::Logging::new()).unwrap();
             prop_assert!(brz.is_deterministic());
 
             // Ground truth #1: language, against the input NFA directly (via a
@@ -941,7 +981,10 @@ mod tests {
         let expected = subset_construction(&nfa, &initial);
 
         let mut a = as_single_track_automaton(nfa);
-        assert_eq!(determinize(&mut a, &initial, None), Ok(()));
+        assert_eq!(
+            determinize(&mut a, &initial, None, &mut crate::logging::Logging::new()),
+            Ok(())
+        );
         assert_same_fa(&a.fa, &expected);
         // Track metadata is untouched by determinization (Java only writes `A.getFa()`).
         assert_eq!(a.label, vec!["x".to_string()]);
@@ -954,7 +997,15 @@ mod tests {
         let mut a = as_single_track_automaton(nfa.clone());
         let mut ctx = RecordingContext::default();
 
-        assert_eq!(determinize(&mut a, &initial, Some(&mut ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut a,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
 
         // Java `:100-101`: exactly one index consumed, and the strategy looked up under
         // that same index.
@@ -993,7 +1044,15 @@ mod tests {
 
         for _ in 0..3 {
             let mut a = as_single_track_automaton(nfa.clone());
-            assert_eq!(determinize(&mut a, &initial, Some(&mut ctx)), Ok(()));
+            assert_eq!(
+                determinize(
+                    &mut a,
+                    &initial,
+                    Some(&mut ctx),
+                    &mut crate::logging::Logging::new()
+                ),
+                Ok(())
+            );
         }
 
         assert_eq!(ctx.indices_issued, vec![0, 1, 2]);
@@ -1019,7 +1078,15 @@ mod tests {
         // Baseline: no override -> `SC`, 3 states.
         let mut sc = as_single_track_automaton(nfa.clone());
         let mut sc_ctx = RecordingContext::default();
-        assert_eq!(determinize(&mut sc, &initial, Some(&mut sc_ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut sc,
+                &initial,
+                Some(&mut sc_ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
         assert_eq!(sc.fa.q, 3);
         assert_same_fa(&sc.fa, &subset_construction(&nfa, &initial));
 
@@ -1029,9 +1096,20 @@ mod tests {
             strategies: [(0, DetStrategy::Brz)].into_iter().collect(),
             ..RecordingContext::default()
         };
-        assert_eq!(determinize(&mut brz, &initial, Some(&mut brz_ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut brz,
+                &initial,
+                Some(&mut brz_ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
         assert_eq!(brz_ctx.strategy_queries, vec![(0, DetStrategy::Brz)]);
-        assert_same_fa(&brz.fa, &brzozowski(&nfa, &initial).unwrap());
+        assert_same_fa(
+            &brz.fa,
+            &brzozowski(&nfa, &initial, &mut crate::logging::Logging::new()).unwrap(),
+        );
         assert_eq!(brz.fa.q, 2, "Brzozowski's result is the minimal DFA");
 
         for word in [
@@ -1065,9 +1143,25 @@ mod tests {
         };
 
         let mut first = as_single_track_automaton(nfa.clone());
-        assert_eq!(determinize(&mut first, &initial, Some(&mut ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut first,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
         let mut second = as_single_track_automaton(nfa);
-        assert_eq!(determinize(&mut second, &initial, Some(&mut ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut second,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
 
         assert_eq!(ctx.indices_issued, vec![0, 1]);
         assert_eq!(ctx.exports.len(), 2);
@@ -1101,7 +1195,12 @@ mod tests {
         };
 
         assert_eq!(
-            determinize(&mut a, &initial, Some(&mut ctx)),
+            determinize(
+                &mut a,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
             Err(DeterminizeError::DfaoWithNonScStrategy(DetStrategy::Brz))
         );
         // Nothing was determinized: Java throws before the switch, leaving `A` alone.
@@ -1126,13 +1225,24 @@ mod tests {
         let mut a = as_single_track_automaton(fa.clone());
         let mut ctx = RecordingContext::default();
 
-        assert_eq!(determinize(&mut a, &initial, Some(&mut ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut a,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
         assert_same_fa(&a.fa, &subset_construction(&fa, &initial));
         assert!(a.fa.o.iter().all(|&o| o <= 1));
 
         // And with no context at all -- the pre-U0c path -- likewise.
         let mut b = as_single_track_automaton(fa.clone());
-        assert_eq!(determinize(&mut b, &initial, None), Ok(()));
+        assert_eq!(
+            determinize(&mut b, &initial, None, &mut crate::logging::Logging::new()),
+            Ok(())
+        );
         assert_same_fa(&b.fa, &subset_construction(&fa, &initial));
     }
 
@@ -1156,7 +1266,15 @@ mod tests {
         let mut a = as_single_track_automaton(nfa.clone());
         let mut ctx = CounterOnly::default();
 
-        assert_eq!(determinize(&mut a, &initial, Some(&mut ctx)), Ok(()));
+        assert_eq!(
+            determinize(
+                &mut a,
+                &initial,
+                Some(&mut ctx),
+                &mut crate::logging::Logging::new()
+            ),
+            Ok(())
+        );
         assert_eq!(ctx.0, 1, "the counter still advances");
         assert_same_fa(&a.fa, &subset_construction(&nfa, &initial));
     }

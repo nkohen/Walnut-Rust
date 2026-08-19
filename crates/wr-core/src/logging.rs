@@ -182,6 +182,52 @@
 //! [`Logging`] itself (swapped out and restored by the guard), which is exactly
 //! equivalent to Java's behavior for the real non-nested case and a documented,
 //! deliberate simplification for the hypothetical (never-exercised) nested case.
+//!
+//! # Construction-span recording — harness instrumentation, NOT a port of anything
+//!
+//! [`Logging::begin_construction_recording`]/[`end_construction_recording`]/
+//! [`construction_recordings`] have no Java analogue at all — they exist solely so
+//! `tests/golden`'s Tier-1 comparator can identify, with certainty rather than by
+//! guessing from text content, exactly which emitted lines came from
+//! `NumberSystem::with_custom_base_files` building a custom base's `NumberSystem`
+//! for the first time in a session (see that function's docs, and
+//! `crates/wr-cli/src/session.rs`'s `PredicateEnv::number_system` implementation —
+//! specifically NOT the `load_number_system` helper it and `fresh_number_system`
+//! both call, since bracketing the shared helper records `fresh_number_system`'s
+//! own construction too, which is wrong — its logging is genuinely reproducible on
+//! every call, not a session-warmth artifact; see that impl's own docs). That
+//! construction is a genuine session-warmth artifact of running
+//! each golden fixture in its own fresh `Prover` (`tests/golden/STATUS.md` §1b) —
+//! Java's own fixture-generation run built these custom bases once, early, and
+//! every later fixture's capture reflects an already-warm cache, so this text has
+//! no counterpart to compare against in a from-scratch session.
+//!
+//! This is a pure side-channel tap on [`Logging::log_detail`]: while a recording is
+//! active, every line still goes through the exact same `print_details`/`print_enabled`
+//! gates and lands in `detailed_log` exactly as it would with no recording active at
+//! all — recording only ALSO copies that same line into the current span. It cannot
+//! change what any query computes or what any fixture's real `details` text is; it
+//! only lets a caller outside this crate later ask "which contiguous slice of that
+//! text did this one bracketed call produce," verbatim. Deliberately does NOT
+//! validate that construction logged the *right* thing — there is no "right thing"
+//! to check it against in this harness (Java's capture for these fixtures never ran
+//! construction at all), so that responsibility stays where it already is:
+//! `wr-core::numsys`'s and `wr-core::automaton`'s own unit/property tests. A
+//! computation-time `apply_all_representations` call (the `~`/`=>`/`A` handlers
+//! acting on query automata, not on a `NumberSystem`'s own adder/comparator/equality
+//! automata) is never inside a recorded span, so nothing here weakens what the
+//! `details` comparison catches for that case.
+//!
+//! **A recorded span always matches itself, by construction — a caller that removes
+//! it from a comparison gets ZERO independent evidence that the removed text was
+//! correct, only that it was actually emitted.** A change to what
+//! `with_custom_base_files` logs (a wrong track count, a cross-wired restriction
+//! file — see `docs/WALNUT-BUGS.md`-adjacent discussion in `tests/golden/STATUS.md`
+//! for concrete examples of what such a bug would look like) changes the recorded
+//! span identically, so it is removed exactly the same either way. Do not describe a
+//! caller of this mechanism as "unable to mask a construction-time regression" — it
+//! can, and does, for exactly this reason. What it cannot do is remove
+//! computation-time text it was never told to remove.
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -281,6 +327,11 @@ pub struct Logging {
 
     console: Box<dyn Write>,
     err_console: Box<dyn Write>,
+
+    // Harness-only instrumentation — see the module docs' "Construction-span
+    // recording" section. No Java analogue; never read by production dispatch code.
+    active_recording: Option<Vec<String>>,
+    finished_recordings: Vec<Vec<String>>,
 }
 
 impl Default for Logging {
@@ -318,6 +369,8 @@ impl Logging {
             detailed_log_file: None,
             console,
             err_console,
+            active_recording: None,
+            finished_recordings: Vec::new(),
         }
     }
 
@@ -427,6 +480,12 @@ impl Logging {
         self.eval_log_files_active = false;
         self.command_log.clear();
         self.detailed_log.clear();
+        // Not a Java field — scoped to "per command" for the same reason
+        // `detailed_log` is: a stale recording from a previous command in the same
+        // session must never be attributed to this one. See the module docs'
+        // "Construction-span recording" section.
+        self.active_recording = None;
+        self.finished_recordings.clear();
     }
 
     /// Java: `shouldPrintDetails`.
@@ -564,6 +623,72 @@ impl Logging {
         self.print_enabled = true;
     }
 
+    // ------------------------------------------------- construction-span recording
+    // (harness-only instrumentation — see the module docs; no Java analogue)
+
+    /// Starts a new recording span: every line this `Logging` emits into
+    /// `detailed_log` from this call until the matching [`Self::end_construction_recording`]
+    /// (or [`Self::discard_construction_recording`]) is ALSO copied into that span,
+    /// verbatim, in order. Not re-entrant — the one production call site
+    /// (`PredicateEnv::number_system`'s implementation in `wr-cli`, NOT the shared
+    /// `load_number_system` helper `fresh_number_system` also calls through — see that
+    /// impl's own docs for why the distinction matters) never nests it, so a second
+    /// call simply discards whatever the first had collected so far rather than
+    /// stacking. Only meaningful for callers that follow the same discipline that
+    /// call site does; nothing here enforces it project-wide (in particular,
+    /// `PredicateEnv::fresh_number_system`'s *default* trait implementation routes
+    /// through `number_system` and so would inherit its recording — the one override
+    /// this crate ships bypasses that specifically to avoid it).
+    pub fn begin_construction_recording(&mut self) {
+        self.active_recording = Some(Vec::new());
+    }
+
+    /// Ends the current recording span (if any) and files it under
+    /// [`Self::construction_recordings`]. A span with zero lines (the construction
+    /// call logged nothing at all, e.g. it failed before reaching any
+    /// `apply_all_representations` call) is not filed — nothing for a caller to ever
+    /// need to look for. Calling this with no active span is a harmless no-op.
+    ///
+    /// Callers MUST use [`Self::discard_construction_recording`] instead when the
+    /// bracketed call failed: a construction that logs and then errors is not
+    /// memoized (`computeIfAbsent`'s contract — see `PredicateEnv::number_system`'s
+    /// implementation), so it reruns and re-logs on every later attempt, warm or
+    /// cold, exactly like `fresh_number_system`'s genuinely-reproducible case. Filing
+    /// it here would be the same category of bug the whole mechanism exists to avoid.
+    pub fn end_construction_recording(&mut self) {
+        if let Some(lines) = self.active_recording.take() {
+            if !lines.is_empty() {
+                self.finished_recordings.push(lines);
+            }
+        }
+    }
+
+    /// Ends the current recording span (if any) WITHOUT filing it — see
+    /// [`Self::end_construction_recording`]'s docs for when this is the correct call
+    /// instead. A harmless no-op if no span is active.
+    pub fn discard_construction_recording(&mut self) {
+        self.active_recording = None;
+    }
+
+    /// Every non-empty recording span filed since the last [`Self::configure_for_command`]
+    /// (or since this `Logging` was created), in the order construction happened.
+    /// Each inner `Vec` is one span: the exact, ordered lines
+    /// [`crate::automaton::Automaton::apply_all_representations`] (and whatever it
+    /// calls, e.g. `and`'s own `computing &`/`Minimizing` lines) wrote into
+    /// `detailed_log` while building one `NumberSystem` cold.
+    ///
+    /// **This is not, by itself, evidence that construction logged the CORRECT
+    /// text** — a span is exactly whatever the bracketed call actually emitted,
+    /// correct or not, which is precisely why a caller that strips a recorded span
+    /// out of a comparison (`tests/golden`'s `strip_construction_recordings`) is
+    /// NOT thereby verifying that construction's own logging is right. That
+    /// responsibility belongs to this crate's own unit/property tests (see
+    /// `NumberSystem::with_custom_base_files`'s test module for the one that
+    /// exists specifically to close this gap) — never to a caller of this method.
+    pub fn construction_recordings(&self) -> &[Vec<String>] {
+        &self.finished_recordings
+    }
+
     // ------------------------------------------------------------------ logging
 
     /// Java: `logMessage(String)` — `logMessage(printDetails, msg)`.
@@ -610,6 +735,20 @@ impl Logging {
     /// console write are unaffected either way — both always end in a newline,
     /// since each call is its own independent write/log event on those sinks.
     pub fn log_evaluation_step(&mut self, msg: &str, final_line: bool) {
+        // Deliberately untapped by construction-span recording (see the module
+        // docs): its ONE production call site never fires while a span is active
+        // (it belongs to `EvalDef.compute`'s per-token step loop, never to
+        // `NumberSystem` construction), and its `final_line = true` form omits the
+        // trailing newline `Self::log_detail`'s tap assumes every recorded line
+        // has — tapping this without also handling that would be a second bug, not
+        // a fix. Enforced, not just documented: a recording somehow still active
+        // here would silently break the "byte-exact contiguous slice" invariant
+        // every caller of `construction_recordings` relies on.
+        debug_assert!(
+            self.active_recording.is_none(),
+            "log_evaluation_step must never fire while a construction-recording span is \
+             active — see this method's doc comment"
+        );
         let msg_with_indent = format!("{}{msg}", self.indent_prefix());
 
         Self::append(&mut self.command_log, &msg_with_indent, final_line);
@@ -634,6 +773,12 @@ impl Logging {
         if self.print_details {
             Self::append(&mut self.detailed_log, &msg_with_indent, false);
             self.detailed_logger_write(&msg_with_indent);
+            // Harness-only tap — see the module docs. Mirrors exactly what was just
+            // appended to `detailed_log`, so a recorded span is always a byte-exact
+            // contiguous slice of that buffer, never a reconstruction.
+            if let Some(recording) = self.active_recording.as_mut() {
+                recording.push(msg_with_indent.clone());
+            }
         }
 
         if !self.eval_log_files_active {
@@ -1497,5 +1642,203 @@ mod tests {
         logging.initialize_global_log(&path);
         logging.log_command(Some("now it works"));
         assert!(read_file(&path).contains("now it works"));
+    }
+
+    // ------------------------------------------- construction-span recording
+    // (harness-only instrumentation; see the module docs)
+
+    #[test]
+    fn construction_recording_captures_only_lines_emitted_while_active() {
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.log_and_print("before");
+        logging.begin_construction_recording();
+        logging.log_and_print("during 1");
+        logging.indent();
+        logging.log_message("during 2");
+        logging.dedent();
+        logging.end_construction_recording();
+        logging.log_and_print("after");
+
+        assert_eq!(
+            logging.construction_recordings(),
+            // The indent prefix must be part of the recorded string, not dropped --
+            // a recorder that stripped it would still pass a weaker version of this
+            // assertion that only checked message text, which is exactly the gap a
+            // mutation test caught (see this test's sibling below).
+            [vec!["during 1".to_string(), " during 2".to_string()]],
+            "only lines logged strictly between begin/end belong to the span, indent included"
+        );
+        assert_eq!(
+            logging.detailed_log(),
+            "before\nduring 1\n during 2\nafter\n",
+            "recording must not change what actually lands in detailed_log"
+        );
+    }
+
+    #[test]
+    fn a_recorded_span_is_a_byte_exact_contiguous_slice_of_detailed_log() {
+        // The property `strip_construction_recordings` (in `tests/golden`) actually
+        // depends on, stated directly rather than inferred from two separate
+        // assertions: joining a recorded span with newlines and a trailing newline
+        // must appear VERBATIM in `detailed_log`, at the position it was recorded.
+        // A recorder that silently dropped or altered any character (e.g. the
+        // indent prefix) would fail this even though the weaker
+        // "recording matches detailed_log's total content" check above could still
+        // pass by coincidence on a single-span case.
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.log_and_print("before");
+        logging.begin_construction_recording();
+        logging.indent();
+        logging.log_and_print("one");
+        logging.log_and_print("two");
+        logging.dedent();
+        logging.end_construction_recording();
+        logging.log_and_print("after");
+
+        let span = &logging.construction_recordings()[0];
+        let burst = format!("{}\n", span.join("\n"));
+        assert!(
+            logging.detailed_log().contains(&burst),
+            "recorded span {span:?} must appear verbatim, as a contiguous run, in \
+             detailed_log() = {:?}",
+            logging.detailed_log()
+        );
+    }
+
+    #[test]
+    fn construction_recording_only_captures_what_print_details_would_have_kept() {
+        // print_details = false: log_and_print still gates the console on `print`,
+        // but `log_detail` never appends to `detailed_log` at all in that mode, so a
+        // faithful recording must not invent lines that were never really logged.
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, false);
+
+        logging.begin_construction_recording();
+        logging.log_and_print("would-be construction noise");
+        logging.end_construction_recording();
+
+        assert!(
+            logging.construction_recordings().is_empty(),
+            "nothing was ever appended to detailed_log, so nothing should be recorded"
+        );
+    }
+
+    #[test]
+    fn an_empty_span_is_not_filed() {
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.begin_construction_recording();
+        // Nothing logged in between -- e.g. `with_custom_base_files` failed before
+        // reaching any `apply_all_representations` call.
+        logging.end_construction_recording();
+
+        assert!(
+            logging.construction_recordings().is_empty(),
+            "a span with zero lines has nothing for a caller to ever look for"
+        );
+    }
+
+    #[test]
+    fn discard_construction_recording_throws_away_lines_logged_so_far() {
+        // The primitive `PredicateEnv::number_system`'s failure arm relies on: even
+        // if the bracketed call logged real lines before failing, discarding must
+        // throw all of them away, unlike `end_construction_recording` which would
+        // file a non-empty span.
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.begin_construction_recording();
+        logging.log_and_print("logged before the simulated failure");
+        logging.discard_construction_recording();
+
+        assert!(
+            logging.construction_recordings().is_empty(),
+            "discarding must throw away everything recorded so far, not just an empty span"
+        );
+        assert_eq!(
+            logging.detailed_log(),
+            "logged before the simulated failure\n",
+            "discarding the recording must not un-log the line from detailed_log itself"
+        );
+    }
+
+    #[test]
+    fn multiple_construction_spans_are_recorded_separately_and_in_order() {
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.begin_construction_recording();
+        logging.log_and_print("first base");
+        logging.end_construction_recording();
+
+        logging.log_and_print("ordinary query text in between");
+
+        logging.begin_construction_recording();
+        logging.log_and_print("second base, line 1");
+        logging.log_and_print("second base, line 2");
+        logging.end_construction_recording();
+
+        assert_eq!(
+            logging.construction_recordings(),
+            [
+                vec!["first base".to_string()],
+                vec![
+                    "second base, line 1".to_string(),
+                    "second base, line 2".to_string()
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn configure_for_command_clears_recordings_from_a_previous_command() {
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+        logging.begin_construction_recording();
+        logging.log_and_print("stale");
+        logging.end_construction_recording();
+        assert_eq!(logging.construction_recordings().len(), 1);
+
+        // A second command in the same session (i.e. the same `Logging`, matching how
+        // `Prover` reuses one `Logging` for its whole lifetime) must not see the
+        // first command's recording -- exactly like `detailed_log` itself.
+        logging.configure_for_command(false, true);
+        assert!(
+            logging.construction_recordings().is_empty(),
+            "a stale recording from a previous command must not survive configure_for_command"
+        );
+    }
+
+    #[test]
+    fn end_construction_recording_without_begin_is_a_harmless_no_op() {
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+        logging.end_construction_recording();
+        assert!(logging.construction_recordings().is_empty());
+    }
+
+    #[test]
+    fn a_second_begin_before_end_discards_the_first_spans_partial_progress() {
+        // Not re-entrant by design (see the method's docs) -- pinned so a future
+        // caller that accidentally nests begin/end learns about it from a failing
+        // test, not from a silently wrong recorded span.
+        let (mut logging, _out, _err) = logging_with_capture();
+        logging.configure_for_command(false, true);
+
+        logging.begin_construction_recording();
+        logging.log_and_print("discarded");
+        logging.begin_construction_recording();
+        logging.log_and_print("kept");
+        logging.end_construction_recording();
+
+        assert_eq!(
+            logging.construction_recordings(),
+            [vec!["kept".to_string()]]
+        );
     }
 }

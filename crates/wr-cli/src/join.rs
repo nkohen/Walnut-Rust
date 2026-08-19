@@ -286,12 +286,12 @@ pub fn join(
         logging.indent();
 
         // `first.fa.totalize(); next.fa.totalize();` (`:82-83`).
-        totalize(&mut first.fa);
-        totalize(&mut next.fa);
+        totalize(&mut first.fa, logging);
+        totalize(&mut next.fa, logging);
 
         // `first = ProductStrategies.crossProduct(first, next, Prover.FIRST_OP);`
         // (`:84`) -- `determineOutput`'s `FIRST_OP` arm: `aP == 0 ? mQ : aP`.
-        first = cross_product(&first, &next, |a, b| if a == 0 { b } else { a });
+        first = cross_product(&first, &next, |a, b| if a == 0 { b } else { a }, logging);
 
         // `first = WordAutomaton.minimizeWithOutput(first);` (`:85`).
         first = minimize_with_output(&first);

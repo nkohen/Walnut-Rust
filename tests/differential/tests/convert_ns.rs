@@ -203,8 +203,13 @@ fn check_conversion(input: &str, to_msd: bool, to_base: i32, expected: &str, exp
         if to_msd { "msd" } else { "lsd" }
     );
 
-    convert_ns(&mut ours, to_msd, to_base)
-        .unwrap_or_else(|e| panic!("{what}: convert_ns must succeed, got {e}"));
+    convert_ns(
+        &mut ours,
+        to_msd,
+        to_base,
+        &mut wr_core::logging::Logging::new(),
+    )
+    .unwrap_or_else(|e| panic!("{what}: convert_ns must succeed, got {e}"));
 
     let theirs = read_fixture(expected);
 
@@ -418,7 +423,8 @@ fn wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines() {
 #[test]
 fn identical_number_systems_is_rejected_with_javas_message() {
     let mut a = read_fixture("even.txt");
-    let err = convert_ns(&mut a, true, 2).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 2, &mut wr_core::logging::Logging::new())
+        .expect_err("must reject");
     assert_eq!(
         err,
         ConvertNsError::IdenticalNumberSystems {
@@ -437,7 +443,8 @@ fn identical_number_systems_is_rejected_with_javas_message() {
 #[test]
 fn no_common_root_is_rejected_with_javas_message() {
     let mut a = read_fixture("even.txt");
-    let err = convert_ns(&mut a, true, 6).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 6, &mut wr_core::logging::Logging::new())
+        .expect_err("must reject");
     assert_eq!(err, ConvertNsError::NoCommonRoot);
     assert_eq!(
         err.to_string(),
@@ -466,7 +473,8 @@ fn multi_track_input_is_rejected_with_javas_message() {
         vec!["x".to_string(), "y".to_string()],
         vec![Some(true), Some(true)],
     );
-    let err = convert_ns(&mut a, true, 4).expect_err("must reject");
+    let err = convert_ns(&mut a, true, 4, &mut wr_core::logging::Logging::new())
+        .expect_err("must reject");
     assert_eq!(err, ConvertNsError::NotSingleInput);
     assert_eq!(
         err.to_string(),

@@ -221,7 +221,7 @@ pub fn image(
          and a uniform positive length forces at least one non-empty image, which forces \
          h.range to be non-empty -- see module docs",
     );
-    let mut image = combine(&first, iter.collect(), &outputs);
+    let mut image = combine(&first, iter.collect(), &outputs, logging);
 
     // `image.writeAutomata(s, Session.getWriteAddressForWordsLibrary(), imageNewName,
     //  true);` (`:44`).

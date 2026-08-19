@@ -114,8 +114,10 @@ pub fn fix_trail_zero_command(
     let mut m =
         read_from_automata_library(session, old_name).map_err(SimpleTransformError::Read)?;
 
-    // `AutomatonLogicalOps.fixTrailingZerosProblem(M);` (`:759`).
-    fix_trailing_zeros_problem(&mut m);
+    // `AutomatonLogicalOps.fixTrailingZerosProblem(M);` (`:759`). Not an `eval`/`def`
+    // command (see `combine_command`'s matching note in `automaton_ops.rs`) -- a
+    // throwaway logger.
+    fix_trailing_zeros_problem(&mut m, &mut wr_core::logging::Logging::new());
 
     write_automata(
         session,

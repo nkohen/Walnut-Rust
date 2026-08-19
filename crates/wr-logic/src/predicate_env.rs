@@ -377,7 +377,11 @@ pub trait PredicateEnv {
     ///
     /// The returned handle is shared and immutable — see this module's Ruling 1 for why
     /// it is not `&mut NumberSystem` and must not be wrapped in a `RefCell` here.
-    fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError>;
+    fn number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<Rc<NumberSystem>, PredicateEnvError>;
 
     /// `new NumberSystem(name)` — the **unmemoized, freshly constructed** form, as opposed
     /// to [`Self::number_system`]'s `getComputeIfAbsent` cache lookup.
@@ -398,8 +402,12 @@ pub trait PredicateEnv {
     /// populated as a side effect — not observable, since the table is a pure memo). An
     /// implementation backed by real files should override it with a genuinely unmemoized
     /// build, which is what Java does.
-    fn fresh_number_system(&self, name: &str) -> Result<NumberSystem, PredicateEnvError> {
-        Ok((*self.number_system(name)?).clone())
+    fn fresh_number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<NumberSystem, PredicateEnvError> {
+        Ok((*self.number_system(name, logging)?).clone())
     }
 
     /// `new Automaton(Session.getReadFileForWordsLibrary(name + ".txt"))`
@@ -651,7 +659,15 @@ impl InMemoryPredicateEnv {
 }
 
 impl PredicateEnv for InMemoryPredicateEnv {
-    fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
+    // `logging` is unused: `NumberSystem::new`'s `CustomBaseFiles::default()` never
+    // resolves an all-representations file, so this environment's construction never
+    // reaches the one site that needs a real `Logging` (see that method's docs) — same
+    // rationale this file already documents for `ctx`.
+    fn number_system(
+        &self,
+        name: &str,
+        _logging: &mut wr_core::logging::Logging,
+    ) -> Result<Rc<NumberSystem>, PredicateEnvError> {
         if let Some(ns) = self.number_systems.borrow().get(name) {
             return Ok(Rc::clone(ns));
         }
@@ -734,7 +750,9 @@ mod tests {
     fn trait_is_object_safe() {
         let env = InMemoryPredicateEnv::new();
         let dynamic: &dyn PredicateEnv = &env;
-        assert!(dynamic.number_system("msd_2").is_ok());
+        assert!(dynamic
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .is_ok());
     }
 
     // -- number systems ------------------------------------------------------
@@ -742,7 +760,9 @@ mod tests {
     #[test]
     fn number_system_builds_plain_bases_on_demand() {
         let env = InMemoryPredicateEnv::new();
-        let ns = env.number_system("msd_3").expect("msd_3 is constructible");
+        let ns = env
+            .number_system("msd_3", &mut wr_core::logging::Logging::new())
+            .expect("msd_3 is constructible");
         assert_eq!(ns.name(), "msd_3");
         assert!(ns.is_msd());
     }
@@ -754,11 +774,17 @@ mod tests {
     #[test]
     fn number_system_is_memoized_by_name() {
         let env = InMemoryPredicateEnv::new();
-        let a = env.number_system("msd_2").unwrap();
-        let b = env.number_system("msd_2").unwrap();
+        let a = env
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
+        let b = env
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert!(Rc::ptr_eq(&a, &b));
 
-        let other = env.number_system("lsd_2").unwrap();
+        let other = env
+            .number_system("lsd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert!(!Rc::ptr_eq(&a, &other));
         assert!(!other.is_msd());
     }
@@ -771,7 +797,9 @@ mod tests {
     #[test]
     fn failed_number_system_lookup_is_not_negatively_cached() {
         let env = InMemoryPredicateEnv::new();
-        let err = env.number_system("msd_fib").unwrap_err();
+        let err = env
+            .number_system("msd_fib", &mut wr_core::logging::Logging::new())
+            .unwrap_err();
         match &err {
             PredicateEnvError::NumberSystem { name, .. } => assert_eq!(name, "msd_fib"),
             other => panic!("expected a NumberSystem error, got {other:?}"),
@@ -791,7 +819,12 @@ mod tests {
         // End-to-end: simulate what U5's file loading (or a `load` command) would make
         // available, and confirm the now-resolvable name succeeds.
         let env = env.with_number_system("msd_fib", NumberSystem::new("msd_2").unwrap());
-        assert_eq!(env.number_system("msd_fib").unwrap().name(), "msd_2");
+        assert_eq!(
+            env.number_system("msd_fib", &mut wr_core::logging::Logging::new())
+                .unwrap()
+                .name(),
+            "msd_2"
+        );
     }
 
     /// The trait takes *normalized* names; this pins the split so U3's author sees where
@@ -800,9 +833,14 @@ mod tests {
     fn lookup_key_is_the_normalized_name() {
         let env = InMemoryPredicateEnv::new();
         assert_eq!(normalize_number_system_token(Some("?msd5")), "msd_5");
-        let a = env.number_system("msd_5").unwrap();
+        let a = env
+            .number_system("msd_5", &mut wr_core::logging::Logging::new())
+            .unwrap();
         let b = env
-            .number_system(&normalize_number_system_token(Some("?msd5")))
+            .number_system(
+                &normalize_number_system_token(Some("?msd5")),
+                &mut wr_core::logging::Logging::new(),
+            )
             .unwrap();
         assert!(Rc::ptr_eq(&a, &b));
     }

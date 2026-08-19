@@ -114,8 +114,12 @@ pub fn right_quotient_command(
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    let mut c = crate::walnut_exception::catch_walnut_panic(|| right_quotient(&m1, &m2, false))
-        .map_err(QuotientError::from_panic)?;
+    // Not an `eval`/`def` command (see `combine_command`'s matching note in
+    // `automaton_ops.rs`) -- a throwaway logger.
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
+        right_quotient(&m1, &m2, false, &mut wr_core::logging::Logging::new())
+    })
+    .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,
@@ -137,8 +141,12 @@ pub fn left_quotient_command(
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    let mut c = crate::walnut_exception::catch_walnut_panic(|| left_quotient(&m1, &m2))
-        .map_err(QuotientError::from_panic)?;
+    // Not an `eval`/`def` command (see `combine_command`'s matching note in
+    // `automaton_ops.rs`) -- a throwaway logger.
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
+        left_quotient(&m1, &m2, &mut wr_core::logging::Logging::new())
+    })
+    .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,

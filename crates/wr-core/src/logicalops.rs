@@ -189,7 +189,7 @@
 
 use crate::automaton::{Automaton, AutomatonDFA};
 use crate::fa::Fa;
-use crate::minimize::{minimize, MinimizeError};
+use crate::minimize::MinimizeError;
 use crate::product::{cross_product, cross_product_and_minimize, BooleanOp};
 use crate::util;
 use crate::word_automaton;
@@ -240,8 +240,24 @@ use std::rc::Rc;
 /// stricter assert-based cousin — `crate::join`'s port needs the identical relaxed
 /// behavior (a `join` operand is expected to already be deterministic in practice,
 /// but Java's own `totalize()` never asserts that, so neither should the port).
-pub fn totalize(fa: &mut Fa) {
+pub fn totalize(fa: &mut Fa, logging: &mut crate::logging::Logging) {
+    // `FA.totalize()`'s own logging (`FA.java:218-233`) -- no indent/dedent, just the
+    // TOTALIZING/TOTALIZED pair. Every caller of this function (the `or`/`xor`/`imply`/
+    // `iff` family's `totalize_cross_product`, `wr-cli`'s `join`) needs NO logging of its
+    // own around these calls as a result. NOT `reverse` -- an earlier draft of this note
+    // listed it too, which was simply wrong: `AutomatonLogicalOps.reverse` never calls
+    // `FA.totalize()` at all (confirmed by reading its source), and it has its own real
+    // logging pair (`REVERSING`/`REVERSED`, `reverse_with_ctx`'s own doc comment) around
+    // an entirely different operation.
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!("{}:{} states", crate::logging::TOTALIZING, fa.q));
     fa.totalize_relaxed(0);
+    logging.log_message(&format!(
+        "{}:{} states - {}ms",
+        crate::logging::TOTALIZED,
+        fa.q,
+        time_before.elapsed().as_millis()
+    ));
 }
 
 /// `FA.flipOutput()` (`FA.java:423-426`), i.e. `setOutputIfEqual(q, !isAccepting(q))`
@@ -266,8 +282,8 @@ fn flip_output(fa: &mut Fa) {
 /// trims. So `docs/WALNUT-BUGS.md` WB-001 is reachable through every caller of this
 /// helper ([`not`], [`fix_trailing_zeros_problem`]) whose input has a state unreachable
 /// from `q0`. Ported verbatim per `CLAUDE.md`'s mechanical-port rule.
-fn just_minimize(fa: &Fa) -> Fa {
-    match minimize(fa) {
+fn just_minimize(fa: &Fa, logging: &mut crate::logging::Logging) -> Fa {
+    match crate::minimize::minimize_with_logging(fa, logging) {
         Ok(minimized) => minimized,
         Err(MinimizeError::NotDeterministic) => panic!("Unexpected NFA instead of DFA."),
         Err(MinimizeError::ConflictingTransitions) => {
@@ -489,7 +505,7 @@ fn flipped_ns_name(name: &str) -> String {
 /// already deterministic. See [`Automaton::as_dfa`]'s docs for the full statement of that
 /// assumption, why it holds on the `eval` call graph, and what a caller that can violate
 /// it should do instead.
-pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
+pub fn and(a: &Automaton, b: &Automaton, logging: &mut crate::logging::Logging) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         if a.fa.is_true_false_automaton() {
             return if a.fa.is_true_automaton() {
@@ -498,9 +514,29 @@ pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
                 AutomatonDFA::true_false(false)
             };
         }
-        return and(b, a); // and is symmetric
+        return and(b, a, logging); // and is symmetric
     }
-    cross_product_and_minimize(a, b, |p, q| BooleanOp::And.combine(p, q))
+    // `logMessage(COMPUTING + " " + friendlyOp + ":" + A.Q + " states - " + B.Q + "
+    // states")`, `indent()`, `crossProductAndMinimize`, `dedent()`, `logMessage(COMPUTED
+    // ...)` (`AutomatonLogicalOps.java:51-58`) -- skipped entirely on the TRUE/FALSE
+    // short-circuit above, which is why this whole block sits after it.
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} &:{} states - {} states",
+        crate::logging::COMPUTING,
+        a.fa.q,
+        b.fa.q
+    ));
+    logging.indent();
+    let n = cross_product_and_minimize(a, b, |p, q| BooleanOp::And.combine(p, q), logging);
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} &:{} states - {}ms",
+        crate::logging::COMPUTED,
+        n.automaton().fa.q,
+        time_before.elapsed().as_millis()
+    ));
+    n
 }
 
 /// `AutomatonLogicalOps.totalizeCrossProduct` (`:112-126`) — the precondition-enforcing
@@ -508,22 +544,54 @@ pub fn and(a: &Automaton, b: &Automaton) -> AutomatonDFA {
 /// place (Java: `A.fa.totalize(); B.fa.totalize();`, `:117-118`) and only then runs the
 /// cross product. See this module's docs for why skipping this computes the wrong
 /// language for these four connectives but not for [`and`].
-fn totalize_cross_product(a: &mut Automaton, b: &mut Automaton, op: BooleanOp) -> AutomatonDFA {
-    totalize(&mut a.fa);
-    totalize(&mut b.fa);
-    let mut n = cross_product_and_minimize(a, b, |p, q| op.combine(p, q)).into_automaton();
+fn totalize_cross_product(
+    a: &mut Automaton,
+    b: &mut Automaton,
+    op: BooleanOp,
+    logging: &mut crate::logging::Logging,
+) -> AutomatonDFA {
+    // `logMessage(COMPUTING + " " + friendlyOp + ":" + A.Q + " states - " + B.Q + "
+    // states")`, THEN `indent()` (`:112-116`) -- brackets totalize/totalize/
+    // crossProductAndMinimize ONLY; `dedent()` runs BEFORE `applyAllRepresentations`,
+    // unlike `not`'s bracket (which includes it). Both totalize calls log their own
+    // TOTALIZING/TOTALIZED pair internally (`FA.totalize`, see `totalize`'s own docs) --
+    // no separate wrapping needed here for those.
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} {}:{} states - {} states",
+        crate::logging::COMPUTING,
+        op.symbol(),
+        a.fa.q,
+        b.fa.q
+    ));
+    logging.indent();
+    totalize(&mut a.fa, logging);
+    totalize(&mut b.fa, logging);
+    let mut n = cross_product_and_minimize(a, b, |p, q| op.combine(p, q), logging).into_automaton();
+    logging.dedent();
     // `N.applyAllRepresentations()` (`:121`). Live as of U5 — and load-bearing exactly
     // here: `totalize` above adds a sink that accepts every previously-missing transition,
     // which for a custom base re-admits INVALID digit strings, so the restriction has to be
     // re-applied afterwards. (`and` deliberately has no such call: it never totalizes.)
-    n.apply_all_representations();
+    n.apply_all_representations(logging);
+    logging.log_message(&format!(
+        "{} {}:{} states - {}ms",
+        crate::logging::COMPUTED,
+        op.symbol(),
+        n.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     AutomatonDFA::from(n)
 }
 
 /// `AutomatonLogicalOps.or` (`:67-75`) — `L(A) ∪ L(B)`. Totalizes both operands in
 /// place first; see [`totalize_cross_product`]. The TRUE/FALSE short-circuit
 /// (`:68-73`) runs first and does NOT totalize (see this module's docs).
-pub fn or(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+pub fn or(
+    a: &mut Automaton,
+    b: &mut Automaton,
+    logging: &mut crate::logging::Logging,
+) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         if a.fa.is_true_false_automaton() {
             return if a.fa.is_true_automaton() {
@@ -532,15 +600,19 @@ pub fn or(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
                 b.as_dfa()
             };
         }
-        return or(b, a); // or is symmetric
+        return or(b, a, logging); // or is symmetric
     }
-    totalize_cross_product(a, b, BooleanOp::Or)
+    totalize_cross_product(a, b, BooleanOp::Or, logging)
 }
 
 /// `AutomatonLogicalOps.xor` (`:80-92`) — symmetric difference. Totalizes both operands
 /// in place first; see [`totalize_cross_product`]. The TRUE/FALSE short-circuit
 /// (`:81-90`) runs first and does NOT totalize (see this module's docs).
-pub fn xor(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+pub fn xor(
+    a: &mut Automaton,
+    b: &mut Automaton,
+    logging: &mut crate::logging::Logging,
+) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         if a.fa.is_true_false_automaton() {
             // Java: `result = B.asDFA(); if (A.isTRUE) return not(result); return result;`
@@ -548,13 +620,13 @@ pub fn xor(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
             // `not` takes its own trivial branch and just flips the truth value.
             let result = b.as_dfa();
             if a.fa.is_true_automaton() {
-                return not(result);
+                return not(result, logging);
             }
             return result;
         }
-        return xor(b, a); // xor is symmetric
+        return xor(b, a, logging); // xor is symmetric
     }
-    totalize_cross_product(a, b, BooleanOp::Xor)
+    totalize_cross_product(a, b, BooleanOp::Xor, logging)
 }
 
 /// `AutomatonLogicalOps.imply` (`:97-110`) — `¬L(A) ∪ L(B)`. **Asymmetric**: the
@@ -567,7 +639,11 @@ pub fn xor(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
 /// check — sound only because reaching it means `a` is NOT trivial while the outer
 /// disjunction held, so `b` must be (see `crate::fa`'s module docs, which cite this
 /// exact line).
-pub fn imply(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+pub fn imply(
+    a: &mut Automaton,
+    b: &mut Automaton,
+    logging: &mut crate::logging::Logging,
+) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         // not a or b
         if a.fa.is_true_false_automaton() {
@@ -580,10 +656,10 @@ pub fn imply(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
         return if b.fa.is_true_automaton() {
             AutomatonDFA::true_false(true)
         } else {
-            not(a.as_dfa())
+            not(a.as_dfa(), logging)
         };
     }
-    totalize_cross_product(a, b, BooleanOp::Imply)
+    totalize_cross_product(a, b, BooleanOp::Imply, logging)
 }
 
 /// `AutomatonLogicalOps.iff` (`:131-139`) — the complement of [`xor`]. Totalizes both
@@ -594,13 +670,17 @@ pub fn imply(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
 /// never reaches [`crate::product`]: with at least one operand trivial, each `imply`
 /// takes its own short-circuit, and at least one of the two results is itself trivial,
 /// so the closing [`and`] short-circuits too.
-pub fn iff(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
+pub fn iff(
+    a: &mut Automaton,
+    b: &mut Automaton,
+    logging: &mut crate::logging::Logging,
+) -> AutomatonDFA {
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
-        let c = imply(a, b);
-        let d = imply(b, a);
-        return and(c.automaton(), d.automaton());
+        let c = imply(a, b, logging);
+        let d = imply(b, a, logging);
+        return and(c.automaton(), d.automaton(), logging);
     }
-    totalize_cross_product(a, b, BooleanOp::Iff)
+    totalize_cross_product(a, b, BooleanOp::Iff, logging)
 }
 
 /// `AutomatonLogicalOps.not(AutomatonDFA)` (`:144-170`) — complementation.
@@ -628,20 +708,46 @@ pub fn iff(a: &mut Automaton, b: &mut Automaton) -> AutomatonDFA {
 /// Java's `AutomatonLogicalOpsTest.testNotThrowsOnNondeterministicInput` unreplicable —
 /// its fixture builds an `AutomatonDFA` and then reaches past the type to write a
 /// two-destination transition, which module privacy rules out here.
-pub fn not(a: AutomatonDFA) -> AutomatonDFA {
+pub fn not(a: AutomatonDFA, logging: &mut crate::logging::Logging) -> AutomatonDFA {
+    // `boolean print = Logging.shouldPrintDetails();` (`:145`) -- captured ONCE, before
+    // even the trivial check, and reused for both the COMPUTING and COMPUTED calls via
+    // the 2-arg `logMessage(print, msg)` overload (not the 1-arg ambient-gate form used
+    // elsewhere in this file).
+    let print = logging.should_print_details();
     let mut m = a.into_automaton();
     if m.fa.is_true_false_automaton() {
         // Java mutates in place: `setTRUE_AUTOMATON(!isTRUE_AUTOMATON())`, leaving
         // `TRUE_FALSE_AUTOMATON` set, and returns the SAME object — so any stale
-        // `q`/alphabet the argument was carrying survives. Rebuilding a fresh trivial
-        // automaton here instead is the one difference, and it is unobservable: every
-        // reader of a trivial automaton consults only `true_false` (see `crate::fa`'s
-        // module docs).
-        return AutomatonDFA::true_false(!m.fa.is_true_automaton());
+        // `q`/alphabet the argument was carrying survives.
+        //
+        // An earlier version of this fix rebuilt a fresh trivial automaton here instead
+        // (`AutomatonDFA::true_false(...)`) and this comment claimed the difference was
+        // "unobservable: every reader of a trivial automaton consults only `true_false`".
+        // That claim was WRONG — found via `crates/wr-logic/src/eval.rs`'s own later
+        // Phase-3a docs, which record a real, concrete divergence: for `?msd_2 Ax (x >=
+        // 5)`, real Walnut logs `(A x x>=5):4 states` (the STALE state count from the
+        // pre-quantify negation, since neither Java's `not` nor `AutomatonQuantification
+        // .quantify`'s all-tracks-quantified early return ever reset `Q`), while this
+        // port logged `0 states` — building a fresh trivial value threw the stale count
+        // away instead of preserving it. `compute`'s own per-step logging is exactly the
+        // "reader" this port's original claim said didn't exist.
+        //
+        // `AutomatonDFA::from` (not `AutomatonDFA::true_false`) is the right wrap here:
+        // its own trivial branch was found to have the SAME bug via the identical call
+        // graph (`actQuantifier`'s `FORALL` branch calls `M.asDFA()` again right after
+        // this function returns) and was fixed alongside this — see its docs.
+        m.fa.true_false = Some(!m.fa.is_true_automaton());
+        return AutomatonDFA::from(m);
     }
-    totalize(&mut m.fa);
+    // `logMessage(print, COMPUTING + " " + Operator.NEGATE + ":" + Q + " states")`
+    // (`:159`), THEN `Logging.indent()` (`:160`) -- brackets totalize/flipOutput/
+    // justMinimize/applyAllRepresentations, dedented right before the COMPUTED line.
+    let time_before = std::time::Instant::now();
+    logging.log_message_with(print, &format!("computing ~:{} states", m.fa.q));
+    logging.indent();
+    totalize(&mut m.fa, logging);
     flip_output(&mut m.fa);
-    m.fa = just_minimize(&m.fa);
+    m.fa = just_minimize(&m.fa, logging);
     // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- this port's
     // flag lives on the `Automaton` wrapper, so it is reset by hand at every
     // `just_minimize` call site. See `Automaton::canonized`'s doc comment.
@@ -652,7 +758,16 @@ pub fn not(a: AutomatonDFA) -> AutomatonDFA {
     // `~(x=x)` over `msd_fib` would return "the strings containing `11`" instead of the
     // empty language (empirically confirmed against the real Walnut CLI — see
     // `Automaton::apply_all_representations`).
-    m.apply_all_representations();
+    m.apply_all_representations(logging);
+    logging.dedent();
+    logging.log_message_with(
+        print,
+        &format!(
+            "computed ~:{} states - {}ms",
+            m.fa.q,
+            time_before.elapsed().as_millis()
+        ),
+    );
     AutomatonDFA::from(m)
 }
 
@@ -696,7 +811,19 @@ pub fn not(a: AutomatonDFA) -> AutomatonDFA {
 /// `docs/WALNUT-BUGS.md` WB-001 is reachable through the closing
 /// `M.determinizeAndMinimize()` (`:227`) exactly as it is in Java, since `M` inherits
 /// `A`'s (possibly not-fully-`q0`-reachable) state set unchanged.
-pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> Automaton {
+pub fn right_quotient(
+    a: &Automaton,
+    b: &Automaton,
+    skip_subset_check: bool,
+    logging: &mut crate::logging::Logging,
+) -> Automaton {
+    // `logMessage("right quotient: " + …)` (`:178`) -- no `indent()`/`dedent()` bracket of
+    // its own; `M.determinizeAndMinimize()`'s bracket below is the only nesting.
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "right quotient: {} state A with {} state A",
+        a.fa.q, b.fa.q
+    ));
     if !skip_subset_check {
         assert!(
             is_subset_alphabet(&b.alphabet, &a.alphabet),
@@ -741,17 +868,23 @@ pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> 
         t.random_label();
         other_clone.label = t.label.clone();
 
-        let intersection = and(&t, &other_clone);
+        let intersection = and(&t, &other_clone, logging);
         m.fa.o[i] = i32::from(!intersection.automaton().is_empty());
     }
 
-    m.determinize_and_minimize();
+    m.determinize_and_minimize_with_ctx(None, logging);
     // `M.applyAllRepresentations()` (`:228`), between `determinizeAndMinimize` and
     // `forceCanonize` — live as of U5. Needed here for the same reason as in `not`: the
     // accepting set was recomputed from scratch above (`setOutputIfEqual`), with no regard
     // for whether each state is reachable by a VALID representation.
-    m.apply_all_representations();
+    m.apply_all_representations(logging);
     m.force_canonize();
+    // `logMessage("right quotient complete: " + … )` (`:232`).
+    logging.log_message(&format!(
+        "right quotient complete: {} states - {}ms",
+        m.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     m
 }
 
@@ -782,17 +915,35 @@ pub fn right_quotient(a: &Automaton, b: &Automaton, skip_subset_check: bool) -> 
 /// [`Automaton::encode`] already panics on a digit absent from its track's alphabet — a
 /// pre-existing, documented improvement of this crate over Java's silent `indexOf ==
 /// -1` (see `automaton.rs`'s doc comment on `encode`), not a fix introduced here.
-pub fn left_quotient(a: &Automaton, b: &Automaton) -> Automaton {
+pub fn left_quotient(
+    a: &Automaton,
+    b: &Automaton,
+    logging: &mut crate::logging::Logging,
+) -> Automaton {
+    // `logMessage("left quotient: " + …)` (`:239`) -- logged BEFORE the subset-alphabet
+    // check below, matching Java's exact line order (a failing check still logs this
+    // line, with no matching "complete" partner).
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "left quotient: {} state A with {} state A",
+        a.fa.q, b.fa.q
+    ));
     assert!(
         is_subset_alphabet(&a.alphabet, &b.alphabet),
         "First A's alphabet must be a subset of the second A's alphabet for left quotient."
     );
 
-    let m1 = reverse_and_canonize(a);
-    let m2 = reverse_and_canonize(b);
-    let mut m = right_quotient(&m1, &m2, true);
+    let m1 = reverse_and_canonize(a, logging);
+    let m2 = reverse_and_canonize(b, logging);
+    let mut m = right_quotient(&m1, &m2, true, logging);
 
-    reverse(&mut m, true);
+    reverse_with_ctx(&mut m, true, None, logging);
+    // `logMessage("left quotient complete: " + …)` (`:253`).
+    logging.log_message(&format!(
+        "left quotient complete: {} states - {}ms",
+        m.fa.q,
+        time_before.elapsed().as_millis()
+    ));
     m
 }
 
@@ -800,9 +951,9 @@ pub fn left_quotient(a: &Automaton, b: &Automaton) -> Automaton {
 /// each reversal here also flips the operands' msd/lsd flags, which is why
 /// [`left_quotient`]'s closing `reverse(M, true)` restores the original direction
 /// rather than inverting it.
-fn reverse_and_canonize(a: &Automaton) -> Automaton {
+fn reverse_and_canonize(a: &Automaton, logging: &mut crate::logging::Logging) -> Automaton {
     let mut m1 = a.clone();
-    reverse(&mut m1, true);
+    reverse_with_ctx(&mut m1, true, None, logging);
     m1.force_canonize();
     m1
 }
@@ -829,7 +980,7 @@ fn reverse_and_canonize(a: &Automaton) -> Automaton {
 /// the identical guard, added for the identical reason, in `crate::quantify`'s private
 /// `quantify_helper` (at its `a.fa.q == 0` early return).
 pub fn fix_leading_zeros_problem(a: &mut Automaton) {
-    fix_leading_zeros_problem_with_ctx(a, None);
+    fix_leading_zeros_problem_with_ctx(a, None, &mut crate::logging::Logging::new());
 }
 
 /// [`fix_leading_zeros_problem`] with an explicit
@@ -841,9 +992,15 @@ pub fn fix_leading_zeros_problem(a: &mut Automaton) {
 /// This fixup's closing `determinizeAndMinimize(IntSet)` is **unconditional**, so with
 /// `Some(ctx)` it always consumes one automata index — the `Determinizing [#n, …]` line
 /// Walnut prints inside every `fixing leading zeros:` block of a `details` fixture.
+///
+/// `FIXING leading zeros:{q} states` is logged BEFORE the trivial-automaton guard's
+/// early return has any chance to matter (the guard already returned above it), then
+/// `indent()`/`dedent()` bracket the actual fixup work, then `FIXED leading zeros:{q}
+/// states - {ms}ms` (`AutomatonLogicalOps.java:268-282`).
 pub fn fix_leading_zeros_problem_with_ctx(
     a: &mut Automaton,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) {
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:269`, U0). Load-bearing, not
     // cosmetic: `determine_zero()` on a trivial automaton's empty alphabet returns 0,
@@ -855,12 +1012,26 @@ pub fn fix_leading_zeros_problem_with_ctx(
     if a.fa.q == 0 {
         return;
     }
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} leading zeros:{} states",
+        crate::logging::FIXING,
+        a.fa.q
+    ));
+    logging.indent();
     // `A.fa.setCanonized(false);` (`:273`) -- see `Automaton::canonized`'s doc comment
     // for why this port has to do it explicitly.
     a.set_canonized(false);
     let zero = a.determine_zero();
     let initial_state = zero_reachable_states(&mut a.fa, zero);
-    a.determinize_and_minimize_from_with_ctx(&initial_state, ctx);
+    a.determinize_and_minimize_from_with_ctx(&initial_state, ctx, logging);
+    logging.dedent();
+    logging.log_message(&format!(
+        "{} leading zeros:{} states - {}ms",
+        crate::logging::FIXED,
+        a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
 }
 
 /// `AutomatonLogicalOps.zeroReachableStates` (`:289-316`, `private`) — the states
@@ -931,13 +1102,35 @@ pub fn zero_reachable_states(fa: &mut Fa, zero: i32) -> BTreeSet<usize> {
 /// guard is unreachable in both engines and is left unported rather than "fixed".
 /// Confirmed live during U0 against `Walnut-all.jar`: `fixtrailzero fz $t` on a `true`
 /// automaton writes `true` back out, no exception (as do `fixleadzero` and `reverse`).
-pub fn fix_trailing_zeros_problem(a: &mut Automaton) {
+pub fn fix_trailing_zeros_problem(a: &mut Automaton, logging: &mut crate::logging::Logging) {
     let zero = a.determine_zero();
+    // `if (A.fa.setStatesReachableToFinalStatesByZeros(zero))` (`:321`) -- the two
+    // branches log genuinely DIFFERENT text, not "log the pair, or skip it": the
+    // no-op branch gets its own single, partner-less line (`:333`).
     if set_states_reachable_to_final_states_by_zeros(&mut a.fa, zero) {
+        let time_before = std::time::Instant::now();
+        logging.log_message(&format!(
+            "{} trailing zeros:{} states",
+            crate::logging::FIXING,
+            a.fa.q
+        ));
+        logging.indent();
         // `A.fa.setCanonized(false);` (`:326`), plus `justMinimize`'s own reset
         // (`FA.java:584`) -- one assignment covers both.
         a.set_canonized(false);
-        a.fa = just_minimize(&a.fa);
+        a.fa = just_minimize(&a.fa, logging);
+        logging.dedent();
+        logging.log_message(&format!(
+            "{} trailing zeros:{} states - {}ms",
+            crate::logging::FIXED,
+            a.fa.q,
+            time_before.elapsed().as_millis()
+        ));
+    } else {
+        logging.log_message(&format!(
+            "{} trailing zeros: no change necessary.",
+            crate::logging::FIXING
+        ));
     }
 }
 
@@ -1007,7 +1200,7 @@ pub fn remove_leading_zeros(
     a: &Automaton,
     list_of_labels: &[String],
 ) -> Result<Automaton, RemoveLeadingZerosError> {
-    remove_leading_zeros_with_ctx(a, list_of_labels, None)
+    remove_leading_zeros_with_ctx(a, list_of_labels, None, &mut crate::logging::Logging::new())
 }
 
 /// [`remove_leading_zeros`] with an explicit
@@ -1023,6 +1216,7 @@ pub fn remove_leading_zeros_with_ctx(
     a: &Automaton,
     list_of_labels: &[String],
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<Automaton, RemoveLeadingZerosError> {
     // `AutomatonQuantification.validateLabels(A, listOfLabels)` (`:344`). Four lines
     // rather than a call into `crate::quantify`: that module inlines the identical check
@@ -1039,6 +1233,14 @@ pub fn remove_leading_zeros_with_ctx(
     if list_of_labels.is_empty() {
         return Ok(a.clone());
     }
+
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!(
+        "{} leading zeros for:{} states",
+        crate::logging::REMOVING,
+        a.fa.q
+    ));
+    logging.indent();
 
     // `A.getLabel().indexOf(l)` (`:352-354`). `indexOf` takes the FIRST occurrence, so a
     // label repeated across two tracks constrains only the earlier one — the same
@@ -1059,12 +1261,24 @@ pub fn remove_leading_zeros_with_ctx(
     let mut m = Automaton::true_false(false);
     let mut ctx = ctx;
     for n in list_of_inputs {
-        let mut helper = remove_leading_zeros_helper(a, n, ctx.as_deref_mut())?;
-        m = or(&mut m, &mut helper).into_automaton();
+        let mut helper = remove_leading_zeros_helper(a, n, ctx.as_deref_mut(), logging)?;
+        m = or(&mut m, &mut helper, logging).into_automaton();
     }
     // `M = and(A, M);` (`:361`) — note the argument order, and that `and` never mutates
     // (see its docs), so the caller's `a` survives this call unchanged.
-    Ok(and(a, &m).into_automaton())
+    let result = and(a, &m, logging).into_automaton();
+
+    logging.dedent();
+    // `REMOVED + ":" + A.fa.getQ() + " states - " + ms` (`:363-364`) -- Java's quirk,
+    // ported verbatim: this reports `A`'s (the ORIGINAL, unmutated input's) state count,
+    // not the result's.
+    logging.log_message(&format!(
+        "{}:{} states - {}ms",
+        crate::logging::REMOVED,
+        a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
+    Ok(result)
 }
 
 /// `AutomatonLogicalOps.removeLeadingZerosHelper(Automaton, int n)` (`:375-405`,
@@ -1098,6 +1312,7 @@ fn remove_leading_zeros_helper(
     a: &Automaton,
     n: usize,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) -> Result<Automaton, RemoveLeadingZerosError> {
     // `if (n >= A.richAlphabet.getA().size() || n < 0)` (`:376`). The `n < 0` half is
     // unrepresentable for a `usize`.
@@ -1110,7 +1325,17 @@ fn remove_leading_zeros_helper(
 
     let msd = match a.msd[n] {
         Some(msd) => msd,
-        None => return Ok(Automaton::true_false(true)),
+        None => {
+            // `new AutomatonDFA(true)` (`AutomatonLogicalOps.java:381-383`) — DFA-typed
+            // by construction, unlike the plain `Automaton::true_false` this crate
+            // otherwise uses for Java's `new Automaton(boolean)`. Unobservable today (a
+            // fresh trivial value has `q == 0` either way, and the flag reconverges at
+            // the first `as_dfa` downstream), fixed for consistency with
+            // `Automaton::dfa_typed`'s docs, per adversarial review.
+            let mut m = Automaton::true_false(true);
+            m.dfa_typed = true;
+            return Ok(m);
+        }
     };
 
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(), BTreeMap::new()];
@@ -1144,7 +1369,7 @@ fn remove_leading_zeros_helper(
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
-        reverse_with_ctx(&mut m, false, ctx);
+        reverse_with_ctx(&mut m, false, ctx, logging);
     }
     Ok(m)
 }
@@ -1171,7 +1396,7 @@ fn remove_leading_zeros_helper(
 /// The result is a DFA (Java's `:412` note: "the output of this is a DFA"), even though
 /// the input may be an NFA.
 pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
-    reverse_with_ctx(a, reverse_msd, None);
+    reverse_with_ctx(a, reverse_msd, None, &mut crate::logging::Logging::new());
 }
 
 /// [`reverse`] with an explicit [`crate::determinize::DeterminizeContext`] — see
@@ -1182,20 +1407,35 @@ pub fn reverse_with_ctx(
     a: &mut Automaton,
     reverse_msd: bool,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+    logging: &mut crate::logging::Logging,
 ) {
     // `if (A.fa.isTRUE_FALSE_AUTOMATON()) return;` (`:415`, U0). Note this returns
     // BEFORE the `flipNS` step, so reversing a trivial automaton does not flip its
-    // (empty) msd list either — faithful, and vacuous since the list is empty.
+    // (empty) msd list either — faithful, and vacuous since the list is empty. Also
+    // BEFORE the logging pair below, matching Java exactly (a trivial reverse logs
+    // nothing).
     if a.fa.is_true_false_automaton() {
         return;
     }
+    let time_before = std::time::Instant::now();
+    logging.log_message(&format!("{}:{} states", crate::logging::REVERSING, a.fa.q));
+    logging.indent();
     let initial: BTreeSet<usize> = [a.fa.q0].into_iter().collect();
     let set_of_final_states = a.fa.reverse(&initial);
-    a.determinize_and_minimize_from_with_ctx(&set_of_final_states, ctx);
+    a.determinize_and_minimize_from_with_ctx(&set_of_final_states, ctx, logging);
 
     if reverse_msd {
         flip_ns(a);
     }
+    // `Logging.dedent()` sits AFTER `flipNS` (`:427`), not immediately after
+    // `determinizeAndMinimize` — ported in that exact order.
+    logging.dedent();
+    logging.log_message(&format!(
+        "{}:{} states - {}ms",
+        crate::logging::REVERSED,
+        a.fa.q,
+        time_before.elapsed().as_millis()
+    ));
 }
 
 /// `AutomatonLogicalOps.removeStatesWithOutputRebuild(FA, int minOutput)` (`:436-448`).
@@ -1254,7 +1494,12 @@ pub fn remove_states_with_output_rebuild(fa: &mut Fa, min_output: i32) {
 /// deterministic inputs is itself deterministic — the same injectivity argument
 /// `crate::product`'s own docs give), using the assert-free helper avoids relying on
 /// that invariant staying true if a future caller ever violates it.
-pub fn combine(a: &Automaton, subautomata: Vec<Automaton>, outputs: &[i32]) -> Automaton {
+pub fn combine(
+    a: &Automaton,
+    subautomata: Vec<Automaton>,
+    outputs: &[i32],
+    logging: &mut crate::logging::Logging,
+) -> Automaton {
     let mut first = a.clone();
     for q in 0..first.fa.q {
         if first.fa.is_accepting(q) {
@@ -1264,11 +1509,23 @@ pub fn combine(a: &Automaton, subautomata: Vec<Automaton>, outputs: &[i32]) -> A
     // `outputs[0]` is consumed above (for `A`'s own accepting-state rewrite); each
     // subsequent element pairs with `subautomata` in order (Java: `first.combineIndex`
     // starts at `1` and increments once per loop iteration).
+    //
+    // `logMessage(COMPUTING + " =>:" + first.Q + " states - " + next.Q + " states")`,
+    // `indent()`, [the fold step], `dedent()`, `logMessage(COMPUTED ...)`
+    // (`AutomatonLogicalOps.java:692-710`) -- once per loop iteration, not once overall.
     for (combine_out, mut next) in outputs[1..].iter().copied().zip(subautomata) {
+        let time_before = std::time::Instant::now();
+        logging.log_message(&format!(
+            "{} =>:{} states - {} states",
+            crate::logging::COMPUTING,
+            first.fa.q,
+            next.fa.q
+        ));
+        logging.indent();
         first.random_label();
         next.label = first.label.clone();
-        totalize(&mut first.fa);
-        totalize(&mut next.fa);
+        totalize(&mut first.fa, logging);
+        totalize(&mut next.fa, logging);
         let product = cross_product(
             &first,
             &next,
@@ -1279,12 +1536,24 @@ pub fn combine(a: &Automaton, subautomata: Vec<Automaton>, outputs: &[i32]) -> A
                     a_out
                 }
             },
+            logging,
         );
         first = product;
+        logging.dedent();
+        logging.log_message(&format!(
+            "{} =>:{} states - {}ms",
+            crate::logging::COMPUTED,
+            first.fa.q,
+            time_before.elapsed().as_millis()
+        ));
     }
-    totalize(&mut first.fa);
+    // `Logging.indent()` (`:714`) brackets the closing totalize/forceCanonize/
+    // applyAllRepresentationsWithOutput trio, with no logMessage of its own around it.
+    logging.indent();
+    totalize(&mut first.fa, logging);
     first.force_canonize();
-    first.apply_all_representations_with_output();
+    first.apply_all_representations_with_output(logging);
+    logging.dedent();
     first
 }
 
@@ -2092,7 +2361,12 @@ fn convert_lsd_base_to_root(
 /// has the identical defect at the identical call site, so it is ported verbatim, not
 /// guarded; `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` pins it against the
 /// behaviour of the real engine.
-pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), ConvertNsError> {
+pub fn convert_ns(
+    a: &mut Automaton,
+    to_msd: bool,
+    to_base: i32,
+    logging: &mut crate::logging::Logging,
+) -> Result<(), ConvertNsError> {
     // Java's guard is `A.getNS().size() != 1` alone; `alphabet.len()` is checked with it
     // because this crate reads the source base off the alphabet (see the doc comment
     // above) and Java's `NS`/`richAlphabet` lists are always the same length, so no
@@ -2131,10 +2405,10 @@ pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), C
         // The conversion routines assume a complete transition function; totalize before
         // reversal.
         if !is_deterministic_and_total_java(&a.fa) {
-            totalize(&mut a.fa);
+            totalize(&mut a.fa, logging);
         }
         // If only msd <-> lsd differs, just reverse A.
-        word_automaton::reverse_with_output(a, true);
+        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
         return Ok(());
     }
 
@@ -2147,12 +2421,12 @@ pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), C
     // Base conversion groups or ungroups digits and assumes every grouped digit has a
     // transition, so totalize.
     if !is_deterministic_and_total_java(&a.fa) {
-        totalize(&mut a.fa);
+        totalize(&mut a.fa, logging);
     }
 
     // If originally LSD, we need to reverse to treat it as MSD for the conversions.
     if !from_msd {
-        word_automaton::reverse_with_output(a, true);
+        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
     }
 
     // We'll track if A is reversed relative to original.
@@ -2161,28 +2435,28 @@ pub fn convert_ns(a: &mut Automaton, to_msd: bool, to_base: i32) -> Result<(), C
     // Convert from k^i -> k if needed.
     if from_base != common_root {
         let exponent = truncated_log_ratio(from_base, common_root);
-        word_automaton::reverse_with_output(a, true);
+        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
         currently_reversed = true;
 
         convert_lsd_base_to_root(a, from_base, common_root, exponent)?;
-        word_automaton::minimize_self_with_output(a);
+        word_automaton::minimize_self_with_output_with_ctx(a, None, logging);
     }
 
     // Convert from k -> k^j if needed.
     if to_base != common_root {
         if currently_reversed {
             // Undo reversal from the previous step.
-            word_automaton::reverse_with_output(a, true);
+            word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
             currently_reversed = false;
         }
         let exponent = truncated_log_ratio(to_base, common_root);
         convert_msd_base_to_exponent(a, common_root, exponent)?;
-        word_automaton::minimize_self_with_output(a);
+        word_automaton::minimize_self_with_output_with_ctx(a, None, logging);
     }
 
     // If final desired base is LSD but we are still in MSD form, reverse again.
     if to_msd == currently_reversed {
-        word_automaton::reverse_with_output(a, true);
+        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
     }
     Ok(())
 }
@@ -2251,7 +2525,7 @@ mod tests {
     #[test]
     fn totalize_fills_missing_transitions_and_appends_one_non_accepting_sink() {
         let mut fa = exactly_one();
-        totalize(&mut fa);
+        totalize(&mut fa, &mut crate::logging::Logging::new());
         assert_eq!(fa.q, 3);
         assert_eq!(
             fa.o,
@@ -2268,7 +2542,7 @@ mod tests {
     #[test]
     fn totalize_appends_no_sink_when_already_total() {
         let mut fa = ends_with_one();
-        totalize(&mut fa);
+        totalize(&mut fa, &mut crate::logging::Logging::new());
         assert_eq!(fa.q, 2, "an already-total automaton must not grow a sink");
         assert_eq!(fa.o, vec![0, 1]);
     }
@@ -2288,7 +2562,7 @@ mod tests {
             o: vec![0, 1],
             d: vec![d0, BTreeMap::new()],
         };
-        totalize(&mut fa);
+        totalize(&mut fa, &mut crate::logging::Logging::new());
         assert_eq!(fa.q, 3);
         assert_eq!(
             fa.d[0].get(&1),
@@ -2564,7 +2838,11 @@ mod tests {
     #[test]
     fn not_reapplies_the_valid_representation_restriction() {
         let restricted_identity = restricted(no_adjacent_ones());
-        let negated = not(restricted_identity.as_dfa()).into_automaton();
+        let negated = not(
+            restricted_identity.as_dfa(),
+            &mut crate::logging::Logging::new(),
+        )
+        .into_automaton();
         assert!(
             negated.is_empty(),
             "the complement of the valid representations, re-restricted, is empty"
@@ -2573,7 +2851,8 @@ mod tests {
         // The discriminating half: the SAME automaton without the restriction attached
         // complements to a non-empty language, so this test cannot pass by accident.
         let unrestricted = single_track(no_adjacent_ones(), Some(true));
-        let negated_unrestricted = not(unrestricted.as_dfa()).into_automaton();
+        let negated_unrestricted =
+            not(unrestricted.as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
         assert!(!negated_unrestricted.is_empty());
         assert!(negated_unrestricted.fa.accepts_word(&[1, 1]));
     }
@@ -2586,14 +2865,15 @@ mod tests {
     fn totalize_cross_product_reapplies_the_valid_representation_restriction() {
         let mut a = restricted(no_adjacent_ones());
         let mut b = restricted(no_adjacent_ones());
-        let implied = imply(&mut a, &mut b).into_automaton();
+        let implied = imply(&mut a, &mut b, &mut crate::logging::Logging::new()).into_automaton();
         assert!(implied.fa.accepts_word(&[0, 1, 0]));
         accepts_exactly_the_valid_representations(&implied);
 
         // Without the restriction the same tautology really is `Σ*` -- the discriminator.
         let mut c = single_track(no_adjacent_ones(), Some(true));
         let mut d = single_track(no_adjacent_ones(), Some(true));
-        let unrestricted = imply(&mut c, &mut d).into_automaton();
+        let unrestricted =
+            imply(&mut c, &mut d, &mut crate::logging::Logging::new()).into_automaton();
         assert!(unrestricted.fa.accepts_word(&[1, 1]));
     }
 
@@ -2604,7 +2884,7 @@ mod tests {
     fn and_does_not_apply_the_valid_representation_restriction() {
         let a = restricted(universal());
         let b = restricted(universal());
-        let intersection = and(&a, &b).into_automaton();
+        let intersection = and(&a, &b, &mut crate::logging::Logging::new()).into_automaton();
         assert!(
             intersection.fa.accepts_word(&[1, 1]),
             "`and` leaves the restriction unapplied, exactly as Java does"
@@ -2619,12 +2899,13 @@ mod tests {
     fn right_quotient_reapplies_the_valid_representation_restriction() {
         let a = restricted(universal());
         let b = single_track(universal(), Some(true));
-        let quotient = right_quotient(&a, &b, false);
+        let quotient = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
         accepts_exactly_the_valid_representations(&quotient);
 
         // Discriminator: unrestricted, the same quotient is `Σ*`.
         let a_plain = single_track(universal(), Some(true));
-        let plain_quotient = right_quotient(&a_plain, &b, false);
+        let plain_quotient =
+            right_quotient(&a_plain, &b, false, &mut crate::logging::Logging::new());
         assert!(plain_quotient.fa.accepts_word(&[1, 1]));
     }
 
@@ -2635,7 +2916,7 @@ mod tests {
     fn right_quotient_copies_both_halves_of_the_track_metadata_onto_the_second_operand() {
         let a = restricted(universal());
         let b = single_track(universal(), Some(true));
-        let quotient = right_quotient(&a, &b, false);
+        let quotient = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
         assert_eq!(quotient.msd, vec![Some(true)]);
         assert!(quotient.all_reps.iter().all(|r| r.is_some()));
     }
@@ -2685,7 +2966,7 @@ mod tests {
     fn and_does_not_totalize_its_operands_and_intersects_correctly() {
         let a = single_track(exactly_one(), Some(true));
         let b = single_track(ends_with_one(), Some(true));
-        let n = and(&a, &b);
+        let n = and(&a, &b, &mut crate::logging::Logging::new());
 
         assert_eq!(
             a.fa.q,
@@ -2711,7 +2992,7 @@ mod tests {
         // out of `a`'s q0, so "01" -- which `b` accepts -- would be lost.
         let mut a = single_track(exactly_one(), Some(true));
         let mut b = single_track(ends_with_one(), Some(true));
-        let n = or(&mut a, &mut b);
+        let n = or(&mut a, &mut b, &mut crate::logging::Logging::new());
 
         assert_eq!(
             a.fa.q,
@@ -2742,7 +3023,7 @@ mod tests {
         // proptest caught it). Here the partial operand is `b`.
         let mut a = single_track(ends_with_one(), Some(true));
         let mut b = single_track(exactly_one(), Some(true));
-        let n = or(&mut a, &mut b);
+        let n = or(&mut a, &mut b, &mut crate::logging::Logging::new());
 
         assert_eq!(
             b.fa.q,
@@ -2767,7 +3048,7 @@ mod tests {
     fn xor_totalizes_a_partial_operand_before_the_cross_product() {
         let mut a = single_track(exactly_one(), Some(true));
         let mut b = single_track(ends_with_one(), Some(true));
-        let n = xor(&mut a, &mut b);
+        let n = xor(&mut a, &mut b, &mut crate::logging::Logging::new());
 
         for word in WORDS {
             let expected = exactly_one().accepts_word(word) != ends_with_one().accepts_word(word);
@@ -2788,7 +3069,7 @@ mod tests {
     fn imply_totalizes_a_partial_operand_and_respects_operand_order() {
         let mut a = single_track(exactly_one(), Some(true));
         let mut b = single_track(ends_with_one(), Some(true));
-        let n = imply(&mut a, &mut b);
+        let n = imply(&mut a, &mut b, &mut crate::logging::Logging::new());
 
         for word in WORDS {
             let expected = !exactly_one().accepts_word(word) || ends_with_one().accepts_word(word);
@@ -2806,7 +3087,7 @@ mod tests {
         // passed `(b.o, a.o)` to `combine` would be caught here.
         let mut a2 = single_track(exactly_one(), Some(true));
         let mut b2 = single_track(ends_with_one(), Some(true));
-        let swapped = imply(&mut b2, &mut a2);
+        let swapped = imply(&mut b2, &mut a2, &mut crate::logging::Logging::new());
         assert!(
             !swapped.automaton().fa.accepts_word(&[0, 1]),
             "B -> A rejects \"01\" (B accepts it, A does not), while A -> B accepts it"
@@ -2819,7 +3100,7 @@ mod tests {
     fn iff_totalizes_a_partial_operand_before_the_cross_product() {
         let mut a = single_track(exactly_one(), Some(true));
         let mut b = single_track(ends_with_one(), Some(true));
-        let n = iff(&mut a, &mut b);
+        let n = iff(&mut a, &mut b, &mut crate::logging::Logging::new());
 
         for word in WORDS {
             let expected = exactly_one().accepts_word(word) == ends_with_one().accepts_word(word);
@@ -2841,7 +3122,10 @@ mod tests {
     #[test]
     fn not_complements_including_words_that_run_off_a_partial_table() {
         let original = exactly_one();
-        let n = not(single_track(original.clone(), Some(true)).as_dfa());
+        let n = not(
+            single_track(original.clone(), Some(true)).as_dfa(),
+            &mut crate::logging::Logging::new(),
+        );
 
         for word in WORDS {
             assert_eq!(
@@ -2866,8 +3150,11 @@ mod tests {
     #[test]
     fn not_is_an_involution_up_to_language() {
         let original = exactly_one();
-        let once = not(single_track(original.clone(), Some(true)).as_dfa());
-        let twice = not(once);
+        let once = not(
+            single_track(original.clone(), Some(true)).as_dfa(),
+            &mut crate::logging::Logging::new(),
+        );
+        let twice = not(once, &mut crate::logging::Logging::new());
         for word in WORDS {
             assert_eq!(
                 twice.automaton().fa.accepts_word(word),
@@ -2904,7 +3191,7 @@ mod tests {
             Some(true),
         );
         // L(A) = every word of length >= 1, so L(not A) = {epsilon}.
-        let n = not(a.as_dfa());
+        let n = not(a.as_dfa(), &mut crate::logging::Logging::new());
         assert!(n.automaton().fa.accepts_word(&[]));
         assert!(!n.automaton().fa.accepts_word(&[0]));
         assert!(!n.automaton().fa.accepts_word(&[1]));
@@ -2963,19 +3250,19 @@ mod tests {
         ) {
             let build = |fa: &Fa| single_track(fa.clone(), Some(true));
 
-            let n_and = and(&build(&a_fa), &build(&b_fa));
+            let n_and = and(&build(&a_fa), &build(&b_fa), &mut crate::logging::Logging::new());
             assert_connective_matches_oracle(&n_and, &a_fa, &b_fa, |p, q| p && q);
 
-            let n_or = or(&mut build(&a_fa), &mut build(&b_fa));
+            let n_or = or(&mut build(&a_fa), &mut build(&b_fa), &mut crate::logging::Logging::new());
             assert_connective_matches_oracle(&n_or, &a_fa, &b_fa, |p, q| p || q);
 
-            let n_xor = xor(&mut build(&a_fa), &mut build(&b_fa));
+            let n_xor = xor(&mut build(&a_fa), &mut build(&b_fa), &mut crate::logging::Logging::new());
             assert_connective_matches_oracle(&n_xor, &a_fa, &b_fa, |p, q| p != q);
 
-            let n_imply = imply(&mut build(&a_fa), &mut build(&b_fa));
+            let n_imply = imply(&mut build(&a_fa), &mut build(&b_fa), &mut crate::logging::Logging::new());
             assert_connective_matches_oracle(&n_imply, &a_fa, &b_fa, |p, q| !p || q);
 
-            let n_iff = iff(&mut build(&a_fa), &mut build(&b_fa));
+            let n_iff = iff(&mut build(&a_fa), &mut build(&b_fa), &mut crate::logging::Logging::new());
             assert_connective_matches_oracle(&n_iff, &a_fa, &b_fa, |p, q| p == q);
         }
 
@@ -2990,7 +3277,7 @@ mod tests {
         #[test]
         fn not_matches_the_complement_oracle(fa in arb_partial_dfa(4, 2)) {
             let trimmed = crate::trim::trim(&fa);
-            let n = not(single_track(trimmed.clone(), Some(true)).as_dfa());
+            let n = not(single_track(trimmed.clone(), Some(true)).as_dfa(), &mut crate::logging::Logging::new());
 
             let mut trimmed_total = trimmed;
             trimmed_total.totalize(0);
@@ -3050,14 +3337,14 @@ mod tests {
             // LHS: ¬(A ∧ B). `and` does not mutate its operands, so fresh clones
             // aren't strictly needed here, but built the same way as the RHS for
             // symmetry/readability.
-            let and_ab = and(&build(&a_fa), &build(&b_fa));
-            let lhs = not(and_ab);
+            let and_ab = and(&build(&a_fa), &build(&b_fa), &mut crate::logging::Logging::new());
+            let lhs = not(and_ab, &mut crate::logging::Logging::new());
 
             // RHS: ¬A ∨ ¬B. `or` totalizes its operands in place, so each side needs
             // its own fresh automaton -- these are one-shot, not reused afterward.
-            let mut not_a = not(build(&a_fa).as_dfa()).into_automaton();
-            let mut not_b = not(build(&b_fa).as_dfa()).into_automaton();
-            let rhs = or(&mut not_a, &mut not_b);
+            let mut not_a = not(build(&a_fa).as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
+            let mut not_b = not(build(&b_fa).as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
+            let rhs = or(&mut not_a, &mut not_b, &mut crate::logging::Logging::new());
 
             let mut lhs_fa = lhs.automaton().fa.clone();
             lhs_fa.totalize(0);
@@ -3079,13 +3366,13 @@ mod tests {
             let build = |fa: &Fa| single_track(fa.clone(), Some(true));
 
             // LHS: ¬(A ∨ B).
-            let or_ab = or(&mut build(&a_fa), &mut build(&b_fa));
-            let lhs = not(or_ab);
+            let or_ab = or(&mut build(&a_fa), &mut build(&b_fa), &mut crate::logging::Logging::new());
+            let lhs = not(or_ab, &mut crate::logging::Logging::new());
 
             // RHS: ¬A ∧ ¬B (`and` doesn't mutate, so no extra `mut` needed here).
-            let not_a = not(build(&a_fa).as_dfa()).into_automaton();
-            let not_b = not(build(&b_fa).as_dfa()).into_automaton();
-            let rhs = and(&not_a, &not_b);
+            let not_a = not(build(&a_fa).as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
+            let not_b = not(build(&b_fa).as_dfa(), &mut crate::logging::Logging::new()).into_automaton();
+            let rhs = and(&not_a, &not_b, &mut crate::logging::Logging::new());
 
             let mut lhs_fa = lhs.automaton().fa.clone();
             lhs_fa.totalize(0);
@@ -3309,7 +3596,7 @@ mod tests {
         // accepted the same way `remove_leading_zeros_msd_requires_a_nonzero_first_digit`
         // already pins for the unrestricted case.
         let mut applied = m;
-        applied.apply_all_representations();
+        applied.apply_all_representations(&mut crate::logging::Logging::new());
         assert!(
             !applied.fa.accepts_word(&[1, 1]),
             "11 violates no_adjacent_ones and must now be rejected"
@@ -3512,7 +3799,7 @@ mod tests {
         assert!(!a.fa.accepts_word(&[1]), "sanity: \"1\" rejected before");
         assert!(a.fa.accepts_word(&[1, 0]));
 
-        fix_trailing_zeros_problem(&mut a);
+        fix_trailing_zeros_problem(&mut a, &mut crate::logging::Logging::new());
 
         assert!(a.fa.accepts_word(&[1]), "\"1\" now accepted");
         assert!(a.fa.accepts_word(&[1, 0]));
@@ -3545,7 +3832,7 @@ mod tests {
             },
             Some(true),
         );
-        fix_trailing_zeros_problem(&mut a);
+        fix_trailing_zeros_problem(&mut a, &mut crate::logging::Logging::new());
         assert_eq!(
             a.fa.q, 3,
             "no change was needed, so justMinimize must not have run"
@@ -3810,7 +4097,7 @@ mod tests {
             let mut original = single_track(fa, Some(true));
             original.fa = crate::trim::trim(&original.fa);
             let mut fixed = original.clone();
-            fix_trailing_zeros_problem(&mut fixed);
+            fix_trailing_zeros_problem(&mut fixed, &mut crate::logging::Logging::new());
 
             let zero = 0;
             let reached: BTreeSet<usize> = {
@@ -3961,7 +4248,12 @@ mod tests {
         let a = single_track(ends_with_one(), Some(true));
         let next = single_track(even_length(), Some(true));
 
-        let result = combine(&a, vec![next], &[10, 20]);
+        let result = combine(
+            &a,
+            vec![next],
+            &[10, 20],
+            &mut crate::logging::Logging::new(),
+        );
 
         assert_eq!(output_after(&result.fa, &[]), 20, "\"\": even length");
         assert_eq!(
@@ -3993,7 +4285,7 @@ mod tests {
         // An empty `subautomata` list: the `while` loop never runs, so this is just
         // "rewrite A's accepting states to `outputs[0]`, leave everything else."
         let a = single_track(ends_with_one(), Some(true));
-        let result = combine(&a, vec![], &[42]);
+        let result = combine(&a, vec![], &[42], &mut crate::logging::Logging::new());
         assert_eq!(output_after(&result.fa, &[1]), 42, "accepting: rewritten");
         assert_eq!(
             output_after(&result.fa, &[0]),
@@ -4043,7 +4335,7 @@ mod tests {
             vec!["x".to_string(), "y".to_string()],
             vec![Some(true), Some(true)],
         );
-        let _ = right_quotient(&a, &b, false);
+        let _ = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
     }
 
     #[test]
@@ -4074,7 +4366,7 @@ mod tests {
             is_subset_alphabet(&a.alphabet, &b.alphabet),
             "the OPPOSITE containment does hold, so a swapped guard would pass"
         );
-        let _ = right_quotient(&a, &b, false);
+        let _ = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
     }
 
     #[test]
@@ -4105,7 +4397,7 @@ mod tests {
             "precondition: the guard WOULD reject this pair if it ran"
         );
 
-        let m = right_quotient(&a, &b, true);
+        let m = right_quotient(&a, &b, true, &mut crate::logging::Logging::new());
 
         assert!(m.fa.accepts_word(&[0]));
         assert!(!m.fa.accepts_word(&[]));
@@ -4139,7 +4431,7 @@ mod tests {
         );
         assert_eq!(b.encode(&[1]), 0, "sanity: L(B) = {{\"1\"}}");
 
-        let m = right_quotient(&a, &b, false);
+        let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
 
         assert!(m.fa.accepts_word(&[0]), "\"0\" is in L(A)/L(B)");
         assert!(!m.fa.accepts_word(&[]));
@@ -4180,7 +4472,7 @@ mod tests {
         };
         b.label = Vec::new();
 
-        let m = right_quotient(&a, &b, false);
+        let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
 
         // Same hand-derived answer as the bound case: {"01"} / {"1"} = {"0"}.
         assert!(m.fa.accepts_word(&[0]));
@@ -4209,7 +4501,7 @@ mod tests {
             vec![Some(true), Some(true)],
         );
         let b = single_track(exactly_one(), Some(true));
-        let _ = left_quotient(&a, &b);
+        let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
     }
 
     #[test]
@@ -4238,7 +4530,7 @@ mod tests {
             is_subset_alphabet(&b.alphabet, &a.alphabet),
             "the OPPOSITE containment does hold, so a swapped guard would pass"
         );
-        let _ = left_quotient(&a, &b);
+        let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
     }
 
     #[test]
@@ -4261,7 +4553,7 @@ mod tests {
             )
         };
 
-        let m = left_quotient(&a, &b);
+        let m = left_quotient(&a, &b, &mut crate::logging::Logging::new());
 
         assert!(m.fa.accepts_word(&[1]), "\"1\" is in L(B) \\ L(A)");
         assert!(!m.fa.accepts_word(&[]));
@@ -4349,7 +4641,7 @@ mod tests {
             "sanity: but the containment rightQuotient's re-encode actually needs \
              (B subset A) does NOT hold"
         );
-        let _ = left_quotient(&a, &b);
+        let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
     }
 
     // ------------------------------------------- Tier-4 properties over the quotients
@@ -4554,7 +4846,7 @@ mod tests {
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
 
-            let m = right_quotient(&a, &b, false);
+            let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
             for x in all_digit_words(&[0, 1], 4) {
                 prop_assert_eq!(
                     accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &x),
@@ -4578,7 +4870,7 @@ mod tests {
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
 
-            let m = left_quotient(&a, &b);
+            let m = left_quotient(&a, &b, &mut crate::logging::Logging::new());
             for z in all_digit_words(&[0, 1], 4) {
                 prop_assert_eq!(
                     accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &z),
@@ -4639,7 +4931,7 @@ mod tests {
             prop_assert!(!is_subset_alphabet(&b.alphabet, &a.alphabet));
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                left_quotient(&a, &b)
+                left_quotient(&a, &b, &mut crate::logging::Logging::new())
             }));
             let m = match outcome {
                 Ok(m) => m,
@@ -4778,19 +5070,31 @@ mod tests {
         for t in [true, false] {
             // TRUE and X == X; FALSE and X == FALSE (`:45-50`).
             check(
-                &and(&Automaton::true_false(t), &p_automaton()),
+                &and(
+                    &Automaton::true_false(t),
+                    &p_automaton(),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::P } else { Expect::Trivial(false) },
                 &format!("and({t}, P)"),
             );
             // The swap-recursion arm (`:49`, "and is symmetric").
             check(
-                &and(&p_automaton(), &Automaton::true_false(t)),
+                &and(
+                    &p_automaton(),
+                    &Automaton::true_false(t),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::P } else { Expect::Trivial(false) },
                 &format!("and(P, {t})"),
             );
             for u in [true, false] {
                 check(
-                    &and(&Automaton::true_false(t), &Automaton::true_false(u)),
+                    &and(
+                        &Automaton::true_false(t),
+                        &Automaton::true_false(u),
+                        &mut crate::logging::Logging::new(),
+                    ),
                     Expect::Trivial(t && u),
                     &format!("and({t}, {u})"),
                 );
@@ -4802,18 +5106,30 @@ mod tests {
     fn or_short_circuits_on_trivial_operands() {
         for t in [true, false] {
             check(
-                &or(&mut Automaton::true_false(t), &mut p_automaton()),
+                &or(
+                    &mut Automaton::true_false(t),
+                    &mut p_automaton(),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::Trivial(true) } else { Expect::P },
                 &format!("or({t}, P)"),
             );
             check(
-                &or(&mut p_automaton(), &mut Automaton::true_false(t)),
+                &or(
+                    &mut p_automaton(),
+                    &mut Automaton::true_false(t),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::Trivial(true) } else { Expect::P },
                 &format!("or(P, {t})"),
             );
             for u in [true, false] {
                 check(
-                    &or(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    &or(
+                        &mut Automaton::true_false(t),
+                        &mut Automaton::true_false(u),
+                        &mut crate::logging::Logging::new(),
+                    ),
                     Expect::Trivial(t || u),
                     &format!("or({t}, {u})"),
                 );
@@ -4825,18 +5141,30 @@ mod tests {
     fn xor_short_circuits_on_trivial_operands() {
         for t in [true, false] {
             check(
-                &xor(&mut Automaton::true_false(t), &mut p_automaton()),
+                &xor(
+                    &mut Automaton::true_false(t),
+                    &mut p_automaton(),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::NotP } else { Expect::P },
                 &format!("xor({t}, P)"),
             );
             check(
-                &xor(&mut p_automaton(), &mut Automaton::true_false(t)),
+                &xor(
+                    &mut p_automaton(),
+                    &mut Automaton::true_false(t),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::NotP } else { Expect::P },
                 &format!("xor(P, {t})"),
             );
             for u in [true, false] {
                 check(
-                    &xor(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    &xor(
+                        &mut Automaton::true_false(t),
+                        &mut Automaton::true_false(u),
+                        &mut crate::logging::Logging::new(),
+                    ),
                     Expect::Trivial(t != u),
                     &format!("xor({t}, {u})"),
                 );
@@ -4849,7 +5177,11 @@ mod tests {
         for t in [true, false] {
             // TRUE -> X == X; FALSE -> X == TRUE (`:100-102`).
             check(
-                &imply(&mut Automaton::true_false(t), &mut p_automaton()),
+                &imply(
+                    &mut Automaton::true_false(t),
+                    &mut p_automaton(),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::P } else { Expect::Trivial(true) },
                 &format!("imply({t}, P)"),
             );
@@ -4857,7 +5189,11 @@ mod tests {
             // cannot be reached by swapping, and the one whose `B.isTRUE_AUTOMATON()`
             // read has no enclosing `isTRUE_FALSE_AUTOMATON()` check in Java.
             check(
-                &imply(&mut p_automaton(), &mut Automaton::true_false(t)),
+                &imply(
+                    &mut p_automaton(),
+                    &mut Automaton::true_false(t),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t {
                     Expect::Trivial(true)
                 } else {
@@ -4867,7 +5203,11 @@ mod tests {
             );
             for u in [true, false] {
                 check(
-                    &imply(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    &imply(
+                        &mut Automaton::true_false(t),
+                        &mut Automaton::true_false(u),
+                        &mut crate::logging::Logging::new(),
+                    ),
                     Expect::Trivial(!t || u),
                     &format!("imply({t}, {u})"),
                 );
@@ -4879,18 +5219,30 @@ mod tests {
     fn iff_short_circuits_via_its_double_imply_recursion() {
         for t in [true, false] {
             check(
-                &iff(&mut Automaton::true_false(t), &mut p_automaton()),
+                &iff(
+                    &mut Automaton::true_false(t),
+                    &mut p_automaton(),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::P } else { Expect::NotP },
                 &format!("iff({t}, P)"),
             );
             check(
-                &iff(&mut p_automaton(), &mut Automaton::true_false(t)),
+                &iff(
+                    &mut p_automaton(),
+                    &mut Automaton::true_false(t),
+                    &mut crate::logging::Logging::new(),
+                ),
                 if t { Expect::P } else { Expect::NotP },
                 &format!("iff(P, {t})"),
             );
             for u in [true, false] {
                 check(
-                    &iff(&mut Automaton::true_false(t), &mut Automaton::true_false(u)),
+                    &iff(
+                        &mut Automaton::true_false(t),
+                        &mut Automaton::true_false(u),
+                        &mut crate::logging::Logging::new(),
+                    ),
                     Expect::Trivial(t == u),
                     &format!("iff({t}, {u})"),
                 );
@@ -4906,19 +5258,23 @@ mod tests {
         // a sufficient witness.
         for t in [true, false] {
             for op in [
-                or as fn(&mut Automaton, &mut Automaton) -> AutomatonDFA,
+                or as fn(
+                    &mut Automaton,
+                    &mut Automaton,
+                    &mut crate::logging::Logging,
+                ) -> AutomatonDFA,
                 xor,
                 imply,
                 iff,
             ] {
                 let mut p = p_automaton();
                 let mut triv = Automaton::true_false(t);
-                let _ = op(&mut triv, &mut p);
+                let _ = op(&mut triv, &mut p, &mut crate::logging::Logging::new());
                 assert_eq!(p.fa.q, 2, "operand was totalized in a trivial branch");
 
                 let mut p = p_automaton();
                 let mut triv = Automaton::true_false(t);
-                let _ = op(&mut p, &mut triv);
+                let _ = op(&mut p, &mut triv, &mut crate::logging::Logging::new());
                 assert_eq!(p.fa.q, 2, "operand was totalized in a trivial branch");
             }
         }
@@ -4928,12 +5284,21 @@ mod tests {
     fn not_flips_a_trivial_automatons_truth_value_and_stays_trivial() {
         // `:146-149`.
         for t in [true, false] {
-            let n = not(AutomatonDFA::true_false(t));
+            let n = not(
+                AutomatonDFA::true_false(t),
+                &mut crate::logging::Logging::new(),
+            );
             assert!(n.automaton().is_true_false_automaton());
             assert_eq!(n.automaton().is_true_automaton(), !t);
         }
         // Involution, for good measure.
-        let n = not(not(AutomatonDFA::true_false(true)));
+        let n = not(
+            not(
+                AutomatonDFA::true_false(true),
+                &mut crate::logging::Logging::new(),
+            ),
+            &mut crate::logging::Logging::new(),
+        );
         assert!(n.automaton().is_true_automaton());
     }
 
@@ -5018,14 +5383,16 @@ mod tests {
     fn convert_ns_parses_the_base_from_the_name_not_the_alphabet_size() {
         let mut a = epsilon_only(2, true);
         a.set_ns_names(vec![Some("msd_fib".to_string())]);
-        let err = convert_ns(&mut a, true, 2).expect_err("`fib` is not a base");
+        let err = convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new())
+            .expect_err("`fib` is not a base");
         assert_eq!(
             err.to_string(),
             "Base of automaton's number system must be > 1 and int, found: fib"
         );
         // The msd<->lsd flip must be rejected for the same reason, rather than silently
         // reversing the automaton as if it were plain base 2.
-        let err = convert_ns(&mut a, false, 2).expect_err("`fib` is not a base");
+        let err = convert_ns(&mut a, false, 2, &mut crate::logging::Logging::new())
+            .expect_err("`fib` is not a base");
         assert_eq!(
             err.to_string(),
             "Base of automaton's number system must be > 1 and int, found: fib"
@@ -5035,7 +5402,7 @@ mod tests {
         // so plain bases are unaffected by the change.
         let mut plain = epsilon_only(2, true);
         assert!(matches!(
-            convert_ns(&mut plain, true, 2),
+            convert_ns(&mut plain, true, 2, &mut crate::logging::Logging::new()),
             Err(ConvertNsError::IdenticalNumberSystems { ref name }) if name == "msd_2"
         ));
     }
@@ -5104,7 +5471,8 @@ mod tests {
         let mut a = epsilon_only(2, true);
         assert_eq!(simulate(&a.fa, &[]), 1, "language before: {{epsilon}} only");
 
-        convert_ns(&mut a, false, 2).expect("the flip must succeed");
+        convert_ns(&mut a, false, 2, &mut crate::logging::Logging::new())
+            .expect("the flip must succeed");
 
         assert_eq!(a.msd, vec![Some(false)], "number system must now be lsd_2");
         assert_eq!(
@@ -5123,7 +5491,8 @@ mod tests {
     fn convert_ns_base_conversion_from_lsd() {
         let mut a = epsilon_only(4, false);
 
-        convert_ns(&mut a, true, 2).expect("the conversion must succeed");
+        convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new())
+            .expect("the conversion must succeed");
 
         assert_eq!(a.msd, vec![Some(true)], "number system must now be msd_2");
         assert_eq!(a.alphabet, vec![vec![0, 1]]);
@@ -5185,7 +5554,8 @@ mod tests {
     fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
         let mut a = epsilon_only(2, true);
         a.msd = vec![None];
-        let err = convert_ns(&mut a, true, 4).expect_err("Java NPEs here");
+        let err = convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new())
+            .expect_err("Java NPEs here");
         assert_eq!(err, ConvertNsError::NoNumberSystem);
         assert_eq!(
             err.to_string(),
@@ -5200,7 +5570,7 @@ mod tests {
         for t in [true, false] {
             let mut a = Automaton::true_false(t);
             assert_eq!(
-                convert_ns(&mut a, true, 4),
+                convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new()),
                 Err(ConvertNsError::NotSingleInput)
             );
         }
@@ -5572,7 +5942,8 @@ mod tests {
         };
 
         let mut even = parity(1, 0);
-        convert_ns(&mut even, true, 4).expect("the conversion must succeed");
+        convert_ns(&mut even, true, 4, &mut crate::logging::Logging::new())
+            .expect("the conversion must succeed");
         assert_eq!(even.msd, vec![Some(true)]);
         assert_eq!(even.alphabet, vec![vec![0, 1, 2, 3]]);
         assert_eq!(
@@ -5584,7 +5955,8 @@ mod tests {
         // The complementary fixture, to show the corruption is not a lucky constant: the
         // correct answer flips to 0 here, and both engines flip to 1.
         let mut odd = parity(0, 1);
-        convert_ns(&mut odd, true, 4).expect("the conversion must succeed");
+        convert_ns(&mut odd, true, 4, &mut crate::logging::Logging::new())
+            .expect("the conversion must succeed");
         assert_eq!(
             odd.fa.o[odd.fa.q0], 1,
             "WB-001: should be 0, and real walnut-java is wrong in the same direction"
@@ -5634,12 +6006,19 @@ mod tests {
 
         for (msd_mid, base_mid) in [(false, 2), (true, 4), (false, 4), (true, 8), (false, 8)] {
             let mut there = original.clone();
-            convert_ns(&mut there, msd_mid, base_mid).expect("forward conversion");
+            convert_ns(
+                &mut there,
+                msd_mid,
+                base_mid,
+                &mut crate::logging::Logging::new(),
+            )
+            .expect("forward conversion");
             assert_eq!(there.msd, vec![Some(msd_mid)]);
             assert_eq!(there.alphabet, vec![util::int_range_list(base_mid)]);
 
             let mut back = there.clone();
-            convert_ns(&mut back, true, 2).expect("reverse conversion");
+            convert_ns(&mut back, true, 2, &mut crate::logging::Logging::new())
+                .expect("reverse conversion");
             assert_eq!(back.msd, vec![Some(true)]);
             assert_eq!(back.alphabet, vec![vec![0, 1]]);
 
@@ -5889,7 +6268,7 @@ mod tests {
             prop_assume!(!wb_001_can_fire_on_regrouping(&a.fa, j));
             let to_base = 2i32.pow(j as u32);
             let mut converted = a.clone();
-            convert_ns(&mut converted, true, to_base).expect("msd_2 -> msd_2^j must succeed");
+            convert_ns(&mut converted, true, to_base, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_2^j must succeed");
             prop_assert_eq!(&converted.alphabet, &vec![util::int_range_list(to_base)]);
             prop_assert_eq!(&converted.msd, &vec![Some(true)]);
 

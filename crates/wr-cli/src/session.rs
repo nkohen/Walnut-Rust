@@ -642,7 +642,11 @@ impl FileLibraries {
     /// (`:322-330`), which is why this does not special-case standard bases. A user who drops
     /// a `Custom Bases/msd_2_addition.txt` into their home directory really does override
     /// base-2 addition in real Walnut, and does here too.
-    fn load_number_system(&self, name: &str) -> Result<NumberSystem, PredicateEnvError> {
+    fn load_number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<NumberSystem, PredicateEnvError> {
         let numsys_error = |source: NumSysError| PredicateEnvError::NumberSystem {
             name: name.to_string(),
             source,
@@ -657,7 +661,7 @@ impl FileLibraries {
             less_than: self.probe_custom_base(name, numsys::UNDERSCORE_LESS_THAN_AUTOMATON)?,
             all_representations: self.probe_custom_base(name, TXT_EXTENSION)?,
         };
-        NumberSystem::with_custom_base_files(name, files).map_err(numsys_error)
+        NumberSystem::with_custom_base_files(name, files, logging).map_err(numsys_error)
     }
 
     /// One `NumberSystem.loadAutomatonOrNull` probe (`:299-319`), minus the decision logic
@@ -698,14 +702,39 @@ impl FileLibraries {
 }
 
 impl PredicateEnv for FileLibraries {
-    fn number_system(&self, name: &str) -> Result<Rc<NumberSystem>, PredicateEnvError> {
+    fn number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<Rc<NumberSystem>, PredicateEnvError> {
         if let Some(ns) = self.number_systems.borrow().get(name) {
             return Ok(Rc::clone(ns));
         }
         // The borrow above is dropped before the (file-reading, potentially failing) build
         // below; `computeIfAbsent`'s contract is that a throwing mapping function leaves the
         // map untouched, so the insert happens only on success.
-        let ns = Rc::new(self.load_number_system(name)?);
+        //
+        // The construction-recording bracket belongs HERE, not inside `load_number_system`
+        // (which `fresh_number_system` below also calls): only this memoized path's first-ever
+        // construction is a session-warmth artifact with no counterpart in a real Walnut
+        // capture (`tests/golden/STATUS.md` §1b). `fresh_number_system`'s construction runs on
+        // EVERY call, in real Java too, so its logging is always genuinely reproducible and
+        // must never be recorded/stripped — see `wr_core::logging::Logging`'s module docs.
+        //
+        // A FAILED construction must be discarded, not filed: `computeIfAbsent` does not
+        // memoize a throwing mapping function (the comment above, and Java's own contract),
+        // so a construction that logs and then errors reruns -- and re-logs -- on every later
+        // attempt, warm or cold, exactly like `fresh_number_system`'s genuinely-reproducible
+        // case. Filing it here would silently strip real signal on a later, differently-timed
+        // retry of the same failing name.
+        logging.begin_construction_recording();
+        let ns = self.load_number_system(name, logging);
+        if ns.is_ok() {
+            logging.end_construction_recording();
+        } else {
+            logging.discard_construction_recording();
+        }
+        let ns = Rc::new(ns?);
         self.number_systems
             .borrow_mut()
             .insert(name.to_string(), Rc::clone(&ns));
@@ -716,9 +745,18 @@ impl PredicateEnv for FileLibraries {
     /// Java's direct constructor call is, but resolving `Custom Bases/` through this session
     /// the same way that constructor does through the static `Session`. Overriding the trait's
     /// clone-out-of-the-cache default keeps the "`$name(…)` does not share the memoized
-    /// handle" behavior visible here rather than only in the type.
-    fn fresh_number_system(&self, name: &str) -> Result<NumberSystem, PredicateEnvError> {
-        self.load_number_system(name)
+    /// handle" behavior visible here rather than only in the type — and, not merely
+    /// incidentally, keeps this call OUT of `number_system`'s construction-recording bracket
+    /// above: the trait's *default* `fresh_number_system` implementation routes through
+    /// `number_system`, so it would inherit that recording if this impl did not override it.
+    /// Nothing in `wr_core::logging::Logging` enforces "never recorded" as a project-wide
+    /// property of `fresh_number_system` in general — only THIS override actually delivers it.
+    fn fresh_number_system(
+        &self,
+        name: &str,
+        logging: &mut wr_core::logging::Logging,
+    ) -> Result<NumberSystem, PredicateEnvError> {
+        self.load_number_system(name, logging)
     }
 
     // `word`/`function` are the trait's derived forms (`self.word_with_ctx(name, None)`)
@@ -1300,7 +1338,10 @@ mod tests {
         let (_root, global, session) = walnut_tree("standard-ns");
         let (s, _out) = session_with_capture(&global, &session, false);
 
-        let ns = s.libraries().number_system("msd_3").unwrap();
+        let ns = s
+            .libraries()
+            .number_system("msd_3", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert_eq!(ns.name(), "msd_3");
         assert!(ns.is_msd());
     }
@@ -1320,7 +1361,10 @@ mod tests {
         wr_io::writer::write_automaton_txt(&mut msd2_addition, &adder_path).unwrap();
 
         let (s, _out) = session_with_capture(&global, &session, false);
-        let ns = s.libraries().number_system("msd_kk").unwrap();
+        let ns = s
+            .libraries()
+            .number_system("msd_kk", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert_eq!(ns.name(), "msd_kk");
         assert!(ns.is_msd());
         assert!(
@@ -1334,7 +1378,7 @@ mod tests {
         let (s2, _out2) = session_with_capture(&global2, &session2, false);
         assert_eq!(
             s2.libraries()
-                .number_system("msd_kk")
+                .number_system("msd_kk", &mut wr_core::logging::Logging::new())
                 .unwrap_err()
                 .to_string(),
             "Number system msd_kk is not defined."
@@ -1359,7 +1403,10 @@ mod tests {
         .unwrap();
 
         let (s, out) = session_with_capture(&global, &session, false);
-        let ns = s.libraries().number_system("msd_kk").unwrap();
+        let ns = s
+            .libraries()
+            .number_system("msd_kk", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert!(same_language(ns.addition(), &base3));
         assert_ne!(
             ns.addition().alphabet,
@@ -1443,11 +1490,118 @@ mod tests {
         let (_root, global, session) = walnut_tree("memoize");
         let (s, _out) = session_with_capture(&global, &session, false);
 
-        let a = s.libraries().number_system("msd_2").unwrap();
-        let b = s.libraries().number_system("msd_2").unwrap();
+        let a = s
+            .libraries()
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
+        let b = s
+            .libraries()
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert!(Rc::ptr_eq(&a, &b));
-        let other = s.libraries().number_system("lsd_2").unwrap();
+        let other = s
+            .libraries()
+            .number_system("lsd_2", &mut wr_core::logging::Logging::new())
+            .unwrap();
         assert!(!Rc::ptr_eq(&a, &other));
+    }
+
+    /// Pins the fix this file's `number_system` doc comment describes: the
+    /// construction-recording bracket belongs on the MEMOIZED lookup only, not on the
+    /// shared `load_number_system` helper `fresh_number_system` also calls. Getting this
+    /// wrong once (recording both) broke `tests/golden` fixture 379, whose `$fibmr(…)`
+    /// calls go through `fresh_number_system` and genuinely reconstruct — with genuinely
+    /// reproducible logging — on every single call, in real Java too.
+    ///
+    /// Forces `with_custom_base_files` to actually log something during construction by
+    /// dropping a `Custom Bases/msd_2.txt` all-representations file (so the plain `msd_2`
+    /// base takes the same `apply_all_representations` path a real custom base like
+    /// `msd_fib` does) — otherwise construction logs nothing at all and this test would
+    /// pass by vacuously recording zero spans either way.
+    #[test]
+    fn only_the_memoized_lookups_first_cold_call_is_recorded() {
+        let (_root, global, session) = walnut_tree("construction_recording");
+        write(&global, "Custom Bases/msd_2.txt", ZERO_ONLY);
+        let (s, _out) = session_with_capture(&global, &session, false);
+
+        let mut logging = wr_core::logging::Logging::new();
+        logging.configure_for_command(false, true);
+
+        // First call through the memoized lookup: cold, must record exactly one span.
+        s.libraries().number_system("msd_2", &mut logging).unwrap();
+        assert_eq!(
+            logging.construction_recordings().len(),
+            1,
+            "the first, cold call through the memoized lookup must record its construction"
+        );
+        let first_span = logging.construction_recordings()[0].clone();
+        assert!(
+            !first_span.is_empty(),
+            "the all-representations file must have made construction log something"
+        );
+
+        // Second call through the memoized lookup: warm (cache hit), must not add a span.
+        s.libraries().number_system("msd_2", &mut logging).unwrap();
+        assert_eq!(
+            logging.construction_recordings().len(),
+            1,
+            "a memoized cache hit never reconstructs, so it must never add a second span"
+        );
+
+        // The UNMEMOIZED sibling reconstructs every time -- and its logging is real,
+        // reproducible signal (see 379's `$fibmr(...)`), so it must never be recorded.
+        s.libraries()
+            .fresh_number_system("msd_2", &mut logging)
+            .unwrap();
+        assert_eq!(
+            logging.construction_recordings().len(),
+            1,
+            "fresh_number_system's own construction must never be captured as a span"
+        );
+        assert_eq!(
+            logging.construction_recordings()[0],
+            first_span,
+            "the one recorded span must still be exactly the original cold construction"
+        );
+    }
+
+    /// A failed lookup through the memoized path must not leave anything in
+    /// `construction_recordings()`, and must not corrupt a LATER successful
+    /// recording for a different name on the same `Logging`.
+    ///
+    /// **What this does NOT prove**: `msd_kk` fails before `with_custom_base_files`
+    /// ever logs anything (no all-representations file exists for it), so this
+    /// exercises the wiring/no-op path, not "a construction that logs some lines
+    /// and then fails" — that combination is not currently reachable from any real
+    /// `NumberSystem::with_custom_base_files` call (every fallible step happens
+    /// before the only code that logs). `discard_construction_recording` actually
+    /// throwing away already-recorded lines is proven directly, at the `Logging`
+    /// level, by `wr_core::logging`'s own
+    /// `discard_construction_recording_throws_away_lines_logged_so_far`.
+    #[test]
+    fn a_failed_construction_files_no_recording() {
+        let (_root, global, session) = walnut_tree("failed_construction_recording");
+        write(&global, "Custom Bases/msd_2.txt", ZERO_ONLY);
+        let (s, _out) = session_with_capture(&global, &session, false);
+
+        let mut logging = wr_core::logging::Logging::new();
+        logging.configure_for_command(false, true);
+
+        assert!(s.libraries().number_system("msd_kk", &mut logging).is_err());
+        assert!(
+            logging.construction_recordings().is_empty(),
+            "a failed construction must never be filed as a recorded span"
+        );
+
+        // A subsequent successful construction (a different, real base) must still
+        // record normally -- the discard above must not have left the recorder in
+        // a broken state.
+        s.libraries().number_system("msd_2", &mut logging).unwrap();
+        assert_eq!(
+            logging.construction_recordings().len(),
+            1,
+            "a later successful construction must still be recorded after an earlier discard"
+        );
     }
 
     /// `computeIfAbsent` leaves the map unmodified when the mapping function throws, so a
@@ -1459,7 +1613,10 @@ mod tests {
         let (_root, global, session) = walnut_tree("retry");
         let (s, _out) = session_with_capture(&global, &session, false);
 
-        assert!(s.libraries().number_system("msd_kk").is_err());
+        assert!(s
+            .libraries()
+            .number_system("msd_kk", &mut wr_core::logging::Logging::new())
+            .is_err());
         assert!(
             !s.libraries().number_systems.borrow().contains_key("msd_kk"),
             "a failed lookup must not populate the cache"
@@ -1471,7 +1628,10 @@ mod tests {
             PathBuf::from(format!("{global}Custom Bases/msd_kk_addition.txt")),
         )
         .unwrap();
-        assert!(s.libraries().number_system("msd_kk").is_ok());
+        assert!(s
+            .libraries()
+            .number_system("msd_kk", &mut wr_core::logging::Logging::new())
+            .is_ok());
     }
 
     /// `_neg_` is rejected at name-resolution time, before any file is probed — U5's declared
@@ -1485,7 +1645,10 @@ mod tests {
         write(&global, "Custom Bases/msd_neg_fib.txt", "garbage");
 
         let (s, _out) = session_with_capture(&global, &session, false);
-        let err = s.libraries().number_system("msd_neg_fib").unwrap_err();
+        let err = s
+            .libraries()
+            .number_system("msd_neg_fib", &mut wr_core::logging::Logging::new())
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1507,7 +1670,9 @@ mod tests {
         let (_root, global, session) = walnut_tree("dyn");
         let (s, _out) = session_with_capture(&global, &session, false);
         let env: &dyn PredicateEnv = s.predicate_env();
-        assert!(env.number_system("msd_2").is_ok());
+        assert!(env
+            .number_system("msd_2", &mut wr_core::logging::Logging::new())
+            .is_ok());
     }
 
     /// `docs/WALNUT-BUGS.md` WB-005, both halves, made unreachable by construction — see this

@@ -82,71 +82,100 @@
 //! so exact millisecond values are never fixture-significant — only the call *shape*
 //! (which lines get logged, in what order, at what indent) is.
 //!
-//! ## DEFERRED GAP: the per-`act()` `Logging` calls are NOT ported (log-text fidelity)
+//! ## Per-`act()` `Logging` calls — CLOSED (U28)
 //!
-//! **This is an honest, known, tested-as-currently-incomplete gap — not a claim that
-//! those calls don't matter.** Java's individual `act()` bodies *do* call `Logging`, and
-//! those calls *do* have captured effects:
+//! Java's individual `act()` bodies *do* call `Logging`, and those calls *do* have
+//! captured effects:
 //!
 //! * `RelationalOperator.java:96-97` (`logAndPrint("computing " + …)` + `Logging.indent()`)
 //!   and `:175-176` (`Logging.dedent()` + `logAndPrint("computed " + …)`).
 //! * `LogicalOperator.java:78-79`, `:95-96`, `:105-106`, `:112-113`, `:123-124`, `:160`.
-//! * `Word.java:54`, `:78`.
+//! * `Word.java:54`, `:78`, `Function.java:64`, `:97`.
 //!
 //! `Logging.logDetail` (`Main/Logging.java:204-221`) appends to `commandLog` whenever
 //! `!evalLogFilesActive` — which is exactly the `computeHeadless`/`getImageEval` path this
 //! module ports — and to `detailedLog` when `printDetails`. `getDetailedLog()` is what
 //! `TestCase` captures, i.e. exactly what Tier-1's `details*` golden fixtures compare.
 //!
-//! **Concrete, verified divergence.** For `?msd_2 x<5 & x>1`, real Walnut's
-//! `Session/<ts>/Result/global_log.txt` holds ten lines:
+//! **`Logging.disablePrint()`/`enablePrint()` gate WHETHER logging happens at all for
+//! `logMessage`-based calls (`and`/`or`/`quantify`/`minimize`/`determinize`/…'s own
+//! internal wrappers), not just console output.** `logMessage(String)` is
+//! `logMessage(printDetails, msg)` → `if (printEnabled && print) logDetail(...)` — the
+//! WHOLE `logDetail` call (buffers included) is skipped when `printEnabled` is false.
+//! Only the OUTER, per-token `act()`-level "computing X"/"computed X" wrapper
+//! (`RelationalOperator`/`LogicalOperator`/`Word`/`Function`) uses `logAndPrint`, whose
+//! single-arg form calls `logDetail` UNCONDITIONALLY (`printEnabled` only reaches its
+//! CONSOLE-print argument there) — so that outer layer is never suppressed by
+//! `disablePrint()`. An earlier draft of this note claimed `disablePrint`/`enablePrint`
+//! never gate the buffers at all; that was checked against the wrong call (`logAndPrint`)
+//! and is corrected here after `?msd_2 x<5 & x>1`'s constant-construction trace (captured
+//! from the real jar) turned out to need this distinction to reproduce byte-for-byte —
+//! see [`tests::command_log_matches_real_walnut_including_deep_per_act_logging`]'s docs.
 //!
-//! ```text
-//! computing x<5
-//! computed x<5
-//! x<5:4 states - 28ms
-//!  computing x>1
-//!  computed x>1
-//!  x>1:3 states - 1ms
-//!   computing x<5&x>1
-//!   computed x<5&x>1
-//!   (x<5&x>1):4 states - 0ms
-//! Total computation time: 30ms.
-//! ```
+//! [`wr_core::numsys`]'s query-time construction methods (`comparison_const_b`,
+//! `arithmetic_const_a`/`b`/`c`, `constant`, `multiplication`, `division`) now thread the
+//! caller's real [`Logging`] AND call [`Logging::disable_print`]/[`Logging::enable_print`]
+//! at exactly Java's own `disablePrint()`/`enablePrint()` call sites. Because
+//! `disable_print`/`enable_print` are plain field writes (`print_enabled = false`/`true`),
+//! matching Java's own non-save/restore `static boolean printEnabled` exactly, a nested
+//! bracket (e.g. `constant(5)`'s recursive `constant(2)`/`constant(3)`) leaks printing
+//! back on for the rest of the outer call — **this is WB-039** (`docs/WALNUT-BUGS.md`),
+//! previously logged only for its `[strategy …]`/`[export …]` index-instability
+//! consequence; it is ported verbatim here too (not specially emulated — the same
+//! non-nesting primitive naturally reproduces it), and WB-039's entry now also documents
+//! this log-text-visibility consequence. Confirmed via the real jar that eight of the
+//! nine original `details*` golden fixtures don't exercise the LEAK (their session/library
+//! state keeps the relevant sub-constants warm-cached, so the nested-bracket path never
+//! fires for them) — the ninth, fixture 383, is one case where it does; see
+//! `tests/golden/STATUS.md` §1b for why it (and, for an unrelated reason, fixtures
+//! 375-379) still diverge on `details` text despite this closure, a genuine
+//! warm-vs-cold `NumberSystem` session-cache mismatch between this harness and Java's own
+//! fixture-generation run, not a logging correctness gap.
+//! [`wr_core::numsys::NumberSystem::with_custom_base_files`]'s construction-time
+//! `apply_all_representations` call — reached at `NumberSystem` construction for a custom
+//! base that ships its own all-representations file — is real, correctly-threaded logging
+//! reachable through BOTH `PredicateEnv::number_system` (a `?ns` directive) and
+//! `PredicateEnv::fresh_number_system` (`$name(…)`/`Function` tokens); see
+//! [`Predicate::tokenize_and_compute_post_order`](crate::predicate::Predicate)'s docs for
+//! why an attempt to give these two asymmetric `Logging` treatment (to dodge the harness
+//! mismatch above) was tried and reverted.
 //!
-//! This port's [`Logging::command_log`] for the same query holds only four of them — the
-//! three `X:N states - Nms` summaries plus the total, which come from [`compute`]'s own
-//! per-iteration logging and are correct. Every `computing X`/`computed X` pair, which in
-//! Java comes from *inside* the token's `act()` call, is absent. A second, related
-//! divergence: Java's `RelationalOperator.act` calls `indent()` unconditionally but
-//! `dedent()` only on success, so a *failing* relational op leaks `+1` indent into the
-//! next command's log (five spaces vs. this port's four) — also not replicated here.
+//! Ported by threading `&mut Logging` into every `Token::act`/`Operator::act`/
+//! `Word::act`/`Function::act` body (this crate) and every `wr_core::logicalops`/
+//! `product`/`determinize`/`quantify`/`numsys` construction primitive they call — see
+//! each module's own docs for its exact call sites. [`compute_with_ctx`] now forwards its
+//! own `logging` parameter into `Token::act_with_ctx` instead of dropping it.
 //!
-//! **Why it is not fixed in this unit.** The fix is threading `&mut Logging` into every
-//! `Token::act`/`Operator::act`/`Word::act` body across the already-reviewed U4/U9/U10
-//! code — a substantial unit of engineering in its own right, and one that touches code
-//! outside this unit's diff. It is **not** needed for Phase 3a's exit criterion (which is
-//! automaton-level semantic equivalence, per `CLAUDE.md`'s Prime Directive #1), but it
-//! **must land before Phase 3b's U27**, the golden-corpus unit that compares the
-//! `details*` fixtures — the one place `CLAUDE.md` signs off on chasing exact
-//! traversal-order/log-text parity rather than semantic equivalence.
+//! **A second, related fix: the indent-leak-on-failure quirk (WB-041).** Java's
+//! `RelationalOperator.act`, `LogicalOperator.actQuantifier`, and
+//! `Operator.andThenQuantifyIfArithmetic` all call `indent()` unconditionally but
+//! `dedent()` only on success, so a *failing* operation leaks `+1` indent into whatever
+//! logs next. Logged as `docs/WALNUT-BUGS.md`'s WB-041 (log-text only — the decision
+//! procedure itself is unaffected, and no fixture can observe it: real Walnut's own
+//! integration-test harness resets indent per fixture, as does this port's) — ported
+//! verbatim via the same `?`-skips-`dedent()` shape at each of `wr-logic`'s three matching
+//! call sites (`act_relational`, `act_quantifier`, `and_then_quantify_if_arithmetic`).
 //!
-//! [`tests::command_log_pins_the_currently_incomplete_per_act_logging_gap`] pins the
-//! current (four-line) output verbatim, so closing this gap is a deliberate, visible test
-//! change rather than something that drifts unnoticed.
+//! [`tests::command_log_matches_real_walnut_including_deep_per_act_logging`] replaced the
+//! old four-line pin with the full text, captured from the real jar via
+//! `Prover::dispatchForIntegrationTest` — confirming this port and real Walnut now log
+//! byte-identically (after `CLAUDE.md`'s standard timing normalization) for this query.
 //!
-//! ## Related, smaller logging divergence: a `∀`-closed formula's logged state count
+//! ## Related, smaller logging divergence: a `∀`-closed formula's logged state count — CLOSED
 //!
-//! For `?msd_2 Ax (x >= 5)` real Walnut logs `(A x x>=5):4 states`; this port logs
-//! `0 states`. Both agree on the FALSE verdict — this is logging fidelity, not a
-//! decision-procedure defect. Root cause is **pre-existing Phase-2 `wr-core` code**, not
+//! For `?msd_2 Ax (x >= 5)` real Walnut logs `(A x x>=5):4 states`; this port used to log
+//! `0 states`. Both always agreed on the FALSE verdict — this was logging fidelity, not a
+//! decision-procedure defect. Root cause was **pre-existing Phase-2 `wr-core` code**, not
 //! this unit: [`crate::logicalops`]'s Java counterpart flips the `TRUE_FALSE` flag on an
 //! already-trivial automaton *in place* (leaving `Q` untouched), whereas
-//! `wr_core::logicalops::not` materializes a fresh trivial automaton with `q == 0`. This
-//! module is simply the first thing in the port that *prints* that count, which is why it
-//! is documented (and pinned by
-//! [`tests::forall_closed_formula_logs_a_zero_state_count_a_known_divergence`]) here
-//! rather than fixed here.
+//! `wr_core::logicalops::not` materialized a fresh trivial automaton with `q == 0`. This
+//! module was simply the first thing in the port that *prints* that count, which is why
+//! it was documented here rather than fixed here — until `wr_core::logicalops::not`'s own
+//! docs were found to contain a real, self-contradicting claim that the difference was
+//! "unobservable" (written before this module's docs proved otherwise). Fixed as part of
+//! the U28 logging-threading unit: `not`'s TRUE_FALSE branch now preserves the incoming
+//! automaton's stale fields instead of rebuilding fresh, matching Java exactly. Pinned by
+//! [`tests::forall_closed_formula_logs_the_stale_state_count_matching_real_walnut`].
 //!
 //! ## Scope note (RESOLVED in Phase 3b's L1): `lsd_k` numeration
 //!
@@ -491,11 +520,12 @@ pub fn compute_with_ctx(
         // Tier-1 corpus exercises, via `error190.txt`). Without this boundary such a guard
         // would kill the process instead of producing Walnut's positioned error message —
         // strictly less faithful than Java. See `wr_core::walnut_panic`.
-        let outcome =
-            match catch_walnut_panic(|| t.act_with_ctx(fresh, &mut stack, ctx.as_deref_mut())) {
-                Ok(inner) => inner,
-                Err(message) => Err(ActError::Thrown(message)),
-            };
+        let outcome = match catch_walnut_panic(|| {
+            t.act_with_ctx(fresh, &mut stack, ctx.as_deref_mut(), &mut *logging)
+        }) {
+            Ok(inner) => inner,
+            Err(message) => Err(ActError::Thrown(message)),
+        };
         if let Err(source) = outcome {
             // `Logging.printTruncatedStackTrace(e)` (`:124`) on the ORIGINAL exception,
             // before the position-appending wrapper below is built.
@@ -594,6 +624,32 @@ pub fn evaluate_with_logging(
 /// [`wr_io::reader::read_automaton_txt_with_custom_base_resolver_and_ctx`]'s docs for the
 /// repro and for the two deliberate narrowings (an already-deterministic file is not
 /// counted, and nested custom-base loads are not counted).
+///
+/// **Lexing gets THIS function's own real [`Logging`], uniformly — no exceptions.**
+/// `Predicate`'s lexer resolves `NumberSystem`s through two different `PredicateEnv`
+/// methods with two different caching contracts: `number_system` (a `?ns` token's
+/// MEMOIZED lookup — only actually builds a `NumberSystem` the first time a name is
+/// referenced in a session) and `fresh_number_system` (`$name(…)`/`Function`'s
+/// deliberately UNMEMOIZED lookup, Java's own `new NumberSystem(name)` in `Function`'s
+/// constructor — reconstructs every time, regardless of session state). A custom base
+/// with its own all-representations file (`msd_fib`, …) triggers real,
+/// correctly-threaded construction-time `apply_all_representations` logging through
+/// either path (see `wr_core::numsys::NumberSystem::with_custom_base_files`'s docs).
+///
+/// An asymmetric rule — a throwaway specifically for `number_system`'s three call sites,
+/// to make this port's cold-per-fixture Tier-1 golden harness match fixtures Java
+/// captured deep inside its own already-warm fixture-generation session — was tried
+/// (2026-08-17) and reverted after adversarial review (round 3) found it backwards: it
+/// made a genuinely fresh, single-query session (real or ported, equally cold) log LESS
+/// than real Walnut actually would, purely to flatter one test harness's own cold-start
+/// artifact. `Predicate::tokenize_and_compute_post_order` now threads this function's
+/// real `Logging` into `number_system`, `fresh_number_system`, and `put_word`/
+/// `put_function` alike. The resulting, HONEST divergence — fixtures 375-379 and 383,
+/// all one root cause (a genuine warm-vs-cold `NumberSystem` session-cache mismatch this
+/// harness's fresh-`Prover`-per-fixture design cannot reproduce, not a logging
+/// correctness gap) — is recorded in `docs/WALNUT-BUGS.md`'s WB-039 entry,
+/// `tests/golden/tests/golden_corpus.rs`'s `KNOWN_DIVERGENCES`, and
+/// `tests/golden/STATUS.md` §1b, not hidden by weakening production behavior.
 pub fn evaluate_with_logging_and_ctx(
     env: &dyn PredicateEnv,
     logging: &mut Logging,
@@ -601,7 +657,7 @@ pub fn evaluate_with_logging_and_ctx(
     predicate_str: &str,
     mut ctx: Option<&mut (dyn DeterminizeContext + '_)>,
 ) -> Result<Automaton, EvalError> {
-    let predicate = Predicate::new_with_ctx(env, predicate_str, ctx.as_deref_mut())?;
+    let predicate = Predicate::new_with_ctx(env, predicate_str, ctx.as_deref_mut(), logging)?;
     match compute_with_ctx(logging, fresh, predicate.post_order(), ctx)? {
         Expression::Automaton(ae) => Ok(ae.m),
         // `compute` already validated this above (`ResultNotAutomaton` otherwise), so
@@ -1078,11 +1134,25 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // `Logging` output. See this module's docs' "DEFERRED GAP" section: these two
-    // tests pin what the port CURRENTLY logs, which is deliberately less than what
-    // real Walnut logs. They are here so that closing that gap is a visible,
-    // conscious test change rather than silent drift.
+    // `Logging` output. See this module's docs' "Per-`act()` `Logging` calls" section.
     // ------------------------------------------------------------------------
+
+    /// A minimal [`DeterminizeContext`] with no `[strategy …]`/`[export …]` entries — the
+    /// port's stand-in for what a real `eval`/`def` command always has (Java's
+    /// `Prover.mainProver.metaCommands`, a global singleton, is never absent; `None` in
+    /// this port's own `ctx: Option<&mut dyn DeterminizeContext>` represents
+    /// `!Logging.shouldPrintDetails()`, not "no metacommands" — see
+    /// [`wr_core::determinize::determinize`]'s docs). A `printDetails = true` test that
+    /// wants real-Walnut-matching output must pass `Some` here, exactly as a real
+    /// `wr-cli` dispatch would.
+    struct DefaultCtx(usize);
+    impl DeterminizeContext for DefaultCtx {
+        fn next_automaton_index(&mut self) -> usize {
+            let i = self.0;
+            self.0 += 1;
+            i
+        }
+    }
 
     /// Replaces every `<digits>ms` with `Nms`. `CLAUDE.md`'s Prime Directive #1 notes
     /// Walnut's own test suite normalizes timing out of compared text; wall-clock
@@ -1105,14 +1175,35 @@ mod tests {
         out
     }
 
-    /// **Pins a KNOWN-INCOMPLETE output.** Real Walnut's `global_log.txt` for this exact
-    /// query has TEN lines; this port produces the four below. The six missing ones are
-    /// the `computing X`/`computed X` pairs that Java emits from inside each token's
-    /// `act()` body — see this module's docs' "DEFERRED GAP" section for the full listing,
-    /// the Java call sites, and why the fix is a separate unit that must land before Phase
-    /// 3b's U27.
+    /// **Formerly pinned a KNOWN-INCOMPLETE output (four lines vs. real Walnut's ten);
+    /// now CLOSED.** The expected text below is the FULL real-jar capture (via
+    /// `CaptureLog`/`Prover.dispatchForIntegrationTest`, `eval "?msd_2 x<5 & x>1"::` —
+    /// headless, so `evalLogFilesActive` stays false and `getCommandLog()` ==
+    /// `getDetails()`), not hand-derived — `x<5`/`x>1` are constant comparisons, so
+    /// `NumberSystem`'s internal `and`/`quantify`/`fixLeadingZerosProblem`/`determinize`
+    /// construction is itself real, logged detail (see this module's docs), INCLUDING a
+    /// real, verified instance of WB-039's non-nesting `disablePrint`/`enablePrint` leak
+    /// (`x<5`'s `constant(5)` recursing through `constant(2)`/`constant(3)` in a
+    /// cold/empty numeration-system cache — see `docs/WALNUT-BUGS.md`). Uses
+    /// [`evaluate_with_logging_and_ctx`] with a real (if empty) [`DefaultCtx`], not the
+    /// ctx-less [`evaluate_with_logging`] convenience wrapper — a real `wr-cli` dispatch
+    /// with `printDetails = true` always has metacommand context available (see
+    /// [`DefaultCtx`]'s own docs).
+    ///
+    /// **One deliberate, already-decided divergence survives inside the expected text:**
+    /// real Java's two `fixing leading zeros` blocks below each show a
+    /// `Determinizing [#N, strategy: SC]: … states` line (the `[strategy …]`/
+    /// `[export …]` automata-index counter, live because Java's `NumberSystem` shares
+    /// the SAME global `MetaCommands` instance as everything else); this port's
+    /// `wr_core::numsys` never receives a `DeterminizeContext` at all (WB-039's
+    /// **already user-signed-off** stable-indices divergence — a `Logging`-only concern,
+    /// unaffected by this unit's `disable_print`/`enable_print` work, which is
+    /// unrelated), so those two lines are correctly ABSENT here — only their
+    /// unconditional `Determinized: … states - Nms` partner shows. Reopening that
+    /// wouldn't be a bug fix, it would reverse a decision `docs/WALNUT-BUGS.md` already
+    /// records as deliberate.
     #[test]
-    fn command_log_pins_the_currently_incomplete_per_act_logging_gap() {
+    fn command_log_matches_real_walnut_including_deep_per_act_logging() {
         let env = wr_logic_test_env();
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
@@ -1121,25 +1212,87 @@ mod tests {
         // `TestCase`, and therefore Tier 1's `details*` fixtures, actually compare.
         logging.configure_for_command(false, true);
         let mut fresh = FreshIdentifiers::new();
-        evaluate_with_logging(&env, &mut logging, &mut fresh, "?msd_2 x<5 & x>1")
-            .expect("the query itself must evaluate fine — only its logging is incomplete");
+        let mut ctx = DefaultCtx(0);
+        evaluate_with_logging_and_ctx(
+            &env,
+            &mut logging,
+            &mut fresh,
+            "?msd_2 x<5 & x>1",
+            Some(&mut ctx),
+        )
+        .expect("must evaluate");
 
-        let expected = "x<5:4 states - Nms\n \
-                        x>1:3 states - Nms\n  \
-                        (x<5&x>1):4 states - Nms\n\
-                        Total computation time: Nms.";
+        let expected = r#"computing x<5
+ computing &:2 states - 2 states
+  computing cross product:2 states - 2 states
+  computed cross product:4 states - Nms
+  Minimizing: 4 states.
+  Minimized:3 states - Nms.
+ computed &:3 states - Nms
+ computing &:3 states - 2 states
+  computing cross product:3 states - 2 states
+  computed cross product:6 states - Nms
+  Minimizing: 6 states.
+  Minimized:3 states - Nms.
+ computed &:3 states - Nms
+ quantifying:3 states
+   Minimizing: 3 states.
+   Minimized:3 states - Nms.
+ quantified:3 states - Nms
+ fixing leading zeros:3 states
+  Determinized: 3 states - Nms
+  Minimizing: 3 states.
+  Minimized:3 states - Nms.
+ fixed leading zeros:3 states - Nms
+ computing &:2 states - 3 states
+  computing cross product:2 states - 3 states
+  computed cross product:6 states - Nms
+  Minimizing: 6 states.
+  Minimized:4 states - Nms.
+ computed &:4 states - Nms
+ computing &:4 states - 3 states
+  computing cross product:4 states - 3 states
+  computed cross product:12 states - Nms
+  Minimizing: 12 states.
+  Minimized:4 states - Nms.
+ computed &:4 states - Nms
+ quantifying:4 states
+   Minimizing: 4 states.
+   Minimized:4 states - Nms.
+ quantified:4 states - Nms
+ fixing leading zeros:4 states
+  Determinized: 4 states - Nms
+  Minimizing: 4 states.
+  Minimized:4 states - Nms.
+ fixed leading zeros:4 states - Nms
+computed x<5
+x<5:4 states - Nms
+ computing x>1
+ computed x>1
+ x>1:3 states - Nms
+  computing x<5&x>1
+   computing &:4 states - 3 states
+    computing cross product:4 states - 3 states
+    computed cross product:4 states - Nms
+    Minimizing: 4 states.
+    Minimized:4 states - Nms.
+   computed &:4 states - Nms
+  computed x<5&x>1
+  (x<5&x>1):4 states - Nms
+Total computation time: Nms."#;
         assert_eq!(normalize_timing(&logging.command_log()), expected);
         assert_eq!(normalize_timing(&logging.detailed_log()), expected);
     }
 
-    /// **Pins a KNOWN DIVERGENCE, whose root cause is pre-existing Phase-2 `wr-core`
-    /// code, not this unit.** Real Walnut logs `(A x x>=5):4 states`; this port logs
-    /// `0 states`, because `wr_core::logicalops::not` materializes a fresh trivial
-    /// automaton (`q == 0`) where Java flips the `TRUE_FALSE` flag in place and leaves `Q`
-    /// alone. The VERDICT is identical either way (both FALSE) — this is logging fidelity
-    /// only. See this module's docs for the full note.
+    /// **Formerly pinned a KNOWN DIVERGENCE; now CLOSED.** Real Walnut logs
+    /// `(A x x>=5):4 states` (verified against the real `walnut-java` CLI, not
+    /// hand-derived); this port used to log `0 states`, because
+    /// `wr_core::logicalops::not` materialized a fresh trivial automaton (`q == 0`)
+    /// where Java flips the `TRUE_FALSE` flag in place and leaves the stale `Q` alone.
+    /// Fixed by making `not`'s TRUE_FALSE branch preserve the incoming automaton's
+    /// fields instead of rebuilding fresh — see that function's own docs.
     #[test]
-    fn forall_closed_formula_logs_a_zero_state_count_a_known_divergence() {
+    fn forall_closed_formula_logs_the_stale_state_count_matching_real_walnut() {
         let env = wr_logic_test_env();
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
@@ -1151,10 +1304,178 @@ mod tests {
         // The decision procedure agrees with real Walnut …
         assert!(result.fa.is_true_false_automaton());
         assert!(!result.fa.is_true_automaton());
-        // … only the logged state count for the `A` step differs (Walnut: 4).
+        // … and now so does the logged state count for the `A` step (Walnut: 4), and
+        // (U28) so does the deep per-`act()` trace — captured from the real jar via
+        // `eval "?msd_2 Ax (x >= 5)";` (headless, `printDetails = false`).
         assert_eq!(
             normalize_timing(&logging.command_log()),
-            "x>=5:5 states - Nms\n (A x x>=5):0 states - Nms\nTotal computation time: Nms."
+            "computing x>=5\ncomputed x>=5\nx>=5:5 states - Nms\n computing quantifier A\n \
+             computed quantifier (A x x>=5)\n (A x x>=5):4 states - Nms\n\
+             Total computation time: Nms."
+        );
+    }
+
+    /// **The companion of the test above, pinning the OTHER branch of `AutomatonDFA.from`
+    /// (`AutomatonDFA.java:74-85`).** `x=y`'s automaton is `NumberSystem`'s cached
+    /// `equality` value — built via plain `new Automaton()`, never `AutomatonDFA`-wrapped —
+    /// so when `E x,y x=y` fully quantifies it to TRUE_FALSE and `~` negates it, Java's
+    /// `M.asDFA()` takes the `isTRUE_FALSE_AUTOMATON` branch (genuinely fresh, `q == 0`),
+    /// unlike the `∀`-closed test above, where `not()`'s own `AutomatonDFA` return type
+    /// makes the SAME function take the `instanceof AutomatonDFA` branch (preserve). Real
+    /// Walnut logs `0 states` here (verified against the real `walnut-java` CLI). A first
+    /// attempt at fixing the divergence above over-corrected to *always* preserve, which
+    /// this test would have caught immediately (it asserted `0`, the fix would have logged
+    /// a nonzero stale count) — see [`wr_core::automaton::Automaton::dfa_typed`]'s docs for
+    /// the full mechanism.
+    #[test]
+    fn negated_existential_over_a_plain_comparison_still_logs_zero_states() {
+        let env = wr_logic_test_env();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        logging.configure_for_command(false, false);
+        let mut fresh = FreshIdentifiers::new();
+        let result = evaluate_with_logging(&env, &mut logging, &mut fresh, "?msd_2 ~(Ex,y x=y)")
+            .expect("must evaluate");
+
+        assert!(result.fa.is_true_false_automaton());
+        assert!(!result.fa.is_true_automaton());
+        // (U28) captured from the real jar via `eval "?msd_2 ~(Ex,y x=y)";`.
+        assert_eq!(
+            normalize_timing(&logging.command_log()),
+            "computing x=y\ncomputed x=y\nx=y:1 states - Nms\n computing quantifier E\n \
+             computed quantifier (E x , y x=y)\n (E x , y x=y):1 states - Nms\n  \
+             computing ~(E x , y x=y)\n  computed ~(E x , y x=y)\n  \
+             ~(E x , y x=y):0 states - Nms\nTotal computation time: Nms."
+        );
+    }
+
+    /// A second pin of the same "fresh, not preserved" branch, this time reached through
+    /// `and`'s TRUE-operand short-circuit (`B.asDFA()`, `AutomatonLogicalOps.java:45-50`)
+    /// rather than through `not` — a different call site than the test above, so a fix that
+    /// only special-cased `not`'s own call graph would still fail this one. Real Walnut
+    /// logs `0 states` for the whole conjunction (verified against the real `walnut-java`
+    /// CLI): the second existential's automaton (`x<y`'s `E`-quantified TRUE result) is
+    /// `and`'s TRUE-typed but never-`AutomatonDFA`-wrapped operand.
+    #[test]
+    fn conjunction_of_two_plain_existentials_still_logs_zero_states() {
+        let env = wr_logic_test_env();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        logging.configure_for_command(false, false);
+        let mut fresh = FreshIdentifiers::new();
+        let result = evaluate_with_logging(
+            &env,
+            &mut logging,
+            &mut fresh,
+            "?msd_2 (Ex,y x=y) & (Ex,y x<y)",
+        )
+        .expect("must evaluate");
+
+        assert!(result.fa.is_true_false_automaton());
+        assert!(result.fa.is_true_automaton());
+        // (U28) captured from the real jar via `eval "?msd_2 (Ex,y x=y) & (Ex,y x<y)";`.
+        assert_eq!(
+            normalize_timing(&logging.command_log()),
+            "computing x=y\ncomputed x=y\nx=y:1 states - Nms\n computing quantifier E\n \
+             computed quantifier (E x , y x=y)\n (E x , y x=y):1 states - Nms\n  \
+             computing x<y\n  computed x<y\n  x<y:2 states - Nms\n   \
+             computing quantifier E\n   computed quantifier (E x , y x<y)\n   \
+             (E x , y x<y):2 states - Nms\n    computing (E x , y x=y)&(E x , y x<y)\n    \
+             computed (E x , y x=y)&(E x , y x<y)\n    \
+             ((E x , y x=y)&(E x , y x<y)):0 states - Nms\n\
+             Total computation time: Nms."
+        );
+    }
+
+    /// **Producer class: `NumberSystem::make_constant`'s cache (`x=1`).** Java builds this
+    /// via `new AutomatonDFA(...)` — `AutomatonDFA`-typed from construction, unlike the
+    /// `x=y`/`x<y` tests above, whose comparisons are `NumberSystem`'s plain-`Automaton`
+    /// `lessThan`/`equality` fields. So `~(E x x=1)` needs the OTHER branch: real Walnut
+    /// logs the PRESERVED stale count (`2`, not `0`) — verified against the real
+    /// `walnut-java` CLI. An earlier version of `NumberSystem::make_constant` never set
+    /// [`wr_core::automaton::Automaton::dfa_typed`], which this test would have caught
+    /// (it would have logged `0`, not `2`) — found by adversarial review.
+    #[test]
+    fn negated_existential_over_a_cached_constant_preserves_the_stale_state_count() {
+        let env = wr_logic_test_env();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        logging.configure_for_command(false, false);
+        let mut fresh = FreshIdentifiers::new();
+        let result = evaluate_with_logging(&env, &mut logging, &mut fresh, "?msd_2 ~(Ex x=1)")
+            .expect("must evaluate");
+
+        assert!(result.fa.is_true_false_automaton());
+        assert!(!result.fa.is_true_automaton());
+        // (U28) captured from the real jar via `eval "?msd_2 ~(Ex x=1)";`.
+        assert_eq!(
+            normalize_timing(&logging.command_log()),
+            "computing x=1\ncomputed x=1\nx=1:2 states - Nms\n computing quantifier E\n \
+             computed quantifier (E x x=1)\n (E x x=1):2 states - Nms\n  \
+             computing ~(E x x=1)\n  computed ~(E x x=1)\n  ~(E x x=1):2 states - Nms\n\
+             Total computation time: Nms."
+        );
+    }
+
+    /// **Producer class: a `quantify`-derived automaton (`x>=5`).** `NumberSystem.
+    /// comparison` builds this via `and(...)` then a PARTIAL `quantify` (over the carry
+    /// variable), both `AutomatonDFA`-typed operations — so, like the constant test above
+    /// but through a different producer, `~(E x x>=5)` preserves the stale count (`5`).
+    /// This is the case an earlier version of `quantify_helper`'s general (non-early-
+    /// return) path got wrong: it rebuilt a fresh `Automaton` for the projection and
+    /// dropped the input's `dfa_typed`, which this test would have caught (it would have
+    /// logged `0`, not `5`) — found by adversarial review, verified against the real
+    /// `walnut-java` CLI.
+    #[test]
+    fn negated_existential_over_a_quantify_derived_comparison_preserves_the_stale_state_count() {
+        let env = wr_logic_test_env();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        logging.configure_for_command(false, false);
+        let mut fresh = FreshIdentifiers::new();
+        let result = evaluate_with_logging(&env, &mut logging, &mut fresh, "?msd_2 ~(Ex x>=5)")
+            .expect("must evaluate");
+
+        assert!(result.fa.is_true_false_automaton());
+        assert!(!result.fa.is_true_automaton());
+        // (U28) captured from the real jar via `eval "?msd_2 ~(Ex x>=5)";`.
+        assert_eq!(
+            normalize_timing(&logging.command_log()),
+            "computing x>=5\ncomputed x>=5\nx>=5:5 states - Nms\n computing quantifier E\n \
+             computed quantifier (E x x>=5)\n (E x x>=5):5 states - Nms\n  \
+             computing ~(E x x>=5)\n  computed ~(E x x>=5)\n  ~(E x x>=5):5 states - Nms\n\
+             Total computation time: Nms."
+        );
+    }
+
+    /// **Producer class: `and`'s TRUE-operand short-circuit consuming a constant-derived
+    /// existential.** Real Walnut logs the PRESERVED count (`3`, the state count of
+    /// `x=2`'s own `AutomatonDFA`-typed comparison) for the whole conjunction, mirroring
+    /// [`conjunction_of_two_plain_existentials_still_logs_zero_states`] above but on the
+    /// opposite (preserve) branch — verified against the real `walnut-java` CLI.
+    #[test]
+    fn conjunction_of_two_constant_existentials_preserves_the_stale_state_count() {
+        let env = wr_logic_test_env();
+        let mut logging =
+            Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
+        logging.configure_for_command(false, false);
+        let mut fresh = FreshIdentifiers::new();
+        let result =
+            evaluate_with_logging(&env, &mut logging, &mut fresh, "?msd_2 (Ex x=1) & (Ex x=2)")
+                .expect("must evaluate");
+
+        assert!(result.fa.is_true_false_automaton());
+        assert!(result.fa.is_true_automaton());
+        // (U28) captured from the real jar via `eval "?msd_2 (Ex x=1) & (Ex x=2)";`.
+        assert_eq!(
+            normalize_timing(&logging.command_log()),
+            "computing x=1\ncomputed x=1\nx=1:2 states - Nms\n computing quantifier E\n \
+             computed quantifier (E x x=1)\n (E x x=1):2 states - Nms\n  \
+             computing x=2\n  computed x=2\n  x=2:3 states - Nms\n   \
+             computing quantifier E\n   computed quantifier (E x x=2)\n   \
+             (E x x=2):3 states - Nms\n    computing (E x x=1)&(E x x=2)\n    \
+             computed (E x x=1)&(E x x=2)\n    ((E x x=1)&(E x x=2)):3 states - Nms\n\
+             Total computation time: Nms."
         );
     }
 
