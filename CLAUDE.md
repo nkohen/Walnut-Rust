@@ -715,3 +715,156 @@ round's fixes (hundreds of thousands of executions, 0 crashes). `cargo test --wo
 green throughout; `fmt`/`clippy` clean (workspace and `fuzz/`'s own toolchain, both of which
 needed the same signature threading this unit did everywhere else it touched a
 determinization/logging call site).
+
+**U28's code sat uncommitted after being written up above — committed and pushed 2026-08-19**,
+in the same session that landed the fix below. (No commit hash was ever recorded for U28
+itself in this log, unlike every other unit; that gap is now closed.)
+
+**Golden corpus, closing 375-379 for real (2026-08-19): 585/586 pass (99.8%), via a
+harness-only mechanism, not a change to what gets logged.** Round 2's reverted throwaway-
+`Logging` fix (above) tried to make production code quieter — the wrong lever, per Prime
+Directive. This instead teaches the golden-corpus *comparator* to identify, with certainty,
+exactly which `details` text one specific call produced, and exclude only that. `wr_core::
+logging::Logging` gained a side-channel recorder (`begin`/`end`/`discard_construction_
+recording`, `construction_recordings` — no Java analogue) bracketing only `PredicateEnv::
+number_system`'s memoized-lookup call site (`crates/wr-cli/src/session.rs`) — deliberately
+NOT the shared `load_number_system` helper `fresh_number_system` also calls, since that
+construction is genuinely reproducible in real Java too, not session-warmth noise (bracketing
+the shared helper was tried first and broke fixture 379, whose `$fibmr(…)` calls go through
+`fresh_number_system`). `tests/golden`'s comparator (`support::strip_construction_recordings`)
+removes exactly that verbatim, line-anchored text before diffing — the same shape of fix as
+`PathRewrite`.
+
+Two independent adversarial reviewers (Opus, Fable), given only the diff, both found real
+correctness-risk gaps — most seriously that the mechanism's "cannot mask a construction-time
+regression" claim was **false, and live-verified as false**: injecting a bogus extra line into
+`NumberSystem::with_custom_base_files` and re-running the corpus showed 375-378 still passing,
+because a recorded span is copied from the same call that wrote it and so always matches
+itself. Fixed by adding the positive coverage that was missing — a new pinned-line-sequence
+regression test in `numsys.rs` (`a_cold_msd_fib_construction_logs_exactly_these_seven_lines`)
+— and by correcting the doc claims across `logging.rs`/`golden_corpus.rs`/`support/mod.rs` to
+state the real property: this cannot mask a bug in QUERY-COMPUTATION text (never inside a
+recorded span), but is NOT independent verification of construction's OWN text — that
+responsibility stays in `wr-core`'s own tests. Also fixed: the burst match is now anchored to
+line starts (a plain substring search could match mid-line against a differently-indented,
+unrelated line); a construction that logs some lines and then fails is discarded rather than
+filed (not memoized, so it would re-log real signal on every later retry, exactly like
+`fresh_number_system`'s always-genuine case). Every fix mutation-verified (reverted, confirmed
+the corresponding new test fails, reapplied).
+
+**383 stays open, deliberately.** It is a different root cause from 375-379 — `NumberSystem`'s
+own recursive constant-building cache (`constants_dynamic_table`, exercised via `get_constant`)
+leaking WB-039's non-nesting `disablePrint`/`enablePrint` bug, not `PredicateEnv::
+number_system`'s cache. A similar recorder could technically be built for it, but was
+deliberately not: `get_constant` is exercised across a large fraction of the corpus (any query
+comparing against a constant ≥2), unlike `NumberSystem` construction (rare, at most once per
+custom base per session) — a general recorder there risks silently stripping real, currently-
+verified construction-detail text from many OTHER fixtures where it's also Java's own first
+time building that constant, converting genuine matches into unverified no-ops corpus-wide.
+Scoping it narrowly enough to be safe (in effect, keyed to fixture 383 specifically) would
+buy only one fixture's worth of log-text verification for a real generalization risk — a
+worse trade than 375-379's fix, where the affected text is provably rare and narrow. Left as
+the documented `KNOWN_DIVERGENCES` exception it already was; automaton comparison still fully
+enforced.
+
+`cargo test --workspace`, `fmt`, and `clippy` all clean throughout. Both changes landed in one
+commit on `master` (`2563ec3`, on top of `7660a35`) and pushed.
+
+**Item 1 of `docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` (`I`-over-`lsd`) resolved, as a
+negative-hypothesis finding, not a bug fix (2026-08-19).** The backlog note hypothesized
+`act_quantifier`'s `I` (infinitely-often) arm might apply `remove_leading_zeros`'s msd fixup
+unconditionally regardless of msd/lsd, mirroring a bug Phase 3b's L1 fixed in the sibling
+`wr_core::quantify` path (used by `E`/`A`, not `I`). A dedicated Opus investigation subagent —
+per this backlog's own model-tiering instruction — read the real Java source
+(`LogicalOperator.actQuantifier`'s `I` branch, `AutomatonLogicalOps.removeLeadingZeros`/
+`removeLeadingZerosHelper`, `Infinite.infinite`) and ran 47 live queries against a real,
+freshly-verified-current `walnut-java` jar. **The hypothesis was refuted: 0 divergences.**
+`remove_leading_zeros` was already msd/lsd-aware on both sides (it reverses its per-track
+helper automaton exactly when the track's own `!msd`, matching Java's
+`removeLeadingZerosHelper` line-for-line), and `act_quantifier`'s `I` arm already called it
+unconditionally on the identifier list — i.e. the fixup itself, not the dispatch, carries the
+msd/lsd awareness, and it already did. `Infinite.infinite`/`wr_core::infinite::infinite` is
+confirmed msd/lsd-agnostic by construction (a pure `prefix·cycle*·suffix` graph search with no
+`NumberSystem` input at all) — directionality is handled entirely upstream. No `WB-` entry
+warranted.
+
+The real gap the hypothesis pointed at was **missing test coverage**, not a bug: no unit test,
+differential case, or Tier-3 generator coverage (U29's generator explicitly never emits `I`
+queries) existed for `I` over `lsd` anywhere in the repo, and the one piece of coverage that did
+exist by coincidence — Tier-1 golden fixture 520 (`?lsd_10 Ix x > 0`) — turns out to be
+direction-INsensitive (cofinite either way) and could not have caught the hypothesized bug.
+Added: three unit tests in `wr-logic/src/token.rs`
+(`infinite_quantifier_over_lsd_matches_msd_shape`,
+`infinite_quantifier_lsd_two_variables_or_fold`,
+`infinite_quantifier_mixed_numeration_system_selects_correct_direction` — the last a hand-built
+mixed-`lsd_2`/`msd_2` two-track automaton whose `Ix`/`Iy` verdicts must come out opposite,
+the strongest pin), and a new differential file
+(`tests/differential/tests/infinite_quantifier.rs`, 5 tests) including one case built through
+the real `wr_cli::reg::reg` command dispatch rather than a hand-rolled `Fa` table. Every pinned
+verdict was independently re-confirmed against a fresh `walnut-java` CLI run (not just trusted
+from the investigation subagent's report).
+
+This unit's own two-independent-adversarial-reviewer round (Opus, Fable — split context, diff
+only) is itself worth recording: **both reviewers independently found, and mutation-proved,
+that the first draft's two plain msd/lsd-pair unit tests were vacuous** — they built their
+predicate operand via a helper (`predicate_operand`) that hardcodes the relational operator's
+own number system to `msd_2` regardless of what base the caller's `NumberLiteralExpression`
+operand carries (`RelationalOperator::act`'s dispatch reads the operator's own `ns` field, only
+the literal's `BigInt` value), so both "lsd" tests silently re-ran the same `msd_2` computation
+twice. Confirmed by mutating away `remove_leading_zeros_helper`'s `if !msd { reverse_with_ctx
+(...) }` branch: both tests stayed green. Fixed with a new NS-parameterized
+`predicate_operand_ns` helper; re-mutation-tested, now correctly fails. Opus additionally found
+the differential file's original doc claim of "zero prior coverage" was itself inaccurate
+(fixture 520 exists, just isn't discriminating) and that the file's verdict polarity was
+lopsided (6 FALSE / 2 direction-insensitive TRUE) — both fixed, the latter by adding the
+`reg`-based mixed-NS differential test (independently re-verified live: `Ix $mixr(x,y)` TRUE,
+`Iy $mixr(x,y)` FALSE). Several doc-accuracy nits also fixed (a self-contradicting mid-sentence
+claim in the mixed-NS unit test's doc, a stale function-name reference, an internally
+inconsistent capture-provenance numbering). `cargo test --workspace`, `fmt`, and `clippy` all
+clean throughout. Uncommitted as of this write-up — commit is on the user's explicit request per
+this project's git-hygiene rule, not implied by "read and follow" the backlog.
+
+**Item 2 of the same backlog (custom-base `lsd` verification) resolved — also a coverage
+addition, not a bug fix (2026-08-19).** `walnut-java`'s `Custom Bases/` ships no `lsd_fib*`
+files at all (only `msd_fib`/other `msd_*` bases) — `?lsd_fib` resolves on both engines solely
+through `NumberSystem`'s opposite-direction-complement fallback (`msd_fib_addition.txt`,
+language-reversed). An Opus investigation subagent captured eight queries over `lsd_fib`
+(comparison, `∃`, three-track addition, open and closed `∀`, both `I` polarities, `def`-then-
+`$token` reuse) through `wr-cli`'s real `eval`/`def`, all matching real `walnut-java` on the
+first run with zero production changes. Added `tests/differential/tests/lsd_custom_base.rs`
+(7 tests) plus 5 captured fixtures; every fixture and verdict independently re-verified against
+a fresh `walnut-java` jar run (byte-identical). Mutation matrix (3 targeted mutations, each
+applied/confirmed/reverted): `numsys::CustomBaseCandidates::resolve`'s reversal, `quantify`'s
+lsd arm, and `remove_leading_zeros_helper`'s `!msd` branch — each caught by the expected subset
+of the 7 tests, none by the closed-formula-verdict test (documented as a known, deliberate
+weak spot, not an oversight).
+
+Two-independent-adversarial-reviewer round (Sonnet, Fable — different from the Opus author,
+split context): **no correctness defect in the tests or mutation matrix** — both reviewers
+independently re-ran all three mutations themselves rather than trusting the report, and both
+matched the claimed matrix exactly. But Fable caught a real doc-accuracy overclaim: the
+original draft's "never been exercised" framing was false — Java's own gated-slow Tier-1
+golden corpus already exercises `∃` and open `∀` over `lsd_fib` extensively (44 fixtures
+referencing `lsd_fib` in `phase0-artifacts/test-manifest.json`, including fixtures 65/110-115/
+135, all subset-relevant and currently passing — independently confirmed by inspecting the
+manifest directly, not just trusting the reviewer). What is genuinely new here: fast-tier
+presence (the golden corpus is `#[ignore]`d), `I` over a custom base (zero prior fixtures), and
+`def`-then-`$token` reuse over one (also zero prior fixtures). Fixed the overclaim across all
+three places it appeared (`lsd_custom_base.rs`'s module docs, `eval.rs`'s addendum,
+`CAPTURE.md`'s new entry) rather than just softening the headline — the M1 mutation-matrix
+bullet had inherited the same overclaim ("nothing outside this file can see this" — the golden
+corpus can, just not every commit).
+
+**Process lesson, worth keeping**: Fable's review also caught a live fleet-hygiene near-miss —
+running two adversarial reviewers concurrently in the SAME shared working tree, when at least
+one (unprompted) chose to do its own live mutation-verification (temporarily editing production
+files, testing, reverting) rather than only reading, can transiently poison a concurrent
+reviewer's test runs (`CLAUDE.md`'s existing fleet-hygiene section already warns about this for
+concurrent implementers; it applies equally to concurrent reviewers that self-elect to mutate).
+No harm resulted here — both reviewers' mutations were reverted before conflicting, and both
+converged on the identical matrix — but it was luck, not design. Future dispatches of >1
+concurrent reviewer should either instruct read-only review (no live mutation) or give each an
+isolated worktree if mutation-verification is wanted from more than one at once.
+
+`cargo test --workspace`, `fmt`, `clippy`, and `cargo doc` all clean throughout (no new doc
+warnings). Uncommitted, same as item 1 — commit on explicit user request.
