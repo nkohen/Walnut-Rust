@@ -5009,6 +5009,34 @@ mod tests {
         stack.pop().unwrap()
     }
 
+    /// [`predicate_operand`], but over an explicitly-chosen base rather than a hardcoded
+    /// `msd_2` — needed because `RelationalOperator::act`'s dispatch (`:1590`/`:1613-1614`
+    /// arms) reads the OPERATOR's own `ns` field, not the `NumberLiteralExpression`
+    /// operand's attached number system (which arm 4 reads only for its `BigInt` value via
+    /// `ne.value()`). So a literal built with `number_literal(c, &ns("lsd_2"))` does
+    /// **not** make the resulting predicate lsd — only `Operator::relational`'s own `n`
+    /// does. (Found by adversarial review: the first two `lsd`-labelled `I`-quantifier
+    /// tests below originally called plain `predicate_operand`/`lt_const`/`ge_const`,
+    /// which silently built `msd_2` predicates regardless of the `lsd_2`/`lsd_3` literal
+    /// base passed in — both tests stayed green under a mutation that broke the lsd
+    /// branch entirely, i.e. they were vacuous for their stated purpose.)
+    fn predicate_operand_ns(
+        base: &Rc<NumberSystem>,
+        op: &str,
+        a: Expression,
+        b: Expression,
+    ) -> Expression {
+        let mut stack = vec![a, b];
+        Operator::relational(0, op, Rc::clone(base))
+            .act(
+                &mut FreshIdentifiers::new(),
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .expect("building the test operand must not fail");
+        stack.pop().unwrap()
+    }
+
     /// `x < c` over `msd_2`.
     fn lt_const(var: &str, c: i64) -> Expression {
         let n = ns("msd_2");
@@ -5373,6 +5401,178 @@ mod tests {
         assert!(
             m.is_true_false_automaton() && !m.is_true_automaton(),
             "Ix,y (x=y & x<5) must be FALSE"
+        );
+    }
+
+    /// **`I`-over-`lsd` regression coverage** (`docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md`
+    /// item 1). A backlog note hypothesized `act_quantifier`'s `Infinite` arm might apply
+    /// `remove_leading_zeros`'s msd fixup unconditionally, mirroring a bug Phase 3b's L1 fixed
+    /// in the sibling `wr_core::quantify` path — a hypothesis a live-jar investigation against
+    /// the real `walnut-java` CLI (47 queries, 0 divergences) refuted: `remove_leading_zeros`
+    /// (`wr_core::logicalops`) is already msd/lsd-aware (it reverses its per-track helper
+    /// automaton exactly when `!msd`, matching `AutomatonLogicalOps.removeLeadingZerosHelper`,
+    /// `:401-403`), and `act_quantifier`'s `I` arm calls it unconditionally on the identifier
+    /// list regardless of each identifier's own numeration direction — i.e. the fixup itself,
+    /// not the dispatch, is what carries the msd/lsd awareness, and it already does. This is
+    /// simply the missing test the investigation found nowhere in this file. Every verdict here
+    /// was confirmed against the real `walnut-java` CLI (`eval t "?lsd_2 Ix …"`).
+    #[test]
+    fn infinite_quantifier_over_lsd_matches_msd_shape() {
+        let inf = Operator::quantifier(0, "I", 1);
+        for base_ns in ["msd_2", "lsd_2"] {
+            let n = ns(base_ns);
+            for (c, expected, cmp) in [(5i64, false, "<"), (5i64, true, ">=")] {
+                // `predicate_operand_ns`, not the plain `msd_2`-hardcoded
+                // `predicate_operand` — see that function's doc for why using the plain
+                // one here would silently test `msd_2` twice instead of `msd_2`/`lsd_2`.
+                let operand = predicate_operand_ns(&n, cmp, variable("x"), number_literal(c, &n));
+                let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), operand])).m;
+                assert!(
+                    m.is_true_false_automaton(),
+                    "{base_ns} Ix x{cmp}{c}: I must collapse to a trivial automaton"
+                );
+                assert_eq!(m.is_true_automaton(), expected, "{base_ns} Ix x{cmp}{c}");
+            }
+        }
+    }
+
+    /// The two-variable OR-fold shape (`infinite_quantifier_over_two_variables`, above) over
+    /// `lsd_3` instead of `msd_2` — a different base too, since `remove_leading_zeros_helper`'s
+    /// digit decode/reverse doesn't special-case base 2. Confirmed against the real
+    /// `walnut-java` CLI: `Ix,y x=y` is TRUE, `Ix,y (x=y & x<9)` is FALSE (nine pairs).
+    #[test]
+    fn infinite_quantifier_lsd_two_variables_or_fold() {
+        let n = ns("lsd_3");
+        let inf = Operator::quantifier(0, "I", 2);
+        // `predicate_operand_ns`, not the plain `msd_2`-hardcoded `predicate_operand` —
+        // see that function's doc.
+        let eq = predicate_operand_ns(&n, "=", variable("x"), variable("y"));
+        let m = as_automaton_expression(act_logical(
+            &inf,
+            vec![variable("x"), variable("y"), eq.clone()],
+        ))
+        .m;
+        assert!(m.is_true_automaton(), "lsd_3 Ix,y x=y must be TRUE");
+
+        let bounded = act_logical(
+            &Operator::logical_connective(0, "&"),
+            vec![
+                eq,
+                predicate_operand_ns(&n, "<", variable("x"), number_literal(9, &n)),
+            ],
+        );
+        let m = as_automaton_expression(act_logical(
+            &inf,
+            vec![variable("x"), variable("y"), bounded],
+        ))
+        .m;
+        assert!(
+            m.is_true_false_automaton() && !m.is_true_automaton(),
+            "lsd_3 Ix,y (x=y & x<9) must be FALSE"
+        );
+    }
+
+    /// The strongest regression pin for the `I`-over-`lsd` investigation: a single
+    /// **mixed-numeration** two-track automaton (`x` bound `lsd_2`, `y` bound `msd_2`) whose
+    /// language is `{(0,0)ⁿ(1,1) : n ≥ 0}` — every accepted word's LAST symbol is `(1,1)` and
+    /// every position before it is `(0,0)`. Quantifying `x` (lsd) and `y` (msd) on the exact
+    /// same automaton must give OPPOSITE verdicts:
+    ///
+    /// * `x` is lsd (position 0 = least significant), so word length `n+1` encodes `x = 2ⁿ` —
+    ///   distinct values for every `n`, none of them a zero-padded encoding of another (the
+    ///   canonical lsd representation requires a nonzero LAST digit, which every accepted word
+    ///   already has). So `Ix …` must be **TRUE**: infinitely many `x` values.
+    /// * `y` is msd (position 0 = most significant), so word length `n+1` encodes `y = 1` for
+    ///   EVERY `n` — `n ≥ 1` are all non-canonical, leading-zero-padded encodings of the same
+    ///   value `1`; only `n = 0` is canonical. So `Iy …` must be **FALSE**: exactly one `y`
+    ///   value.
+    ///
+    /// A port that applied the msd "first symbol nonzero" fixup unconditionally (the bug this
+    /// test was written to rule out) would flip only the `Ix` half: an unconditional msd
+    /// fixup on the lsd track `x` requires its FIRST symbol nonzero, which only `n = 0`
+    /// satisfies, wrongly collapsing `Ix` to FALSE. `Iy` is insensitive to this particular
+    /// bug (it's already the msd track, so the correct and the buggy-unconditional fixup
+    /// compute the same filter) — which is exactly why both halves are pinned here: `Ix`
+    /// alone would catch "msd fixup applied to every track", but only pairing it with `Iy`
+    /// proves the port isn't instead applying the fixup to NO track (which would leave `Ix`
+    /// still TRUE by coincidence, since `x`'s canonical-representation constraint is
+    /// already vacuous on this automaton — every accepted word's last symbol is already
+    /// `1`) while making `Iy` wrongly TRUE too. Confirmed against the real `walnut-java` CLI via
+    /// `reg mixr lsd_2 msd_2 "[0,0]*[1,1]"` then `eval t "?lsd_2 ?msd_2 Ix $mixr(x,y)"` (TRUE)
+    /// and `eval t2 "?lsd_2 ?msd_2 Iy $mixr(x,y)"` (FALSE).
+    #[test]
+    fn infinite_quantifier_mixed_numeration_system_selects_correct_direction() {
+        // Symbols encode as `d_x + 2*d_y` (`x` is track 0, `y` is track 1, both alphabet
+        // `{0,1}`): sym0=(0,0), sym1=(1,0), sym2=(0,1), sym3=(1,1).
+        let mut d0 = Map::new();
+        d0.insert(0, vec![0]); // (0,0) -> self-loop
+        d0.insert(1, vec![2]); // (1,0) -> dead
+        d0.insert(2, vec![2]); // (0,1) -> dead
+        d0.insert(3, vec![1]); // (1,1) -> accept
+        let mut d1 = Map::new();
+        for sym in 0..4 {
+            d1.insert(sym, vec![2]); // accept has no valid continuation
+        }
+        let mut d2 = Map::new();
+        for sym in 0..4 {
+            d2.insert(sym, vec![2]); // dead self-loop
+        }
+        let mixr = Automaton::new(
+            Fa {
+                q0: 0,
+                q: 3,
+                alphabet_size: 4,
+                o: vec![0, 1, 0],
+                d: vec![d0, d1, d2],
+                true_false: None,
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            vec![Some(false), Some(true)], // x = lsd, y = msd
+        );
+
+        let inf = Operator::quantifier(0, "I", 1);
+        let body = Expression::Automaton(AutomatonExpression::new("mixr(x,y)", mixr));
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("x"), body])).m;
+        assert!(
+            m.is_true_automaton(),
+            "Ix over the lsd track must be TRUE (infinitely many x values: 1, 2, 4, 8, ...)"
+        );
+
+        // Rebuild: `AutomatonExpression::new` takes its automaton by value and
+        // `act_logical` consumes the operand stack, so each quantification needs its own
+        // fresh copy of `mixr`.
+        let mut d0 = Map::new();
+        d0.insert(0, vec![0]);
+        d0.insert(1, vec![2]);
+        d0.insert(2, vec![2]);
+        d0.insert(3, vec![1]);
+        let mut d1 = Map::new();
+        for sym in 0..4 {
+            d1.insert(sym, vec![2]);
+        }
+        let mut d2 = Map::new();
+        for sym in 0..4 {
+            d2.insert(sym, vec![2]);
+        }
+        let mixr2 = Automaton::new(
+            Fa {
+                q0: 0,
+                q: 3,
+                alphabet_size: 4,
+                o: vec![0, 1, 0],
+                d: vec![d0, d1, d2],
+                true_false: None,
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            vec![Some(false), Some(true)],
+        );
+        let body2 = Expression::Automaton(AutomatonExpression::new("mixr(x,y)", mixr2));
+        let m = as_automaton_expression(act_logical(&inf, vec![variable("y"), body2])).m;
+        assert!(
+            m.is_true_false_automaton() && !m.is_true_automaton(),
+            "Iy over the msd track must be FALSE (exactly one y value: 1)"
         );
     }
 
