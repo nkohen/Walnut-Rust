@@ -868,3 +868,103 @@ isolated worktree if mutation-verification is wanted from more than one at once.
 
 `cargo test --workspace`, `fmt`, `clippy`, and `cargo doc` all clean throughout (no new doc
 warnings). Uncommitted, same as item 1 — commit on explicit user request.
+
+**Item 5 of the same backlog (the lone-`\r` line-splitting gap in `wr-io`) resolved — genuinely
+easy, as the existing doc comment predicted (2026-08-19).** Only 3 call sites in
+`crates/wr-io/src/reader.rs` used `str::lines()` (`\n`-only), and every line-number computation
+in the file was the same one-line `i + 1`-off-`.enumerate()` pattern — no hidden fan-out. Added
+`split_lines_java`, a hand-rolled, byte-level `BufferedReader.readLine()`-equivalent splitter
+(`\n`/`\r`/`\r\n` each a terminator, `\r\n` counts once, unterminated final line kept, no
+trailing empty line after a terminator), and swapped all three call sites onto it. 9 new tests
+(3 on the splitter directly, covering every terminator kind and edge case; 3 end-to-end per call
+site on lone-`\r` content; 1 confirming line-number reporting stays correct). Mutation-verified
+(reverted to `str::lines()`, confirmed all 5 gap-pinning tests fail, restored). Checked the fuzz
+corpus for `\r`-only seeds — only one seed contains `\r` at all and it's pure CRLF, so no
+existing seed's behavior changes; re-ran the `wr_io_reader` fuzz target live (~1.5M executions,
+0 crashes). No genuine Walnut (Java) bug involved — pure port-side gap, no `WB-` entry needed.
+Reviewed directly by the coordinator (not the full two-adversarial-reviewer loop — `wr-io` isn't
+a trust-critical crate per this file's own merge-gate scope, and the change is pure string-
+splitting logic, not decision-procedure math); independently traced the trickiest edge cases
+(a lone `\r` immediately followed by an unrelated `\r\n`) by hand before merging.
+`cargo test --workspace`, `fmt`, `clippy` all clean.
+
+**Item 3 of the same backlog (wiring real `Logging` into non-`eval`/`def` commands) resolved
+(2026-08-19) — and turned out substantially larger than its own enumeration once two rounds of
+adversarial review ran.** The starting premise: `Prover` already has a real `logging: Logging`
+field, correctly `configure_for_command`-d on EVERY dispatch (not just `eval`/`def` — this
+infrastructure already existed), but a number of command-handler functions constructed their own
+throwaway `Logging::new()` instead of receiving it, so `<command>;::` silently printed nothing
+for those commands even though the `wr-core` primitives they call have logged since U28. The
+backlog's own enumeration named 8 call sites; investigation found 2 more in the same shape
+(`fix_lead_zero_command`/`minimize_command`, both confirmed live to log in real Java) before any
+review ran, landing an initial fix across quotient/convert/combine/union/intersect/alphabet/
+fixleadzero/fixtrailzero/minimize/reg — 10 sites, plus a first differential test file
+(`tests/differential/tests/cli_command_logging.rs`) checking real captured text per command
+family, not just "the code compiles."
+
+**Two-independent-adversarial-reviewer round (Opus, Fable — split context, diff only, instructed
+read-only per this session's own fleet-hygiene lesson above) both found real, live-verified gaps
+beyond that first pass** — the enumeration itself was still incomplete:
+- **`reverse` was missed entirely** (Opus) — a whole command family, not in the original list,
+  confirmed live to have gone from correctly logging nothing pre-fix... to still logging nothing
+  post-fix, because nobody had touched it.
+- **`concat`/`star` had throwaway `Logging::new()` INSIDE the very file this diff was already
+  editing** (Opus) — `automaton_ops.rs`'s `concat_pair`/`star` already received the real
+  `logging` as a parameter and used it on surrounding lines, but called the plain
+  `determinize_and_minimize()` instead of the `_with_ctx` sibling one line away.
+- **`inf`/`test` shared the same gap** via `remove_leading_zeros` (Opus), in `prover_helper.rs`/
+  `test_command.rs`.
+- **`union`/`intersect` are missing Java's `computed =>:Q states - Tms` line entirely**
+  (BOTH reviewers, independently) — `Union.java:76` logs it once per fold iteration; the port
+  never did. The new test's own transcript of real captured output silently omitted this exact
+  line, so the test itself couldn't have caught it — reviewers caught the missing line in
+  production code AND the doctored-looking transcript in the same pass.
+- **The `reg` test's whole premise was factually wrong** (Opus) — it observed real Walnut's
+  CONSOLE printing nothing for a cold custom-base `reg` and concluded "real Walnut logs nothing
+  here," settling for a weak smoke test. The console and `detailedLog()` are different channels
+  in Java (`NumberSystem`'s `disablePrint()` bracket, WB-039, suppresses the console via
+  `printEnabled` but `Logging.logDetail` gates `detailedLog` on `printDetails` alone, and
+  `Automaton.applyAllRepresentations`'s `"Applying valid representation #i"` is a `logAndPrint`
+  that never re-checks `printEnabled`) — so `detailedLog()` DOES carry seven real lines here,
+  which is exactly what this fix was supposed to prove reaches through, and the test had settled
+  for asserting nothing about it.
+- **The one genuine behavioral change this diff made** (a new `Logging.indent()`/`dedent()`
+  bracket in `alphabet.rs`'s `set_alphabet`, verified against real Java's `Automaton.java:218-220`
+  — accurate) **was exercised by no test at all**, because the existing test's operand (a literal
+  `{0,1}` alphabet) has no `NumberSystem`, so the bracketed code path never runs and the bracket
+  is a no-op either way.
+- Both reviewers independently confirmed the two gaps the diff DID correctly leave out of scope
+  (the `Determinizing […]` line's `ctx.is_some()` gating — genuinely needs a `DeterminizeContext`,
+  U32-scoped; `convertNS`'s unported `CONVERTING`/`CONVERTED` announcement lines, pre-existing and
+  already flagged in `logicalops.rs`'s own module docs) — so the reviewers weren't just finding
+  more work, they were also confirming the deliberate boundary was drawn in the right place.
+
+**Fixer round closed every finding, live-verified against the real jar, and — while it was in
+there — found the SAME missed-announcement-line pattern in `Concat`/`Star` too** (their own
+`concat:`/`concat complete:`/`concatenated =>:`/`star:`/`star complete:` lines,
+`Concat.java:54/61/80`, `Star.java:23/33`, never ported at all, same class as the `union`/
+`intersect` gap above but not explicitly named in either review). Final tally: **15 call sites**
+across 7 `wr-cli` files threaded with the real `Logging`, 5 previously-unported announcement-line
+classes added (`union`/`intersect`'s `computed =>:`, `concat`'s three lines, `star`'s two),
+`tests/differential/tests/cli_command_logging.rs` grown from 9 to 16 tests (new: `reverse`,
+`concat`, `star`, `intersect`, `inf`, `test`, the alphabet-indent case; the `reg` test rewritten
+from a weak smoke test to an exact 7-line `assert_eq!` on `detailedLog()`, matching
+`crates/wr-core/src/numsys.rs`'s existing `a_cold_msd_fib_construction_logs_exactly_these_seven_lines`
+pin for the direct-construction path). `fresh_prover` fixed to sink its console output like every
+other test file, instead of polluting real `cargo test` stdout. Six mutations applied/confirmed-
+failing/restored (one per fixed finding). Every fix independently re-verified by the coordinator
+against the real Java source directly (not just the review/fixer text) for at least the highest-
+risk claims: `Concat.java`/`Star.java`/`Union.java`'s exact log lines, `Automaton.java:218-220`'s
+indent/dedent bracket. `git diff --stat -- crates/wr-core/` confirmed empty throughout every
+round — this entire unit is `wr-cli`-only parameter threading and new test coverage, no
+`wr-core`/`wr-logic` change at any point, though the coordinator still ran it through the full
+two-reviewer loop given the size and real-behavior-change nature of the diff.
+
+**Golden corpus unchanged (585/586, the same single known-open fixture 383), 0 regression** — the
+only `::`-suffixed fixture on any affected command in the whole 675-fixture manifest
+(`alphabet test617 msd_4 T::`) compares an automaton, not text, so was never at risk.
+`cargo test --workspace` green (1532+ tests), `fmt`/`clippy` clean throughout. Uncommitted, same
+as items 1/2/5 above — commit on explicit user request.
+
+**This closes `docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` in full — all four items (1, 2, 3,
+5) are resolved.**
