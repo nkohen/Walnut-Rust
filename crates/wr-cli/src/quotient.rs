@@ -32,19 +32,25 @@ pub enum QuotientError {
     /// `RuntimeException` that is not a `WalnutException` — hence rendered by
     /// `Prover`'s handler with a stack-trace header rather than message-only.
     ///
-    /// **Historical note (`docs/WALNUT-BUGS.md` WB-010, fixed as of `walnut-java` commit
-    /// `c5ff914` on `bugfix/wb-010`, and matched here in `wr_core::logicalops::
-    /// left_quotient`):** the known live instance of this variant used to be `leftQuotient`
-    /// checking its subset guard in the wrong direction, letting a genuinely-mismatched
-    /// pair slip past it to die later inside `RichAlphabet.encode` — an
-    /// `ArrayIndexOutOfBoundsException` in Java, this crate's own `"digit N not in track
-    /// i's alphabet"` panic. With the fix, `left_quotient`'s own guard now catches that
-    /// exact shape (`B`'s alphabet ⊄ `A`'s) before the re-encode ever runs, reporting it
-    /// as [`QuotientError::Walnut`] instead — so `left_quotient_command` is not currently
-    /// known to reach `Runtime` on any input. The variant is kept regardless, as the
-    /// generic "any other panic" recovery boundary this file's module doc describes; a
-    /// genuinely different, currently-unknown panic inside either quotient primitive
-    /// would still land here rather than killing the process.
+    /// **`left_quotient_command`'s WB-010 instance of this variant is now closed**
+    /// (`docs/WALNUT-BUGS.md`, `walnut-java` commit `c5ff914` on `bugfix/wb-010`,
+    /// matched here in `wr_core::logicalops::left_quotient`): `leftQuotient` used to
+    /// check its subset guard in the wrong direction, letting a genuinely-mismatched
+    /// pair slip past it to die later inside `RichAlphabet.encode`. With the fix,
+    /// `left_quotient`'s own guard now catches that exact shape (`B`'s alphabet ⊄ `A`'s)
+    /// before the re-encode ever runs, reporting it as [`QuotientError::Walnut`]
+    /// instead. `left_quotient_command`'s internal `reverse_and_canonize` step also
+    /// determinizes both operands before the re-encode runs, which independently wipes
+    /// WB-038's bogus out-of-alphabet `-1` encoding key if either operand carries one —
+    /// so that trigger is closed on this path too, not just WB-010's.
+    ///
+    /// **`right_quotient_command` still has a live, reproducible trigger**, found by
+    /// adversarial review of the WB-010 fix: WB-038 (`docs/WALNUT-BUGS.md`) lets
+    /// `AutomatonReader` encode an out-of-alphabet transition digit to a bogus `-1` key;
+    /// calling `rightquo` directly (not through `leftQuotient`'s delegation, which
+    /// determinizes first) reaches `right_quotient`'s own re-encode with that `-1` key
+    /// still present, producing exactly this variant. Pinned by
+    /// `right_quotient_reports_wb_038s_bogus_encoding_key_as_runtime` below.
     Runtime(String),
 }
 
@@ -375,6 +381,50 @@ mod tests {
             "Java (post-fix) throws a WalnutException here, so it renders message-only"
         );
         assert!(!dir.join("Automata Library").join("c.txt").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live trigger [`QuotientError::Runtime`]'s doc comment names: WB-038
+    /// (`docs/WALNUT-BUGS.md`) lets `AutomatonReader` accept a transition on a digit
+    /// outside the declared alphabet, encoding it to a bogus `-1` key. `pb` here declares
+    /// `msd_2` (alphabet `{0,1}`) but has a transition on digit `2` — the subset guard
+    /// passes (both operands declare the same `{0,1}` alphabet), so `rightquo` reaches
+    /// `right_quotient`'s own re-encode with the bogus `-1` key still present. Found by
+    /// adversarial review of the WB-010 fix, which left this variant with no test at all
+    /// after flipping the one test that used to reach it.
+    #[test]
+    fn right_quotient_reports_wb_038s_bogus_encoding_key_as_runtime() {
+        let (session, dir) = temp_session("right-wb038");
+        fs::write(
+            dir.join("Automata Library/pa.txt"),
+            "msd_2\n\n0 0\n0 -> 1\n\n1 1\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Automata Library/pb.txt"),
+            "msd_2\n\n0 0\n0 -> 1\n2 -> 1\n\n1 1\n",
+        )
+        .unwrap();
+
+        let err = right_quotient_command(
+            &session,
+            &mut Logging::new(),
+            "rightquo pc pa pb;",
+            "pa",
+            "pb",
+            "pc",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, QuotientError::Runtime(_)),
+            "WB-038's bogus -1 key must still reach the re-encode on this path; got {err:?}"
+        );
+        assert!(
+            !err.is_walnut_exception(),
+            "Java throws an unchecked (non-WalnutException) exception here, so it \
+             renders with a stack-trace header, not message-only"
+        );
+        assert!(!dir.join("Automata Library").join("pc.txt").exists());
         fs::remove_dir_all(&dir).ok();
     }
 

@@ -4591,6 +4591,69 @@ mod tests {
         assert!(!m.fa.accepts_word(&[0, 1]), "\"01\" should be rejected");
     }
 
+    /// **WB-010**, a NON-PREFIX subset alphabet — found missing by adversarial review of
+    /// the sibling `left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset`
+    /// above, whose `B` alphabet `{0,1}` is a PREFIX of `A`'s `{0,1,2}`: at every symbol,
+    /// `B`'s local index equals the digit value, and that digit value sits at the SAME
+    /// local index in `A` too, so `right_quotient`'s internal re-encode
+    /// (`a.encode(&other_clone.decode(sym))`) is the IDENTITY function throughout —
+    /// mutation-proven (deleting the re-encode entirely left the sibling test, its
+    /// property-test analogue, and both new differential tests all green). `B`'s
+    /// alphabet here is `{1,2}`: `B`'s local index 1 (digit value `2`) must re-encode to
+    /// `A`'s local index 2 for digit value `2` — a genuine `1 -> 2` index shift, not an
+    /// identity map, so a broken or deleted re-encode step changes this test's answer.
+    #[test]
+    fn left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_non_prefix_subset() {
+        // A over {0,1,2}, language exactly {"20", "21"}: q0=a0; a0-2->a1; a1-0->a2,
+        // a1-1->a3; outputs [0,0,1,1] (a2, a3 accept).
+        let a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 4,
+                alphabet_size: 3,
+                o: vec![0, 0, 1, 1],
+                d: vec![
+                    BTreeMap::from([(2, vec![1])]),
+                    BTreeMap::from([(0, vec![2]), (1, vec![3])]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ],
+            },
+            vec![vec![0, 1, 2]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
+        // B over {1,2} (local index 0 = digit value 1, local index 1 = digit value 2) --
+        // a genuine, non-prefix subset of A's alphabet -- language exactly {"2"}:
+        // b0 -(local idx 1, value 2)-> b1 (accept); no transition on local idx 0.
+        let b = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 2,
+                o: vec![0, 1],
+                d: vec![BTreeMap::from([(1, vec![1])]), BTreeMap::new()],
+            },
+            vec![vec![1, 2]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
+        assert!(
+            is_subset_alphabet(&b.alphabet, &a.alphabet),
+            "sanity: B's alphabet {{1,2}} is a genuine (non-prefix) subset of A's {{0,1,2}}"
+        );
+
+        let m = left_quotient(&a, &b, &mut crate::logging::Logging::new());
+
+        // L(B) \ L(A) = { z : "2"+z in L(A) } = { z : "2"+z in {"20","21"} } = {"0","1"}.
+        assert!(!m.fa.accepts_word(&[]), "empty string should be rejected");
+        assert!(m.fa.accepts_word(&[0]), "\"0\" should be accepted");
+        assert!(m.fa.accepts_word(&[1]), "\"1\" should be accepted");
+        assert!(!m.fa.accepts_word(&[2]), "\"2\" should be rejected");
+    }
+
     #[test]
     fn left_quotient_matches_the_hand_derived_quotient() {
         // L(A) = {"01"}, L(B) = {"0"} => { z : exists w in L(B), wz in L(A) } = {"1"}.
@@ -4943,15 +5006,28 @@ mod tests {
         /// `walnut-java` commit `c5ff914` on `bugfix/wb-010`): `leftQuotient` against
         /// the brute-force set-theoretic quotient, on the shape only the FIXED guard
         /// admits — `B`'s alphabet a genuine but non-equal subset of `A`'s (`A` over
-        /// `{0,1,2}`, `B` over `{0,1}`). Before the fix this shape was wrongly REJECTED
+        /// `{0,1,2}`, `B` over `{1,2}`). Before the fix this shape was wrongly REJECTED
         /// outright (the old guard required `A ⊆ B`, false here since `A`'s alphabet is
         /// strictly larger); the hand-built
         /// `left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset`
         /// pins one such input, this property covers the whole shape.
+        ///
+        /// `B`'s alphabet is deliberately `{1,2}`, NOT `{0,1}` — a NON-PREFIX subset.
+        /// An earlier revision of this property used `{0,1}`, a prefix subset under
+        /// which `right_quotient`'s internal re-encode (`a.encode(&b.decode(sym))`, the
+        /// step this whole fix is about) happens to be the IDENTITY function at every
+        /// symbol, so it could pass even with that re-encode step deleted entirely.
+        /// Found by adversarial review, mutation-proven: replacing the re-encode with
+        /// the identity kept this property green under `{0,1}` and only failed once the
+        /// alphabet was changed to a genuinely index-shifting subset like `{1,2}` (`B`'s
+        /// local index 0 is digit VALUE 1, which sits at `A`'s local index 1 — an
+        /// accident of `{0,1}` starting at 0; `{1,2}`'s local index 0 is digit VALUE 1,
+        /// which sits at `A`'s local index 1 too, so the genuinely discriminating part
+        /// is local index 1 -> value 2 -> `A`'s local index 2, a real `1 -> 2` shift).
         #[test]
         fn left_quotient_matches_the_brute_force_quotient_on_a_proper_subset_alphabet(
             a in arb_partial_automaton_over(3, vec![0, 1, 2]),
-            b in arb_partial_automaton_over(3, vec![0, 1]),
+            b in arb_partial_automaton_over(3, vec![1, 2]),
         ) {
             let mut a = a;
             let mut b = b;
@@ -4974,23 +5050,34 @@ mod tests {
             }
         }
 
-        /// Tier-4 **on WB-010's own guarded shape, now fixed**: `A` over `{0,1}`, `B`
-        /// over `{0,1,2}`. Before the fix (`docs/WALNUT-BUGS.md`, `walnut-java` commit
-        /// `c5ff914`), `leftQuotient`'s backwards `isSubsetA(A, B)` guard PASSED on this
-        /// shape while the containment the internal `rightQuotient` re-encode actually
-        /// needed (`B ⊆ A`) did not hold — sometimes succeeding, sometimes panicking
-        /// deep inside the re-encode, depending on whether `B`'s out-of-`A`-alphabet
-        /// digits survived `reverse_and_canonize` (see this file's git history, pre-fix
-        /// revision, for that property in its original "either correct or the
-        /// documented failure" form). After the fix the guard itself — now checking
-        /// `isSubsetA(B, A)` — rejects EVERY input on this shape, deterministically,
-        /// before any of the quotient machinery runs: since the generator here always
-        /// produces `B ⊄ A` (checked below), the fixed guard's own precondition can
-        /// never hold, so the panic is not merely likely but syntactically guaranteed.
+        /// Tier-4 **on WB-010's own guarded shape, now fixed**: `A`'s alphabet is always
+        /// SMALLER than `B`'s, so `B ⊄ A` is a syntactic guarantee of the generator, not
+        /// a randomized property of the generated automaton contents — this test's own
+        /// job is only to confirm the fixed guard rejects EVERY such shape, deterministically,
+        /// before any of the quotient machinery runs, with the exact WB-010 message.
+        /// (Found by adversarial review: an earlier revision hardcoded ONE alphabet pair
+        /// for both `a` and `b` across all generated cases — i.e. every case exercised
+        /// literally the same two alphabets and only the automata's states/transitions
+        /// varied, which the guard doesn't even look at. `alphabet_pair` below samples
+        /// among several different non-subset alphabet shapes instead, so this property
+        /// is checking the guard against real shape variety, not one fixed pair.)
+        /// Before the fix (`docs/WALNUT-BUGS.md`, `walnut-java` commit `c5ff914`),
+        /// `leftQuotient`'s backwards `isSubsetA(A, B)` guard PASSED whenever `A ⊆ B`
+        /// held (always true here, since `A`'s alphabet is a subset of `B`'s) while the
+        /// containment the internal `rightQuotient` re-encode actually needed (`B ⊆ A`)
+        /// did not — sometimes succeeding, sometimes panicking deep inside the re-encode,
+        /// depending on whether `B`'s out-of-`A`-alphabet digits survived
+        /// `reverse_and_canonize` (see this file's git history, pre-fix revision, for
+        /// that property in its original "either correct or the documented failure"
+        /// form).
         #[test]
         fn left_quotient_rejects_the_wb_010_shape_before_any_computation(
-            a in arb_partial_automaton_over(3, vec![0, 1]),
-            b in arb_partial_automaton_over(3, vec![0, 1, 2]),
+            (a, b) in prop_oneof![
+                (arb_partial_automaton_over(3, vec![0, 1]), arb_partial_automaton_over(3, vec![0, 1, 2])),
+                (arb_partial_automaton_over(3, vec![1, 2]), arb_partial_automaton_over(3, vec![0, 1, 2, 3])),
+                (arb_partial_automaton_over(3, vec![0]), arb_partial_automaton_over(3, vec![0, 1])),
+                (arb_partial_automaton_over(3, vec![2, 3]), arb_partial_automaton_over(3, vec![0, 1, 2, 3, 4])),
+            ],
         ) {
             let mut a = a;
             let mut b = b;

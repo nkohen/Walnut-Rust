@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 915211808e6b32d166e9f461d8d4b75e37eb29ac6b79db7eea318a654e7fede6 # shrinks to a_fa = Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{}] }, b_fa = Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{}] }
+cc 6d05f1d9beb704e69820260d4d2a9e1fd547175abe88d79fabea8d8e3f34fe00 # shrinks to a = Automaton { fa: Fa { q0: 0, q: 2, alphabet_size: 3, o: [1, 0], d: [{1: [1]}, {0: [0]}], true_false: None }, alphabet: [[0, 1, 2]], label: ["x"], msd: [Some(true)], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }, b = Automaton { fa: Fa { q0: 0, q: 1, alphabet_size: 2, o: [1], d: [{1: [0]}], true_false: None }, alphabet: [[1, 2]], label: ["x"], msd: [Some(true)], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }
