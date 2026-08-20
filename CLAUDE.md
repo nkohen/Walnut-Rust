@@ -45,8 +45,12 @@ minimize, reverse, quotient; `eval`/`def`/`reg`/`morphism`/`image`; the `.txt` a
 CAS matrix export (`AutomatonMatrixWriter` + the Maple/MATLAB/Mathematica/Sage emitters, `wr_io::matrix_writer`,
 ported 2026-08-19 per `docs/CAS-EXPORT-DISPATCH.md`); **Ostrowski numeration** (`ost` — `wr_core::ostrowski` +
 `wr_cli::ost`, ported 2026-08-20 per `docs/OSTROWSKI-DISPATCH.md`) — see "Current status" below for both.
-**DROP:** Fibonacci / Pell / negative-base numeration. (Fibonacci/Pell were never separate code — they are
-ordinary custom-base data files running through the already-KEEP loader; see `docs/UNPORTED-SCOPE-SIZING.md`.)
+**KEEP, as of 2026-08-20: negative-base numeration** (`msd_neg_k`/`lsd_neg_k`/`msd_neg_fib`/`lsd_neg_fib`
+— `wr_core::numsys`, ported per `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A).
+**DROP:** `split`/`rsplit`, and with them `NumberSystem`'s base-change surface (`baseNBaseChange`/
+`setBaseChangeAutomaton`/`determineNegativeNS`), which exists solely to serve those two commands.
+(Fibonacci/Pell were never separate code — they are ordinary custom-base data files running through the
+already-KEEP loader; see `docs/UNPORTED-SCOPE-SIZING.md`.)
 **TO CLASSIFY (Phase 0):** `split`/`rsplit`/`join`/`transduce`/`convert`/`minimize`/`fixleadzero`/… — inline commands
 in `Prover.java` with no `Commands/` class; classify each KEEP/DROP against research need. See DESIGN.md §3.
 

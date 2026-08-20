@@ -400,11 +400,15 @@ pub fn defined_name(command_script: &str) -> Option<String> {
 /// An earlier draft of this rule exempted a name that already exists in the seeded `Global`
 /// tree, on the theory that the fixture could read the seed copy instead. Concretely wrong,
 /// and the corpus proves it: `Global/Word Automata Library/test444.txt` exists — but it is a
-/// leftover from a previous Java run of fixture 444, `rsplit test444[+][+] test440;`, and its
-/// header is `msd_neg_2`. Negative-base numeration is exactly what makes 444 DROP-scope, so
-/// the seed copy is itself DROP-scope output and this port cannot even read it
-/// (`UnsupportedNegativeBase`). A name a DROP fixture defines is unavailable no matter which
-/// copy is on disk.
+/// leftover from a previous Java run of fixture 444, `rsplit test444[+][+] test440;`, whose
+/// output is DROP-scope because `rsplit` is (see `docs/BOUNDARY-MAP.md` §6). A name a DROP
+/// fixture defines is unavailable no matter which copy is on disk.
+///
+/// (Its header is `msd_neg_2`, and until 2026-08-20 that was a second, independent reason
+/// this port could not even read the seed copy. Negative-base numeration is ported now
+/// — `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A — so the header no longer disqualifies
+/// it and the `rsplit` command alone does. The rule and the classifier are unchanged: both
+/// are driven by `subset_relevant`, not by whether the file happens to parse.)
 ///
 /// `global_library_names` is therefore no longer consulted for the availability decision; it
 /// is kept as a parameter (and asserted against) purely so the harness can report when the two

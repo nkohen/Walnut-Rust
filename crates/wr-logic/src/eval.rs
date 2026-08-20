@@ -399,12 +399,12 @@ fn num_sys_error_is_handled(e: &NumSysError) -> bool {
         | NumSysError::AdditionAlphabetsDiffer(_)
         | NumSysError::LessThanInputCount(_)
         | NumSysError::LessThanAlphabetMismatch(_) => true,
-        // …with two port-local exceptions to that sentence, both reported as `handled`
-        // (message-only) since neither has any JVM frames to report: `Quantify` wraps
-        // `wr_core::quantify`'s own internal surfaces (see `ActError::Quantify` below),
-        // and `UnsupportedNegativeBase` is this port's declared, deliberate divergence
-        // (Phase 3a U5) rather than anything Java throws.
-        NumSysError::Quantify(_) | NumSysError::UnsupportedNegativeBase(_) => true,
+        // …with one port-local exception to that sentence, reported as `handled`
+        // (message-only) since it has no JVM frames to report: `Quantify` wraps
+        // `wr_core::quantify`'s own internal surfaces (see `ActError::Quantify` below).
+        // (`UnsupportedNegativeBase` used to be the second such exception; it is gone —
+        // negative bases are ported, `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A.)
+        NumSysError::Quantify(_) => true,
     }
 }
 

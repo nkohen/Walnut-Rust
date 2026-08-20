@@ -63,11 +63,13 @@
 //!
 //! # Exclusions (each recorded per-id in the report, never silent)
 //!
-//! 1. `subset-filter.json`'s 83 DROP-scope fixtures (negative-base numeration; `split`/
-//!    `rsplit`). `ost` used to be in that list; Ostrowski numeration is now ported
-//!    (`wr_core::ostrowski` + `wr_cli::ost`), so fixture 625's row was flipped to
-//!    `subset_relevant` — with `subset-filter.json`'s own three aggregate counts updated
-//!    in the same edit, since `support::load_fixtures` self-checks them. 625 is the only
+//! 1. `subset-filter.json`'s 15 DROP-scope fixtures (`split`/`rsplit`). Two families used
+//!    to be in that list and have since been ported, each time by flipping the affected
+//!    rows to `subset_relevant` and updating `subset-filter.json`'s own aggregate counts
+//!    in the same edit (since `support::load_fixtures` self-checks them): `ost`
+//!    (Ostrowski numeration, `wr_core::ostrowski` + `wr_cli::ost`, 1 fixture) and
+//!    **negative-base numeration** (`msd_neg_*`/`lsd_neg_*`,
+//!    `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A, 68 fixtures — 83 → 15). 625 is the only
 //!    fixture in the corpus with TWO recorded automaton pairs (see the comparator's
 //!    step 4).
 //! 2. The deferred **OTF** determinization strategies `CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`

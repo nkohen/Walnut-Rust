@@ -244,7 +244,9 @@ mod tests {
         let err = reg(
             &session,
             &mut wr_core::logging::Logging::new(),
-            "msd_neg_2 ",
+            // See `alphabet`'s twin of this test: `msd_neg_2` resolves now, `msd_nope`
+            // does not.
+            "msd_nope ",
             "0*",
             "r",
         )

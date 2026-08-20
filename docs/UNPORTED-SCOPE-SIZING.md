@@ -74,7 +74,27 @@ what actually shipped.
   start.
 - **Demand signal**: thin — only 1 golden fixture (`drop_command:ost`) references it.
 
-### 3. Negative-base numeration + `split`/`rsplit` — bundle these, they're one project
+### 3. Negative-base numeration + `split`/`rsplit` — **negative base PORTED (2026-08-20); `split`/`rsplit` still open**
+
+> **Status: half done, deliberately split in two.** `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` sequenced this
+> as Layer A (negative-base numeration alone — 68 of the 83 fixtures, no `split`) then Layer B
+> (`baseChange`/`determineNegativeNS`/`baseNBaseChange` + `Split.java` — the remaining 15). **Layer A is
+> landed**: `crates/wr-core/src/numsys.rs` has `base_neg_n_addition`/`base_neg_n_less_than`, the full
+> `validateNeg`, and every restored `n.signum() < 0` arm; the `_neg_` rejection gates in `wr-io`'s reader
+> and `wr-cli`'s session are gone; Tier 1 moved from 587 compared / 586 pass to **675 compared / 654
+> pass**, with all 68 negative-base fixtures green on the first run. **WB-043** was found and logged in
+> the process (a genuine `arithmetic(String, String, BigInteger, MINUS)` operator bug in Java, latent —
+> unreachable from every production call site — ported verbatim).
+>
+> The sizing below was **accurate about the demand signal and pessimistic about the risk.** "Re-threading
+> sign-handling through already-hardened call sites and re-validating that whole stack" turned out to be
+> almost entirely re-validation, not re-threading: nothing outside `numsys.rs` computes a base from a
+> number-system name (`parse_base_of` has zero non-test callers), the per-track `ns_name` plumbing added
+> in Phase 3b already carried `msd_neg_2` correctly, and no existing generator baked positive-only bases
+> into its input space — differential-gen's base list simply never emits `_neg_`. The `wr-io`/`wr-cli`
+> de-gating was two deleted `if` blocks. What the module doc's method-by-method deletion record bought
+> was real: it was the literal undo-list.
+
 
 - **Java surface**: negative-base is not a separate file — ~100-150 LOC of `isNeg`-gated branches
   spread across `setLessThanAutomaton`/`setBaseChangeAutomaton`/`arithmetic()` in
@@ -114,7 +134,9 @@ what actually shipped.
 
 ## If picking one up next
 
-CAS export is the easy win if there's a concrete research need for it. Ostrowski is the
-interesting-but-isolated option. Negative-base+`split`/`rsplit` is the highest-value/highest-risk
-pair (largest fixture footprint, but touches already-hardened trust-critical code). OTF should
-stay deferred absent a new workload that demonstrably needs it.
+CAS export, Ostrowski, and negative-base numeration are all done. **What is left of this list is
+`split`/`rsplit` (15 fixtures) and OTF (0 fixtures).** `split`/`rsplit` is now a much smaller job than
+item 3 originally sized, because Layer A already shipped the negative number system it operates on:
+what remains is `NumberSystem`'s base-change surface (`baseNBaseChange` / `setBaseChangeAutomaton` /
+`determineNegativeNS`, ~90 LOC) plus `Split.java`'s 123 LOC of composition over primitives `wr-core`
+already has. OTF should stay deferred absent a new workload that demonstrably needs it.

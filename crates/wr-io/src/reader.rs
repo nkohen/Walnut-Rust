@@ -260,8 +260,8 @@ pub enum ReadError {
     /// Propagated from custom-base [`NumberSystem`] construction (U13): a header token
     /// named a syntactically-plausible custom base whose files failed to resolve into a
     /// valid number system (missing files falling back to a non-numeric name, a
-    /// malformed name, a `_neg_` name, or a structurally invalid loaded automaton — see
-    /// [`NumSysError`]). Only reachable through
+    /// malformed name, a base that overflows `int`, or a structurally invalid loaded
+    /// automaton — see [`NumSysError`]). Only reachable through
     /// [`read_automaton_txt_with_custom_bases`]/[`read_automaton_dfa_txt_with_custom_bases`];
     /// plain [`read_automaton_txt`] never attempts a custom-base load at all, so it can
     /// never produce this variant.
@@ -478,10 +478,14 @@ pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadErro
 /// File-name resolution and the precedence/fallback logic above are
 /// [`wr_core::numsys::custom_base_candidate_names`]/[`CustomBaseCandidates::resolve`]
 /// (Phase 3a's U5) — this function supplies only the actual `Path::is_file`/file-read
-/// steps, matching `wr-core`'s "no file I/O" boundary (see that module's docs). A `_neg_`
-/// name (`msd_neg_fib`) is rejected up front, before any file is even probed, mirroring
-/// `NumberSystem`'s own line order (`isNeg` checked at `:137`, before `setAdditionAutomaton`
-/// at `:142`) — see [`load_custom_base`].
+/// steps, matching `wr-core`'s "no file I/O" boundary (see that module's docs).
+///
+/// A `_neg_` name (`msd_neg_fib`) used to be rejected up front here, before any file was
+/// probed — this port's declared divergence while negative-base numeration was out of
+/// scope. It is ported now (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A), so a `_neg_`
+/// name resolves through exactly the same probes as any other custom base: `msd_neg_fib`
+/// really does load `Custom Bases/msd_neg_fib{,_addition,_less_than}.txt`, and
+/// `lsd_neg_fib` reaches them through the opposite-direction-complement fallback.
 ///
 /// # Recursion and `docs/WALNUT-BUGS.md` WB-014
 ///
@@ -1278,12 +1282,6 @@ fn load_custom_base(
     resolver: &dyn CustomBaseResolver,
     in_progress: &mut BTreeSet<String>,
 ) -> Result<NumberSystem, ReadError> {
-    // Mirrors `NumberSystem`'s own constructor order (`isNeg` checked at `:137`, BEFORE
-    // any file is consulted at `:142`): avoids probing/reading `Custom Bases/msd_neg_*`
-    // files for a name that's going to be rejected anyway.
-    if name.contains(numsys::UNDERSCORE_NEG_UNDERSCORE) {
-        return Err(NumSysError::UnsupportedNegativeBase(name.to_string()).into());
-    }
     if !in_progress.insert(name.to_string()) {
         return Err(ReadError::CustomBaseCycle(name.to_string()));
     }
@@ -2769,17 +2767,31 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The flipped form of the former
+    /// `custom_base_negative_name_is_rejected_before_any_file_io` (negative bases are
+    /// ported now — `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A). A `_neg_` header
+    /// token is no longer special-cased here at all: it resolves exactly like any other
+    /// custom base, which means `msd_neg_fib` (not `^neg_\d+$`) genuinely needs its files
+    /// and `msd_neg_2` (which is) does not.
     #[test]
-    fn custom_base_negative_name_is_rejected_before_any_file_io() {
-        // An empty directory: if the `_neg_` check ran AFTER file probing, this would
-        // fail with a `NotDefined`/file-not-found error instead of the intended
-        // `UnsupportedNegativeBase` -- pins the ordering, not just the outcome.
+    fn custom_base_negative_names_resolve_like_any_other_base() {
         let dir = std::env::temp_dir().join(format!("wr-io-test-cb-neg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty directory: `neg_fib` is not a number, so there is nothing to build
+        // programmatically and the loader reports Java's own "not defined".
         assert!(matches!(
             load_custom_base("msd_neg_fib", &CustomBasesDir(&dir), &mut BTreeSet::new()),
-            Err(ReadError::NumSys(NumSysError::UnsupportedNegativeBase(_)))
+            Err(ReadError::NumSys(NumSysError::NotDefined(_)))
         ));
+
+        // …while `msd_neg_2` needs no files at all: `UtilityMethods.parseNegNumber("neg_2")`
+        // is 2, so `NumberSystem.setAdditionAutomaton` builds `baseNegNAddition(2)`.
+        let ns =
+            load_custom_base("msd_neg_2", &CustomBasesDir(&dir), &mut BTreeSet::new()).unwrap();
+        assert_eq!(ns.name(), "msd_neg_2");
+        assert_eq!(ns.get_alphabet(), &[0, 1]);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -63,9 +63,28 @@ pub fn is_number(s: &str) -> bool {
 /// Java's actual signature and callers rely on the `0` sentinel, e.g.
 /// `NumberSystem.setAdditionAutomaton`'s `parseNegNumber(base) > 1` guard).
 pub fn parse_neg_number(s: &str) -> i32 {
+    match try_parse_neg_number(s) {
+        Ok(v) => v,
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// [`parse_neg_number`]'s non-panicking form, for the call sites where the argument is
+/// **raw user input** rather than something already past a magnitude-bounding gate —
+/// exactly the split [`try_parse_int`] documents for its own panicking twin.
+///
+/// The `\d+` in `^neg_\d+$` says nothing about magnitude, so `msd_neg_99999999999`
+/// (a name a user can type straight into `eval`, or put in a `.txt` header) reaches
+/// `Integer.parseInt` with an overflowing digit run. Java throws
+/// `NumberFormatException` there and `Prover.readBuffer` catches it; this port's
+/// `NumberSystem` boundary reports it as `NumSysError::BaseNotAnI32` instead of
+/// panicking, matching the recoverable-`Result` treatment `NumberSystem`'s
+/// `set_addition_automaton` already takes for the positive-base twin of the same class
+/// of input (see [`crate::numsys`]).
+pub fn try_parse_neg_number(s: &str) -> Result<i32, NumberFormatError> {
     match s.strip_prefix("neg_") {
-        Some(rest) if is_number(rest) => parse_int(rest),
-        _ => 0,
+        Some(rest) if is_number(rest) => try_parse_int(rest),
+        _ => Ok(0),
     }
 }
 

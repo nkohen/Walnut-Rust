@@ -11,14 +11,15 @@
 //! comparator, and constant automata over base-k that the FOL decider composes
 //! all live here, alongside the automaton types they produce.
 //!
-//! DROPPED: negative bases (DESIGN.md §3, `docs/BOUNDARY-MAP.md` §4.1), and the bespoke
-//! Ostrowski / Fibonacci / Pell *algorithms*. **NOT dropped, as of Phase 3a's U5: the
-//! generic `Custom Bases/*.txt` mechanism**, which is how every one of those numerations
-//! (`msd_fib`, `msd_pell`, `msd_trib`, `msd_tib`, `msd_ns`, …) is actually configured in
-//! Walnut — there is no Fibonacci-specific code path in `NumberSystem.java` at all, only a
-//! file loader. See [`NumberSystem::with_custom_base_files`]. (`CLAUDE.md`'s
-//! "DROP: Ostrowski/Fibonacci/Pell" line predates that distinction and needs the same
-//! correction the Phase 3 plan's gap #4 already records.)
+//! NOT dropped, as of Phase 3a's U5: the generic `Custom Bases/*.txt` mechanism, which is
+//! how every "bespoke" numeration (`msd_fib`, `msd_pell`, `msd_trib`, `msd_tib`, `msd_ns`,
+//! …) is actually configured in Walnut — there is no Fibonacci-specific code path in
+//! `NumberSystem.java` at all, only a file loader. See
+//! [`NumberSystem::with_custom_base_files`].
+//!
+//! NOT dropped, as of the negative-base unit (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`,
+//! Layer A): **negative bases** (`msd_neg_2`, `lsd_neg_2`, `msd_neg_fib`, …). See the
+//! section below for what that restored, and what is still outstanding.
 //!
 //! # U7 scope — what is here, and what is deliberately not
 //!
@@ -29,32 +30,42 @@
 //! `division` dynamic-programming families, and the `comparison`/`arithmetic`
 //! dispatchers.
 //!
-//! ## DROPPED: negative bases (`isNeg`), decided in `docs/BOUNDARY-MAP.md` §4.1
+//! ## Negative bases (`isNeg`): dropped by U7, RESTORED by the Layer-A unit
 //!
 //! Java's `NumberSystem` interleaves positive- and negative-base logic through an
-//! `isNeg` field. Per the recorded user decision, negative-base code is **deleted
-//! outright**, not stubbed: `baseNegNAddition` (`:503-533`), `baseNegNLessThan`
-//! (`:541-561`), `baseNBaseChange` (`:568-601`), `setBaseChangeAutomaton`
-//! (`:443-468`), `determineNegativeNS` (`:219-230`) and the `baseChange` field are
-//! all absent here. Three consequences worth naming explicitly, because they are
-//! *simplifications of surviving methods*, not whole-method deletions:
+//! `isNeg` field (`:99`, set from `name.contains("_neg_")` at `:137`). Phase 2's U7
+//! deleted every negative-base path outright per `docs/BOUNDARY-MAP.md` §4.1, which
+//! anticipated the deletion being revisited ("a self-contained later port … not worse off
+//! for having been deleted now"). That is what Layer A of
+//! `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` did. Restored, method by method:
 //!
-//! 1. `validateNeg` (`:1026-1028`) is `if (!isNeg && n.signum() < 0) throw`. With
-//!    `isNeg` gone it is exactly "reject negative constants" — kept, as
-//!    [`NumberSystem::validate_non_negative`].
-//! 2. **Every `n.signum() < 0` branch that sits AFTER a `validateNeg` call is
-//!    therefore unreachable in a positive base and is deleted**: `comparison`'s
-//!    `:701-702`, `arithmetic`'s `:809-813`/`:861-864`/`:910-913`, `constant`'s
-//!    `:944-951`, `multiplication`'s `:986-994`, and `division`'s `n < 0` operand
-//!    selections at `:1047-1048`. Each deletion is called out again at its own
-//!    porting site below.
-//! 3. `setBaseChangeAutomaton`'s `isNeg == false` arms were *already* found dead by
-//!    Phase 0 characterization work (`docs/WALNUT-BUGS.md`'s dead-code section;
-//!    `NumberSystemTest.testBaseChangeOnAPositiveNumberSystemCannotCompare` can only
-//!    reach them by reflection). Its only production caller is `determineNegativeNS`,
-//!    whose own javadoc says "Currently used ONLY in split command" — and `split` is
-//!    DROP (`docs/BOUNDARY-MAP.md` §6). So the whole base-change surface is dropped
-//!    for two independent reasons, not just the negative-base one.
+//! * `base_neg_n_addition` (`baseNegNAddition`, `:503-533`) and
+//!   `base_neg_n_less_than` (`baseNegNLessThan`, `:541-561`), plus the two fallback
+//!   arms that select them (`NumberSystem::set_addition_automaton` `:327-328`,
+//!   `NumberSystem::set_less_than_automaton` `:372-373`).
+//! * `NumberSystem::validate_neg` (`validateNeg`, `:1026-1028`) — the full
+//!   `if (!isNeg && n.signum() < 0) throw`, not the `isNeg`-folded-away version U7 kept.
+//!   This is the guard that makes every arm below reachable.
+//! * Every `n.signum() < 0` arm that sits after a `validateNeg` call:
+//!   [`NumberSystem::comparison_const_b`]'s (`:700-702`),
+//!   [`NumberSystem::arithmetic_const_b`]'s (`:809-813`),
+//!   [`NumberSystem::arithmetic_const_a`]'s (`:861-864`),
+//!   [`NumberSystem::arithmetic_const_c`]'s (`:910-913`),
+//!   `NumberSystem::constant`'s (`:944-951`),
+//!   `NumberSystem::multiplication`'s (`:986-994`), and
+//!   `NumberSystem::division`'s two operand selections (`:1046-1048`).
+//!
+//! ### Still absent: the base-change surface (Layer B, `split`/`rsplit`)
+//!
+//! `baseNBaseChange` (`:568-601`), `setBaseChangeAutomaton` (`:443-468`),
+//! `determineNegativeNS` (`:219-230`), the `baseChange` field and
+//! `UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) are still not ported. They are not part of
+//! the numeration system a user can write in a formula: `determineNegativeNS`'s own
+//! javadoc says "Currently used ONLY in split command", and `setBaseChangeAutomaton`'s
+//! `isNeg == false` arms were found dead by Phase 0 besides
+//! (`docs/WALNUT-BUGS.md`'s dead-code section;
+//! `NumberSystemTest.testBaseChangeOnAPositiveNumberSystemCannotCompare` can only reach
+//! them by reflection).
 //!
 //! ## U5 (Phase 3a): file-backed custom bases, I/O-free
 //!
@@ -90,9 +101,10 @@
 //!   can, on plausible user input, so they are `Err`s
 //!   ([`NumSysError::AdditionInputCount`] and friends). `NumberSystemTest`'s six
 //!   file-backed validation tests finally have analogs here.
-//! * `msd_neg_*` no longer fails by accident (`"neg_fib"` not being `\d+`) — it names a
-//!   real, shipped, file-backed base. It is now rejected on purpose and by name:
-//!   [`NumSysError::UnsupportedNegativeBase`].
+//! * `msd_neg_fib` no longer fails by accident (`"neg_fib"` not being `\d+`) — it names a
+//!   real, shipped, file-backed base, and as of Layer A it loads and works like any other
+//!   custom base. (`msd_neg_2` never went through the file path at all: `"neg_2"` IS
+//!   `^neg_\d+$`, so it is built programmatically by `base_neg_n_addition`.)
 //!
 //! ## The `lsd` half of the composed constructions (deferred by U7, delivered in 3b/L1)
 //!
@@ -270,12 +282,11 @@ pub const MSD_2: &str = "msd_2";
 pub const LSD: &str = "lsd";
 /// `NumberSystem.LSD_UNDERSCORE` (`:75`).
 pub const LSD_UNDERSCORE: &str = "lsd_";
-/// `NumberSystem.UNDERSCORE_NEG_UNDERSCORE` (`:78`). Java uses it to compute `isNeg`
-/// (`:137`, with the source comment "fix: `msd_neg_fib`... but not `msd_renege`" —
-/// the leading underscore is what stops `msd_renege` matching). This port uses it to
-/// *reject* the whole negative-base family: see [`NumSysError::UnsupportedNegativeBase`].
-/// `NEG_UNDERSCORE` (`:77`) itself is not ported — its only other use is building the
-/// negative-base name in the dropped `determineNegativeNS`.
+/// `NumberSystem.UNDERSCORE_NEG_UNDERSCORE` (`:78`) — the `isNeg` test at `:137`, with
+/// Java's own source comment "fix: `msd_neg_fib`... but not `msd_renege`": the leading
+/// underscore is what stops `msd_renege` matching. `NEG_UNDERSCORE` (`:77`) itself is
+/// not ported yet — its only other use is building the negative-base name in
+/// `determineNegativeNS`/`setBaseChangeAutomaton`, which are Layer B (`split`).
 pub const UNDERSCORE_NEG_UNDERSCORE: &str = "_neg_";
 
 /// `Prover.TXT_EXTENSION` — the extension of the "set of all representations" file
@@ -286,8 +297,9 @@ pub const UNDERSCORE_ADDITION_AUTOMATON: &str = "_addition.txt";
 /// `NumberSystem.UNDERSCORE_LESS_THAN_AUTOMATON` (`:84`).
 pub const UNDERSCORE_LESS_THAN_AUTOMATON: &str = "_less_than.txt";
 
-// `NumberSystem.UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) is NOT ported: the whole
-// base-change surface is dropped for two independent reasons (see module docs).
+// `NumberSystem.UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) is NOT ported yet: the whole
+// base-change surface (`setBaseChangeAutomaton`, `baseNBaseChange`, `determineNegativeNS`)
+// exists only to serve the `split`/`rsplit` command, and is Layer B of this unit.
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -360,31 +372,6 @@ pub enum NumSysError {
     /// `UnsupportedLsdFixup` error and this variant was how every composed construction
     /// failed on an `lsd_k` system (see module docs).
     Quantify(QuantifyError),
-    /// **A deliberate divergence from Java, decided in Phase 3a's U5**, not a ported
-    /// `WalnutException`: any name containing `_neg_` (`msd_neg_fib`, `lsd_neg_3`, …) is
-    /// rejected here at name-resolution time.
-    ///
-    /// Java supports negative bases through `isNeg` (`NumberSystem.java:137`) plus
-    /// `baseNegNAddition`/`baseNegNLessThan`/`setBaseChangeAutomaton`, and ships
-    /// `Custom Bases/msd_neg_fib*.txt`. Negative-base numeration is DROPPED from this
-    /// port's scope (`docs/BOUNDARY-MAP.md` §4.1, decided in Phase 2's U7, which deleted
-    /// that code outright rather than stubbing it).
-    ///
-    /// Before U5 the deletion produced the right answer for the wrong reason: `msd_neg_3`
-    /// happened to fail with [`NumSysError::NotDefined`] because `"neg_3"` isn't `\d+`.
-    /// U5's custom-base loading breaks that accident — `msd_neg_fib` names a real,
-    /// shipped, file-backed base, so a caller that hands over the loaded
-    /// `msd_neg_fib_addition.txt`/`msd_neg_fib_less_than.txt` would otherwise get a
-    /// *silently wrong* number system: the files are the negative-base adder/comparator,
-    /// but every construction layered on them here
-    /// ([`NumberSystem::validate_non_negative`] and the deleted `n.signum() < 0`
-    /// branches) assumes a positive base. So this variant makes the deferral explicit and
-    /// loud, per `docs/DESIGN.md`'s "deferred features fail cleanly" principle.
-    ///
-    /// The check runs BEFORE any file is consulted (mirroring Java's own line order:
-    /// `isNeg` at `:137`, `setAdditionAutomaton` at `:142`), so it can never be masked by
-    /// a missing-file error and never causes a pointless load attempt.
-    UnsupportedNegativeBase(String),
     /// `"The addition automaton must have exactly 3 inputs: base " + name` (`:342-345`).
     ///
     /// This and the five variants below were ported as `assert!`s in U7, on the grounds
@@ -421,8 +408,7 @@ impl From<QuantifyError> for NumSysError {
 /// Assigned to this unit by `wr_logic::predicate_env`'s U1 notes ("pending `NumSysError`'s
 /// `Display`, U5"). Three variants have no Java message of their own and say so inline:
 /// [`Self::MalformedName`] (Java throws a bare `StringIndexOutOfBoundsException`),
-/// [`Self::BaseNotAnI32`] (a bare `NumberFormatException`), and
-/// [`Self::UnsupportedNegativeBase`] (this port's own declared divergence).
+/// and [`Self::BaseNotAnI32`] (a bare `NumberFormatException`).
 impl fmt::Display for NumSysError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -463,11 +449,6 @@ impl fmt::Display for NumSysError {
             NumSysError::DivisionByZero => write!(f, "division by zero"),
             NumSysError::MultiplicationByZero => write!(f, "multiplication(0)"),
             NumSysError::Quantify(e) => write!(f, "{e:?}"),
-            // This port's own text: Java has no such error (it supports negative bases).
-            NumSysError::UnsupportedNegativeBase(name) => write!(
-                f,
-                "Number system {name} is not supported: negative bases are out of scope."
-            ),
             NumSysError::AdditionInputCount(name) => write!(
                 f,
                 "The addition automaton must have exactly 3 inputs: base {name}"
@@ -935,6 +916,96 @@ fn base_n_addition_automaton(n: i32, is_msd: bool) -> Automaton {
     addition
 }
 
+/// `NumberSystem.baseNegNAddition(int n)` (`:503-533`) — three tracks over `{0..n-1}`,
+/// accepting iff `track2 == track0 + track1` when every track is read as a base-**(-n)**
+/// numeral, most-significant-digit first.
+///
+/// Three states with outputs `[1, 0, 0]`; the state number is Java's own, and the
+/// invariant it stands for is the running signed discrepancy
+/// `P = value(track0 prefix) + value(track1 prefix) - value(track2 prefix)`, which the
+/// msd-first recurrence `P' = (-n)·P + (i + j - k)` keeps inside `{0, -1, +1}`:
+///
+/// | state | `P` | outgoing |
+/// |-------|-----|----------|
+/// | 0 (accepting) | `0` | `i+j-k ∈ {0, -1, +1}` → states `0`, `1`, `2` |
+/// | 1 | `-1` | `P' = n + (i+j-k)`, and only `i=j=0, k=n-1` keeps `P'` in range (`P' = +1`) → state `2` |
+/// | 2 | `+1` | `P' = (i+j-k) - n ∈ {0, -1, +1}` → states `0`, `1`, `2` |
+///
+/// So state 1 is genuinely reachable (from state 0 on `i+j+1 == k`, and from state 2 on
+/// `i+j+1 == k+n`) and genuinely near-dead-ended: from `P = -1` the next step multiplies
+/// by `-n`, and only the smallest possible `i+j-k` (namely `0+0-(n-1)`) pulls the result
+/// back into range. That single edge is Java's `if (i == 0 && j == 0 && k == n - 1)`
+/// line — not a special case bolted on, just the one surviving transition.
+///
+/// Same `l` counter convention as [`base_n_addition_automaton`]: `i` fastest inside `j`
+/// inside `k`, which is this crate's mixed-radix `encode([i, j, k])`.
+fn base_neg_n_addition(n: i32, is_msd: bool) -> Automaton {
+    let alphabet: Vec<i32> = (0..n).collect();
+    let mut addition = init_basic_automaton(vec![1, 0, 0], 3, &alphabet, is_msd);
+    let mut l = 0i32;
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                if i + j == k {
+                    add_new_transition(&mut addition.fa, 0, 0, l);
+                } else if i + j + 1 == k {
+                    add_new_transition(&mut addition.fa, 0, 1, l);
+                } else if i + j - 1 == k {
+                    add_new_transition(&mut addition.fa, 0, 2, l);
+                }
+                if i + j == k + n {
+                    add_new_transition(&mut addition.fa, 2, 0, l);
+                } else if i + j + 1 == k + n {
+                    add_new_transition(&mut addition.fa, 2, 1, l);
+                } else if i + j - 1 == k + n {
+                    add_new_transition(&mut addition.fa, 2, 2, l);
+                }
+                if i == 0 && j == 0 && k == n - 1 {
+                    add_new_transition(&mut addition.fa, 1, 2, l);
+                }
+                l += 1;
+            }
+        }
+    }
+    addition
+}
+
+/// `NumberSystem.baseNegNLessThan(int n)` (`:541-561`) — two tracks over `{0..n-1}`,
+/// accepting iff `track0 < track1` as base-**(-n)** numerals, msd-first.
+///
+/// Three states with outputs `[0, 1, 0]`, i.e. state **1** is the accepting one. Because
+/// the base is negative, each further position flips the sense of the comparison: with
+/// `t` the first differing position of two equal-length words of length `m`,
+/// `sign(x - y) = sign(x_t - y_t)·(-1)^(m-1-t)`. The automaton encodes exactly that —
+/// state 0 is "equal so far" (rejecting, so equal words are not `<`), the first
+/// difference lands in state 1 (`i < j`) or state 2 (`j < i`), and every subsequent
+/// symbol toggles `1 ↔ 2` unconditionally.
+///
+/// Unlike [`lexicographic_less_than`], which spells its state-1 self-loop as the swapped
+/// `i * size + j`, this uses Java's plain running counter `l` throughout (`i` fastest
+/// inside `j`, so `l == encode([i, j])`) — as Java does here.
+fn base_neg_n_less_than(n: i32, is_msd: bool) -> Automaton {
+    let alphabet: Vec<i32> = (0..n).collect();
+    let mut less_than = init_basic_automaton(vec![0, 1, 0], 2, &alphabet, is_msd);
+    let mut l = 0i32;
+    for j in 0..n {
+        for i in 0..n {
+            if i == j {
+                add_new_transition(&mut less_than.fa, 0, 0, l);
+            } else if i < j {
+                add_new_transition(&mut less_than.fa, 0, 1, l);
+            } else {
+                // `j < i`
+                add_new_transition(&mut less_than.fa, 0, 2, l);
+            }
+            add_new_transition(&mut less_than.fa, 1, 2, l);
+            add_new_transition(&mut less_than.fa, 2, 1, l);
+            l += 1;
+        }
+    }
+    less_than
+}
+
 /// `NumberSystem.lexicographicLessThan(List<Integer> alphabet)` (`:417-433`) — two
 /// tracks, accepting iff track 0 is lexicographically less than track 1.
 ///
@@ -1104,6 +1175,13 @@ pub struct NumberSystem {
     name: String,
     /// `NumberSystem.isMsd` (`:94`).
     is_msd: bool,
+    /// `NumberSystem.isNeg` (`:99`), assigned `name.contains("_neg_")` (`:137`) — the
+    /// name-shaped test Java's own comment explains ("fix: `msd_neg_fib`… but not
+    /// `msd_renege`"). Read only by `validateNeg` (`:1026-1028`), `determineNegativeNS`
+    /// (`:221`, Layer B) and `setBaseChangeAutomaton` (`:451-452`, Layer B); the
+    /// *construction* of the negative-base adder/comparator is driven by
+    /// `UtilityMethods.parseNegNumber(base) > 1` instead, not by this flag.
+    is_neg: bool,
     /// `NumberSystem.addition` (`:112`): three ordered inputs, accepts iff the third is
     /// the sum of the first two.
     addition: Automaton,
@@ -1195,9 +1273,7 @@ impl NumberSystem {
     ///
     /// Java's sequence, preserved exactly, because the order is load-bearing:
     ///
-    /// 1. `determineMsdOrLsd`/`isMsd` (`:135-136`), then `isNeg` (`:137`) — which this port
-    ///    turns into a hard [`NumSysError::UnsupportedNegativeBase`] rejection, BEFORE any
-    ///    file is consulted, matching Java's own line order;
+    /// 1. `determineMsdOrLsd`/`isMsd` (`:135-136`), then `isNeg` (`:137`);
     /// 2. `setAdditionAutomaton` (`:142`) — file first, programmatic fallback second;
     /// 3. `setLessThanAutomaton` (`:143`) and `setEqualityAutomaton(getAlphabet())`
     ///    (`:144`), both of which read `getAlphabet()` = the (possibly file-loaded) adder's
@@ -1228,10 +1304,8 @@ impl NumberSystem {
         // `isMsd = msdOrLsd.equals(MSD)` (`:136`) -- anything that is not EXACTLY
         // "msd" (including "MSD", or the empty prefix of a name like "_5") is lsd.
         let is_msd = msd_or_lsd == MSD;
-        // `isNeg = name.contains(UNDERSCORE_NEG_UNDERSCORE)` (`:137`) -> reject.
-        if name.contains(UNDERSCORE_NEG_UNDERSCORE) {
-            return Err(NumSysError::UnsupportedNegativeBase(name.to_string()));
-        }
+        // `isNeg = name.contains(UNDERSCORE_NEG_UNDERSCORE)` (`:137`).
+        let is_neg = name.contains(UNDERSCORE_NEG_UNDERSCORE);
         let base = determine_base(name);
 
         // `Logging.disablePrint()` (`:140`), matching Java's own — see
@@ -1246,8 +1320,13 @@ impl NumberSystem {
         let mut addition =
             Self::set_addition_automaton(name, base, is_msd, files.addition.resolve())?;
         let alphabet = addition.alphabet[0].clone();
-        let mut less_than =
-            Self::set_less_than_automaton(name, &alphabet, is_msd, files.less_than.resolve())?;
+        let mut less_than = Self::set_less_than_automaton(
+            name,
+            base,
+            &alphabet,
+            is_msd,
+            files.less_than.resolve(),
+        )?;
         let mut equality = equality_automaton(&alphabet, is_msd);
 
         // `addition.getNS().set(i, this)` (`:364-366`), `lessThan.getNS().set(i, this)`
@@ -1292,6 +1371,7 @@ impl NumberSystem {
         Ok(NumberSystem {
             name: name.to_string(),
             is_msd,
+            is_neg,
             addition,
             less_than,
             equality,
@@ -1305,10 +1385,21 @@ impl NumberSystem {
     /// `NumberSystem.setAdditionAutomaton(String name, String base)` (`:322-367`).
     ///
     /// `loaded` is `loadAutomatonOrNull(name, UNDERSCORE_ADDITION_AUTOMATON, base)`'s
-    /// result (`:323`), resolved by the caller. The `baseNegNAddition` fallback
-    /// (`:327-328`) is deleted along with the rest of the negative-base surface — and is
-    /// now unreachable anyway, since [`NumberSystem::with_custom_base_files`] rejects
-    /// `_neg_` names outright.
+    /// result (`:323`), resolved by the caller.
+    ///
+    /// Java's three-way fallback (`:325-331`) is ported literally, and its ORDER matters:
+    /// `isNumber(base) && parseInt(base) > 1` first ([`base_n_addition_automaton`]), then
+    /// `parseNegNumber(base) > 1` ([`base_neg_n_addition`], reached for a `neg_k` base such
+    /// as `msd_neg_2`'s `"neg_2"`), then the `"Number system … is not defined."` throw.
+    /// A base of `"1"`, `"0"` or `"fib"` falls all the way through to the throw.
+    ///
+    /// The `i32`-overflow handling on BOTH numeric arms is this port's one declared
+    /// divergence here: Java lets `Integer.parseInt` throw `NumberFormatException` (caught
+    /// by `Prover.readBuffer`), while this returns [`NumSysError::BaseNotAnI32`] — the
+    /// treatment U30's fuzzing already established for the positive arm, extended to the
+    /// negative one via [`crate::util::try_parse_neg_number`] because
+    /// `msd_neg_99999999999` is reachable straight from raw user input (a query token, or
+    /// a `.txt` header) exactly like its positive twin.
     ///
     /// **The `if (!isMsd) reverse(...)` step sits INSIDE the "no file found" branch**
     /// (`:335-337`) — a file-loaded adder is used exactly as loaded, because
@@ -1334,16 +1425,32 @@ impl NumberSystem {
         let mut addition = match loaded {
             Some(loaded) => loaded,
             None => {
-                if !is_number(base) {
-                    return Err(NumSysError::NotDefined(name.to_string()));
-                }
-                let k: i32 = base
-                    .parse()
-                    .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
-                if k <= 1 {
-                    return Err(NumSysError::NotDefined(name.to_string()));
-                }
-                let mut addition = base_n_addition_automaton(k, is_msd);
+                // `if (isNumber(base) && Integer.parseInt(base) > 1)` (`:325`) --
+                // short-circuiting, so the parse only runs on a `\d+` base.
+                let positive = if is_number(base) {
+                    Some(
+                        base.parse::<i32>()
+                            .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?,
+                    )
+                    .filter(|k| *k > 1)
+                } else {
+                    None
+                };
+                let mut addition = match positive {
+                    Some(k) => base_n_addition_automaton(k, is_msd),
+                    // `else if (UtilityMethods.parseNegNumber(base) > 1)` (`:327-328`).
+                    None => {
+                        let neg = crate::util::try_parse_neg_number(base)
+                            .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
+                        if neg > 1 {
+                            base_neg_n_addition(neg, is_msd)
+                        } else {
+                            // `else throw new WalnutException("Number system … is not
+                            // defined.")` (`:330`).
+                            return Err(NumSysError::NotDefined(name.to_string()));
+                        }
+                    }
+                };
                 if !is_msd {
                     // `AutomatonLogicalOps.reverse(addition, false)` (`:336`) -- reverse the
                     // LANGUAGE, keep the declared numeration direction (`reverseMsd = false`).
@@ -1379,10 +1486,17 @@ impl NumberSystem {
     /// `NumberSystem.setLessThanAutomaton(String name, String base)` (`:369-396`).
     ///
     /// `loaded` is `loadAutomatonOrNull(name, UNDERSCORE_LESS_THAN_AUTOMATON, base)`'s
-    /// result (`:370`); the `baseNegNLessThan` fallback (`:372-373`) is deleted with the
-    /// rest of the negative-base surface. Same "the reverse lives inside the no-file
-    /// branch" note as [`NumberSystem::set_addition_automaton`]. `alphabet` is
-    /// `getAlphabet()`, i.e. the adder's track-0 alphabet.
+    /// result (`:370`). Same "the reverse lives inside the no-file branch" note as
+    /// [`NumberSystem::set_addition_automaton`]. `alphabet` is `getAlphabet()`, i.e. the
+    /// adder's track-0 alphabet.
+    ///
+    /// The fallback here is only TWO-way, not three (`:371-380`): `parseNegNumber(base) >
+    /// 1` selects [`base_neg_n_less_than`], and **everything else** — including a base
+    /// that is not a number at all — falls to [`lexicographic_less_than`] over the adder's
+    /// alphabet. There is deliberately no "not defined" throw and no `isNumber` test:
+    /// [`NumberSystem::set_addition_automaton`] has already run and would have thrown for
+    /// an unusable base, and a file-backed custom base (`msd_fib`) legitimately lands on
+    /// the lexicographic branch when it ships no `_less_than.txt`.
     ///
     /// Note `lessThan.getNS().set(i, this)` (`:392`) sits INSIDE the validation loop, after
     /// that iteration's alphabet check — so a mismatch on track 0 leaves track 1's number
@@ -1390,6 +1504,7 @@ impl NumberSystem {
     /// than hoisted.
     fn set_less_than_automaton(
         name: &str,
+        base: &str,
         alphabet: &[i32],
         is_msd: bool,
         loaded: Option<Automaton>,
@@ -1397,7 +1512,14 @@ impl NumberSystem {
         let mut less_than = match loaded {
             Some(loaded) => loaded,
             None => {
-                let mut less_than = lexicographic_less_than(alphabet, is_msd);
+                // `if (UtilityMethods.parseNegNumber(base) > 1)` (`:372-373`).
+                let neg = crate::util::try_parse_neg_number(base)
+                    .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
+                let mut less_than = if neg > 1 {
+                    base_neg_n_less_than(neg, is_msd)
+                } else {
+                    lexicographic_less_than(alphabet, is_msd)
+                };
                 if !is_msd {
                     reverse(&mut less_than, false);
                 }
@@ -1519,10 +1641,14 @@ impl NumberSystem {
         NumberSystem::with_custom_base_files(&new_name, files, logging)
     }
 
-    /// `NumberSystem.validateNeg(BigInteger)` (`:1026-1028`), with the `!isNeg` half
-    /// folded away (always true here — see module docs).
-    fn validate_non_negative(&self, n: &BigInt) -> Result<(), NumSysError> {
-        if *n < big(0) {
+    /// `NumberSystem.validateNeg(BigInteger)` (`:1026-1028`) — in full:
+    /// `if (!isNeg && n.signum() < 0) throw`.
+    ///
+    /// This one guard is what makes every `n.signum() < 0` arm below reachable: in a
+    /// negative base a constant may legitimately be negative, so the arms are NOT dead
+    /// code, and in a positive base they are unreachable because this rejects first.
+    fn validate_neg(&self, n: &BigInt) -> Result<(), NumSysError> {
+        if !self.is_neg && *n < big(0) {
             return Err(NumSysError::NegativeConstant(n.to_string()));
         }
         Ok(())
@@ -1604,9 +1730,13 @@ impl NumberSystem {
     /// `NumberSystem.comparison(String a, BigInteger b, RelationalOperator.Ops)`
     /// (`:696-723`) — one input labelled `a`, accepting iff `a op b`.
     ///
-    /// The `b.signum() < 0` arm (`:700-703`) is DELETED: `validateNeg(b)` on the line
-    /// above already rejected every negative `b` once negative bases are out of scope
-    /// (see module docs).
+    /// The `b.signum() < 0` arm (`:700-702`) is reachable only in a negative base (see
+    /// `NumberSystem::validate_neg`): it rewrites `a op b` as
+    /// `∃B (a + (-b) = B & B op 0)`, so the whole negative-constant case is handled by
+    /// one addition and a comparison against `0`. Note it does NOT take the
+    /// `EQUAL`/`NOT_EQUAL` short-circuit below — those go through the same `and`+quantify
+    /// tail as every other relation, because the recursive `comparison(B, 0, op)` is what
+    /// applies the operator.
     ///
     /// `EQUAL`/`NOT_EQUAL` short-circuit on the constant automaton itself; every other
     /// relation binds the constant to the fresh name `"new " + a` (Java's comment:
@@ -1623,22 +1753,33 @@ impl NumberSystem {
         op: RelationalOp,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(b)?;
+        self.validate_neg(b)?;
         let b_name = format!("new {a}");
-        let mut n = self.get_constant(b, logging)?;
-        if op == RelationalOp::Equal {
-            n.bind(names(&[a]));
-            return Ok(n);
-        }
-        if op == RelationalOp::NotEqual {
-            n.bind(names(&[a]));
-            logging.disable_print();
-            let result = not(n.as_dfa(), logging).into_automaton();
-            logging.enable_print();
-            return Ok(result);
-        }
-        n.bind(names(&[&b_name]));
-        let m = self.comparison(a, &b_name, op, logging);
+        // `if (b.signum() < 0)` (`:700-702`) -- negative bases only. Java declares
+        // `Automaton N, M;` and assigns both in each arm; the negative arm never touches
+        // `getConstant(b)` at all, so the positive arm's `N = getConstant(b)` (`:704`)
+        // stays inside its own branch here too.
+        let (m, n) = if b.sign() == Sign::Minus {
+            let m = self.arithmetic_const_b(a, &(-b), &b_name, ArithmeticOp::Plus, logging)?;
+            let n = self.comparison_const_b(&b_name, &big(0), op, logging)?;
+            (m, n)
+        } else {
+            let mut n = self.get_constant(b, logging)?;
+            if op == RelationalOp::Equal {
+                n.bind(names(&[a]));
+                return Ok(n);
+            }
+            if op == RelationalOp::NotEqual {
+                n.bind(names(&[a]));
+                logging.disable_print();
+                let result = not(n.as_dfa(), logging).into_automaton();
+                logging.enable_print();
+                return Ok(result);
+            }
+            n.bind(names(&[&b_name]));
+            let m = self.comparison(a, &b_name, op, logging);
+            (m, n)
+        };
         logging.disable_print();
         let mut m = and(&m, &n, logging).into_automaton();
         quantify_with_ctx(&mut m, &label_set(&[&b_name]), None, logging)?;
@@ -1655,7 +1796,7 @@ impl NumberSystem {
         op: RelationalOp,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(a)?;
+        self.validate_neg(a)?;
         self.comparison_const_b(b, a, op.reverse_operator(), logging)
     }
 
@@ -1694,8 +1835,13 @@ impl NumberSystem {
     /// `NumberSystem.arithmetic(String a, BigInteger b, String c, ArithmeticOperator.Ops)`
     /// (`:789-824`) — two inputs `a` and `c`, accepting iff `c = a op b`.
     ///
-    /// The `b.signum() < 0` rewrite (`:809-813`, "we rewrite `a-b=c` as `a+(-b)=c`") is
-    /// DELETED — unreachable after `validateNeg` once negative bases are gone.
+    /// The `b.signum() < 0` rewrite (`:809-813`, Java's comment: "We rewrite `a-b=c` as
+    /// `a+(-b)=c` and `a+b=c` as `a-(-b)=c`") is reachable only in a negative base: it
+    /// binds `|b|` to the fresh name and FLIPS the operator. Java spells the flip as
+    /// `op == PLUS ? MINUS : PLUS`, which is not the same as "negate the operator" —
+    /// `UNARY_NEGATIVE` maps to `PLUS` here where the positive arm would have passed it
+    /// straight through to [`NumberSystem::arithmetic`]'s "unexpected operator" throw.
+    /// Ported verbatim, quirk included.
     pub fn arithmetic_const_b(
         &self,
         a: &str,
@@ -1704,7 +1850,7 @@ impl NumberSystem {
         op: ArithmeticOp,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(b)?;
+        self.validate_neg(b)?;
         if op == ArithmeticOp::Mult {
             let mut n = self.get_multiplication(b, logging)?;
             n.bind(names(&[a, c]));
@@ -1719,9 +1865,21 @@ impl NumberSystem {
         // Java: `String B = a + c;` -- "this way we make sure that B is not equal to a
         // or c" (string CONCATENATION, not addition).
         let b_name = format!("{a}{c}");
-        let mut n = self.get_constant(b, logging)?;
-        n.bind(names(&[&b_name]));
-        let m = self.arithmetic(a, &b_name, c, op)?;
+        // `if (b.signum() < 0)` (`:809-813`) -- negative bases only.
+        let (m, n) = if b.sign() == Sign::Minus {
+            let mut n = self.get_constant(&(-b), logging)?;
+            n.bind(names(&[&b_name]));
+            let flipped = if op == ArithmeticOp::Plus {
+                ArithmeticOp::Minus
+            } else {
+                ArithmeticOp::Plus
+            };
+            (self.arithmetic(a, &b_name, c, flipped)?, n)
+        } else {
+            let mut n = self.get_constant(b, logging)?;
+            n.bind(names(&[&b_name]));
+            (self.arithmetic(a, &b_name, c, op)?, n)
+        };
         logging.disable_print();
         let mut m = and(&m, &n, logging).into_automaton();
         quantify_with_ctx(&mut m, &label_set(&[&b_name]), None, logging)?;
@@ -1732,9 +1890,13 @@ impl NumberSystem {
     /// `NumberSystem.arithmetic(BigInteger a, String b, String c, ArithmeticOperator.Ops)`
     /// (`:844-877`) — two inputs `b` and `c`, accepting iff `c = a op b`.
     ///
-    /// The `a.signum() < 0 && PLUS` rewrite (`:861-864`) is DELETED (unreachable after
-    /// `validateNeg`), so only the `else` arm survives — which is also the arm Java's
-    /// own `NumberSystemTest.testConstantAsTheLeftOperand` characterizes for `a >= 0`.
+    /// The `a.signum() < 0 && PLUS` rewrite (`:861-864`, "We rewrite `a+b=c` and
+    /// `c+(-a)=b`") is reachable only in a negative base, and note the guard is a
+    /// CONJUNCTION: a negative `a` with `MINUS` falls to the `else`, which then calls
+    /// `getConstant(a)` on a negative value on purpose — Java's own comment there says
+    /// "Notice `a-b=c` is false unless we are in a negative base. So we may call get(a)
+    /// where a < 0". That is one of the two live entry points into
+    /// `NumberSystem::constant`'s own negative arm.
     pub fn arithmetic_const_a(
         &self,
         a: &BigInt,
@@ -1743,7 +1905,7 @@ impl NumberSystem {
         op: ArithmeticOp,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(a)?;
+        self.validate_neg(a)?;
         if op == ArithmeticOp::Mult {
             let mut n = self.get_multiplication(a, logging)?;
             n.bind(names(&[b, c]));
@@ -1754,9 +1916,16 @@ impl NumberSystem {
         }
 
         let a_name = format!("{b}{c}");
-        let mut n = self.get_constant(a, logging)?;
-        n.bind(names(&[&a_name]));
-        let m = self.arithmetic(&a_name, b, c, op)?;
+        // `if (a.signum() < 0 && arithmeticOperator.equals(PLUS))` (`:861-864`).
+        let (m, n) = if a.sign() == Sign::Minus && op == ArithmeticOp::Plus {
+            let mut n = self.get_constant(&(-a), logging)?;
+            n.bind(names(&[&a_name]));
+            (self.arithmetic(c, &a_name, b, op)?, n)
+        } else {
+            let mut n = self.get_constant(a, logging)?;
+            n.bind(names(&[&a_name]));
+            (self.arithmetic(&a_name, b, c, op)?, n)
+        };
         logging.disable_print();
         let mut m = and(&m, &n, logging).into_automaton();
         quantify_with_ctx(&mut m, &label_set(&[&a_name]), None, logging)?;
@@ -1767,8 +1936,11 @@ impl NumberSystem {
     /// `NumberSystem.arithmetic(String a, String b, BigInteger c, ArithmeticOperator.Ops)`
     /// (`:897-926`) — two inputs `a` and `b`, accepting iff `c = a op b`.
     ///
-    /// The `c.signum() < 0 && MINUS` rewrite (`:910-913`) is DELETED (unreachable after
-    /// `validateNeg`).
+    /// The `c.signum() < 0 && MINUS` rewrite (`:910-913`, "We rewrite `a-b=c` and
+    /// `a+(-c)=b`") is reachable only in a negative base. Same conjunction shape as
+    /// [`NumberSystem::arithmetic_const_a`]: a negative `c` with `PLUS` falls to the
+    /// `else` and calls `getConstant(c)` on a negative value deliberately — the second
+    /// live entry point into `NumberSystem::constant`'s negative arm.
     pub fn arithmetic_const_c(
         &self,
         a: &str,
@@ -1777,7 +1949,7 @@ impl NumberSystem {
         op: ArithmeticOp,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(c)?;
+        self.validate_neg(c)?;
         if op == ArithmeticOp::Mult || op == ArithmeticOp::Div {
             return Err(NumSysError::OperatorTwoVariables(op.symbol()));
         }
@@ -1785,9 +1957,16 @@ impl NumberSystem {
         // Java's comment here says "this way we make sure that A is not equal to a or
         // b" while naming the variable `C` -- a stale copy-paste, preserved as-is.
         let c_name = format!("{a}{b}");
-        let mut n = self.get_constant(c, logging)?;
-        n.bind(names(&[&c_name]));
-        let m = self.arithmetic(a, b, &c_name, op)?;
+        // `if (c.signum() < 0 && arithmeticOperator.equals(MINUS))` (`:910-913`).
+        let (m, n) = if c.sign() == Sign::Minus && op == ArithmeticOp::Minus {
+            let mut n = self.get_constant(&(-c), logging)?;
+            n.bind(names(&[&c_name]));
+            (self.arithmetic(a, &c_name, b, op)?, n)
+        } else {
+            let mut n = self.get_constant(c, logging)?;
+            n.bind(names(&[&c_name]));
+            (self.arithmetic(a, b, &c_name, op)?, n)
+        };
         logging.disable_print();
         let mut m = and(&m, &n, logging).into_automaton();
         quantify_with_ctx(&mut m, &label_set(&[&c_name]), None, logging)?;
@@ -1859,8 +2038,9 @@ impl NumberSystem {
     /// `NumberSystem.constant(BigInteger n)` (`:931-971`), memoized.
     ///
     /// `n == 0` and `n == 1` are the base cases (see [`NumberSystem::make_zero`] /
-    /// [`NumberSystem::make_one`]); the `n < 0` arm (`:944-951`) is DELETED
-    /// (unreachable after `validateNeg`). For `n >= 2` the automaton is built
+    /// [`NumberSystem::make_one`]); the `n < 0` arm (`:944-951`) is live only in a
+    /// negative base, where it is `∃b (a + b = 0 & b = -n)` — one adder intersection on
+    /// top of the already-memoized `getConstant(-n)`. For `n >= 2` the automaton is built
     /// **recursively by halving**: `Ea Eb (a + b = c & a = floor(n/2) & b = ceil(n/2))`,
     /// so the recursion depth is `log2(n)` and each level costs one adder intersection
     /// plus one ∃-elimination.
@@ -1878,7 +2058,7 @@ impl NumberSystem {
         n: &BigInt,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(n)?;
+        self.validate_neg(n)?;
         {
             let table = self.constants_dynamic_table.borrow();
             if let Some(cached) = table.get(n) {
@@ -1898,6 +2078,15 @@ impl NumberSystem {
             self.make_zero()
         } else if *n == big(1) {
             self.make_one()
+        } else if n.sign() == Sign::Minus {
+            // `else if (n.signum() < 0)` (`:944-951`) -- negative bases only.
+            // `Eb, a + b = 0 & b = -n`.
+            let mut m = self.get_constant(&(-n), logging)?;
+            m.bind(names(&[b]));
+            let p = self.arithmetic_const_c(a, b, &big(0), ArithmeticOp::Plus, logging)?;
+            let mut p = and(&p, &m, logging).into_automaton();
+            quantify_with_ctx(&mut p, &label_set(&[b]), None, logging)?;
+            p
         } else {
             // `n.divideAndRemainder(2)`: floor and ceil halves. `/` on a non-negative
             // BigInt truncates toward zero, which IS floor here.
@@ -2030,7 +2219,7 @@ impl NumberSystem {
     /// accepts iff the second is `n` times the first.
     ///
     /// `n == 0` is rejected outright ("the case of n==0 is handled in Computer class").
-    /// The `n < 0` arm (`:986-994`) is DELETED (unreachable after `validateNeg`). For
+    /// The `n < 0` arm (`:986-994`) is live only in a negative base. For
     /// `n > 2` this is binary exponentiation over the doubler: with `k = n / 2` and
     /// `b = k*a`, either `d = 2b` (`n` even) or `d = 2b + a` (`n` odd).
     ///
@@ -2047,7 +2236,7 @@ impl NumberSystem {
         n: &BigInt,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(n)?;
+        self.validate_neg(n)?;
         if *n == big(0) {
             return Err(NumSysError::MultiplicationByZero);
         }
@@ -2065,6 +2254,17 @@ impl NumberSystem {
         logging.disable_print();
         let p = if *n == big(1) {
             self.equality.clone()
+        } else if n.sign() == Sign::Minus {
+            // `else if (n.signum() < 0)` (`:986-994`) -- negative bases only, and note
+            // Java tests it BEFORE `n == 2`, so this arm's position in the chain is
+            // Java's. `Ec, b + c = 0 & c = (-n)*a`.
+            let mut m = self.get_multiplication(&(-n), logging)?;
+            m.bind(names(&[a, c]));
+            let p = self.arithmetic_const_c(b, c, &big(0), ArithmeticOp::Plus, logging)?;
+            let mut p = and(&p, &m, logging).into_automaton();
+            quantify_with_ctx(&mut p, &label_set(&[c]), None, logging)?;
+            p.sort_label();
+            p
         } else if *n == two {
             // `a + a = d`: `bind` merges the two same-labelled tracks, leaving (a, d).
             let mut p = self.arithmetic(a, a, d, ArithmeticOp::Plus)?;
@@ -2106,15 +2306,19 @@ impl NumberSystem {
     /// `NumberSystem.division(BigInteger n)` (`:1034-1058`), memoized. Two inputs;
     /// accepts iff the second is one `n`th of the first (integer division).
     ///
-    /// `a / n = b  <=>  Er,q  a = q + r & q = n*b & 0 <= r < n` (Java's own comment).
-    /// The `n < 0` operand selections at `:1047-1048` are DELETED (unreachable after
-    /// `validateNeg`), so the two range comparisons are always `r >= 0` and `r < n`.
+    /// `a / n = b  <=>  Er,q  a = q + r & q = n*b & 0 <= r < n` (Java's own comment), or,
+    /// for negative `n` in a negative base, `… & n < r <= 0` — that is the ONLY thing the
+    /// two `n.signum() < 0` operand selections at `:1047-1048` change (`GREATER_EQ_THAN`
+    /// ⇄ `LESS_EQ_THAN` on the first, `LESS_THAN` ⇄ `GREATER_THAN` on the second).
+    /// The second comparison then passes a NEGATIVE constant to
+    /// [`NumberSystem::comparison_const_b`], which only survives `validateNeg` because
+    /// `is_neg` — the load-bearing coupling between the two.
     fn division(
         &self,
         n: &BigInt,
         logging: &mut crate::logging::Logging,
     ) -> Result<Automaton, NumSysError> {
-        self.validate_non_negative(n)?;
+        self.validate_neg(n)?;
         if *n == big(0) {
             return Err(NumSysError::DivisionByZero);
         }
@@ -2133,8 +2337,28 @@ impl NumberSystem {
         logging.disable_print();
         let m = self.arithmetic(q, r, a, ArithmeticOp::Plus)?;
         let nn = self.arithmetic_const_a(n, b, q, ArithmeticOp::Mult, logging)?;
-        let p1 = self.comparison_const_b(r, &big(0), RelationalOp::GreaterEqThan, logging)?;
-        let p2 = self.comparison_const_b(r, n, RelationalOp::LessThan, logging)?;
+        // `n < 0: n < r <= 0, n > 0: 0 <= r < n` (`:1046-1048`).
+        let is_negative = n.sign() == Sign::Minus;
+        let p1 = self.comparison_const_b(
+            r,
+            &big(0),
+            if is_negative {
+                RelationalOp::LessEqThan
+            } else {
+                RelationalOp::GreaterEqThan
+            },
+            logging,
+        )?;
+        let p2 = self.comparison_const_b(
+            r,
+            n,
+            if is_negative {
+                RelationalOp::GreaterThan
+            } else {
+                RelationalOp::LessThan
+            },
+            logging,
+        )?;
 
         let p = and(&p1, &p2, logging).into_automaton();
         let rr = and(&m, &nn, logging).into_automaton();
@@ -3001,6 +3225,283 @@ mod tests {
         assert!(!accepts_digits(&diff_is_one, &[("x", "10"), ("y", "11")])); // 2-3!=1
     }
 
+    // ------------------------------------------------------- Tier 2: the `msd_neg_*`
+    // characterization tests, now that negative bases are real
+    //
+    // Each of the five tests below is a direct replica of a `NumberSystemTest` method
+    // whose fixtures are `msd_neg_3`/`msd_neg_10` — which U7's deletion made
+    // unportable, so the three `constant_as_the_*` tests above had to settle for
+    // "the SHAPE, replicated over `msd_2` instead". Those stay (they are the
+    // positive-base half); these are the halves that were missing. Java's own
+    // hand-checked digit fixtures and its own comments are carried over verbatim,
+    // including the base-(-3) place values `1, -3, 9, -27`.
+
+    /// `wr_core::equiv`'s oracle requires TOTAL DFAs, and the automata `arithmetic`
+    /// hands back are partial (dead-end symbols are simply absent). Totalizing a clone
+    /// of each is language-preserving by construction — `AutomatonLogicalOps.totalize`
+    /// only adds transitions into a fresh non-accepting sink — so this is the
+    /// semantic-equivalence comparison `CLAUDE.md`'s prime directive asks for, not a
+    /// weakening of it.
+    fn same_language(a: &Automaton, b: &Automaton) -> bool {
+        let (mut a, mut b) = (a.clone(), b.clone());
+        let log = &mut crate::logging::Logging::new();
+        crate::logicalops::totalize(&mut a.fa, log);
+        crate::logicalops::totalize(&mut b.fa, log);
+        crate::equiv::automaton_language_equivalent(&a, &b).unwrap()
+    }
+
+    /// `NumberSystemTest.testNegArithmeticOrdering` (`:146-162`).
+    ///
+    /// Java asserts the two automata are equal by `toString()` after `canonize()`. This
+    /// port compares by SEMANTIC LANGUAGE EQUIVALENCE instead (`CLAUDE.md`'s prime
+    /// directive — Walnut's own suite uses Brics `faEqual` for exactly this), plus the
+    /// label vector, which is what the Java assertion was actually reaching for.
+    ///
+    /// **The second half of this test is `docs/WALNUT-BUGS.md` WB-043's live evidence.**
+    /// Java asserts `arithmetic("a", "b", -1, MINUS)` (contract: `-1 = a - b`, i.e.
+    /// `b = a + 1`) equals `arithmetic("a", 1, "b", MINUS)` (`b = a - 1`) — two
+    /// genuinely different relations. It passes because the negative-constant rewrite at
+    /// `:913` re-dispatches with `MINUS` where the algebra needs `PLUS`. Ported verbatim,
+    /// so this replica asserts the same (wrong) equality Java's does.
+    #[test]
+    fn neg_arithmetic_ordering() {
+        let ns = NumberSystem::new("msd_neg_3").unwrap();
+        let log = &mut crate::logging::Logging::new();
+
+        // `-1 + a = b` is built the same way as `b + 1 = a`. (This half is CORRECT:
+        // `arithmetic(BigInteger, String, String, PLUS)`'s rewrite really does need PLUS.)
+        let mut a = ns
+            .arithmetic_const_a(&big(-1), "a", "b", ArithmeticOp::Plus, log)
+            .unwrap();
+        let mut b = ns
+            .arithmetic_const_b("b", &big(1), "a", ArithmeticOp::Plus, log)
+            .unwrap();
+        a.canonize();
+        b.canonize();
+        assert_eq!(a.label, b.label);
+        assert!(same_language(&a, &b));
+        // …and it is the right relation, not just a self-consistent one: in base -3,
+        // "01" = 1, "00" = 0, "12" = -3 + 2 = -1. `-1 + a = b` at a=1 gives b=0.
+        let check = ns
+            .arithmetic_const_a(&big(-1), "a", "b", ArithmeticOp::Plus, log)
+            .unwrap();
+        assert!(accepts_digits(&check, &[("a", "01"), ("b", "00")]));
+        assert!(!accepts_digits(&check, &[("a", "00"), ("b", "01")]));
+
+        // "Very similar case" (Java's comment) -- and WB-043: this equality holds only
+        // because the `c < 0 && MINUS` rewrite is wrong. See this test's doc comment.
+        let mut a = ns
+            .arithmetic_const_c("a", "b", &big(-1), ArithmeticOp::Minus, log)
+            .unwrap();
+        let mut b = ns
+            .arithmetic_const_b("a", &big(1), "b", ArithmeticOp::Minus, log)
+            .unwrap();
+        a.canonize();
+        b.canonize();
+        assert_eq!(a.label, b.label);
+        assert!(same_language(&a, &b));
+    }
+
+    /// `NumberSystemTest.testNegConstant` (`:164-169`) — `msd_neg_10`, the one fixture
+    /// in the whole corpus with a two-digit negative base. Java asserts only the
+    /// alphabet size; the value check is this port's addition (Java's own comment there
+    /// is a `TODO: add more tests here`).
+    #[test]
+    fn neg_constant_in_base_minus_ten() {
+        let ns = NumberSystem::new("msd_neg_10").unwrap();
+        let a = ns
+            .get_constant(&big(-5), &mut crate::logging::Logging::new())
+            .unwrap();
+        assert_eq!(a.alphabet[0].len(), 10);
+        // Base -10, place values 1, -10, 100: "15" = -10 + 5 = -5, "05" = 5.
+        // `getConstant` hands back an UNBOUND automaton (Java binds at the call site), and
+        // `accepts_digits` matches by label, so the bind has to come first.
+        let mut a = a;
+        a.bind(names(&["a"]));
+        assert!(accepts_digits(&a, &[("a", "15")]));
+        assert!(!accepts_digits(&a, &[("a", "05")]));
+    }
+
+    /// `NumberSystemTest.testNegativeConstantAsTheRightOperand` (`:441-472`), verbatim
+    /// fixtures — the `b.signum() < 0` arm of `arithmetic(String, BigInteger, String)`.
+    #[test]
+    fn negative_constant_as_the_right_operand() {
+        let ns = NumberSystem::new("msd_neg_3").unwrap();
+        let log = &mut crate::logging::Logging::new();
+        let arith = |a: &str, b: i32, c: &str, op| {
+            ns.arithmetic_const_b(a, &big(b), c, op, &mut crate::logging::Logging::new())
+                .unwrap()
+        };
+
+        // "x + (-1) = y", i.e. y = x - 1, is built exactly like "x - 1 = y".
+        let mut via_negative_plus = arith("x", -1, "y", ArithmeticOp::Plus);
+        let mut via_positive_minus = arith("x", 1, "y", ArithmeticOp::Minus);
+        via_negative_plus.canonize();
+        via_positive_minus.canonize();
+        assert!(same_language(&via_negative_plus, &via_positive_minus));
+
+        // "x - (-1) = y", i.e. y = x + 1, is built exactly like "x + 1 = y".
+        let mut via_negative_minus = arith("x", -1, "y", ArithmeticOp::Minus);
+        let mut via_positive_plus = arith("x", 1, "y", ArithmeticOp::Plus);
+        via_negative_minus.canonize();
+        via_positive_plus.canonize();
+        assert!(same_language(&via_negative_minus, &via_positive_plus));
+
+        // Semantics, hand-checked in base -3 (digits {0,1,2}, place values 1, -3, 9):
+        //   "121" = 9 - 6 + 1 = 4,  "120" = 9 - 6 + 0 = 3,  "1" = 1,  "0" = 0
+        let minus_one = arith("x", -1, "y", ArithmeticOp::Plus);
+        assert_eq!(minus_one.get_arity(), 2);
+        assert!(accepts_digits(&minus_one, &[("x", "1"), ("y", "0")])); // 1 - 1 = 0
+        assert!(!accepts_digits(&minus_one, &[("x", "1"), ("y", "1")])); // 1 - 1 != 1
+        assert!(accepts_digits(&minus_one, &[("x", "121"), ("y", "120")])); // 4 - 1 = 3
+        assert!(!accepts_digits(&minus_one, &[("x", "121"), ("y", "121")])); // 4 - 1 != 4
+
+        let plus_one = arith("x", -1, "y", ArithmeticOp::Minus);
+        assert!(accepts_digits(&plus_one, &[("x", "120"), ("y", "121")])); // 3 + 1 = 4
+        assert!(!accepts_digits(&plus_one, &[("x", "121"), ("y", "120")])); // 4 + 1 != 3
+        let _ = log;
+    }
+
+    /// `NumberSystemTest.testConstantAsTheLeftOperand` (`:474-493`), verbatim fixtures —
+    /// including its point that `a < 0` with `MINUS` takes the **else** arm, because
+    /// Java's guard is `a.signum() < 0 && op == PLUS`.
+    #[test]
+    fn negative_constant_as_the_left_operand() {
+        let ns = NumberSystem::new("msd_neg_3").unwrap();
+        let arith = |a: i32, b: &str, c: &str, op| {
+            ns.arithmetic_const_a(&big(a), b, c, op, &mut crate::logging::Logging::new())
+                .unwrap()
+        };
+
+        // In base -3: "12" = -3 + 2 = -1, "11" = -3 + 1 = -2, "01" = 1, "00" = 0.
+        let neg_minus = arith(-1, "x", "y", ArithmeticOp::Minus);
+        assert_eq!(neg_minus.get_arity(), 2);
+        assert!(accepts_digits(&neg_minus, &[("x", "00"), ("y", "12")])); // -1 - 0 = -1
+        assert!(accepts_digits(&neg_minus, &[("x", "01"), ("y", "11")])); // -1 - 1 = -2
+        assert!(!accepts_digits(&neg_minus, &[("x", "01"), ("y", "12")])); // -1 - 1 != -1
+
+        // a >= 0 also takes the "else" arm: y = 1 + x
+        let pos_plus = arith(1, "x", "y", ArithmeticOp::Plus);
+        assert_eq!(pos_plus.get_arity(), 2);
+        assert!(accepts_digits(&pos_plus, &[("x", "0"), ("y", "1")])); // 1 + 0 = 1
+        assert!(!accepts_digits(&pos_plus, &[("x", "1"), ("y", "0")])); // 1 + 1 != 0
+        assert!(accepts_digits(&pos_plus, &[("x", "002"), ("y", "120")])); // 1 + 2 = 3
+
+        // …and the arm that IS rewritten (`a < 0 && PLUS`): y = -1 + x.
+        let neg_plus = arith(-1, "x", "y", ArithmeticOp::Plus);
+        assert_eq!(neg_plus.get_arity(), 2);
+        assert!(accepts_digits(&neg_plus, &[("x", "00"), ("y", "12")])); // -1 + 0 = -1
+        assert!(accepts_digits(&neg_plus, &[("x", "01"), ("y", "00")])); // -1 + 1 = 0
+        assert!(!accepts_digits(&neg_plus, &[("x", "01"), ("y", "01")])); // -1 + 1 != 1
+    }
+
+    /// `NumberSystemTest.testConstantAsTheResult` (`:495-512`), verbatim fixtures —
+    /// mirror image of the above: only `c < 0 && MINUS` is rewritten, so `x + y = -1`
+    /// takes the else arm and calls `getConstant(-1)` on purpose.
+    #[test]
+    fn negative_constant_as_the_result() {
+        let ns = NumberSystem::new("msd_neg_3").unwrap();
+        let arith = |a: &str, b: &str, c: i32, op| {
+            ns.arithmetic_const_c(a, b, &big(c), op, &mut crate::logging::Logging::new())
+                .unwrap()
+        };
+
+        let sum_is_minus_one = arith("x", "y", -1, ArithmeticOp::Plus);
+        assert_eq!(sum_is_minus_one.get_arity(), 2);
+        assert!(accepts_digits(
+            &sum_is_minus_one,
+            &[("x", "00"), ("y", "12")]
+        )); // 0 + -1
+        assert!(accepts_digits(
+            &sum_is_minus_one,
+            &[("x", "01"), ("y", "11")]
+        )); // 1 + -2
+        assert!(!accepts_digits(
+            &sum_is_minus_one,
+            &[("x", "01"), ("y", "12")]
+        )); // 1 + -1 = 0
+
+        let sum_is_one = arith("x", "y", 1, ArithmeticOp::Plus);
+        assert_eq!(sum_is_one.get_arity(), 2);
+        assert!(accepts_digits(&sum_is_one, &[("x", "0"), ("y", "1")]));
+        assert!(accepts_digits(&sum_is_one, &[("x", "1"), ("y", "0")]));
+        assert!(!accepts_digits(&sum_is_one, &[("x", "1"), ("y", "1")])); // 1 + 1 = 2
+
+        // …and the arm that IS rewritten (`c < 0 && MINUS`), which is
+        // `docs/WALNUT-BUGS.md` **WB-043**: the contract says this is `x - y = -1`
+        // (i.e. `y = x + 1`), but Java re-dispatches the rewrite with `MINUS` where the
+        // algebra needs `PLUS`, so what it actually builds is `y = x - 1`. Ported
+        // verbatim; this pins the buggy language on purpose, so a silent "cleanup"
+        // fails here instead of diverging from the oracle.
+        //
+        // Base -3 place values 1, -3, 9: "00" = 0, "01" = 1, "12" = -1, "002" = 2.
+        let diff_is_minus_one = arith("x", "y", -1, ArithmeticOp::Minus);
+        assert_eq!(diff_is_minus_one.get_arity(), 2);
+        // What Java (and so this port) computes -- `y = x - 1`:
+        assert!(accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "00"), ("y", "12")]
+        )); // 0-1 = -1
+        assert!(accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "01"), ("y", "00")]
+        )); // 1-1 = 0
+            // What the CONTRACT would require (`y = x + 1`) -- correctly NOT accepted here,
+            // which is precisely the bug:
+        assert!(!accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "00"), ("y", "01")]
+        ));
+        assert!(!accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "001"), ("y", "002")]
+        ));
+        // …and `x - 1 = y` really is the same automaton, the WB-043 equality:
+        let via_const_b = ns
+            .arithmetic_const_b(
+                "x",
+                &big(1),
+                "y",
+                ArithmeticOp::Minus,
+                &mut crate::logging::Logging::new(),
+            )
+            .unwrap();
+        assert!(same_language(&diff_is_minus_one, &via_const_b));
+    }
+
+    /// `NumberSystemTest.testNegativeBaseThreeAdditionAutomatonSemantics` (`:571-590`),
+    /// verbatim fixtures — the hand-checked semantics of [`base_neg_n_addition`] itself,
+    /// distinct from (and much more localized than) the exhaustive Tier-4 sweep below.
+    #[test]
+    fn negative_base_three_addition_automaton_semantics() {
+        let ns = NumberSystem::new("msd_neg_3").unwrap();
+        let plus = ns.arithmetic("a", "b", "c", ArithmeticOp::Plus).unwrap();
+        assert_eq!(plus.get_arity(), 3);
+
+        // 1 + 1 = 2
+        assert!(accepts_digits(&plus, &[("a", "1"), ("b", "1"), ("c", "2")]));
+        // 2 + 2 = 4 : "002" + "002" = "121"  (9 - 6 + 1 = 4)
+        assert!(accepts_digits(
+            &plus,
+            &[("a", "002"), ("b", "002"), ("c", "121")]
+        ));
+        // 2 + 2 != 5 : "122" = 9 - 6 + 2 = 5
+        assert!(!accepts_digits(
+            &plus,
+            &[("a", "002"), ("b", "002"), ("c", "122")]
+        ));
+        // 1 + (-1) = 0 : "01" + "12" = "00"   ("12" = -3 + 2 = -1)
+        assert!(accepts_digits(
+            &plus,
+            &[("a", "01"), ("b", "12"), ("c", "00")]
+        ));
+        // 1 + (-1) != -1
+        assert!(!accepts_digits(
+            &plus,
+            &[("a", "01"), ("b", "12"), ("c", "12")]
+        ));
+    }
+
     /// `division` has no Java unit test beyond the dead-overload characterization, but
     /// it is the most heavily composed construction in the file (two comparisons, one
     /// multiplication, one adder, a two-variable ∃). Checked by hand against
@@ -3772,6 +4273,413 @@ mod tests {
                 })
                 .collect();
             prop_assert_eq!(accepts_tuples(&over_n, &word), y == x / n, "{}/{}={}", x, n, y);
+        }
+    }
+
+    // =========================================================================
+    // Tier 4: the same invariants, over NEGATIVE bases
+    // =========================================================================
+    //
+    // These are the positive-base properties above, extended to base -n rather than
+    // re-derived as a parallel disconnected set (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`
+    // asks for exactly that). The oracle is `value_msd_neg`/`neg_digits` below — plain
+    // integer arithmetic on `i64`, never the adder, comparator, or any other automaton
+    // this module builds, so it cannot re-derive the constructions under test.
+    //
+    // Where the construction under test contains NO existential quantifier (the adder
+    // and the comparator are a `clone` + `bind`, plus at most a complement), the sweep
+    // is EXHAUSTIVE over every digit word of a fixed length — strictly stronger than
+    // sampling, and cheap at these sizes. Where it does (`constant`, `multiplication`,
+    // `division`), the sweep is over VALUES encoded at a deliberately generous width,
+    // because a quantified intermediate that does not fit the word length would produce
+    // a false rejection and turn a real property into a flaky one.
+    //
+    // # Mutation matrix
+    //
+    // Each mutation below was really applied, run, confirmed failing, and reverted — the
+    // "caught by" column is the OBSERVED set, not the expected one (`adder` =
+    // `negative_base_adder_computes_real_addition`, and so on):
+    //
+    // | mutation | caught by |
+    // |----------|-----------|
+    // | M1: drop `base_neg_n_addition`'s `(1, 2)` edge (`i==0 && j==0 && k==n-1`) | adder, constant, multiplication, division |
+    // | M2: swap `base_neg_n_less_than`'s `i < j` / `j < i` arms | comparator, division |
+    // | M3: make `base_neg_n_less_than`'s `1 -> 2` / `2 -> 1` edges self-loops (drop the sign flip) | comparator, division |
+    // | M4: flip `division`'s `n.signum() < 0` operand selection | division |
+    // | M5: drop `set_less_than_automaton`'s `parseNegNumber(base) > 1` arm (fall back to lexicographic) | comparator, division |
+    // | M6: drop `set_less_than_automaton`'s `if (!isMsd) reverse(...)` step | lsd-agrees |
+    //
+    // Two things that matrix says, worth stating rather than leaving to be inferred:
+    // `negative_base_lsd_agrees_with_msd_after_reversal` catches NONE of M1-M5 — it is a
+    // *consistency* check between the two directions, and any mutation to a shared
+    // construction moves both sides together — so M6 is what proves it is not vacuous.
+    // And `negative_base_adder_computes_real_addition` catches only M1: it is the only
+    // one of these tests whose automaton is a bare `clone` + `bind` of the adder, which
+    // is exactly why it can afford to be exhaustive.
+
+    /// The reference decoder for a base-`(-n)` msd-first digit word: `Σ d_i · (-n)^i`.
+    /// Deliberately the naive Horner fold, so it shares no code with anything under test.
+    fn value_msd_neg(digits: &[i32], n: i32) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |acc, &d| acc * (-(n as i64)) + d as i64)
+    }
+
+    /// The reference ENCODER: the base-`(-n)` representation of `v`, msd-first, padded
+    /// with leading zeros to exactly `width` digits — or `None` if it does not fit.
+    ///
+    /// Every integer (positive, negative or zero) has such a representation, which is
+    /// the whole point of a negative base; the standard algorithm takes the
+    /// non-negative remainder and divides by `-n`.
+    fn neg_digits(mut v: i64, n: i32, width: usize) -> Option<Vec<i32>> {
+        let n = n as i64;
+        let mut lsd_first: Vec<i32> = Vec::new();
+        while v != 0 {
+            let r = v.rem_euclid(n);
+            v = (v - r) / (-n);
+            lsd_first.push(r as i32);
+        }
+        if lsd_first.len() > width {
+            return None;
+        }
+        lsd_first.resize(width, 0);
+        lsd_first.reverse();
+        Some(lsd_first)
+    }
+
+    /// Every digit word of length `len` over `{0..n-1}`, msd-first, in lexicographic
+    /// order. `n.pow(len)` of them — keep both small.
+    fn all_neg_base_words(n: i32, len: usize) -> Vec<Vec<i32>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..len {
+            let mut next = Vec::with_capacity(out.len() * n as usize);
+            for w in &out {
+                for d in 0..n {
+                    let mut w = w.clone();
+                    w.push(d);
+                    next.push(w);
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// Lay per-label digit words out in the automaton's OWN track order — the same
+    /// `a.label`-driven shuffle the positive-base properties above do inline.
+    fn word_by_label(a: &Automaton, assign: &[(&str, &[i32])]) -> Vec<Vec<i32>> {
+        let width = assign[0].1.len();
+        (0..width)
+            .map(|i| {
+                a.label
+                    .iter()
+                    .map(|l| {
+                        assign
+                            .iter()
+                            .find(|(name, _)| name == l)
+                            .unwrap_or_else(|| panic!("unbound label {l} in {:?}", a.label))
+                            .1[i]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The encoder and the decoder must be inverses, and must agree with the textbook
+    /// base-`(-2)` expansions — a guard against this whole section quietly agreeing on a
+    /// wrong convention (the negative-base twin of
+    /// [`msd_string_writes_the_most_significant_digit_first`]).
+    #[test]
+    fn the_negative_base_reference_codec_is_self_consistent() {
+        // Hand-checked: 3 = 4 - 2 + 1 = 1·(-2)² + 1·(-2)¹ + 1·(-2)⁰.
+        assert_eq!(neg_digits(3, 2, 3).unwrap(), vec![1, 1, 1]);
+        assert_eq!(value_msd_neg(&[1, 1, 1], 2), 3);
+        // -1 = 1·(-2)¹ + 1·(-2)⁰ = -2 + 1.
+        assert_eq!(neg_digits(-1, 2, 2).unwrap(), vec![1, 1]);
+        assert_eq!(value_msd_neg(&[1, 1], 2), -1);
+        assert_eq!(neg_digits(0, 2, 4).unwrap(), vec![0, 0, 0, 0]);
+        // Round-trip every value a 7-digit base-(-2) word can hold, and every value a
+        // 5-digit base-(-3) one can.
+        for (n, width) in [(2, 7), (3, 5)] {
+            for w in all_neg_base_words(n, width) {
+                let v = value_msd_neg(&w, n);
+                assert_eq!(
+                    neg_digits(v, n, width).unwrap(),
+                    strip_to_canonical(&w, n, width),
+                    "{w:?}"
+                );
+            }
+            assert_eq!(neg_digits(i64::from(n).pow(30), n, width), None);
+        }
+    }
+
+    /// `neg_digits` returns the CANONICAL (no redundant leading zeros beyond the pad)
+    /// form, so the round-trip check above re-canonicalizes its input rather than
+    /// asserting a word equals itself: `11` and `0011` both denote -1.
+    fn strip_to_canonical(w: &[i32], n: i32, width: usize) -> Vec<i32> {
+        neg_digits(value_msd_neg(w, n), n, width).unwrap()
+    }
+
+    /// Tier-4, negative bases: **the comparator really is the order relation**, all six
+    /// relations, EXHAUSTIVELY over every pair of equal-length digit words.
+    ///
+    /// This is the property that pins `base_neg_n_less_than`'s whole reason for existing:
+    /// in a negative base the comparison is *not* lexicographic — every further position
+    /// flips its sense — so a construction that reused `lexicographicLessThan` would fail
+    /// on the very first word pair of odd length.
+    #[test]
+    fn negative_base_comparator_agrees_with_the_integer_order() {
+        for (n, len) in [(2, 5), (3, 4)] {
+            let ns = NumberSystem::new(&format!("msd_neg_{n}")).unwrap();
+            let words = all_neg_base_words(n, len);
+            for op in [
+                RelationalOp::LessThan,
+                RelationalOp::GreaterThan,
+                RelationalOp::Equal,
+                RelationalOp::NotEqual,
+                RelationalOp::LessEqThan,
+                RelationalOp::GreaterEqThan,
+            ] {
+                let cmp = ns.comparison("p", "q", op, &mut crate::logging::Logging::new());
+                for x in &words {
+                    for y in &words {
+                        let (vx, vy) = (value_msd_neg(x, n), value_msd_neg(y, n));
+                        let expected = match op {
+                            RelationalOp::LessThan => vx < vy,
+                            RelationalOp::GreaterThan => vx > vy,
+                            RelationalOp::Equal => vx == vy,
+                            RelationalOp::NotEqual => vx != vy,
+                            RelationalOp::LessEqThan => vx <= vy,
+                            RelationalOp::GreaterEqThan => vx >= vy,
+                        };
+                        let word = word_by_label(&cmp, &[("p", x), ("q", y)]);
+                        assert_eq!(
+                            accepts_tuples(&cmp, &word),
+                            expected,
+                            "msd_neg_{n} {op:?}: {x:?}({vx}) vs {y:?}({vy})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tier-4, negative bases: **the adder automaton computes real addition**, both
+    /// directions, EXHAUSTIVELY over every digit triple of a fixed length.
+    ///
+    /// Exhaustiveness matters more here than in the positive-base twin: the
+    /// three-state carry structure of `baseNegNAddition` has a state (`1`, "the running
+    /// discrepancy is -1") whose single outgoing edge fires on exactly ONE symbol of the
+    /// `n³`, so a sampled generator would almost never exercise it.
+    #[test]
+    fn negative_base_adder_computes_real_addition() {
+        for (n, len) in [(2, 4), (3, 3)] {
+            let ns = NumberSystem::new(&format!("msd_neg_{n}")).unwrap();
+            let plus = ns.arithmetic("a", "b", "c", ArithmeticOp::Plus).unwrap();
+            let words = all_neg_base_words(n, len);
+            let mut accepted = 0usize;
+            for x in &words {
+                for y in &words {
+                    for z in &words {
+                        let (vx, vy, vz) = (
+                            value_msd_neg(x, n),
+                            value_msd_neg(y, n),
+                            value_msd_neg(z, n),
+                        );
+                        let word = word_by_label(&plus, &[("a", x), ("b", y), ("c", z)]);
+                        let got = accepts_tuples(&plus, &word);
+                        assert_eq!(
+                            got,
+                            vx + vy == vz,
+                            "msd_neg_{n}: {vx} + {vy} == {vz}? ({x:?},{y:?},{z:?})"
+                        );
+                        accepted += usize::from(got);
+                    }
+                }
+            }
+            // A reject-everything mutant would satisfy the assertion above only if the
+            // sweep contained no genuine sums at all -- it contains plenty.
+            assert!(accepted > 0, "msd_neg_{n}: swept no accepting triple");
+        }
+    }
+
+    /// Tier-4, negative bases: **msd and lsd agree after reversal.** `lsd_neg_k`'s adder
+    /// and comparator are built by `AutomatonLogicalOps.reverse` of the msd ones
+    /// (`NumberSystem.java:332-334`/`:377-379`), and that step sits inside the
+    /// no-file-found branch, so it applies to the negative-base constructions too.
+    #[test]
+    fn negative_base_lsd_agrees_with_msd_after_reversal() {
+        let (n, len) = (2, 4);
+        let msd = NumberSystem::new(&format!("msd_neg_{n}")).unwrap();
+        let lsd = NumberSystem::new(&format!("lsd_neg_{n}")).unwrap();
+        let msd_plus = msd.arithmetic("a", "b", "c", ArithmeticOp::Plus).unwrap();
+        let lsd_plus = lsd.arithmetic("a", "b", "c", ArithmeticOp::Plus).unwrap();
+        let msd_lt = msd.comparison(
+            "p",
+            "q",
+            RelationalOp::LessThan,
+            &mut crate::logging::Logging::new(),
+        );
+        let lsd_lt = lsd.comparison(
+            "p",
+            "q",
+            RelationalOp::LessThan,
+            &mut crate::logging::Logging::new(),
+        );
+        let words = all_neg_base_words(n, len);
+        let rev = |w: &Vec<i32>| -> Vec<i32> { w.iter().rev().copied().collect() };
+        for x in &words {
+            for y in &words {
+                let (rx, ry) = (rev(x), rev(y));
+                assert_eq!(
+                    accepts_tuples(&msd_lt, &word_by_label(&msd_lt, &[("p", x), ("q", y)])),
+                    accepts_tuples(&lsd_lt, &word_by_label(&lsd_lt, &[("p", &rx), ("q", &ry)])),
+                    "less_than {x:?} {y:?}"
+                );
+                for z in &words {
+                    let rz = rev(z);
+                    assert_eq!(
+                        accepts_tuples(
+                            &msd_plus,
+                            &word_by_label(&msd_plus, &[("a", x), ("b", y), ("c", z)])
+                        ),
+                        accepts_tuples(
+                            &lsd_plus,
+                            &word_by_label(&lsd_plus, &[("a", &rx), ("b", &ry), ("c", &rz)])
+                        ),
+                        "addition {x:?} {y:?} {z:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Tier-4, negative bases: `getConstant(v)` accepts exactly the base-`(-n)`
+    /// representations of `v` — **including negative `v`**, which is the entire point of
+    /// `constant`'s restored `n.signum() < 0` arm and is unreachable in a positive base
+    /// (`validateNeg` rejects first).
+    ///
+    /// "exactly the representations" is only true of a PROGRAMMATIC base. A file-backed
+    /// one that ships an all-representations file — `Custom Bases/msd_neg_fib.txt` is
+    /// real and shipped — has its constants intersected with that restriction by
+    /// `applyAllRepresentations`, so the language is a strict subset of "every word whose
+    /// value is `v`". Do not extend this sweep to `neg_fib` without changing the oracle.
+    #[test]
+    fn negative_base_get_constant_accepts_exactly_that_value() {
+        let (n, width) = (2, 6);
+        let ns = NumberSystem::new("msd_neg_2").unwrap();
+        let words = all_neg_base_words(n, width);
+        for v in -6i64..=6 {
+            let automaton = ns
+                .get_constant(&BigInt::from(v), &mut crate::logging::Logging::new())
+                .unwrap();
+            let mut accepted = 0usize;
+            for w in &words {
+                let word: Vec<Vec<i32>> = w.iter().map(|&d| vec![d]).collect();
+                let got = accepts_tuples(&automaton, &word);
+                assert_eq!(got, value_msd_neg(w, n) == v, "constant {v} fed {w:?}");
+                accepted += usize::from(got);
+            }
+            assert!(
+                accepted > 0,
+                "constant {v}: no width-{width} word denotes it"
+            );
+        }
+    }
+
+    /// Tier-4, negative bases: `multiplication(k)` accepts `(x, y)` iff `y == k·x`, with
+    /// `k` on BOTH sides of zero — the negative side runs `multiplication`'s restored
+    /// `n.signum() < 0` arm (`Ec, b + c = 0 & c = (-n)·a`).
+    ///
+    /// Values, not all-words, because this construction quantifies: an intermediate that
+    /// did not fit the word length would look like a wrong answer. Width 8 in base -2
+    /// spans roughly `-170..=85`, comfortably past every intermediate here.
+    #[test]
+    fn negative_base_multiplication_computes_real_multiplication() {
+        let (n, width) = (2, 8);
+        let ns = NumberSystem::new("msd_neg_2").unwrap();
+        for k in [-3i64, -2, -1, 1, 2, 3] {
+            let times_k = ns
+                .arithmetic_const_b(
+                    "x",
+                    &BigInt::from(k),
+                    "y",
+                    ArithmeticOp::Mult,
+                    &mut crate::logging::Logging::new(),
+                )
+                .unwrap();
+            for x in -5i64..=5 {
+                for y in -15i64..=15 {
+                    let (Some(xd), Some(yd)) = (neg_digits(x, n, width), neg_digits(y, n, width))
+                    else {
+                        continue;
+                    };
+                    let word = word_by_label(&times_k, &[("x", &xd), ("y", &yd)]);
+                    assert_eq!(
+                        accepts_tuples(&times_k, &word),
+                        y == k * x,
+                        "msd_neg_2: {k}*{x} == {y}?"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Tier-4, negative bases: `division(k)` is FLOOR division — for both signs of `k`.
+    ///
+    /// This is the property that pins `division`'s restored `n.signum() < 0` operand
+    /// selection (`:1046-1048`). Java's own comment states the two remainder ranges
+    /// (`0 <= r < n` for positive `n`, `n < r <= 0` for negative), and both cash out to
+    /// the SAME arithmetic statement — `b` is the unique integer with `a = k·b + r` and
+    /// `r` strictly between `0` and `k` — which is floor division, `b = ⌊a/k⌋`. The
+    /// oracle below computes that directly from `a` and `k` and never consults the
+    /// identity the construction is built from.
+    ///
+    /// Cross-check against the real corpus (`walnut-java`'s own `IntegrationTest`
+    /// fixtures 642-644, which this port now replays green in Tier 1, in their own id
+    /// order): 642 `?msd_neg_2 _3 / _2 = 1`, 643 `?msd_neg_2 3 / _2 = _2`,
+    /// 644 `?msd_neg_2 _3 / 2 = _2` — i.e. `⌊-3/-2⌋ = 1`, `⌊3/-2⌋ = -2`, `⌊-3/2⌋ = -2`,
+    /// exactly what `floor_div` says.
+    #[test]
+    fn negative_base_division_matches_floor_division() {
+        fn floor_div(a: i64, k: i64) -> i64 {
+            let q = a / k;
+            if a % k != 0 && ((a < 0) != (k < 0)) {
+                q - 1
+            } else {
+                q
+            }
+        }
+        assert_eq!(floor_div(3, -2), -2);
+        assert_eq!(floor_div(-3, -2), 1);
+        assert_eq!(floor_div(-3, 2), -2);
+
+        let (n, width) = (2, 8);
+        let ns = NumberSystem::new("msd_neg_2").unwrap();
+        for k in [-3i64, -2, -1, 1, 2, 3] {
+            let over_k = ns
+                .arithmetic_const_b(
+                    "x",
+                    &BigInt::from(k),
+                    "y",
+                    ArithmeticOp::Div,
+                    &mut crate::logging::Logging::new(),
+                )
+                .unwrap();
+            for x in -10i64..=10 {
+                for y in -10i64..=10 {
+                    let (Some(xd), Some(yd)) = (neg_digits(x, n, width), neg_digits(y, n, width))
+                    else {
+                        continue;
+                    };
+                    let word = word_by_label(&over_k, &[("x", &xd), ("y", &yd)]);
+                    assert_eq!(
+                        accepts_tuples(&over_k, &word),
+                        y == floor_div(x, k),
+                        "msd_neg_2: {x}/{k} == {y}?"
+                    );
+                }
+            }
         }
     }
 
@@ -4553,33 +5461,133 @@ mod tests {
         );
     }
 
-    // --------------------------------------------------- the `msd_neg_*` U5 decision
+    // --------------------------------------------------- the `msd_neg_*` family
 
-    /// U5's decision: a `_neg_` name is an explicit, named "unsupported numeration" error at
-    /// NAME-RESOLUTION time — not a silent misparse, and not an attempt to load the
-    /// (genuinely present) `Custom Bases/msd_neg_fib*.txt` files.
+    /// The direct replacement for U5's `negative_base_names_are_rejected_by_name_before_
+    /// any_file_is_consulted`, flipped now that negative-base numeration is real (Layer A
+    /// of `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`). Same four names, asserting the behavior
+    /// Java actually has instead of this port's former blanket rejection.
+    ///
+    /// The split is Java's, not arbitrary: construction is driven by
+    /// `UtilityMethods.parseNegNumber(base) > 1`, which matches `^neg_\d+$`. So
+    /// `msd_neg_3`/`lsd_neg_2` build programmatically, while `neg_fib` is not a number and
+    /// falls all the way through `setAdditionAutomaton`'s chain to the plain
+    /// "not defined" throw — i.e. `msd_neg_fib` is a FILE-backed base in Java too, exactly
+    /// like `msd_fib`.
     #[test]
-    fn negative_base_names_are_rejected_by_name_before_any_file_is_consulted() {
-        for name in ["msd_neg_fib", "lsd_neg_fib", "msd_neg_3", "lsd_neg_2"] {
+    fn negative_base_names_construct_programmatically_when_the_base_is_a_number() {
+        for name in ["msd_neg_3", "lsd_neg_2"] {
+            let ns = NumberSystem::new(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(ns.name(), name);
+            assert!(ns.is_neg, "{name} must set isNeg");
+            assert_eq!(ns.is_msd(), name.starts_with("msd"), "{name}");
+            // Three tracks over `{0..n-1}` -- the negative-base adder, not the positive one.
+            let n = crate::util::parse_neg_number(determine_base(name));
+            assert_eq!(
+                ns.addition().alphabet,
+                vec![(0..n).collect::<Vec<i32>>(); 3]
+            );
+            assert_eq!(
+                ns.less_than().alphabet,
+                vec![(0..n).collect::<Vec<i32>>(); 2]
+            );
+        }
+        // `neg_fib` is not `^neg_\d+$`, so there is nothing to build programmatically.
+        for name in ["msd_neg_fib", "lsd_neg_fib"] {
             assert_eq!(
                 NumberSystem::new(name).unwrap_err(),
-                NumSysError::UnsupportedNegativeBase(name.to_string()),
-                "{name}"
-            );
-            // Supplying perfectly good files must NOT rescue it -- the rejection happens
-            // first, so the negative-base adder can never be layered under this module's
-            // positive-base-only constructions.
-            assert_eq!(
-                NumberSystem::with_custom_base_files(
-                    name,
-                    msd_fib_files(),
-                    &mut crate::logging::Logging::new()
-                )
-                .unwrap_err(),
-                NumSysError::UnsupportedNegativeBase(name.to_string()),
+                NumSysError::NotDefined(name.to_string()),
                 "{name}"
             );
         }
+    }
+
+    /// …and supplying files DOES now rescue the file-backed negative base, which is the
+    /// half U5's rejection made unreachable. (`msd_fib_files()` is a stand-in corpus —
+    /// what is under test is that a `_neg_` name reaches the loader at all and keeps
+    /// `isNeg` set, not the arithmetic of the Fibonacci adder.)
+    #[test]
+    fn a_file_backed_negative_base_now_loads_instead_of_being_rejected_by_name() {
+        for name in ["msd_neg_fib", "lsd_neg_fib"] {
+            let ns = NumberSystem::with_custom_base_files(
+                name,
+                msd_fib_files(),
+                &mut crate::logging::Logging::new(),
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(ns.is_neg, "{name} must set isNeg");
+            // `isNeg` is what lets a negative constant through `validateNeg`.
+            assert!(ns.validate_neg(&big(-1)).is_ok(), "{name}");
+        }
+        // The same guard still rejects a negative constant in a POSITIVE base.
+        let msd_fib = NumberSystem::with_custom_base_files(
+            "msd_fib",
+            msd_fib_files(),
+            &mut crate::logging::Logging::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            msd_fib.validate_neg(&big(-1)).unwrap_err(),
+            NumSysError::NegativeConstant("-1".to_string())
+        );
+    }
+
+    /// Malformed / edge-case negative-base NAMES, every outcome verified live against
+    /// `target/Walnut-all.jar` (2026-08-20) rather than derived from the source:
+    ///
+    /// | name | real Walnut | here |
+    /// |------|-------------|------|
+    /// | `msd_neg_99999999999` | `NumberFormatException: For input string: "99999999999"` (caught by `Prover.readBuffer`) | [`NumSysError::BaseNotAnI32`] — this port's pre-existing declared divergence for the positive twin, extended to the negative one |
+    /// | `msd_neg_1` | `Number system msd_neg_1 is not defined.` | same |
+    /// | `msd_neg_0` | `Number system msd_neg_0 is not defined.` | same |
+    /// | `msd_renege` | `Number system msd_renege is not defined.` | same |
+    /// | `msd__neg_2` | `Number system msd__neg_2 is not defined.` | same |
+    /// | `lsd_neg_` | `Number system lsd_neg_ is not defined.` | same |
+    ///
+    /// `msd__neg_2` is the interesting one: it DOES contain `_neg_`, so `isNeg` is true,
+    /// but `determineBase` takes everything after the FIRST `_`, giving `"_neg_2"`, which
+    /// is neither `^\d+$` nor `^neg_\d+$` — so it falls through both fallback arms to
+    /// the plain "not defined" throw, with `isNeg` set and no adder ever built.
+    ///
+    /// The overflow rows matter beyond tidiness: `d_max`-style digit runs reach here
+    /// straight from raw user input, and Tier-5 fuzzing has already found this exact
+    /// class of bug three times in this port (see [`crate::util::parse_int`]'s docs).
+    /// None of these panics.
+    #[test]
+    fn malformed_negative_base_names_fail_the_way_real_walnut_does() {
+        for (name, expected) in [
+            (
+                "msd_neg_99999999999",
+                NumSysError::BaseNotAnI32("neg_99999999999".to_string()),
+            ),
+            (
+                "msd_neg_2147483648",
+                NumSysError::BaseNotAnI32("neg_2147483648".to_string()),
+            ),
+            (
+                "msd_neg_1",
+                NumSysError::NotDefined("msd_neg_1".to_string()),
+            ),
+            (
+                "msd_neg_0",
+                NumSysError::NotDefined("msd_neg_0".to_string()),
+            ),
+            (
+                "msd__neg_2",
+                NumSysError::NotDefined("msd__neg_2".to_string()),
+            ),
+            ("lsd_neg_", NumSysError::NotDefined("lsd_neg_".to_string())),
+        ] {
+            assert_eq!(NumberSystem::new(name).unwrap_err(), expected, "{name}");
+        }
+        // Deliberately NOT tested: `msd_neg_2147483647`, the largest base that parses.
+        // Its name is fine, so construction proceeds to `intRangeList(2147483647)` and
+        // tries to materialize a 2^31-element alphabet -- Java throws
+        // `OutOfMemoryError` there and this port would spend minutes allocating before
+        // its own `determine_alphabet_size` overflow check ever runs. That behaviour is
+        // identical for the POSITIVE base `msd_2147483647` and predates this unit, so it
+        // is a pre-existing shared limitation, not something the negative-base restoration
+        // introduced -- noted here rather than turned into a multi-minute test.
     }
 
     /// Java's own comment on `isNeg` names the false positive its leading underscore

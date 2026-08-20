@@ -163,6 +163,25 @@ is ever wanted, it's a self-contained later port (read Java → translate → te
 for having been deleted now. This also **confirms `split`/`rsplit` as DROP** (§6) rather than
 DROP-contingent — the coupling in §6.1 is now settled the same direction.
 
+**REVISITED AND REVERSED, 2026-08-20: negative-base numeration is now PORTED** (Layer A of
+`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`), which is exactly the "self-contained later port
+(read Java → translate → test → review)" the 2026-08-08 decision above anticipated. Nothing
+in that decision's reasoning turned out wrong — it was a scheduling call, and the deletion
+did make the later port cleaner, because `crates/wr-core/src/numsys.rs`'s module doc had
+recorded the removal method-by-method with exact Java line numbers and that list was the
+literal undo-list. Restored: `baseNegNAddition` (`:503-533`), `baseNegNLessThan`
+(`:541-561`), the two fallback arms that select them, `validateNeg`'s full
+`!isNeg && n.signum() < 0`, and every `n.signum() < 0` arm in `comparison`/`arithmetic`
+(three overloads)/`constant`/`multiplication`/`division`. Tier 1 went from 587 compared /
+586 pass to **675 compared / 654 pass** as the 68 negative-base fixtures came back in.
+
+Still DROP as of Layer A, and the reason is now narrower than "negative bases are out of
+scope": the **base-change** surface (`baseNBaseChange` `:568-601`, `setBaseChangeAutomaton`
+`:443-468`, `determineNegativeNS` `:219-230`, the `baseChange` field). It exists solely to
+serve `split`/`rsplit` — `determineNegativeNS`'s own javadoc says "Currently used ONLY in
+split command" — so §6's `split`/`rsplit` call is what keeps it out, not §4.1's. That is
+Layer B of the same dispatch.
+
 ### 4.2 Split `AutomatonLogicalOps.java` across wr-core/wr-logic, or keep it monolithic in wr-core?
 Boolean connectives (`and/or/xor/imply/iff/not`) read as logic-layer semantics; quotient/reverse/`convertNS`/
 `combine` read as automaton-algorithm-layer. DESIGN.md itself flagged this file as ambiguous; content confirms

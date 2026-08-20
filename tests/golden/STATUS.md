@@ -52,11 +52,24 @@ rather than passing silently.
 | | |
 |---|---|
 | fixtures replayed | **675** (the whole `IntegrationTest.L` list, in order) |
-| compared | **587** |
-| **pass** | **586** (99.8% of compared) |
+| compared | **655** |
+| **pass** | **654** (99.8% of compared) |
 | **fail** | **1** (in `KNOWN_DIVERGENCES`, a distinct root cause from the five closed below) |
-| skipped (excluded, each with a recorded reason) | **88** |
+| skipped (excluded, each with a recorded reason) | **20** |
 | timed out / not-run | **0** |
+
+**The 68 negative-base fixtures joined the compared set (2026-08-20)** when negative-base
+numeration was ported (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A —
+`wr_core::numsys`'s `base_neg_n_addition`/`base_neg_n_less_than`, the full `validateNeg`,
+and every restored `n.signum() < 0` arm). **All 68 pass, on the first run, with no harness
+change of any kind** — unlike fixture 625 below, this was purely an exclusion-side flip
+plus real production code. The exclusion side is the same cross-repo edit 625 needed:
+`walnut-java/phase0-artifacts/subset-filter.json` flipped every row whose only
+`drop_reason` was `negative_base_number_system:*` (39 `msd_neg_2`, 14 `msd_neg_fib`,
+11 `lsd_neg_fib`, 3 `lsd_neg_2`, 1 `msd_neg_10`), with `subset_relevant_count` (592→660),
+`drop_relevant_count` (83→15) and `drop_reason_counts` updated in the same edit because
+`support::load_fixtures` self-checks them. What remains excluded on that axis is
+`split`/`rsplit` alone — Layer B of the same dispatch.
 
 **Fixture 625 (`ost test625 [0 3 1] [1 2];`) joined the compared set (2026-08-20)** when
 Ostrowski numeration was ported (`wr_core::ostrowski` + `wr_cli::ost`). It passes. Two
@@ -168,10 +181,14 @@ Skip breakdown:
 
 | count | reason |
 |---|---|
-| 68 | `skip-drop-scope[negative_base_number_system]` |
-| 16 | `skip-drop-scope[drop_command]` (`split`/`rsplit`/`ost`) |
+| 15 | `skip-drop-scope[drop_command]` (`split`/`rsplit`) |
 | 4 | `skip-otf-deferred[CCL / CCLS / BRZ_CCL / BRZ_CCLS]` |
 | 1 | `skip-transitive-drop-dep[test444,test445,test446,test447]` (fixture 448) |
+
+(Two categories are gone from this table rather than reduced: `ost` left
+`skip-drop-scope[drop_command]` on 2026-08-20 when Ostrowski landed, and
+`skip-drop-scope[negative_base_number_system]` — 68 fixtures — left it the same day when
+negative-base numeration did.)
 
 Partial comparisons (compared, but not in full — recorded per id in the run report):
 

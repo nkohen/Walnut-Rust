@@ -454,3 +454,47 @@ per `CLAUDE.md`'s Prime Directive.
 
 `ostq2.txt` is the literal text `true` (a closed formula collapsing to the TRUE
 automaton); real Walnut also printed `TRUE` on stdout for it.
+
+---
+
+# Ground-truth capture: negative-base numeration (`fixtures/negative_base/*.txt`)
+
+Captured 2026-08-20 for `tests/negative_base.rs`, the Tier-3 half of
+`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`'s Layer A (negative-base numeration:
+`msd_neg_k` / `lsd_neg_k` / `msd_neg_fib` / `lsd_neg_fib`).
+
+The full command file, the per-fixture `cp` list, and the reasoning for each query are in
+`tests/negative_base.rs`'s own module documentation — kept there rather than duplicated
+here because the mutation matrix that justifies the query choice lives beside it. In
+outline:
+
+```bash
+cd ~/dev/walnut-java     # built with ./mvnw -q clean package -DskipTests -Pfat-jar
+cat > "Command Files/negcap.txt" <<'EOF'
+eval nblt          "?msd_neg_2 x < y";
+eval nbltlsd       "?lsd_neg_2 x < y";
+eval nbadd         "?msd_neg_2 x + y = z";
+eval nbconst       "?msd_neg_2 x = _5";
+eval nbquant       "?msd_neg_3 Ex (x + x = y & y < 5)";
+eval nbdiv         "?msd_neg_2 y = x / _3";
+eval nbmul         "?msd_neg_2 y = _2 * x";
+eval nbfiblsd      "?lsd_neg_fib x >= 2";
+eval nbfibmsd      "?msd_neg_fib Ex (x < 5 & y = x)";
+eval nbclosed      "?msd_neg_2 Ax Ey (y > x)";
+eval nbclosedfalse "?msd_neg_2 Ax (x >= 0)";
+EOF
+java -jar target/Walnut-all.jar negcap.txt < /dev/null
+```
+
+Nine automata were copied out of `Session/<timestamp>/Automata Library/`; the two closed
+formulae print `TRUE`/`FALSE` on stdout and need no fixture file. The three
+`Custom Bases/msd_neg_fib{,_addition,_less_than}.txt` files the two `neg_fib` cases need
+were copied from `walnut-java`'s own `Custom Bases/` — they are Walnut's data files,
+carried under the same GPLv3 attribution as every other fixture from that repo. Note
+there is deliberately **no** `lsd_neg_fib*` file: real Walnut ships none either, so
+`?lsd_neg_fib` resolves on both engines only through `NumberSystem.loadAutomatonOrNull`'s
+opposite-direction-complement-plus-reverse fallback, which is exactly what
+`neg_fib_lsd_resolves_through_the_complement_fallback` is there to check.
+
+The command file and session directory were deleted from the `walnut-java` checkout
+afterward, matching every recipe above.

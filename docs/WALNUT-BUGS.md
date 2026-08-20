@@ -2267,6 +2267,73 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-043 — `NumberSystem.arithmetic(String, String, BigInteger, MINUS)`'s negative-constant rewrite uses the WRONG operator, computing `b = a - |c|` where `a - b = c` requires `b = a + |c|`
+
+- **Where:** `Automata/NumberSystem.java:910-913`.
+
+  ```java
+  if (c.signum() < 0 && arithmeticOperator.equals(ArithmeticOperator.Ops.MINUS)) {
+      // We rewrite "a-b=c" and "a+(-c)=b"
+      N = getConstant(c.negate());
+      N.bind(List.of(C));
+      M = arithmetic(a, C, b, arithmeticOperator);   // <-- MINUS, not PLUS
+  }
+  ```
+- **What:** this overload's contract (its own javadoc, `:884`) is "accepts iff
+  `c = a arithmeticOperator b`". For `MINUS` that is `c = a - b`; with `c < 0` and
+  `C := -c > 0` the algebra Java's own comment states — *"We rewrite `a-b=c` and
+  `a+(-c)=b`"* — gives `b = a + C`. But the recursive call passes `arithmeticOperator`
+  (which is `MINUS` on this branch, by the guard's own conjunct), and
+  `arithmetic(a, C, b, MINUS)` means `b = a - C`. So the constructed automaton is
+  `b = a - |c|`, the reflection of the right answer through `a`. Writing `PLUS` instead of
+  `arithmeticOperator` on that one line is the whole difference.
+
+  Note the sibling arm two methods up is written correctly: `arithmetic(BigInteger, String,
+  String, PLUS)`'s `a.signum() < 0` rewrite (`:861-864`) also re-dispatches with
+  `arithmeticOperator`, but there the guard's conjunct is `PLUS` and the required rewrite
+  (`c + (-a) = b`) genuinely IS a `PLUS` — so the same spelling happens to be right. That
+  near-miss is probably how the `MINUS` case survived.
+- **Confirmed live, by Walnut's own test suite:** `NumberSystemTest.testNegArithmeticOrdering`
+  (`src/test/java/Automata/NumberSystemTest.java:155-161`) asserts
+
+  ```java
+  A = ns.arithmetic("a", "b", -1, Ops.MINUS);   // contract: -1 = a - b, i.e. b = a + 1
+  B = ns.arithmetic("a", 1, "b", Ops.MINUS);    //                            b = a - 1
+  Assertions.assertEquals(A.toString(), B.toString()); // "basically the same..."
+  ```
+
+  — i.e. the existing characterization test pins the buggy output as expected behavior. That
+  suite is green, so the behavior is confirmed, not inferred.
+- **Blast radius: zero in production, today.** Every call site of the `BigInteger`-third-
+  argument overload in the whole `src/main/java` tree passes the constant `0` with `PLUS`
+  (`ArithmeticOperator.java:118` unary negation, `Main/Commands/Split.java:112`,
+  `NumberSystem.constant`'s `:949` and `multiplication`'s `:991`), and `0` is not negative —
+  so no user query can reach this arm. `Prover`'s surface syntax has no way to write "two
+  variables combined arithmetically, equated to a *negative literal*" that routes here either:
+  `?msd_neg_3 x - y = _1` parses as an arithmetic operator producing a fresh temp plus a
+  RELATIONAL comparison against the literal (`comparison(String, BigInteger, EQUAL)`), which
+  is a different, correct code path — verified live against `target/Walnut-all.jar`, where
+  `?msd_neg_3 x - y = _1` produces exactly the automaton `?msd_neg_3 y = x + 1` does, not the
+  one `?msd_neg_3 y = x - 1` does. The arm is reachable only by calling `NumberSystem`
+  directly, as `NumberSystemTest` does.
+- **Found:** the negative-base port (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`, Layer A),
+  2026-08-20, while writing the Tier-2 replica of `testNegArithmeticOrdering` — the port's own
+  new `x - y = -1` fixture failed against the ported code, and chasing why led here.
+- **Rust port:** ported verbatim. `wr_core::numsys::NumberSystem::arithmetic_const_c` passes
+  `op` (not `ArithmeticOp::Plus`) on this arm, exactly as Java does, and
+  `negative_constant_as_the_result` pins the resulting `b = a - |c|` language with an explicit
+  reference back to this entry — so a future "cleanup" that silently corrects the algebra
+  fails a test rather than quietly diverging from the oracle.
+- **Upstream:** not filed. Fixing it in `walnut-java` would also require changing
+  `NumberSystemTest.testNegArithmeticOrdering`'s assertion, which currently encodes the bug;
+  that is a deliberate PR plus explicit sign-off on a port divergence per `CLAUDE.md`'s
+  log-then-decide process, not something to resolve mid-port.
+- **Severity:** latent. Wrong output, but currently unreachable from every production caller —
+  it becomes a live wrong-answer bug the moment anyone adds a call site that passes a negative
+  constant as the result of a `MINUS`.
+
+---
+
 ## Dead code / doc-vs-implementation mismatches (tracked in `PROGRESS.md`, not duplicated here)
 
 Several Phase 0 findings are confirmed-dead code or javadoc/implementation mismatches with **no

@@ -623,7 +623,10 @@ mod tests {
     #[test]
     fn an_unresolvable_number_system_reports_a_number_system_error() {
         let env = InMemoryPredicateEnv::new();
-        let err = determine_alphabets_and_ns("msd_neg_2 ", &env, &mut Logging::new()).unwrap_err();
+        // `msd_neg_2` used to serve as the unresolvable name here; it resolves now
+        // (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A), so use a base that genuinely
+        // has no programmatic construction and no `Custom Bases/` file.
+        let err = determine_alphabets_and_ns("msd_nope ", &env, &mut Logging::new()).unwrap_err();
         assert!(matches!(err, AlphabetError::NumberSystem(_)));
     }
 

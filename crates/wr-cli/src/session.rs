@@ -632,11 +632,6 @@ impl FileLibraries {
     /// `new NumberSystem(name)` (`NumberSystem.java:132-163`) with this session supplying the
     /// three `loadAutomatonOrNull` probes (`:299-319`).
     ///
-    /// Java's line order is preserved, and it matters: `isNeg` is checked at `:137`, before
-    /// `setAdditionAutomaton` reaches a file at `:142`, so a `_neg_` name is rejected without
-    /// ever probing the (genuinely present) `Custom Bases/msd_neg_fib*.txt` files. `wr-io`'s
-    /// [`reader`] does the same for header tokens; this is the query-token twin of it.
-    ///
     /// Note that Java probes `Custom Bases/` for **every** name, `msd_2` included — the
     /// programmatic base-*k* adder is only the *fallback* inside `setAdditionAutomaton`
     /// (`:322-330`), which is why this does not special-case standard bases. A user who drops
@@ -651,11 +646,6 @@ impl FileLibraries {
             name: name.to_string(),
             source,
         };
-        if name.contains(numsys::UNDERSCORE_NEG_UNDERSCORE) {
-            return Err(numsys_error(NumSysError::UnsupportedNegativeBase(
-                name.to_string(),
-            )));
-        }
         let files = CustomBaseFiles {
             addition: self.probe_custom_base(name, numsys::UNDERSCORE_ADDITION_AUTOMATON)?,
             less_than: self.probe_custom_base(name, numsys::UNDERSCORE_LESS_THAN_AUTOMATON)?,
@@ -1634,12 +1624,15 @@ mod tests {
             .is_ok());
     }
 
-    /// `_neg_` is rejected at name-resolution time, before any file is probed — U5's declared
-    /// divergence, mirroring Java's own `isNeg`-before-`setAdditionAutomaton` line order.
-    /// Checked with `msd_neg_fib*` files actually PRESENT (and unparseable), so "no file was
-    /// found" cannot be what produced the error.
+    /// The flipped form of the former `a_negative_base_is_rejected_before_its_files_are_read`
+    /// (negative bases are ported now — `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A).
+    ///
+    /// The two halves are what the old test's own setup was implicitly contrasting:
+    /// `msd_neg_fib` IS file-backed (so unparseable files now surface as a real read error,
+    /// proving the files are genuinely consulted rather than short-circuited by name), while
+    /// `msd_neg_2` is not (so it constructs with no `Custom Bases/` entry at all).
     #[test]
-    fn a_negative_base_is_rejected_before_its_files_are_read() {
+    fn a_negative_base_now_reads_its_files_instead_of_being_rejected_by_name() {
         let (_root, global, session) = walnut_tree("neg");
         write(&global, "Custom Bases/msd_neg_fib_addition.txt", "garbage");
         write(&global, "Custom Bases/msd_neg_fib.txt", "garbage");
@@ -1650,15 +1643,16 @@ mod tests {
             .number_system("msd_neg_fib", &mut wr_core::logging::Logging::new())
             .unwrap_err();
         assert!(
-            matches!(
-                err,
-                PredicateEnvError::NumberSystem {
-                    source: NumSysError::UnsupportedNegativeBase(_),
-                    ..
-                }
-            ),
+            matches!(err, PredicateEnvError::MalformedAutomaton { .. }),
             "{err:?}"
         );
+
+        let ns = s
+            .libraries()
+            .number_system("msd_neg_2", &mut wr_core::logging::Logging::new())
+            .expect("msd_neg_2 is built programmatically, no Custom Bases file needed");
+        assert_eq!(ns.name(), "msd_neg_2");
+        assert_eq!(ns.get_alphabet(), &[0, 1]);
     }
 
     // ------------------------------------------------------------- structure / WB-005
