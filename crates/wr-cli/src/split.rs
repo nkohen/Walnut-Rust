@@ -243,6 +243,20 @@ pub fn process_split_command(
         )?);
     }
 
+    // WB-044 (`docs/WALNUT-BUGS.md`), fixed upstream in `walnut-java` commit `d757221`
+    // (branch `bugfix/wb-002-012-037-044`): a trivial (`true`/`false`) operand has an
+    // empty output vector (`M.fa.getO()` is empty), so `outputs` is empty, `uncombine`
+    // returns nothing, and `split_subautomata` is empty here -- `Split.java:57`'s
+    // `subautomata.remove(0)` used to throw a raw `IndexOutOfBoundsException` for this
+    // shape. Java's fix adds this exact guard, one frame above where `processSplit`'s
+    // own `getAlphabetSize() == 0` guard would otherwise have caught it, had any
+    // subautomaton existed for that guard to run against.
+    if split_subautomata.is_empty() {
+        return Err(SplitError::Walnut(
+            "Cannot split automaton with no output values.".to_string(),
+        ));
+    }
+
     // `Automaton N = subautomata.remove(0); N = combine(N, rest, outputs);` (`:57-58`).
     let first = split_subautomata.remove(0);
     let mut n = combine(&first, split_subautomata, &outputs, logging);
@@ -748,37 +762,34 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// `docs/WALNUT-BUGS.md` **WB-044**, pinned rather than fixed: a trivial
+    /// `docs/WALNUT-BUGS.md` **WB-044**, fixed upstream in `walnut-java` commit
+    /// `d757221` (branch `bugfix/wb-002-012-037-044`) and here to match: a trivial
     /// (`true`/`false`) operand has an empty output vector, so `outputs` is empty,
-    /// `uncombine` returns nothing, and `Split.java:57`'s `subautomata.remove(0)` blows up
-    /// — in Java with `IndexOutOfBoundsException: Index 0 out of bounds for length 0`, here
-    /// with `Vec::remove`'s own panic. Both engines recover (Java's
-    /// `Prover.readBuffer` catch, this port's `Prover::caught`) and keep the session alive;
-    /// only the message text differs, which is `ProverError::Thrown`'s pre-existing
-    /// documented divergence.
-    ///
-    /// Verified by running the SAME command file through both engines, not inferred from
-    /// the source. This test asserts the panic reaches the caller as a panic (so
-    /// `Prover::caught` is what handles it) rather than being quietly swallowed here.
+    /// `uncombine` returns nothing, and `split_subautomata` is empty by the time
+    /// `Split.java:57`'s `subautomata.remove(0)` used to run. That used to blow up — in
+    /// Java with `IndexOutOfBoundsException: Index 0 out of bounds for length 0`, here
+    /// with `Vec::remove`'s own panic (both engines recovered, Java's
+    /// `Prover.readBuffer` catch, this port's `Prover::caught`, so the session stayed
+    /// alive either way, just with a bad diagnostic). Both engines now raise a clean,
+    /// diagnosable error with the exact same message text before ever reaching that
+    /// `remove(0)` call — no panic, no `Prover::caught` recovery needed.
     #[test]
-    fn split_on_a_true_automaton_recovers_like_java_does() {
+    fn split_on_a_true_automaton_raises_a_clean_error_like_fixed_java_does() {
         let (session, dir) = temp_session("truefalse");
         write(&dir, "Automata Library", "t.txt", "true\n");
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_split_command(
-                &session,
-                &mut log(),
-                "split out t[+];",
-                false,
-                "t",
-                "out",
-                "[+]",
-            )
-        }));
-        assert!(
-            caught.is_err(),
-            "WB-044: the unguarded remove(0) must still panic, for `Prover::caught` to \
-             recover the way Java's own catch does"
+        let err = process_split_command(
+            &session,
+            &mut log(),
+            "split out t[+];",
+            false,
+            "t",
+            "out",
+            "[+]",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cannot split automaton with no output values."
         );
         fs::remove_dir_all(&dir).ok();
     }

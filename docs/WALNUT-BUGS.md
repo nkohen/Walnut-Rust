@@ -2421,20 +2421,34 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** the `split`/`rsplit` port (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`, Layer B),
   2026-08-20, by running the same input through both engines rather than by reading the
   source.
-- **Rust port:** ported verbatim — `wr_cli::split::process_split_command` performs the same
-  unguarded `remove(0)`, which panics and is recovered by `Prover::caught` (this port's
-  stand-in for Java's `catch (RuntimeException)`), so the session survives exactly as Java's
-  does. **The message text differs**: Rust's `Vec::remove` says `removal index (is 0) should
-  be < len (is 0)` where the JVM says `Index 0 out of bounds for length 0`. That is the
+- **Rust port:** was `ported verbatim` — `wr_cli::split::process_split_command` performed the same
+  unguarded `remove(0)`, which panicked and was recovered by `Prover::caught` (this port's
+  stand-in for Java's `catch (RuntimeException)`), so the session survived exactly as Java's
+  did. **The message text differed**: Rust's `Vec::remove` says `removal index (is 0) should
+  be < len (is 0)` where the JVM said `Index 0 out of bounds for length 0`. That was the
   pre-existing, documented `ProverError::Thrown` divergence (see `Prover::caught`'s docs),
-  not a new one, and no golden fixture compares this text. Pinned by
-  `wr_cli::split`'s `split_on_a_true_automaton_recovers_like_java_does`.
-- **Upstream:** not filed. Fixing it would mean adding a guard Java does not have (most
-  naturally hoisting `processSplit`'s `getAlphabetSize() == 0` check, or its own message,
-  up into `processSplitCommand`), i.e. a deliberate divergence needing explicit sign-off per
-  `CLAUDE.md`'s log-then-decide process.
-- **Severity:** cosmetic. Both engines refuse the command and both survive; only the
-  diagnostic quality is wrong.
+  not a new one, and no golden fixture compared this text.
+- **Upstream:** **fixed**, `walnut-java` commit `d757221` (branch `bugfix/wb-002-012-037-044`):
+  `Split.processSplitCommand` gained exactly the guard this entry's earlier draft described as
+  "fixing it would mean adding" — `if (subautomata.isEmpty()) throw new WalnutException("Cannot
+  split automaton with no output values.");`, placed immediately before the `remove(0)` call.
+- **Severity:** cosmetic pre-fix. Both engines refused the command and both survived; only the
+  diagnostic quality was wrong.
+- **Resolved (2026-08-20):** upstream fixed as described above (commit `d757221`; verified live,
+  `split out T[+];` on a `true`-only `T.txt` now prints `Cannot split automaton with no output
+  values.` cleanly, no stack trace). **Rust port: fixed, matches walnut-java as of commit
+  `d757221`.** This one WAS a real, functional Rust-side change (unlike WB-037's text-only fix):
+  `process_split_command` now has the matching `split_subautomata.is_empty()` guard, placed
+  immediately before the `remove(0)`, raising `SplitError::Walnut("Cannot split automaton with no
+  output values.".to_string())` — a clean `Result::Err` with Java's exact fixed message, instead
+  of the former panic. The old pinning test
+  (`split_on_a_true_automaton_recovers_like_java_does`, which asserted the panic reached
+  `Prover::caught`) is renamed and flipped to
+  `split_on_a_true_automaton_raises_a_clean_error_like_fixed_java_does`, asserting the clean
+  `Err` and its exact message instead — not deleted, per `CLAUDE.md`'s merge gate. Differential
+  coverage against a live capture from the fixed branch:
+  `tests/differential/tests/java_bugfix_wb044.rs`'s
+  `wb044_split_on_a_true_false_automaton_matches_fixed_java`.
 
 ---
 
