@@ -132,6 +132,15 @@ what actually shipped.
 
 ### 4. OTF determinization family (CCL/CCLS/BRZ_CCL/BRZ_CCLS/`OTF()`) — largest by a wide margin
 
+> **Status: superseded by a much deeper investigation, `docs/OTF-DETERMINIZATION-SIZING.md`
+> (2026-08-20).** The one-pass estimate below held up on the library-LOC dimension (a fresh exact
+> line count came in at the same 5,216 LOC, slightly *less* once dead/demo code is excluded — see
+> that doc's §2) but missed an entire second dependency layer (`net.automatalib`'s partition-
+> refinement internals, no Rust equivalent, unsized by this note) and the fact that OTF is a
+> not-yet-presented TACAS 2026 research algorithm with real bugfix history four months old — a
+> correctness-maturity profile nothing else this project has ported shares. Read the new doc for
+> the real sizing; this section is kept only as the record of what the first pass estimated.
+
 - **Java surface**: branches within `DeterminizationStrategies.java`'s 326 LOC, plus an external,
   unvendored `io.github.jn1z:otf` Maven dependency (no local LOC visible — the real cost is
   outside this repo entirely).
@@ -155,7 +164,9 @@ what actually shipped.
 documented zero**: 0 golden fixtures require it, and Phase 0 Item 7 confirmed empirically that no
 query in the real corpus needs a non-`SC`/`BRZ` strategy to terminate. It should stay deferred
 absent a new research workload that demonstrably needs it — the honest read there remains "don't",
-not "rank it low".
+not "rank it low". See `docs/OTF-DETERMINIZATION-SIZING.md` for the full, much deeper 2026-08-20
+investigation (the real dependency graph, the correctness-maturity risk, a revised effort estimate)
+if this is ever reconsidered.
 
 With item 3 closed, `walnut-java`'s `Automata/` and `Main/Commands/` have no unported file left,
 and the golden corpus has no DROP-scope exclusion at all (675 of 675 fixtures compared).
