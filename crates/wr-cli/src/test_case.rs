@@ -9,15 +9,19 @@
 //!
 //! Java's file imports `Automata.Writer.AutomatonMatrixWriter.EMPTY_MATRIX_TEST_CASES`
 //! (`TestCase.java:27`), a constant defined as `List.of("", "", "", "")`
-//! (`AutomatonMatrixWriter.java:21`). `AutomatonMatrixWriter` itself — the CAS
-//! (Maple/Sage/Mathematica/MATLAB) incidence-matrix exporter — is confirmed DROP scope
-//! for this project (`docs/DESIGN.md`: CAS matrix exports out of scope). This module
-//! does **not** port `AutomatonMatrixWriter` to satisfy that import: [`EMPTY_MATRIX_TEST_CASES`]
-//! below is the bare four-empty-string literal `TestCase.java` itself consumes,
-//! reproduced locally so this file has zero dependency on the dropped writer. If a
-//! future unit ever needs the *real* matrix-writing logic, that is a separate, explicit
-//! scope decision — not something this unit's placeholder should be read as pre-deciding
-//! either way.
+//! (`AutomatonMatrixWriter.java:21`). **Updated (2026-08-19, `docs/CAS-EXPORT-DISPATCH.md`):
+//! `AutomatonMatrixWriter` — the CAS (Maple/MATLAB/Mathematica/Sage) incidence-matrix
+//! exporter — is no longer DROP scope; it is ported at [`wr_io::matrix_writer`], reached
+//! from `wr-cli`'s real `eval`/`def` dispatch (`eval_def.rs`) whenever a non-empty
+//! free-variable list is supplied on a non-trivial result.** [`EMPTY_MATRIX_TEST_CASES`]
+//! below remains a real, still-needed local constant, not a placeholder for a dropped
+//! writer: it is the bare four-empty-string literal `TestCase.java` itself falls back to
+//! whenever NO free-variable list was supplied (the ordinary case for a plain `eval`,
+//! e.g. [`TestCase::from_automaton`] below). This module still has no *unconditional*
+//! dependency on the writer — it is `wr-cli`'s `eval_def.rs` that calls into
+//! `wr_io::matrix_writer` directly and passes the real, non-empty matrix addresses to
+//! [`TestCase::new`] when a free-variable list was supplied; this file never calls the
+//! writer itself.
 //!
 //! # `UtilityMethods.readFromFile`
 //!

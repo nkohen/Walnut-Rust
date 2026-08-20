@@ -77,10 +77,12 @@
 //! `crates/wr-cli/src/prover.rs`'s module docs — so fixtures 637, 659 and 660 are compared
 //! normally. 638-641 remain excluded, but under (2): they ask for OTF strategies.)
 //!
-//! Plus one *partial* exclusion: the fixtures whose recorded expectation includes CAS
-//! incidence-matrix files (`.mpl`/`.m`/`.wl`/`.sage`). The CAS matrix writer is confirmed
-//! DROP scope for this port, so those fixtures have their automaton/details/error compared
-//! and **only** their matrix comparison skipped — reported per id as `cas-matrix-skipped`.
+//! (There also used to be a *partial* exclusion: the 7 fixtures whose recorded expectation
+//! includes CAS incidence-matrix files, `.mpl`/`.m`/`.wl`/`.sage`, had their matrix comparison
+//! skipped (`cas-matrix-skipped`) because the CAS matrix writer was DROP scope. CAS export is
+//! now ported (`wr_io::matrix_writer`, `.claude/plans/amber-transcribing-ledger.md`), so those
+//! 7 fixtures (374-379, 383) are compared exactly like every other fixture — including their
+//! matrix output.)
 //!
 //! # Resource discipline — an ENFORCED per-fixture cap
 //!
@@ -168,20 +170,42 @@ const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024;
 // Verdicts
 // ---------------------------------------------------------------------------
 
+/// Which TEXT comparison a [`FailedHalf::Text`] reason came from.
+///
+/// This exists because [`FailedHalf::Text`] alone is not fine-grained enough:
+/// [`KNOWN_DIVERGENCES`]' legitimacy rests on each entry excusing one SPECIFIC, documented
+/// text gap (e.g. 383's is `details` only), not "some text field or other". Before this
+/// existed, an entry matched any text-only failure on its id regardless of which text field
+/// actually diverged — so a fixture whose `details` gap is well-understood and whose entry
+/// only ever justified that gap could ALSO silently absorb an unrelated regression in, say,
+/// its matrix output, as long as the automaton still matched. Scoping each entry to the
+/// field(s) it actually documents (see `KNOWN_DIVERGENCES`' `&[TextField]` column and its use
+/// at the gate) closes that hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TextField {
+    Details,
+    Matrix,
+    Graphviz,
+    Error,
+}
+
 /// Which comparison a failure reason came from.
 ///
 /// This exists for one reason: [`KNOWN_DIVERGENCES`]' whole legitimacy rests on the claim
-/// that every entry in it is a **text-only** divergence whose automaton already matches.
-/// Matching a known entry by fixture id alone would let a future regression break the
-/// AUTOMATON comparison for one of those ids and still report green — the id is in the
-/// list, so the gate would wave it through. Tagging each reason turns "these are text-only"
-/// from a one-time manual observation into an invariant the gate enforces on every run
-/// (see [`Verdict::is_text_only_failure`] and its use at the gate).
+/// that every entry in it is a **text-only** divergence, in the SPECIFIC field(s) it names,
+/// whose automaton already matches. Matching a known entry by fixture id alone would let a
+/// future regression break the AUTOMATON comparison for one of those ids and still report
+/// green — the id is in the list, so the gate would wave it through. Tagging each reason
+/// turns "these are text-only, in this field" from a one-time manual observation into an
+/// invariant the gate enforces on every run (see [`Verdict::is_text_only_failure`] for the
+/// coarse check and [`Verdict::is_excused_by`] for the field-scoped one the gate actually
+/// uses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FailedHalf {
-    /// A TEXT comparison: `details`, the error message, matrix output, graphviz. The only
-    /// half a [`KNOWN_DIVERGENCES`] entry may excuse.
-    Text,
+    /// A TEXT comparison: `details`, the error message, matrix output, graphviz — see
+    /// [`TextField`] for which. The only half a [`KNOWN_DIVERGENCES`] entry may excuse, and
+    /// only for the field(s) that entry names.
+    Text(TextField),
     /// The `wr_core::equiv` automaton comparison — **including** the cases where it could
     /// not be run at all: an unreadable recorded automaton, a missing/extra automaton, the
     /// wrong number of pairs, the command **erroring** where the corpus records a successful
@@ -241,16 +265,43 @@ impl Verdict {
         }
     }
 
-    /// Whether EVERY collected reason is a [`FailedHalf::Text`] one — i.e. the automaton
-    /// comparison ran and matched, and the harness/dispatch were fine.
+    /// Whether EVERY collected reason is a [`FailedHalf::Text`] one, in ANY field — i.e. the
+    /// automaton comparison ran and matched, and the harness/dispatch were fine.
     ///
-    /// A [`KNOWN_DIVERGENCES`] entry is honored only when this is true. A `Timeout`/
-    /// `NotRun`/`Pass` verdict is not a text-only failure (there is no failure, or no
-    /// comparison happened at all), so this is `false` for those by construction.
+    /// This is the coarse check; it is what makes a failure ELIGIBLE for a
+    /// [`KNOWN_DIVERGENCES`] entry to excuse at all, but the gate does not stop here — it
+    /// additionally requires [`Verdict::is_excused_by`] to hold for that entry's specific
+    /// declared field(s), so a text-only failure in an UNDOCUMENTED field still fails the
+    /// gate. A `Timeout`/`NotRun`/`Pass` verdict is not a text-only failure (there is no
+    /// failure, or no comparison happened at all), so this is `false` for those by
+    /// construction.
     fn is_text_only_failure(&self) -> bool {
         match self {
             Verdict::Fail(reasons) => {
-                !reasons.is_empty() && reasons.iter().all(|(half, _)| *half == FailedHalf::Text)
+                !reasons.is_empty()
+                    && reasons
+                        .iter()
+                        .all(|(half, _)| matches!(half, FailedHalf::Text(_)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a [`KNOWN_DIVERGENCES`] entry declaring exactly `allowed` fields may excuse
+    /// this verdict: every collected reason must be [`FailedHalf::Text`] AND its
+    /// [`TextField`] must be one of `allowed`. Strictly stronger than
+    /// [`Verdict::is_text_only_failure`] — that method alone was the gap this type closes
+    /// (see [`TextField`]'s docs): a fixture whose entry only ever justified its `details`
+    /// gap could otherwise also absorb a same-run regression in, say, its matrix output, as
+    /// long as the automaton still matched.
+    fn is_excused_by(&self, allowed: &[TextField]) -> bool {
+        match self {
+            Verdict::Fail(reasons) => {
+                !reasons.is_empty()
+                    && reasons.iter().all(|(half, _)| match half {
+                        FailedHalf::Text(field) => allowed.contains(field),
+                        FailedHalf::Automaton | FailedHalf::Harness => false,
+                    })
             }
             _ => false,
         }
@@ -394,14 +445,17 @@ fn halted_outcome(halt: &Halt, id: usize, command: &str) -> Option<Outcome> {
 /// An entry here is only legitimate when it names a `docs/WALNUT-BUGS.md` entry, an already-
 /// signed-off scope decision, or an open follow-up unit — never "this one is hard".
 ///
-/// **An entry excuses a TEXT divergence only.** Every id below is accepted specifically
-/// because its automaton comparison already passes and only the log text differs — so the
-/// gate honors an entry only when [`Verdict::is_text_only_failure`] holds for that run's
-/// verdict ([`FailedHalf`]). If a future regression breaks fixture 637's or 660's
-/// *automaton*, being on this list will not save it: it is reported as `NOT TEXT-ONLY`.
-/// Before that check existed, matching was by id alone, and exactly that regression would
-/// have reported green.
-const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
+/// **An entry excuses a TEXT divergence in the SPECIFIC field(s) it declares — nothing
+/// broader.** Every id below is accepted specifically because its automaton comparison
+/// already passes and only the named field's text differs — so the gate honors an entry
+/// only when [`Verdict::is_excused_by`] holds for that run's verdict against that entry's
+/// declared `&[TextField]`. If a future regression breaks fixture 383's *automaton*, being
+/// on this list will not save it (`NOT TEXT-ONLY`); if it instead breaks an UNDECLARED text
+/// field on an id that IS listed — e.g. 383's matrix output, when its entry declares only
+/// `Details` — the gate reports that as a genuine new failure too, not a laundered pass.
+/// Before `TextField` scoping existed, an entry excused ANY text-only failure on its id
+/// regardless of which field diverged, and exactly that gap would have reported green.
+const KNOWN_DIVERGENCES: &[(usize, &[TextField], &str)] = &[
     // -- root cause 1 (CLOSED, U28, 2026-08-17): `details` per-`act()`/`wr-core` logging --
     //
     // 628 and 637 used to live here — every STATE COUNT already matched real Walnut
@@ -462,6 +516,12 @@ const KNOWN_DIVERGENCES: &[(usize, &str)] = &[
     // `tests/golden/STATUS.md` §1b for the full account.
     (
         383,
+        // Declares `Details` only — deliberately NOT `Matrix`, even though 383 is also one
+        // of the seven CAS-matrix fixtures compared byte-for-byte since the matrix-export
+        // unit landed. This entry's whole justification (the paragraph above) is about
+        // `details` log text; it says nothing about matrix output, so it must not be able
+        // to excuse a matrix regression on 383 just because both happen to be `Text`.
+        &[TextField::Details],
         "details: WB-039 `disablePrint`/`enablePrint` leak during recursive constant \
          construction, captured from Java's WARM session — see the comment above this list \
          and `tests/golden/STATUS.md` §1b for the full account. Both automata match; only \
@@ -771,7 +831,10 @@ fn tier1_golden_corpus() {
         return;
     }
 
-    let known: BTreeMap<usize, &str> = KNOWN_DIVERGENCES.iter().copied().collect();
+    let known: BTreeMap<usize, (&[TextField], &str)> = KNOWN_DIVERGENCES
+        .iter()
+        .map(|&(id, fields, why)| (id, (fields, why)))
+        .collect();
     let failing: BTreeMap<usize, String> = outcomes
         .iter()
         .filter_map(|o| match &o.verdict {
@@ -803,28 +866,49 @@ fn tier1_golden_corpus() {
         .map(|o| o.id)
         .collect();
 
-    // Which fixtures diverged in a way a `KNOWN_DIVERGENCES` entry is even *allowed* to
-    // excuse: a failure every one of whose reasons is a TEXT one (see `FailedHalf`). An id
-    // in `KNOWN_DIVERGENCES` whose automaton comparison broke — or that timed out, or that
-    // panicked the harness — is a NEW FAILURE, not a known one, however long it has been on
-    // the list. Matching by id alone (what this gate used to do) would let exactly that
-    // regression report green.
-    let text_only: BTreeSet<usize> = outcomes
+    // Which fixtures diverged in a way THEIR OWN `KNOWN_DIVERGENCES` entry is allowed to
+    // excuse: a failure every one of whose reasons is `FailedHalf::Text` AND whose
+    // `TextField` is among that entry's declared fields (see `TextField`, `Verdict::
+    // is_excused_by`). An id in `KNOWN_DIVERGENCES` whose automaton comparison broke, that
+    // timed out, that panicked the harness, or whose text failure landed in a field the
+    // entry never documented, is a NEW FAILURE, not a known one, however long it has been
+    // on the list. Matching by id alone (what this gate used to do, and what matching by id
+    // + "some text field or other" still did before `TextField` scoping) would let exactly
+    // that class of regression report green.
+    let excused: BTreeSet<usize> = outcomes
         .iter()
-        .filter(|o| o.verdict.is_text_only_failure())
+        .filter(|o| {
+            known
+                .get(&o.id)
+                .is_some_and(|entry| o.verdict.is_excused_by(entry.0))
+        })
         .map(|o| o.id)
         .collect();
 
     let mut problems = String::new();
     for (id, why) in &failing {
-        if !not_run.contains(id) && !(known.contains_key(id) && text_only.contains(id)) {
-            if known.contains_key(id) {
-                let _ = writeln!(
-                    problems,
-                    "  NOT TEXT-ONLY fixture {id} IS in KNOWN_DIVERGENCES, but this run's \
-                     divergence is not a text-only one — every entry there is accepted \
-                     *because* its automaton already matches, so this does not qualify: {why}"
-                );
+        if !not_run.contains(id) && !excused.contains(id) {
+            if let Some((fields, entry_why)) = known.get(id) {
+                if outcomes
+                    .iter()
+                    .find(|o| o.id == *id)
+                    .is_some_and(|o| o.verdict.is_text_only_failure())
+                {
+                    let _ = writeln!(
+                        problems,
+                        "  UNDECLARED TEXT FIELD  fixture {id} IS in KNOWN_DIVERGENCES \
+                         (declared fields: {fields:?}; entry: {entry_why}), and this run's \
+                         divergence IS text-only, but not in a field the entry declares — a \
+                         real, new divergence, not the documented one: {why}"
+                    );
+                } else {
+                    let _ = writeln!(
+                        problems,
+                        "  NOT TEXT-ONLY fixture {id} IS in KNOWN_DIVERGENCES, but this run's \
+                         divergence is not a text-only one — every entry there is accepted \
+                         *because* its automaton already matches, so this does not qualify: {why}"
+                    );
+                }
             } else {
                 let _ = writeln!(problems, "  NEW FAILURE   fixture {id}: {why}");
             }
@@ -839,8 +923,9 @@ fn tier1_golden_corpus() {
             failing.get(&first).map(String::as_str).unwrap_or("not run")
         );
     }
-    for (id, why) in &known {
+    for (id, entry) in &known {
         if !failing.contains_key(id) {
+            let why = entry.1;
             let _ = writeln!(
                 problems,
                 "  STALE ENTRY   fixture {id} is listed in KNOWN_DIVERGENCES ({why}) but now passes \
@@ -933,7 +1018,6 @@ impl FixtureJob {
                     &actual,
                     &self.rewrite,
                     prover.logging().construction_recordings(),
-                    &mut notes,
                 ),
             },
         };
@@ -1148,17 +1232,20 @@ fn a_timeout_halts_the_run_and_later_fixtures_are_not_run() {
 /// test of its own rather than a comment.
 #[test]
 fn only_a_text_only_failure_can_be_excused_by_a_known_divergence() {
-    let text = |why: &str| Verdict::fail(FailedHalf::Text, why);
+    let text = |field: TextField, why: &str| Verdict::fail(FailedHalf::Text(field), why);
     let automaton = |why: &str| Verdict::fail(FailedHalf::Automaton, why);
 
-    // A pure `details` mismatch — the shape all nine current entries have.
-    assert!(text("details differs").is_text_only_failure());
+    // A pure `details` mismatch — the shape 383's entry has.
+    assert!(text(TextField::Details, "details differs").is_text_only_failure());
 
     // The automaton half broke: never excusable, alone or alongside a text mismatch.
     assert!(!automaton("language differs").is_text_only_failure());
     assert!(
         !fold_failures(
-            vec![(FailedHalf::Text, "details differs".to_string())],
+            vec![(
+                FailedHalf::Text(TextField::Details),
+                "details differs".to_string()
+            )],
             automaton("language differs"),
         )
         .is_text_only_failure(),
@@ -1166,7 +1253,10 @@ fn only_a_text_only_failure_can_be_excused_by_a_known_divergence() {
     );
     // ...and folding still reports BOTH reasons, so the report says why.
     let both = fold_failures(
-        vec![(FailedHalf::Text, "details differs".to_string())],
+        vec![(
+            FailedHalf::Text(TextField::Details),
+            "details differs".to_string(),
+        )],
         automaton("language differs"),
     );
     assert!(both.message().contains("details differs"));
@@ -1187,6 +1277,55 @@ fn only_a_text_only_failure_can_be_excused_by_a_known_divergence() {
 
     // And a clean fold is still a pass.
     assert_eq!(fold_failures(Vec::new(), Verdict::Pass), Verdict::Pass);
+}
+
+/// The finer-grained invariant `is_text_only_failure` alone cannot enforce: a
+/// [`KNOWN_DIVERGENCES`] entry only excuses the SPECIFIC field(s) it declares, not "any text
+/// field that happens to be all that's wrong." This is the fix for the gate-laundering hole
+/// two independent adversarial reviewers found in the CAS-matrix-export unit: fixture 383's
+/// entry documents a `details`-only gap, but before `TextField` existed, the gate would also
+/// have excused a same-run `matrix` regression on 383 — both are `FailedHalf::Text`, and the
+/// old gate could not tell them apart.
+#[test]
+fn a_known_divergence_only_excuses_its_own_declared_text_field() {
+    let matrix_only = Verdict::fail(
+        FailedHalf::Text(TextField::Matrix),
+        "matrix output[0] differs",
+    );
+    let details_only = Verdict::fail(FailedHalf::Text(TextField::Details), "details differs");
+    let both_fields = fold_failures(
+        vec![(
+            FailedHalf::Text(TextField::Matrix),
+            "matrix output[0] differs".to_string(),
+        )],
+        details_only.clone(),
+    );
+
+    // An entry declaring only `Details` (383's real shape) must NOT excuse a matrix-only
+    // failure, even though the failure is entirely text (this is the bug: both are
+    // `FailedHalf::Text`, so `is_text_only_failure` alone would wrongly say yes).
+    assert!(matrix_only.is_text_only_failure());
+    assert!(!matrix_only.is_excused_by(&[TextField::Details]));
+    // ...but it DOES excuse a matrix failure once the entry actually declares `Matrix`.
+    assert!(matrix_only.is_excused_by(&[TextField::Matrix]));
+
+    // A details-only failure is excused by a details-only entry (383's actual, correct case).
+    assert!(details_only.is_excused_by(&[TextField::Details]));
+
+    // A run that fails in BOTH declared and undeclared fields is not excused — every reason
+    // must fall within the declared set, not just one of them.
+    assert!(!both_fields.is_excused_by(&[TextField::Details]));
+    assert!(both_fields.is_excused_by(&[TextField::Details, TextField::Matrix]));
+
+    // An automaton-half failure is never excusable by any field list, even a permissive one.
+    assert!(
+        !Verdict::fail(FailedHalf::Automaton, "language differs").is_excused_by(&[
+            TextField::Details,
+            TextField::Matrix,
+            TextField::Graphviz,
+            TextField::Error
+        ])
+    );
 }
 
 /// The same invariant, driven through the **real comparison functions** rather than through
@@ -1288,14 +1427,12 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
     };
 
     // 1. graphviz differs AND the automaton differs.
-    let mut notes = Vec::new();
     let verdict = compare_test_case(
         &session,
         &expected_with_gv(&only_zero),
         &actual(),
         &rewrite,
         &[],
-        &mut notes,
     );
     assert!(
         verdict.message().contains("graphviz"),
@@ -1311,14 +1448,12 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
     );
 
     // 2. the same graphviz mismatch with a MATCHING automaton is still text-only.
-    let mut notes = Vec::new();
     let verdict = compare_test_case(
         &session,
         &expected_with_gv(&everything),
         &actual(),
         &rewrite,
         &[],
-        &mut notes,
     );
     assert!(
         verdict.is_text_only_failure(),
@@ -1327,7 +1462,6 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
 
     // 3. the corpus records an ERROR but the command succeeded: no automaton was recorded,
     //    so the automaton comparison cannot run — never excusable.
-    let mut notes = Vec::new();
     let verdict = compare_test_case(
         &session,
         &Expected {
@@ -1340,7 +1474,6 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
         &actual(),
         &rewrite,
         &[],
-        &mut notes,
     );
     assert!(
         !verdict.is_text_only_failure(),
@@ -1390,7 +1523,7 @@ fn compare_error(expected: &Expected, actual: &str) -> Verdict {
         )
     } else {
         Verdict::fail(
-            FailedHalf::Text,
+            FailedHalf::Text(TextField::Error),
             format!(
                 "error message differs (exact comparison, as in Java)\n  expected: {}\n  actual:   {actual}",
                 expected.error
@@ -1405,7 +1538,6 @@ fn compare_test_case(
     actual: &TestCase,
     rewrite: &PathRewrite,
     construction_recordings: &[Vec<String>],
-    notes: &mut Vec<String>,
 ) -> Verdict {
     if !expected.error.is_empty() {
         // Tagged `Automaton`, not `Text`, even though the strings being contrasted are text:
@@ -1447,13 +1579,9 @@ fn compare_test_case(
             )
         }
     };
-    if expected.has_cas_matrices() {
-        // CAS incidence-matrix export is DROP scope for this port; compared automaton/details
-        // still apply. Recorded, not silent.
-        notes.push("cas-matrix-skipped (CAS export is DROP scope)".to_string());
-    } else if expected.matrix_output.len() != actual_matrix.len() {
+    if expected.matrix_output.len() != actual_matrix.len() {
         failures.push((
-            FailedHalf::Text,
+            FailedHalf::Text(TextField::Matrix),
             format!(
                 "matrix output size differs: expected {}, actual {}",
                 expected.matrix_output.len(),
@@ -1468,7 +1596,7 @@ fn compare_test_case(
             .enumerate()
         {
             if let Err(why) = compare_messages(e.trim(), a.trim(), &format!("matrix output[{i}]")) {
-                failures.push((FailedHalf::Text, why));
+                failures.push((FailedHalf::Text(TextField::Matrix), why));
             }
         }
     }
@@ -1484,7 +1612,7 @@ fn compare_test_case(
                     actual_gv.trim(),
                     "graphviz output",
                 ) {
-                    failures.push((FailedHalf::Text, why));
+                    failures.push((FailedHalf::Text(TextField::Graphviz), why));
                 }
             }
             // A harness-level read failure is never excusable, but it must not discard the
@@ -1518,7 +1646,7 @@ fn compare_test_case(
         )),
         "details",
     ) {
-        failures.push((FailedHalf::Text, why));
+        failures.push((FailedHalf::Text(TextField::Details), why));
     }
 
     // 4. automaton pairs (`:947-961`). `loadTestCases` always records exactly one pair for a

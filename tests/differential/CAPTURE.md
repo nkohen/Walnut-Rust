@@ -348,3 +348,52 @@ fixture's header says `lsd_fib`, so it must be read with
 `wr_io::reader::read_automaton_txt_with_custom_bases` against a directory holding
 `msd_fib.txt`/`msd_fib_addition.txt` — plain `read_automaton_txt` rejects a custom-base
 header with `ReadError::UnsupportedNumeration`.
+
+---
+
+# Ground-truth capture: `fixtures/cas_export/def_freevars_ok.*`
+
+CAS matrix export (`docs/CAS-EXPORT-DISPATCH.md`, `.claude/plans/amber-transcribing-ledger.md`,
+`wr_io::matrix_writer`) is checked by `tests/phase3a_checkpoint.rs`'s
+`def_style_free_variable_list_passes_validation_and_writes_real_matrix_files`. Before this
+capture, that test only checked non-empty content + a substring (`m.contains("M_x_y_")`) — an
+adversarial review of the CAS-export diff found this survives a wrong matrix order, a wrong
+fix-up representative, or wrong separators/braces in any of the four formats, and pointed out
+the fast tier had NO byte-exact end-to-end pin of the `eval`/`def` → matrix-file pipeline (the
+Tier-1 golden corpus's own byte-exact coverage of the same fixtures, 374-379/383, is
+`#[ignore]`d, gated-slow). This capture closes that gap for the fast tier.
+
+## Query
+
+```
+eval def_freevars_ok x y "?msd_2 x < 5 & y = x";
+```
+
+Chosen to match the pre-existing Rust test's call exactly (`?msd_2 x < 5 & y = x`, name
+`def_freevars_ok`, free variables `x y`) — both names are real track labels on a non-trivial
+result, so `AutomatonMatrixWriter.writeMatrix`'s validation succeeds and all four CAS files are
+produced.
+
+## How it was captured (reproducible)
+
+```bash
+cd ~/dev/walnut-java   # already built: target/Walnut-all.jar
+cat > "Command Files/casexport_capture.txt" <<'EOF'
+eval def_freevars_ok x y "?msd_2 x < 5 & y = x";
+EOF
+java -jar target/Walnut-all.jar casexport_capture.txt < /dev/null
+S="Session/<timestamp>/Result"
+cp "$S/def_freevars_ok.mpl" "$S/def_freevars_ok.m" "$S/def_freevars_ok.wl" "$S/def_freevars_ok.sage" \
+   ~/dev/walnut-rs/tests/differential/fixtures/cas_export/
+```
+
+Note this capture reads from `Session/<timestamp>/Result/`, not `.../Automata Library/` like
+every other entry in this file — matrix files are written only to `Result/`
+(`AutomatonMatrixWriter`/`EvalDef.writeMatrices`), never promoted to the library. The command
+file and session directory were deleted from the `walnut-java` checkout afterward, per this
+file's established practice.
+
+The test compares `TestCase::matrix_output()`'s four strings against these four files,
+trimmed, in `wr_io::matrix_writer::EMITTERS` order (Maple/MATLAB/Mathematica/Sage) — the same
+order `tests/golden`'s `MATRIX_EXTENSIONS` uses and the order this project's plan flagged as
+load-bearing for `matrix_output[i]` indexing.

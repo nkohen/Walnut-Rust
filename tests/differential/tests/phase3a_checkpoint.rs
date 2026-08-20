@@ -516,13 +516,23 @@ fn closed_formula_evaluates_to_false_matching_real_walnut_verdict() {
 
 /// `?msd_2 x < 5 & y = x` with an explicit, VALID free-variable list (`"x y"`) -- both names
 /// are real track labels on a non-trivial result, so real Walnut's
-/// `AutomatonMatrixWriter.writeMatrix` validation (ported as
-/// `wr_cli::eval_def::validate_free_variables`) SUCCEEDS and (in real Walnut) proceeds to CAS
-/// export. This port's confirmed, signed-off divergence (see `eval_def.rs`'s own module docs,
-/// "CAS matrix-export handling") is that validation still runs and still succeeds, but no
-/// matrix side-files are produced -- checked explicitly below, not just implied by `Ok(..)`.
+/// `AutomatonMatrixWriter.writeMatrix` validation SUCCEEDS and proceeds to real CAS export.
+/// CAS matrix export is no longer DROP scope (`.claude/plans/amber-transcribing-ledger.md`,
+/// `wr_io::matrix_writer`) -- this now asserts the real matrix content is produced, not the
+/// signed-off divergence it used to pin.
+///
+/// The matrix comparison is BYTE-EXACT against real `walnut-java` output captured for this
+/// exact query (`fixtures/cas_export/`, see this crate's `CAPTURE.md`) -- not a substring
+/// check. A substring check (`m.contains("M_x_y_")`) would survive a wrong matrix order, a
+/// wrong fix-up representative, wrong separators, wrong brace nesting, wrong `Q`, or wrong
+/// `q0` in any of the four formats; this is the fast-tier's only end-to-end byte-exact pin of
+/// the `eval`/`def` -> matrix-file pipeline (the golden corpus's own byte-exact coverage of
+/// the same pipeline is `#[ignore]`d, gated-slow). Byte-exact text comparison is correct here
+/// -- `CLAUDE.md`'s "compare by semantic equivalence, never structural identity" rule is about
+/// AUTOMATA, not CAS text output, which real Walnut's own `IntegrationTest` also compares
+/// exactly (mod normalization).
 #[test]
-fn def_style_free_variable_list_passes_validation_like_real_walnut() {
+fn def_style_free_variable_list_passes_validation_and_writes_real_matrix_files() {
     let (session, dir) = temp_session("def-freevars-ok");
     let mut logging = Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
     let mut fresh = FreshIdentifiers::new();
@@ -541,17 +551,23 @@ fn def_style_free_variable_list_passes_validation_like_real_walnut() {
     )
     .unwrap_or_else(|e| panic!("a valid free-variable list must succeed, got {e}"));
 
-    assert_eq!(
-        tc.matrix_output().unwrap(),
-        vec![
-            "".to_string(),
-            "".to_string(),
-            "".to_string(),
-            "".to_string()
-        ],
-        "the confirmed, signed-off divergence: validation succeeds like real Walnut, but no \
-         CAS matrix side-files are produced (DROP scope)"
-    );
+    let matrix_output = tc.matrix_output().unwrap();
+    assert_eq!(matrix_output.len(), 4);
+    // `EMITTERS`/`matrix_output()` order: Maple, MATLAB, Mathematica, Sage
+    // (`AutomatonMatrixWriter.java:16-18`; `crates/wr-io/src/matrix_writer.rs`).
+    let expected_exts = ["mpl", "m", "wl", "sage"];
+    for (m, ext) in matrix_output.iter().zip(expected_exts) {
+        let expected = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("fixtures/cas_export/def_freevars_ok.{ext}")),
+        )
+        .unwrap_or_else(|e| panic!("reading captured cas_export/def_freevars_ok.{ext}: {e}"));
+        assert_eq!(
+            m.trim(),
+            expected.trim(),
+            "matrix output for .{ext} must match real walnut-java byte-for-byte"
+        );
+    }
     let a = tc.automaton_pairs()[0].automaton().unwrap().clone();
     assert_equivalent_to_fixture(a, "def_freevars_ok", true, "def_freevars_ok");
     fs::remove_dir_all(&dir).ok();
@@ -607,10 +623,25 @@ fn eval_and_def_are_the_identical_dispatch_call() {
         Ok(true),
         "eval-style and def-style calls to the identical function must agree"
     );
-    // Neither is a TRUE/FALSE result, so neither prints anything -- the free-variable list
-    // alone doesn't change whether a print happens.
+    // Neither is a TRUE/FALSE result, so neither prints the `____` line -- the free-variable
+    // list alone doesn't change whether THAT print happens. It DOES, however, now (CAS export
+    // is no longer DROP scope) trigger the SEPARATE "Matrix files:" print for the `def`-style
+    // call, since that call alone supplied a non-empty free-variable list. Pinned exactly
+    // (all four emitter lines, not just the leading "Matrix files:\n"), matching
+    // `eval_def.rs`'s own `free_variable_result_writes_automaton_normally_and_the_real_
+    // matrix_side_files` convention -- a `starts_with` check alone would not notice a
+    // wrong/missing/reordered emitter line.
     assert_eq!(stdout_eval, Vec::<u8>::new());
-    assert_eq!(stdout_def, Vec::<u8>::new());
+    let result_dir = dir.join("Result");
+    assert_eq!(
+        String::from_utf8(stdout_def.clone()).unwrap(),
+        format!(
+            "Matrix files:\n  Maple: {rd}/as_def.mpl\n  MATLAB/Octave: {rd}/as_def.m\n  \
+             Mathematica: {rd}/as_def.wl\n  Sage: {rd}/as_def.sage\n",
+            rd = result_dir.to_str().unwrap()
+        ),
+        "the def-style call's free-variable list should trigger the real CAS export print now"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

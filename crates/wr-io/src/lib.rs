@@ -19,6 +19,7 @@
 //! differential test (`.claude/plans/fluttering-foraging-spindle.md`) needed to ingest
 //! real `walnut-java` output. The writer ([`writer`]) landed in Phase 3a's U12.
 
+pub mod matrix_writer;
 pub mod parse_methods;
 pub mod reader;
 pub mod writer;

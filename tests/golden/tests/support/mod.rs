@@ -759,16 +759,6 @@ pub struct Expected {
     pub matrix_output: Vec<String>,
 }
 
-impl Expected {
-    /// `true` iff any expected CAS matrix file has content. The CAS incidence-matrix writer is
-    /// confirmed DROP scope for this port (`docs/DESIGN.md`; `crates/wr-cli/src/test_case.rs`'s
-    /// module docs), so these fixtures get their automaton/details/error compared and their
-    /// matrix comparison explicitly skipped and reported.
-    pub fn has_cas_matrices(&self) -> bool {
-        self.matrix_output.iter().any(|m| !m.trim().is_empty())
-    }
-}
-
 pub fn load_expected(corpus_root: &Path, id: usize) -> io::Result<Expected> {
     let automaton_path = corpus_root.join(format!("automaton{id}.txt"));
     let mut matrix_output = Vec::with_capacity(MATRIX_EXTENSIONS.len());
@@ -925,6 +915,22 @@ mod tests {
     use super::*;
 
     // -- normalize_message ----------------------------------------------------
+
+    // -- MATRIX_EXTENSIONS / EMITTERS ------------------------------------------
+
+    /// `MATRIX_EXTENSIONS` and `wr_io::matrix_writer::EMITTERS` are two independent literals
+    /// in two different crates that must stay in the same order (Maple/MATLAB/Mathematica/
+    /// Sage) — a reorder of either one alone would silently pair every expected `.mpl`
+    /// against an actual `.m`, etc., with no compiler error to catch it (an adversarial
+    /// review of the CAS-export diff flagged this as untested).
+    #[test]
+    fn matrix_extensions_agree_with_wr_io_emitters_order() {
+        let emitter_extensions: Vec<&str> = wr_io::matrix_writer::EMITTERS
+            .iter()
+            .map(|spec| spec.extension)
+            .collect();
+        assert_eq!(emitter_extensions, MATRIX_EXTENSIONS.to_vec());
+    }
 
     #[test]
     fn doubled_spaces_collapse_once_not_repeatedly() {

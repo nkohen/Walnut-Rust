@@ -152,14 +152,48 @@ Skip breakdown:
 
 Partial comparisons (compared, but not in full — recorded per id in the run report):
 
-* fixtures **374, 375, 376, 377, 378, 379, 383** — `cas-matrix-skipped`. Their recorded
-  expectation includes CAS incidence matrices (`.mpl`/`.m`/`.wl`/`.sage`); the CAS writer is
-  confirmed DROP scope for this port, so automaton/details/error are compared and only the
-  matrix files are not.
 * fixtures **638-641** — `not executed`. They ask for a deferred OTF strategy on the same
   1,790-state query as 637, which without a working `[strategy …]` would blow the per-fixture
   budget for no information; `no_later_fixture_depends_on_an_unexecuted_one` proves nothing
   downstream reads their output. (637, 659 and 660 ARE executed and compared now.)
+
+## CAS incidence-matrix export — **CLOSED (2026-08-19)**
+
+Fixtures **374, 375, 376, 377, 378, 379, 383** used to be `cas-matrix-skipped`: their
+recorded expectation includes CAS incidence matrices (`.mpl`/`.m`/`.wl`/`.sage`), and the
+CAS writer was confirmed DROP scope, so only automaton/details/error were compared and
+the matrix files were explicitly excluded. CAS export is no longer DROP scope
+(`.claude/plans/amber-transcribing-ledger.md`, `crates/wr-io/src/matrix_writer.rs`) — the
+skip branch and `Expected::has_cas_matrices` are gone, and all 7 fixtures now get their
+matrix output compared exactly like every other text field (`compare_messages`, trimmed).
+All 7 pass on all four extensions (28 comparisons); 383 still fails, but only on its
+pre-existing `details` divergence (§1b below).
+
+**A real gate-laundering hole here, found independently by two adversarial reviewers, not
+by this unit's own first-pass verification.** 383 is both a matrix fixture and the sole
+surviving `KNOWN_DIVERGENCES` entry, whose gate condition (before this fix) was "every
+failure reason is `FailedHalf::Text`" with no regard for WHICH text field diverged — so a
+genuine matrix regression on 383 specifically would have been silently excused by the
+entry's `details`-only justification, both being tagged `Text`. The first-pass mutation
+check (corrupting `MapleEmitter::begin` and observing 383 report both reasons together)
+did not actually exercise this: it proved the OTHER six fixtures (not in
+`KNOWN_DIVERGENCES`) fail loudly, which they always would have; it said nothing about
+whether the gate itself would still pass 383. Statically confirmed the gate would have
+excused 383 alone.
+
+**Fixed by giving `FailedHalf::Text` a `TextField` discriminant** (`Details`/`Matrix`/
+`Graphviz`/`Error`) and scoping each `KNOWN_DIVERGENCES` entry to the field(s) it actually
+declares (`Verdict::is_excused_by`, `golden_corpus.rs`) — 383's entry now declares
+`&[TextField::Details]` only. Mutation-verified correctly this time, with the corruption
+still in place while checking the GATE's verdict specifically: corrupting
+`MapleEmitter::begin`'s output makes the full corpus run **FAIL** the gate, reporting
+fixture 383 as `UNDECLARED TEXT FIELD` (a real, new divergence, not the documented one) —
+not silently passed. Reverting the corruption restores a clean, green run with 383's
+matrix comparison passing on its own and only its documented `details` divergence
+remaining. Two new unit tests pin the field-scoping directly:
+`a_known_divergence_only_excuses_its_own_declared_text_field` (hand-built verdicts) and
+the existing `only_a_text_only_failure_can_be_excused_by_a_known_divergence` (updated for
+the `TextField` parameter).
 
 ## The 1 remaining divergence (5 of the former 6 closed 2026-08-19)
 

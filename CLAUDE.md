@@ -41,8 +41,10 @@ instead of something an agent quietly resolves mid-port.
 
 **KEEP:** the full first-order-logic decider over **base-k** numeration — parser, quantifier elimination
 (∃ projection+determinize, ∀ = ¬∃¬), boolean/product ops, determinize (`SC` default + plain Brzozowski), Valmari
-minimize, reverse, quotient; `eval`/`def`/`reg`/`morphism`/`image`; the `.txt` automaton format (multi-track + NFA).
-**DROP:** Ostrowski / Fibonacci / Pell / negative-base numeration; CAS matrix exports.
+minimize, reverse, quotient; `eval`/`def`/`reg`/`morphism`/`image`; the `.txt` automaton format (multi-track + NFA);
+CAS matrix export (`AutomatonMatrixWriter` + the Maple/MATLAB/Mathematica/Sage emitters, `wr_io::matrix_writer`,
+ported 2026-08-19 per `docs/CAS-EXPORT-DISPATCH.md` — see "Current status" below).
+**DROP:** Ostrowski / Fibonacci / Pell / negative-base numeration.
 **TO CLASSIFY (Phase 0):** `split`/`rsplit`/`join`/`transduce`/`convert`/`minimize`/`fixleadzero`/… — inline commands
 in `Prover.java` with no `Commands/` class; classify each KEEP/DROP against research need. See DESIGN.md §3.
 
@@ -968,3 +970,52 @@ as items 1/2/5 above — commit on explicit user request.
 
 **This closes `docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` in full — all four items (1, 2, 3,
 5) are resolved.**
+
+**CAS matrix export ported (`docs/CAS-EXPORT-DISPATCH.md`, 2026-08-19) — CAS export is no longer
+DROP scope.** Investigation first: Phase-0 coverage on the six Java files
+(`AutomatonMatrixWriter`/`MatrixEmitter`/the four emitters) turned out already high (93.5-100%
+line, freshly measured via an unrestricted JaCoCo run — the files are excluded from the tracked
+report), so no separate coverage-driving pass was needed; and the dispatch doc's one open
+architectural question (headless vs. interactive `EvalDef` dispatch) resolved to "no gap" —
+both `wr-cli`'s real dispatch and `tests/golden`'s harness already sit on Java's interactive
+`compute()` path, not `computeHeadless()`. Plan at `.claude/plans/amber-transcribing-ledger.md`,
+adversarially reviewed before execution (fable — caught a mischaracterized test-coverage claim,
+a golden-corpus known-divergence laundering hole, a missing mutation-verification step, an
+unflagged test needing a flip, an under-scoped review tier, and a stale WB-007 status line; all
+fixed in the plan before any code landed). Implemented: a new `wr-io` module
+(`crates/wr-io/src/matrix_writer.rs`) mechanically porting `AutomatonMatrixWriter` + the Maple/
+MATLAB/Mathematica/Sage emitters; the `wr-cli` wiring (`eval_def.rs`) that was previously a
+`Vec::new()` stub; `tests/golden`'s harness comparison (`Expected::has_cas_matrices`/the
+`cas-matrix-skipped` branch deleted — all 586 fixtures now compared symmetrically). **WB-042**
+logged (`MathematicaEmitter` uses `#`, invalid Wolfram Language syntax, as its comment prefix —
+ported verbatim, not fixed).
+
+Two independent adversarial reviewers (opus, fable — split context, diff only) both converged on
+the same real correctness-risk finding neither the implementer's own first-pass verification nor
+the plan's pre-registered check had actually closed: fixture 383 is both a matrix fixture and the
+sole surviving `KNOWN_DIVERGENCES` entry (a `details`-text-only WB-039 gap), and the gate's
+"every failure reason is text" check could not tell a documented `details` divergence apart from
+an undocumented `matrix` one — so a real matrix regression on 383 specifically would have been
+silently excused. The plan's own mutation check (corrupting `MapleEmitter::begin`) hadn't
+actually exercised this, since it only proved the OTHER six fixtures fail loudly, which they
+always would have. Fixed by giving `FailedHalf::Text` a `TextField` discriminant
+(`Details`/`Matrix`/`Graphviz`/`Error`) and scoping each `KNOWN_DIVERGENCES` entry to the
+field(s) it actually declares (`Verdict::is_excused_by`, `tests/golden/tests/golden_corpus.rs`)
+— live mutation-verified in the correct direction this time (corrupting `MapleEmitter::begin`
+and checking the GATE's own verdict, not just the report text, now fails the run with an
+`UNDECLARED TEXT FIELD` diagnosis on 383; reverting restores green). Also fixed from the same
+review round: a weak fast-tier differential assertion (a substring check that would have
+survived a wrong matrix order/fixup/separator in any of the four formats) replaced with a
+byte-exact comparison against a fresh `walnut-java` capture (`tests/differential/fixtures/
+cas_export/`, `tests/differential/CAPTURE.md`); the two `eval_def.rs` free-variable validation-
+error tests extended to assert the same zero-byte-first-file-then-stop quirk `wr-io`'s own test
+already pinned at the primitive level; a new test locking `wr_io::matrix_writer::EMITTERS`'
+extension order to `tests/golden`'s `MATRIX_EXTENSIONS` (two independent literals in different
+crates that must stay in sync, previously untested); and a silent `as i32` truncation on
+`alphabet_size` replaced with the same panic-on-overflow idiom `Automaton::
+determine_alphabet_size` already established for this exact conversion. Golden corpus:
+585/586 unchanged (0 regression; 383 remains the one open, deliberately excused divergence,
+correctly excused with the tightened gate), 28 new byte-for-byte matrix comparisons now
+genuinely run instead of being skipped. `cargo test --workspace` green throughout, `fmt`/
+`clippy` clean. Uncommitted — commit on explicit user request, per this project's standing
+git-hygiene rule.

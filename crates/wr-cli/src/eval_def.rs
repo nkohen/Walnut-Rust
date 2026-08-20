@@ -89,7 +89,7 @@
 //! all, simply because there is no result name to write one under. Pinned by
 //! [`tests::non_headless_true_result_writes_a_degenerate_automaton_file_and_prints`] below.
 //!
-//! # CAS matrix-export handling — the plan's sign-off item #1 (already decided)
+//! # CAS matrix-export handling — now real (`.claude/plans/amber-transcribing-ledger.md`)
 //!
 //! `EvalDef.evalDefCommand`'s non-headless branch unconditionally calls
 //! `writeMatrices(M, freeVarStr, resultName)` (`:72`), which (`:160-172`) calls
@@ -100,61 +100,43 @@
 //!
 //! **`free_var_str` is a separate, EXPLICIT command-line argument, not auto-detected from
 //! the predicate.** Verified against the real `walnut-java` CLI (not just this unit's own
-//! task description): `Main/Prover.java`'s `eval`/`def` regex (not yet ported, Phase 3b's
-//! U21) captures it as `evalName`'s trailing `(?:\s+RE_IDENTIFIER)*` group — i.e. `eval r x
-//! y "x < 3 & y = x";` passes `freeVarStr = "x y"` and DOES trigger real Walnut's CAS
-//! export (confirmed live: produces `r.m`/`r.mpl`/`r.wl`/`r.sage` plus the `"Matrix
-//! files:"` print), while `eval r "x < 3 & y = x";` — same predicate, same genuinely-free
-//! `x`/`y`, but no extra identifiers on the command line — passes `freeVarStr = ""` and
-//! triggers nothing, confirmed live too. So "does the predicate have free variables" and
-//! "does this call attempt CAS export" are Java's two independently-controllable inputs,
-//! not the same question.
+//! task description): `Main/Prover.java`'s `eval`/`def` regex captures it as `evalName`'s
+//! trailing `(?:\s+RE_IDENTIFIER)*` group — i.e. `eval r x y "x < 3 & y = x";` passes
+//! `freeVarStr = "x y"` and DOES trigger real Walnut's CAS export (confirmed live:
+//! produces `r.m`/`r.mpl`/`r.wl`/`r.sage` plus the `"Matrix files:"` print), while `eval r
+//! "x < 3 & y = x";` — same predicate, same genuinely-free `x`/`y`, but no extra
+//! identifiers on the command line — passes `freeVarStr = ""` and triggers nothing,
+//! confirmed live too. So "does the predicate have free variables" and "does this call
+//! attempt CAS export" are Java's two independently-controllable inputs, not the same
+//! question.
 //!
-//! `AutomatonMatrixWriter` (the CAS/Maple/Sage/Mathematica/MATLAB incidence-matrix
-//! exporter) is confirmed DROP scope (`CLAUDE.md`: "DROP: ... CAS matrix exports"). Per
-//! the Phase 3 plan's sign-off item #1 ("keep writing the automaton output normally, but
-//! never produce the matrix side-files"), this call site is handled by NOT porting the
-//! actual CAS-file-writing machinery (`AutomatonMatrixWriter.writeAll`/`writeMatrix`'s
-//! matrix/vector emission, `writeMatrices`'s `"Matrix files:"` print) at all.
-//! `matrix_addresses` is always `vec![]` on the success path. This coincides exactly with
-//! Java's own value whenever the CALLER passes no free-variable list (the common case,
-//! and every query already covered by earlier units' tests); it is a confirmed,
-//! signed-off DIVERGENCE from Java only when a caller DOES pass a non-empty one AND
-//! validation would have passed, where real Walnut would additionally print
-//! `"Matrix files:"` and populate `matrix_addresses` with real `.m`/`.mpl`/`.wl`/`.sage`
-//! paths — flagged here, not silent, per the plan's own framing (Tier-1's U27 is expected
-//! to skip matrix-file comparison for those 7 golden fixtures).
+//! `AutomatonMatrixWriter` (the CAS/Maple/MATLAB/Mathematica/Sage incidence-matrix
+//! exporter) was previously confirmed DROP scope, per a since-superseded Phase 3
+//! sign-off ("keep writing the automaton output normally, but never produce the matrix
+//! side-files"). That sign-off has been revisited and reversed: the actual
+//! CAS-file-writing machinery is now ported, in `wr_io::matrix_writer` (see that
+//! module's own docs for the full mechanical-port account, including WB-042 and the two
+//! confirmed-unreachable-but-ported validation checks). This function now calls
+//! [`wr_io::matrix_writer::write_all`] for real whenever `free_var_str` names at least
+//! one identifier, and prints `"Matrix files:"` plus one line per emitter
+//! (`EvalDef.java:165-169`, raw `System.out.println` — routed through this function's
+//! own `stdout` seam, same as the `TRUE`/`FALSE` print above) exactly as Java does.
+//! `matrix_addresses` is now the real `.mpl`/`.m`/`.wl`/`.sage` paths on the success
+//! path, matching Java's own value — there is no longer a divergence here.
 //!
-//! **This is narrower than "fewer files, otherwise no behavior change."**
-//! `AutomatonMatrixWriter.writeMatrix` (`AutomatonMatrixWriter.java:28-37,41-58`) does two
-//! pieces of real INPUT VALIDATION before any file writing — both cheap, DFA-writer-
-//! independent checks reachable from `EvalDef.evalDefCommand`'s unguarded
-//! `writeMatrices(M, freeVarStr, resultName)` call (`:72`) whenever `freeVarStr` names at
-//! least one identifier (`determineFreeVariables`, `:174-184`, scanning `freeVarStr` with
-//! `PAT_FOR_A_FREE_VARIABLE_IN_eval_def_CMDS` = `RE_IDENTIFIER` = `[a-zA-Z]\w*`, findall
-//! style):
-//!
-//! 1. `fa.isTRUE_FALSE_AUTOMATON()` (`:32-34`): a non-empty free-variable list against a
-//!    trivial TRUE/FALSE result throws
-//!    `"incidence matrices cannot be calculated, because the automaton does not have a
-//!    free variable."` — [`EvalDefError::NoFreeVariableOnTrivialAutomaton`].
-//! 2. Per named variable, against `automaton.getLabel()` (`:41-58`): a name that is not a
-//!    track label throws `"incidence matrices for the variable " + v + " cannot be
-//!    calculated, because " + v + " is not a free variable."` —
-//!    [`EvalDefError::NotAFreeVariable`]; a name repeated in the caller's list throws
-//!    `"Duplicate free variable: " + v"` — [`EvalDefError::DuplicateFreeVariable`].
-//!
-//! `AutomatonMatrixWriter.writeAll`'s own try/catch only catches `IOException` (`:180`),
-//! so these `WalnutException`s (Java's unchecked `RuntimeException`s) propagate UNCAUGHT
-//! out of `evalDefCommand` entirely — the whole `eval`/`def` command fails, even though
-//! `M.writeAutomata(...)` (`:67`) and the TRUE/FALSE console print (`:68-70`) have
-//! ALREADY run as side effects by that point (`writeMatrices` is called at `:72`, after
-//! both). This module ports ONLY these two validation checks, as explicit `Err` returns
-//! at the same point in the control flow Java has them (after `write_automata`/the print,
-//! matching Java's real statement order) — it still does NOT port the actual
-//! CAS-file-writing machinery itself, preserving the sign-off's core commitment. A call
-//! whose free-variable list is empty (the common case) never reaches this validation at
-//! all, matching `writeMatrices`'s own `!freeVariables.isEmpty()` guard (`:163`).
+//! `AutomatonMatrixWriter.writeMatrix`'s five real `WalnutException`s (see
+//! `wr_io::matrix_writer::MatrixWriteError`'s docs for the exact line numbers and which
+//! two are confirmed unreachable but ported anyway) are NOT caught by
+//! `AutomatonMatrixWriter.writeAll`'s `catch (IOException e)` (`:180`), so they
+//! propagate UNCAUGHT out of `evalDefCommand` entirely — the whole `eval`/`def` command
+//! fails, even though `M.writeAutomata(...)` (`:67`) and the TRUE/FALSE console print
+//! (`:68-70`) have ALREADY run as side effects by that point (`writeMatrices` is called
+//! at `:72`, after both). [`wr_io::matrix_writer::write_all`]'s `Result` is converted to
+//! an [`EvalDefError`] at the exact same point in the control flow Java has the
+//! (uncaught) exception — after `write_automata`/the print, matching Java's real
+//! statement order. A call whose free-variable list is empty (the common case) never
+//! reaches `write_all` at all, matching `writeMatrices`'s own
+//! `!freeVariables.isEmpty()` guard (`:163`).
 //!
 //! [`TestCase::gv_address`]: crate::test_case::TestCase
 use std::io::Write;
@@ -174,9 +156,10 @@ use crate::test_case::{AutomatonFilenamePair, TestCase, DEFAULT_TESTFILE};
 /// see that module's `LoggableError for ActError` docs), from
 /// [`crate::automaton_output::write_automata`] (a real I/O failure — see that function's
 /// own docs on why this propagates rather than being swallowed-and-logged the way Java's
-/// `Automaton.writeAutomata` is), or from this module's own port of
-/// `AutomatonMatrixWriter.writeMatrix`'s two validation `WalnutException`s (see this
-/// module's docs, "CAS matrix-export handling").
+/// `Automaton.writeAutomata` is), or from [`wr_io::matrix_writer::write_all`]'s own port
+/// of `AutomatonMatrixWriter.writeMatrix`'s validation `WalnutException`s (see this
+/// module's docs, "CAS matrix-export handling", and `wr_io::matrix_writer`'s own docs for
+/// the full validation order).
 #[derive(Debug)]
 pub enum EvalDefError {
     Eval(EvalError),
@@ -184,6 +167,13 @@ pub enum EvalDefError {
     /// `AutomatonMatrixWriter.writeMatrix` (`:32-34`): a non-empty free-variable list
     /// against a trivial TRUE/FALSE result automaton.
     NoFreeVariableOnTrivialAutomaton,
+    /// `AutomatonMatrixWriter.writeMatrix` (`:44-45`): two entries of the result
+    /// automaton's own label are identical. Confirmed unreachable in practice (this
+    /// crate's own invariants keep track labels unique) — ported anyway, see
+    /// `wr_io::matrix_writer`'s module docs.
+    DuplicateLabelVariable {
+        name: String,
+    },
     /// `AutomatonMatrixWriter.writeMatrix` (`:52-55`): `name` is not one of the result
     /// automaton's track labels (`Automaton.getLabel()`).
     NotAFreeVariable {
@@ -192,6 +182,12 @@ pub enum EvalDefError {
     /// `AutomatonMatrixWriter.writeMatrix` (`:56-58`): `name` appears more than once in
     /// the caller's free-variable list.
     DuplicateFreeVariable {
+        name: String,
+    },
+    /// `AutomatonMatrixWriter.writeMatrix` (`:68-69`): a free variable's track has an
+    /// empty domain. Confirmed unreachable in practice — ported anyway, see
+    /// `wr_io::matrix_writer`'s module docs.
+    EmptyValueDomain {
         name: String,
     },
 }
@@ -207,6 +203,10 @@ impl std::fmt::Display for EvalDefError {
                 "incidence matrices cannot be calculated, because the automaton does not \
                  have a free variable."
             ),
+            // Verbatim `AutomatonMatrixWriter.java:45`.
+            EvalDefError::DuplicateLabelVariable { name } => {
+                write!(f, "Duplicate variable in automaton label: {name}")
+            }
             // Verbatim `AutomatonMatrixWriter.java:53-54`.
             EvalDefError::NotAFreeVariable { name } => write!(
                 f,
@@ -216,6 +216,10 @@ impl std::fmt::Display for EvalDefError {
             // Verbatim `AutomatonMatrixWriter.java:57`.
             EvalDefError::DuplicateFreeVariable { name } => {
                 write!(f, "Duplicate free variable: {name}")
+            }
+            // Verbatim `AutomatonMatrixWriter.java:69`.
+            EvalDefError::EmptyValueDomain { name } => {
+                write!(f, "Empty value domain for free variable: {name}")
             }
         }
     }
@@ -232,6 +236,19 @@ impl From<EvalError> for EvalDefError {
 impl From<std::io::Error> for EvalDefError {
     fn from(e: std::io::Error) -> Self {
         EvalDefError::Io(e)
+    }
+}
+
+impl From<wr_io::matrix_writer::MatrixWriteError> for EvalDefError {
+    fn from(e: wr_io::matrix_writer::MatrixWriteError) -> Self {
+        use wr_io::matrix_writer::MatrixWriteError as M;
+        match e {
+            M::NoFreeVariableOnTrivialAutomaton => EvalDefError::NoFreeVariableOnTrivialAutomaton,
+            M::DuplicateLabelVariable { name } => EvalDefError::DuplicateLabelVariable { name },
+            M::NotAFreeVariable { name } => EvalDefError::NotAFreeVariable { name },
+            M::DuplicateFreeVariable { name } => EvalDefError::DuplicateFreeVariable { name },
+            M::EmptyValueDomain { name } => EvalDefError::EmptyValueDomain { name },
+        }
     }
 }
 
@@ -391,19 +408,29 @@ pub fn eval_def_command_with_stdout_and_ctx(
         }
 
         // `List<String> matrixAddresses = writeMatrices(M, freeVarStr, resultName);`
-        // (`:72`) -- the actual CAS-file-writing machinery is DROP scope (see this
-        // module's docs), but `writeMatrices`/`writeMatrix`'s real input VALIDATION is
-        // ported below, so a call that would genuinely fail in Java still fails here
-        // rather than silently reporting success.
+        // (`:72`), inlining `EvalDef.writeMatrices` (`:160-172`) itself: a no-op
+        // (`vec![]`, matching `writeMatrices`'s own `!freeVariables.isEmpty()` guard,
+        // `:163`) when the caller named no free variables; otherwise a real call into
+        // [`wr_io::matrix_writer::write_all`] (see this module's docs, "CAS
+        // matrix-export handling") followed by Java's own `"Matrix files:"` print
+        // (`:165-169`, raw `System.out.println`, routed through `stdout` like the
+        // `TRUE`/`FALSE` print above).
         let free_variables = determine_free_variables(free_var_str);
-        validate_free_variables(&automaton, &free_variables)?;
-
-        // Always empty on the success path: this coincides with Java's own value
-        // whenever there are no free variables (validation above is then a no-op, since
-        // `determine_free_variables` returned `vec![]`), and is a confirmed, signed-off
-        // divergence when validation WOULD have passed in Java (no "Matrix files:"
-        // print, no CAS side-files) -- see this module's docs.
-        let matrix_addresses: Vec<String> = Vec::new();
+        let matrix_addresses: Vec<String> = if free_variables.is_empty() {
+            Vec::new()
+        } else {
+            wr_io::matrix_writer::write_all(&mut automaton, &result_name, &free_variables)
+                .map_err(EvalDefError::from)?;
+            let _ = writeln!(stdout, "Matrix files:");
+            wr_io::matrix_writer::EMITTERS
+                .iter()
+                .map(|spec| {
+                    let path = format!("{result_name}{}", spec.extension);
+                    let _ = writeln!(stdout, "  {}: {path}", spec.intro);
+                    path
+                })
+                .collect()
+        };
 
         // `return new TestCase("", matrixAddresses, resultName + Prover.GV_EXTENSION,
         //  Logging.getDetailedLog(), List.of(new TestCase.AutomatonFilenamePair(M,
@@ -492,40 +519,6 @@ fn determine_free_variables(free_var_str: Option<&str>) -> Vec<String> {
         }
     }
     result
-}
-
-/// `AutomatonMatrixWriter.writeMatrix`'s two validation checks
-/// (`AutomatonMatrixWriter.java:28-37,41-58`), ported as explicit `Err` returns -- see
-/// this module's docs, "CAS matrix-export handling", for why only these validation
-/// checks are ported and not the matrix-writing machinery itself.
-///
-/// A no-op (`Ok(())`) when `free_variables` is empty, matching `writeMatrices`'s own
-/// `!freeVariables.isEmpty()` guard (`EvalDef.java:163`) that keeps
-/// `AutomatonMatrixWriter.writeAll` -- and therefore this validation -- from ever running
-/// at all on the common "no free-variable list supplied" call shape.
-fn validate_free_variables(
-    automaton: &wr_core::automaton::Automaton,
-    free_variables: &[String],
-) -> Result<(), EvalDefError> {
-    if free_variables.is_empty() {
-        return Ok(());
-    }
-    // `:32-34`.
-    if automaton.fa.is_true_false_automaton() {
-        return Err(EvalDefError::NoFreeVariableOnTrivialAutomaton);
-    }
-    // `:41-58`, membership check then duplicate check, in the caller's list order --
-    // matching Java's single `for (String v : freeVariables)` loop exactly.
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for v in free_variables {
-        if !automaton.label.iter().any(|l| l == v) {
-            return Err(EvalDefError::NotAFreeVariable { name: v.clone() });
-        }
-        if !seen.insert(v.as_str()) {
-            return Err(EvalDefError::DuplicateFreeVariable { name: v.clone() });
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -844,7 +837,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    fn free_variable_result_writes_automaton_normally_with_no_matrix_side_files() {
+    fn free_variable_result_writes_automaton_normally_and_the_real_matrix_side_files() {
         let (session, dir) = temp_session("free-var");
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
@@ -856,9 +849,10 @@ mod tests {
         // not "does the predicate happen to have a free variable", is what actually
         // triggers `writeMatrices`'s CAS export; verified live against `walnut-java`)
         // passes both validation checks ("x" is a real track label on a non-trivial
-        // result), so real Walnut would additionally print "Matrix files:" and write
-        // `r.m`/`r.mpl`/`r.wl`/`r.sage` (DROP scope, sign-off item #1). This test's own
-        // call therefore succeeds too, just without those matrix side-files.
+        // result), so real Walnut additionally prints "Matrix files:" and writes
+        // `r.m`/`r.mpl`/`r.wl`/`r.sage` -- CAS export is no longer DROP scope
+        // (`.claude/plans/amber-transcribing-ledger.md`), so this test now asserts that
+        // real behavior instead of the signed-off divergence it used to pin.
         let tc = eval_def_command_with_stdout(
             &session,
             &mut logging,
@@ -881,29 +875,41 @@ mod tests {
             .unwrap()
             .is_true_false_automaton());
 
-        // No matrix side-files, and no attempt to reach the dropped CAS-export machinery:
-        // `matrix_output()` is empty (real Walnut would populate 4 real
-        // `.m`/`.mpl`/`.wl`/`.sage` addresses here -- this is the confirmed, signed-off
-        // divergence, not a bug).
-        assert_eq!(
-            tc.matrix_output().unwrap(),
-            vec![
-                "".to_string(),
-                "".to_string(),
-                "".to_string(),
-                "".to_string()
-            ]
-        );
-        assert_eq!(stdout_text(&stdout), "", "no \"Matrix files:\" print");
-        // No stray `.m`/`.sage`/`.mpl` files anywhere under Result/.
-        for entry in fs::read_dir(dir.join("Result")).unwrap() {
-            let name = entry.unwrap().file_name();
-            let name = name.to_str().unwrap();
+        // All four real matrix side-files exist, in `wr_io::matrix_writer::EMITTERS`
+        // order (Maple/MATLAB/Mathematica/Sage), each with real, non-empty content.
+        let result_dir = dir.join("Result");
+        for ext in [".mpl", ".m", ".wl", ".sage"] {
             assert!(
-                name.ends_with(".gv") || name.ends_with(".txt") || name.ends_with("_log.txt"),
-                "unexpected file under Result/: {name}"
+                result_dir.join(format!("r{ext}")).is_file(),
+                "expected r{ext} to exist"
             );
         }
+        let matrix_output = tc.matrix_output().unwrap();
+        assert_eq!(matrix_output.len(), 4);
+        for m in &matrix_output {
+            assert!(
+                !m.trim().is_empty(),
+                "expected real matrix content, got empty"
+            );
+        }
+        // Free variable "x" has domain {0, 1} (msd_2), which contains 0 -- the fix-up
+        // representative is `M_x_0` (`AutomatonMatrixWriter.java:76-78`'s "prefer 0"
+        // branch), and the Maple emitter's fixup comment hardcodes "v" (see
+        // `wr_io::matrix_writer::MapleEmitter`'s doc comment on that specific quirk).
+        assert!(
+            matrix_output[0].contains("M_x_0"),
+            "Maple output should reference M_x_0:\n{}",
+            matrix_output[0]
+        );
+
+        assert_eq!(
+            stdout_text(&stdout),
+            format!(
+                "Matrix files:\n  Maple: {result_dir}/r.mpl\n  MATLAB/Octave: {result_dir}/r.m\n  \
+                 Mathematica: {result_dir}/r.wl\n  Sage: {result_dir}/r.sage\n",
+                result_dir = result_dir.to_str().unwrap()
+            )
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -955,6 +961,27 @@ mod tests {
         assert!(dir.join("Result").join("r.txt").is_file());
         assert!(dir.join("Automata Library").join("r.txt").is_file());
 
+        // The SAME partial-write quirk `wr_io::matrix_writer`'s own
+        // `write_all_validation_error_leaves_a_zero_byte_first_file_and_no_others` pins at
+        // the primitive level, confirmed here to survive the real `eval_def` wiring: Java's
+        // `writeAll` opens each emitter's `FileWriter` before calling `writeMatrix`, one
+        // emitter at a time, so the FIRST emitter (Maple, `EMITTERS`' order) leaves a
+        // zero-byte file behind when validation throws, and the remaining three are never
+        // attempted.
+        let maple = dir.join("Result").join("r.mpl");
+        assert!(maple.is_file(), "Maple's file should still be created");
+        assert_eq!(
+            fs::metadata(&maple).unwrap().len(),
+            0,
+            "but left at zero bytes"
+        );
+        for ext in ["m", "wl", "sage"] {
+            assert!(
+                !dir.join("Result").join(format!("r.{ext}")).exists(),
+                "extension .{ext} should never have been attempted"
+            );
+        }
+
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -992,6 +1019,23 @@ mod tests {
         // The side effects still ran first, exactly as in real Java.
         assert!(dir.join("Result").join("r.gv").is_file());
         assert!(dir.join("Result").join("r.txt").is_file());
+
+        // Same zero-byte-first-file-then-stop quirk as the trivial-automaton case above --
+        // this validation check also fires inside `writeMatrix`, after Maple's `FileWriter`
+        // is already open.
+        let maple = dir.join("Result").join("r.mpl");
+        assert!(maple.is_file(), "Maple's file should still be created");
+        assert_eq!(
+            fs::metadata(&maple).unwrap().len(),
+            0,
+            "but left at zero bytes"
+        );
+        for ext in ["m", "wl", "sage"] {
+            assert!(
+                !dir.join("Result").join(format!("r.{ext}")).exists(),
+                "extension .{ext} should never have been attempted"
+            );
+        }
 
         fs::remove_dir_all(&dir).ok();
     }

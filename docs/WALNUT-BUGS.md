@@ -303,9 +303,18 @@ bug costs a silent wrong answer somewhere downstream.
   4-element list of `""`.
 - **Found:** Phase 0, Item 4 first wave, 2026-08-08. Now asserted explicitly in `EvalDefTest.java`
   so it can't regress silently.
-- **Rust port:** `not yet reached` — this is CAS-matrix-export-adjacent (`TestCase`/test-harness
-  plumbing), out of the KEEP subset per `docs/BOUNDARY-MAP.md`; only relevant if a Rust-side test
-  harness ever needs an equivalent sentinel.
+- **Rust port:** **reached and reproduced, verbatim, as of `.claude/plans/amber-transcribing-ledger.md`
+  (2026-08-19)**, once CAS matrix export stopped being DROP scope. `crate::test_case::TestCase`'s
+  own `EMPTY_MATRIX_TEST_CASES`/`matrix_output()` (`crates/wr-cli/src/test_case.rs`) already
+  carried this exact sentinel from Phase 3a onward (see that module's own scope note), and it
+  is now genuinely exercised on the success path: `wr_cli::eval_def`'s dispatch now returns the
+  real 4-element list of matrix FILE ADDRESSES (matching Java's `EvalDef.writeMatrices` /
+  `TestCase`'s `matrixAddresses` field) whenever a free-variable list was supplied — the matrix
+  CONTENT itself is only materialized when a caller later reads those files via
+  `TestCase::matrix_output()` — and the SAME `["", "", "", ""]` sentinel whenever no
+  free-variable list was supplied (the common case). The surprise this entry documents (the
+  sentinel shape, not `List.of()`) is live in the port exactly as it is in Java, not merely
+  modeled for a hypothetical future caller.
 - **Upstream:** not filed.
 - **Severity:** cosmetic — a documentation/API-clarity issue, not a behavior bug.
 
@@ -2219,6 +2228,42 @@ bug costs a silent wrong answer somewhere downstream.
 - **Upstream:** not filed. The Java-side fix is mechanical: wrap each body in try/finally with the
   `dedent()` in the `finally`, or (matching WB-039's suggested fix for the same class of bug) a
   try-with-resources scope object.
+
+---
+
+## WB-042 — `MathematicaEmitter` uses `#` (Wolfram `Slot`) as its comment prefix, not `(* ... *)`, making every generated `.wl` file unloadable in real Mathematica/WL
+
+- **Where:** `Automata/Writer/MathematicaEmitter.java:29` (`COMMENT_CHAR = "#"`), used at
+  `:44,52,83` via `AutomatonMatrixWriter.writeInitialRowVectorComment`/
+  `writeIncidenceMatricesComment`/`writeFinalColumnVectorComment`.
+- **What:** every comment LINE this emitter writes (the "row vector v denotes..." /
+  "incidence matrix..." / "column vector w denotes..." blocks) is prefixed with a bare `#`,
+  which is a Wolfram Language syntax error (`#` is the `Slot` token, not a comment marker) —
+  so every `.wl` file `eval`/`def`'s CAS matrix export produces is unloadable as-is in real
+  Mathematica/Wolfram Language. The SAME file correctly uses `(* ... *)` at `:39` (`begin`)
+  and `:95` (`emitFixup`), so this is an internal inconsistency within one emitter, not a
+  missing feature — the file's author clearly knows the correct WL comment syntax and simply
+  didn't use it for these three shared comment blocks (likely because
+  `AutomatonMatrixWriter.write*Comment` helpers are shared across all four emitters and take
+  a single `commentChar` string, which cannot express `(* ... *)`'s two-sided delimiter).
+  The other three emitters are all correct for their own language: Maple `#`, Sage `#`,
+  MATLAB/Octave `%`.
+- **Confirmed live:** the checked-in golden fixture
+  `walnut-java/src/test/resources/integrationTests/automaton374.wl` (and 375-379, 383) — its
+  body contains bare `#`-prefixed lines exactly as described.
+- **Found:** `.claude/plans/amber-transcribing-ledger.md` (CAS matrix export port), 2026-08-19,
+  cross-checked against the real Java source and the checked-in `.wl` fixtures.
+- **Rust port:** ported verbatim — `wr_io::matrix_writer::MathematicaEmitter` writes the same
+  bare `#`-prefixed lines for these three comment blocks (still correctly using `(* ... *)`
+  for `begin`/`emit_fixup`, matching Java's own inconsistency exactly). The 7 golden `.wl`
+  fixtures encode this buggy output; "fixing" it to `(* ... *)` would itself be a text-fixture
+  regression against `CLAUDE.md`'s mechanical-port rule.
+- **Upstream:** not filed. If the user later wants this fixed in `walnut-java`, that is a
+  deliberate PR plus explicit sign-off on a port divergence, per `CLAUDE.md`'s log-then-decide
+  process — not something to resolve mid-port.
+- **Severity:** cosmetic-in-scope, real-in-consequence — the decision procedure and every other
+  output format are unaffected; a user who actually opens the generated `.wl` file in
+  Mathematica/WL gets a real syntax error on the first comment line.
 
 ---
 

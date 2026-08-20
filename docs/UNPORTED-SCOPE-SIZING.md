@@ -29,7 +29,15 @@ Ostrowski, and the OTF determinization family.
 
 ## Ranking (smallest → largest task)
 
-### 1. CAS matrix export — smallest
+### 1. CAS matrix export — smallest — **PORTED (2026-08-19)**
+
+**This item is resolved, not just sized.** Executed via
+`.claude/plans/amber-transcribing-ledger.md`: `crates/wr-io/src/matrix_writer.rs` (the four
+emitters + `write_matrix`/`write_all`), wired into `crates/wr-cli/src/eval_def.rs`, with the
+golden corpus's 7 matrix fixtures (374-379, 383) now compared in full — all pass on all four
+extensions. WB-042 logged (`MathematicaEmitter`'s `#`-vs-`(* *)` bug, ported verbatim). The
+sizing below is kept as the record of what was estimated beforehand, for comparison against
+what actually shipped.
 
 - **Java surface**: `Writer/AutomatonMatrixWriter.java` (188 LOC) + `MatrixEmitter.java` (26 LOC)
   + 4 format emitters (Maple 105, Sage 104, Matlab 105, Mathematica 102) ≈ **630 LOC total**,

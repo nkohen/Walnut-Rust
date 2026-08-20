@@ -53,7 +53,10 @@ This converts Walnut's weakest asset (moderate unit coverage — 92 tests) into 
 
 **Non-goals (for the initial subset)**
 - Ostrowski / Fibonacci / Pell / negative-base numeration systems.
-- CAS matrix exports (Maple/Mathematica/Matlab/Sage) — Sage export can be revisited later.
+- ~~CAS matrix exports (Maple/Mathematica/Matlab/Sage) — Sage export can be revisited later.~~
+  **Revisited and reversed 2026-08-19** (`.claude/plans/amber-transcribing-ledger.md`): CAS
+  matrix export is now KEEP scope and ported (`crates/wr-io/src/matrix_writer.rs`). See that
+  plan and `tests/golden/STATUS.md`'s "CAS incidence-matrix export — CLOSED" entry.
 - Drop-in file-format identity for *every* Walnut command; we match the subset's commands exactly and skip the rest.
 - Idiomatic-Rust elegance in v1 (deliberately deferred behind the mechanical port).
 
@@ -85,7 +88,7 @@ Walnut is 13,803 LOC of Java across 76 files in 11 packages. The subset keeps th
 
 **Broader gap (kit-review #2):** the same "missed files" problem applies beyond `Prover.java` — the first draft enumerated only some of the `Automata/` package. **Phase 0 must run a file-by-file inventory of the *entire* `Automata/` directory** (and its subpackages), assigning each file KEEP/DROP and a crate, and produce a **verified Java-file → Rust-crate boundary map** (the walnut-rs analogue of Bun's `LIFETIMES.tsv`) — adversarially reviewed **before Phase 2**. This is the single highest-value pre-build artifact: a crate-boundary decision discovered mid-port forces rework across everything already built on the wrong boundary.
 
-**DROP (initially):** `Automata/Numeration/Ostrowski` (491 LOC) + `NodeState`; Fibonacci/Pell/negative-base branches of `NumberSystem`; CAS matrix writers (Maple/Mathematica/Matlab/Sage — ~28 golden files); `Transducer`-heavy paths *only if* `transduce` is dropped. This removes the messiest ~god-class surface and the exotic-numeration edge cases — the two hardest things to port *exactly*. (`Transducer` was later confirmed KEEP — see the file table above. Fibonacci/Pell turned out to be a non-issue: they're plain custom-base data files running through the already-KEEP generic loader, not separate code — see [`docs/UNPORTED-SCOPE-SIZING.md`](UNPORTED-SCOPE-SIZING.md), which also ranks the genuinely-dropped items — CAS export, negative-base, `split`/`rsplit`, Ostrowski, OTF — by porting effort should any of them ever be revisited.)
+**DROP (initially):** `Automata/Numeration/Ostrowski` (491 LOC) + `NodeState`; Fibonacci/Pell/negative-base branches of `NumberSystem`; CAS matrix writers (Maple/Mathematica/Matlab/Sage — ~28 golden files); `Transducer`-heavy paths *only if* `transduce` is dropped. This removes the messiest ~god-class surface and the exotic-numeration edge cases — the two hardest things to port *exactly*. (`Transducer` was later confirmed KEEP — see the file table above. Fibonacci/Pell turned out to be a non-issue: they're plain custom-base data files running through the already-KEEP generic loader, not separate code — see [`docs/UNPORTED-SCOPE-SIZING.md`](UNPORTED-SCOPE-SIZING.md), which also ranks the genuinely-dropped items — CAS export, negative-base, `split`/`rsplit`, Ostrowski, OTF — by porting effort should any of them ever be revisited. **CAS matrix export itself was later un-dropped — see the non-goals list above.**)
 
 **Net port surface:** ~8–10k LOC of Java, of which the agent survey judges ~80% "straightforward" (clean, static, mechanically portable) and ~20% risky (parser edge cases, `NumberSystem`, the external OTF/Brics/AutomataLib dependencies — see §7).
 
