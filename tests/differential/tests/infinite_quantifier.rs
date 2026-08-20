@@ -205,8 +205,10 @@ fn infinite_quantifier_mixed_numeration_system_matches_real_walnut_output() {
 
     let x_filtered = wr_core::logicalops::remove_leading_zeros(&build_mixr(), &["x".to_string()])
         .expect("remove_leading_zeros over the lsd track must not fail");
-    let x_verdict = wr_core::infinite::infinite(&x_filtered)
-        .expect("infinite must not fail on a small trimmed automaton");
+    // WB-002 (`docs/WALNUT-BUGS.md`), fixed upstream: `wr_core::infinite::infinite` no
+    // longer returns a `Result` (it matches Java's own post-fix signature — see
+    // `wr_core::infinite`'s module docs), so no `.expect(..)` is needed here anymore.
+    let x_verdict = wr_core::infinite::infinite(&x_filtered);
     assert!(
         x_verdict.is_some(),
         "Ix $mixr(x,y) must be TRUE (infinitely many lsd x values: 1, 2, 4, 8, ...)"
@@ -214,8 +216,7 @@ fn infinite_quantifier_mixed_numeration_system_matches_real_walnut_output() {
 
     let y_filtered = wr_core::logicalops::remove_leading_zeros(&build_mixr(), &["y".to_string()])
         .expect("remove_leading_zeros over the msd track must not fail");
-    let y_verdict = wr_core::infinite::infinite(&y_filtered)
-        .expect("infinite must not fail on a small trimmed automaton");
+    let y_verdict = wr_core::infinite::infinite(&y_filtered);
     assert!(
         y_verdict.is_none(),
         "Iy $mixr(x,y) must be FALSE (exactly one msd y value: 1)"

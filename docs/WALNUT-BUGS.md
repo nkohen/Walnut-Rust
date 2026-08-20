@@ -181,7 +181,11 @@ bug costs a silent wrong answer somewhere downstream.
   `infinite::tests::empty_language_is_finite_regardless_of_state_count` (the `Q > 1` case, proving
   the pre-trim `DegenerateSelfLoop` guard correctly does *not* fire there, and the port still
   answers "finite").
-- **Upstream:** not filed.
+- **Upstream:** **fixed**, `walnut-java` commit `aa4a241` (branch `bugfix/wb-002-012-037-044`):
+  `Infinite.infiniteTrimmed` now checks `suffix == null` (the `findPath` sentinel) and returns
+  `""` directly, instead of letting `decode(null, r)` iterate over it. `InfiniteTest.
+  testSingleStateSelfLoopWithNoAcceptingStateThrowsNPE` was renamed
+  `...IsFinite` and now asserts `""`, not the NPE.
 - **Severity:** moderate — crash (not silent-wrong-answer) on a degenerate but real input shape;
   unclear how often a real query's automaton collapses to exactly this 1-state, non-accepting,
   self-looping form before `inf` is invoked on it.
@@ -194,6 +198,24 @@ bug costs a silent wrong answer somewhere downstream.
   port's guard catches an invalid `q0` for *every* `Q`, not just `Q <= 1`, which changes no answer
   for any well-formed automaton and is strictly safer, but is worth recording for completeness since
   it's a second, distinct place this same guard-reordering diverges from literal Java behavior.
+- **Resolved (2026-08-20):** upstream fixed as described above (commit `aa4a241`, verified live:
+  `./mvnw -Dtest=Automata.FA.InfiniteTest test` green on that branch, and a hand-built trigger
+  automaton run through the CLI now prints `Automaton wb002trigger accepts finitely many values.`
+  cleanly instead of a stack trace). **Rust port: fixed, matches walnut-java as of commit
+  `aa4a241`.** `wr_core::infinite::infinite`'s pre-trim `DegenerateSelfLoop` guard was removed
+  entirely, not replaced — the pre-existing, unrelated post-trim `trimmed.is_language_empty()`
+  guard already answers `None` for this exact input (a single non-accepting self-looping state
+  has no accepting state at all, so its language is empty regardless of `Q`, and this port's own
+  `trim` collapses any empty-language input to a canonical self-looping sink the same way
+  regardless of self-loop presence — see `infinite.rs`'s module docs, "Porting the fix: deleting a
+  guard, not adding one"). The `InfiniteError` type (and every downstream `ActError::Infinite`/
+  `ProverHelperError::Infinite` variant and `LoggableError` NPE classification it fed) is deleted;
+  `infinite()`'s signature is now plain `Option<String>`, matching Java's own signature having no
+  error path at all anymore. Every test previously pinning `Err(InfiniteError::DegenerateSelfLoop)`
+  now pins `None`, matching the fixed Java exactly — zero tests deleted, per `CLAUDE.md`'s merge
+  gate. Differential coverage against a live capture from the fixed branch:
+  `tests/differential/tests/java_bugfix_wb002.rs`'s
+  `wb002_degenerate_self_loop_automaton_matches_fixed_java`.
 
 ---
 

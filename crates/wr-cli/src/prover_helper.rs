@@ -26,7 +26,7 @@
 use std::io::{self, Write};
 
 use wr_core::automaton::Automaton;
-use wr_core::infinite::{infinite, InfiniteError};
+use wr_core::infinite::infinite;
 use wr_core::logging::Logging;
 use wr_core::logicalops::{remove_leading_zeros_with_ctx, RemoveLeadingZerosError};
 use wr_io::writer::{export_automaton_to_ba, write_automaton_gv, BaWriteError};
@@ -54,9 +54,6 @@ pub enum ProverHelperError {
     Read(PredicateEnvError),
     /// Propagated from `AutomatonLogicalOps.removeLeadingZeros` (`:52`).
     RemoveLeadingZeros(RemoveLeadingZerosError),
-    /// Propagated from `Infinite.infinite` (`:57`) — WB-002's crash trigger, reported as
-    /// an error here rather than a panic.
-    Infinite(InfiniteError),
 }
 
 impl std::fmt::Display for ProverHelperError {
@@ -70,7 +67,6 @@ impl std::fmt::Display for ProverHelperError {
             ProverHelperError::Io(e) => write!(f, "{e}"),
             ProverHelperError::Read(e) => write!(f, "{e}"),
             ProverHelperError::RemoveLeadingZeros(e) => write!(f, "{e}"),
-            ProverHelperError::Infinite(e) => write!(f, "{e}"),
         }
     }
 }
@@ -98,12 +94,6 @@ impl From<PredicateEnvError> for ProverHelperError {
 impl From<RemoveLeadingZerosError> for ProverHelperError {
     fn from(e: RemoveLeadingZerosError) -> Self {
         ProverHelperError::RemoveLeadingZeros(e)
-    }
-}
-
-impl From<InfiniteError> for ProverHelperError {
-    fn from(e: InfiniteError) -> Self {
-        ProverHelperError::Infinite(e)
     }
 }
 
@@ -251,7 +241,7 @@ pub fn inf_from_automaton_to(
     // `String infReg = Infinite.infinite(M.fa, M.richAlphabet);` (`:57`). This port
     // returns `Option<String>` where Java returns `""`-for-finite, so `is_some()` is
     // Java's `!infReg.isEmpty()` -- see `wr_core::infinite`'s docs.
-    let inf_reg = infinite(m)?;
+    let inf_reg = infinite(m);
     match &inf_reg {
         Some(reg) => writeln!(
             stdout,

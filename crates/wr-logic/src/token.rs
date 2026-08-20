@@ -75,7 +75,7 @@ use std::rc::Rc;
 use num_bigint::BigInt;
 use wr_core::automaton::Automaton;
 use wr_core::determinize::DeterminizeContext;
-use wr_core::infinite::{infinite, InfiniteError};
+use wr_core::infinite::infinite;
 use wr_core::logicalops::{
     and, iff, imply, not, or, remove_leading_zeros_with_ctx, reverse_with_ctx, xor,
     RemoveLeadingZerosError,
@@ -376,10 +376,6 @@ pub enum ActError {
     /// `WalnutException`s in Java; see [`RemoveLeadingZerosError`] for why neither is
     /// reachable through a well-formed formula.
     RemoveLeadingZeros(RemoveLeadingZerosError),
-    /// The `I` quantifier's `Infinite.infinite` call (`:152`) — added by U10. Its single
-    /// variant stands in for a real Java `NullPointerException` (WB-002), surfaced as an
-    /// `Err` rather than a panic; see [`wr_core::infinite::InfiniteError`].
-    Infinite(InfiniteError),
     /// A `wr-core` guard that ports a Java `RuntimeException` as a `panic!`/`assert!`
     /// (rather than as an `Err`) fired inside `act()`, and
     /// [`wr_core::walnut_panic::catch_walnut_panic`] recovered its message.
@@ -425,12 +421,6 @@ impl From<RemoveLeadingZerosError> for ActError {
     }
 }
 
-impl From<InfiniteError> for ActError {
-    fn from(e: InfiniteError) -> Self {
-        ActError::Infinite(e)
-    }
-}
-
 impl fmt::Display for ActError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -452,7 +442,6 @@ impl fmt::Display for ActError {
             ActError::NumberSystem(e) => write!(f, "{e}"),
             // Both carry verbatim Walnut text of their own.
             ActError::RemoveLeadingZeros(e) => write!(f, "{e}"),
-            ActError::Infinite(e) => write!(f, "{e}"),
             // The recovered panic payload IS the Java exception message.
             ActError::Thrown(message) => write!(f, "{message}"),
         }
@@ -1422,7 +1411,7 @@ impl Operator {
                         // Automaton(!infReg.isEmpty());` — the `""`-means-finite sentinel
                         // this port already replaced with `Option` (see
                         // `wr_core::infinite`'s module docs), so `!isEmpty()` is `is_some`.
-                        let inf_reg = infinite(&automaton)?;
+                        let inf_reg = infinite(&automaton);
                         automaton = Automaton::true_false(inf_reg.is_some());
                     }
                     _ => unreachable!("only the three quantifier kinds reach this method"),

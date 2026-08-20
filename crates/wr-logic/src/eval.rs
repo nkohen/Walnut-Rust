@@ -235,15 +235,20 @@
 //! own docs, `is_handled()` mirrors Java's `e instanceof WalnutException` triage: almost
 //! every [`ActError`] variant corresponds to a real, deliberately-thrown
 //! `WalnutException` and is `handled` (message-only console/log line, no stack frames).
-//! The two documented exceptions are genuine Walnut (Java) bugs already logged in
-//! `docs/WALNUT-BUGS.md` — real, UNCAUGHT `NullPointerException`s, not `WalnutException`s
-//! — reported here as `is_handled() == false` with the closest honest `kind()` text
-//! (`"java.lang.NullPointerException"`) and an empty `stack_trace_lines()` (this port has
-//! no JVM frames to report; see `wr_core::logging`'s own module docs on why frame text
-//! has no Rust analogue and is a documented, not silent, fidelity limit):
+//! The one remaining documented exception is a genuine Walnut (Java) bug already logged
+//! in `docs/WALNUT-BUGS.md` — a real, UNCAUGHT `NullPointerException`, not a
+//! `WalnutException` — reported here as `is_handled() == false` with the closest honest
+//! `kind()` text (`"java.lang.NullPointerException"`) and an empty `stack_trace_lines()`
+//! (this port has no JVM frames to report; see `wr_core::logging`'s own module docs on
+//! why frame text has no Rust analogue and is a documented, not silent, fidelity limit):
 //!
 //! * [`crate::expr::ExprError::RepeatedIdentifierMissingNumberSystem`] — WB-013.
-//! * [`ActError::Infinite`] (wrapping [`wr_core::infinite::InfiniteError`]) — WB-002.
+//!
+//! (WB-002, the `I` quantifier's own former `NullPointerException` trigger via
+//! `wr_core::infinite::infinite`, used to be the second entry here — `ActError::Infinite`
+//! wrapping `wr_core::infinite::InfiniteError`. Fixed upstream, `walnut-java` commit
+//! `aa4a241`: `infinite()` no longer errors on any input, so this port's `ActError` has
+//! no `Infinite` variant to classify anymore.)
 
 use std::fmt;
 use std::time::Instant;
@@ -440,9 +445,6 @@ impl LoggableError for ActError {
             // `handled` so they render as a message-only line rather than inventing JVM
             // frames this port cannot produce.
             ActError::Quantify(_) => true,
-            // WB-002: a real, UNCAUGHT `NullPointerException` in Java, not a
-            // `WalnutException`.
-            ActError::Infinite(_) => false,
             // A recovered `wr-core` guard panic. Every guard this variant can currently carry
             // ports a deliberately-thrown Java `WalnutException` (`wr_core::product`'s
             // same-label/different-alphabet guard, `wr_core::logicalops`'s quotient subset
@@ -462,8 +464,9 @@ impl LoggableError for ActError {
 
     fn kind(&self) -> String {
         match self {
-            ActError::Expr(ExprError::RepeatedIdentifierMissingNumberSystem { .. })
-            | ActError::Infinite(_) => "java.lang.NullPointerException".to_string(),
+            ActError::Expr(ExprError::RepeatedIdentifierMissingNumberSystem { .. }) => {
+                "java.lang.NullPointerException".to_string()
+            }
             // The three `NumSysError`s `num_sys_error_is_handled` classifies as unhandled
             // each name a *different* uncaught JVM exception — see that function's own
             // per-variant comments for the throw site each one stands in for.

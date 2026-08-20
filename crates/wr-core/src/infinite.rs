@@ -10,14 +10,12 @@
 //! language — it is one reachable `prefix · cycle* · suffix` shape that proves
 //! infinitude and nothing more.
 //!
-//! # Return type: `Result<Option<String>, InfiniteError>`, not Java's `""`-sentinel `String`
+//! # Return type: `Option<String>`, not Java's `""`-sentinel `String`
 //!
 //! Java's `infinite()` returns `""` for "the language is finite, no witness" and a
 //! non-empty regex otherwise. `PORTING.md`'s "`null`/sentinel return -> `Option<T>`"
 //! ruling applies directly to this exact idiom, so this port returns `None`/`Some(re)`
-//! instead — same information, no reliance on `.is_empty()` at call sites. The outer
-//! `Result` is a separate concern (see "WB-002" below): on one narrow input shape,
-//! Java's `infinite()` doesn't return `""` at all, it throws `NullPointerException`.
+//! instead — same information, no reliance on `.is_empty()` at call sites.
 //!
 //! # Trivial (`TRUE`/`FALSE`) automaton input (U0)
 //!
@@ -48,52 +46,55 @@
 //! directly (mirroring how [`crate::trim::trim`] itself guards, per its own module
 //! docs) rules that out regardless of `q`.
 //!
-//! # WB-002: reproducing Java's *exact* crash trigger as a `Result::Err`
+//! # WB-002: Java's *exact* former crash trigger — RESOLVED, upstream and here
 //!
-//! `docs/WALNUT-BUGS.md`'s WB-002 documents a genuine Walnut (Java) bug:
-//! `Infinite.infinite` throws `NullPointerException` on a narrow, precise input shape
-//! — not, as an earlier draft of this file assumed, on "any empty-language input".
+//! `docs/WALNUT-BUGS.md`'s WB-002 documented a genuine Walnut (Java) bug:
+//! `Infinite.infinite` used to throw `NullPointerException` on a narrow, precise input
+//! shape — not, as an earlier draft of this file assumed, on "any empty-language
+//! input". **Fixed upstream** in `walnut-java` commit `aa4a241` (branch
+//! `bugfix/wb-002-012-037-044`): `infiniteTrimmed` now checks for a `null` suffix
+//! (Java's `findPath` sentinel) and returns `""` directly instead of letting
+//! `decode(null, r)` iterate over it. This port's own history with the same trigger
+//! shape, and why no new guard was needed to match the fix, follows.
+//!
 //! Working out the exact shape means following `Trimmer.trimAutomaton`'s own guard:
 //! `if (a.isTRUE_FALSE_AUTOMATON() || a.getQ() <= 1) return;` (`Trimmer.java:31-33`) —
 //! trimming is skipped **entirely** when the automaton has at most one state, so a
 //! 1-state input reaches `infiniteTrimmed` completely untrimmed.
 //!
 //! Within that untrimmed `Q == 1` case, tracing `findCycle`/`findPath`/`decode` by hand
-//! gives four sub-cases for the sole state, only one of which crashes:
+//! gives four sub-cases for the sole state — this table records Java's result **before**
+//! `aa4a241`; the crashing row now cleanly returns `""` too (Java's `if (suffix == null)
+//! return "";` guard), same as the other three:
 //!
-//! | state 0 accepting? | self-loop present? | Java's `infinite()` result            |
+//! | state 0 accepting? | self-loop present? | Java's `infinite()` result (pre-fix)  |
 //! |---------------------|---------------------|---------------------------------------|
 //! | yes                  | yes                  | `"([0])*"` (genuinely infinite)       |
 //! | yes                  | no                   | `""` (finite — language is `{ε}`)     |
-//! | **no**                | **yes**               | **`NullPointerException`**            |
+//! | **no**                | **yes**               | **`NullPointerException`** (now `""`) |
 //! | no                   | no                   | `""` (finite — language is `∅`)       |
 //!
-//! The crash needs BOTH a non-accepting sole state AND at least one outgoing
+//! The crash needed BOTH a non-accepting sole state AND at least one outgoing
 //! transition (with `Q == 1`, any transition necessarily targets the state itself, so
 //! "has a transition" and "has a self-loop" coincide): `findCycle` immediately hits
 //! the self-loop as a back edge (state 0 is still `ON_STACK` when it revisits itself)
 //! and reports a "cycle" starting and ending at state 0; `findPath`'s BFS for a suffix
-//! from there to an accepting state then exhausts (there is none reachable) and
-//! returns Java `null`; `decode(null, r)` iterates that null list and NPEs. *Without*
-//! a self-loop, `findCycle` has no transitions to traverse at all, reports no cycle,
-//! and `infiniteTrimmed` returns `""` before ever reaching `findPath`/`decode` — so
-//! "empty language, `Q == 1`" does *not* automatically crash; it specifically needs
-//! the self-loop.
+//! from there to an accepting state then exhausts (there is none reachable) and used to
+//! return Java `null`, which `decode(null, r)` iterated over and NPE'd — now caught by
+//! the `suffix == null` guard one line earlier. *Without* a self-loop, `findCycle` has
+//! no transitions to traverse at all, reports no cycle, and `infiniteTrimmed` returns
+//! `""` before ever reaching `findPath`/`decode` — so "empty language, `Q == 1`" was
+//! never a blanket crash trigger; it specifically needed the self-loop.
 //!
-//! **Empirically confirmed, not just reasoned from source.** `walnut-java`'s own
-//! `InfiniteTest.testSingleStateSelfLoopWithNoAcceptingStateThrowsNPE` (the
-//! not-accepting + self-loop row) is a *passing* JUnit characterization test that
-//! asserts the NPE (`./mvnw -Dtest=Automata.FA.InfiniteTest test`: 7/7 green,
-//! including that one, confirmed while authoring this fix). The other three rows were
-//! checked with a small standalone driver (`InfProbe.java`, compiled and run against
-//! the same `target/classes`, calling `Infinite.infinite` directly on hand-built `FA`s
-//! for each shape) — its output matched the table exactly:
-//! ```text
-//! Q1 accepting+selfloop -> OK, result = "([0])*"
-//! Q1 accepting+noloop -> OK, result = ""
-//! Q1 nonaccepting+selfloop -> THREW java.lang.NullPointerException: Cannot invoke "java.util.List.iterator()" because "symbols" is null
-//! Q1 nonaccepting+noloop -> OK, result = ""
-//! ```
+//! **Empirically confirmed, not just reasoned from source — both before and after the
+//! fix.** `walnut-java`'s own `InfiniteTest` (renamed
+//! `testSingleStateSelfLoopWithNoAcceptingStateIsFinite` by `aa4a241`, formerly
+//! `...ThrowsNPE`) now asserts `Infinite.infinite(fa, r)` equals `""` for exactly this
+//! shape (`./mvnw -Dtest=Automata.FA.InfiniteTest test` on `bugfix/wb-002-012-037-044`:
+//! green, including that row) — confirming the clean `""` in place of the old stack
+//! trace. Before the fix, the other three rows were checked with a small standalone
+//! driver (`InfProbe.java`, run against `target/classes`) and matched the table above
+//! exactly.
 //!
 //! ## `Q > 1` empty language was never a divergence
 //!
@@ -119,47 +120,46 @@
 //! then fails the suffix search exactly like Java's real `Q == 1` crash case — a shape
 //! [`find_path`] would hit as a `None` this file would otherwise have to `.expect(..)`
 //! away incorrectly. So [`infinite`] still keeps a `trimmed.is_language_empty()` guard
-//! *after* trimming (returning `Ok(None)`), purely to route around this port's own
+//! *after* trimming (returning `None`), purely to route around this port's own
 //! trim's self-looping-canonical-shape choice — not to emulate anything about Java,
 //! which never reaches its DFS at all for `Q > 1` empty-language input. That guard is
 //! not a divergence: it changes no answer Java gives (Java already answers `""` there
 //! too, just via a different mechanism), it only prevents this port's differently-shaped
 //! trim result from tripping an unrelated internal invariant below.
 //!
-//! ## The fix: `Result<Option<String>, InfiniteError>`
+//! ## Porting the fix: deleting a guard, not adding one
 //!
-//! [`infinite`] therefore does two separate things, in this order:
-//! 1. **Before** calling [`crate::trim::trim`], checks the untrimmed input directly
-//!    against Java's *exact* trigger (`q == 1`, state `0` not accepting, at least one
-//!    outgoing transition) and returns [`InfiniteError::DegenerateSelfLoop`] — a
-//!    `Result::Err`, not a `panic!`, matching the WB-011/WB-012/WB-013 precedent that a
-//!    genuine Java `RuntimeException` `Prover.dispatch`'s top-level
-//!    `catch (RuntimeException e)` recovers from (prints a stack trace, the session
-//!    continues) is more faithfully ported as a recoverable `Result` than an uncaught
-//!    Rust `panic!` (which would unwind and, absent a `catch_unwind` boundary this port
-//!    doesn't have yet, kill the whole process — the opposite of Java's actual
-//!    behavior).
-//! 2. **After** trimming, keeps the `trimmed.is_language_empty()` guard described
-//!    above, strictly to route around this port's own trim's self-looping-canonical-
-//!    shape choice for `Q > 1` (and, harmlessly, any other `Q`) — `Ok(None)`, matching
-//!    Java's real "finite" answer for that input, just reached by a different
-//!    mechanism on both sides.
+//! Before `aa4a241`, this port faithfully reproduced Java's crash as a `Result::Err`
+//! (`InfiniteError::DegenerateSelfLoop`), checked on the untrimmed input *before*
+//! calling [`crate::trim::trim`] — matching the WB-011/WB-012/WB-013 precedent that a
+//! genuine Java `RuntimeException` `Prover.dispatch`'s top-level catch recovers from is
+//! more faithfully ported as a recoverable `Result` than an uncaught Rust `panic!`.
 //!
-//! Every case that reaches neither guard behaves exactly as it did before this fix.
+//! Now that Java itself answers `""` for this exact shape, that pre-trim guard is
+//! simply **removed** — and, unlike a typical bug port, no *replacement* guard was
+//! needed, because [`infinite`] already had a second, unrelated guard that happens to
+//! produce the exact same answer for this exact input: the `trimmed.is_language_empty()`
+//! check *after* trimming (see "`Q > 1` empty language was never a divergence" above).
+//! A single non-accepting, self-looping state has no accepting state at all, so its
+//! language is empty regardless of `Q` — [`crate::trim::trim`] collapses it (like any
+//! other empty-language input, any `Q`) to this port's canonical fully self-looping
+//! 1-state sink via its `keep.is_empty()` branch, and the post-trim guard answers
+//! `None` before the DFS ever runs. That guard predates this fix and was never about
+//! WB-002 (it exists to route around this port's own `trim`'s self-looping-canonical-
+//! shape choice, described above) — it just happens to *also* be the correct answer
+//! for the input WB-002's crash used to live on, once the pre-trim short-circuit that
+//! used to intercept it first is gone.
 //!
-//! `docs/WALNUT-BUGS.md`'s WB-002 entry is updated alongside this module to describe
-//! exactly this: not a blanket "every empty-language input" divergence, but Java's
-//! real, narrow trigger reproduced precisely as a `Result::Err`.
+//! `docs/WALNUT-BUGS.md`'s WB-002 entry is updated alongside this module: `fixed,
+//! matches walnut-java as of commit aa4a241`.
 //!
-//! Once both guards above have passed, `find_path`'s "no target found" case (Java's
-//! `null`) is provably unreachable. The pre-trim guard rules out the one untrimmed
-//! shape ([`crate::trim::trim`] no-op-equivalent: `q == 1`) where a non-empty-language
-//! trim result could still leave a state unable to reach acceptance; every other `q`
-//! either collapses via `keep.is_empty()` (caught by the post-trim guard) or survives
-//! trim's real reachability computation, which by construction keeps only states that
-//! are both forward-reachable from `q0` and backward-co-reachable to an accepting
-//! state (`trim.rs`'s own module docs). `find_cycle` only ever visits states
-//! reachable from `q0` in the trimmed automaton, so `cycle.start` is
+//! With the pre-trim guard gone, `find_path`'s "no target found" case (Java's `null`)
+//! remains provably unreachable, for the same reason as before: every `q` either
+//! collapses via `keep.is_empty()` (caught by the post-trim `is_language_empty()`
+//! guard) or survives trim's real reachability computation, which by construction
+//! keeps only states that are both forward-reachable from `q0` and backward-
+//! co-reachable to an accepting state (`trim.rs`'s own module docs). `find_cycle` only
+//! ever visits states reachable from `q0` in the trimmed automaton, so `cycle.start` is
 //! backward-co-reachable to acceptance by construction, and a BFS from a
 //! backward-co-reachable state is guaranteed to discover *some* accepting state. This
 //! is asserted via `.expect(..)`, not silently `unwrap`ped, so a violation (should
@@ -185,41 +185,6 @@ use crate::automaton::Automaton;
 use crate::fa::Fa;
 use crate::trim;
 use std::collections::VecDeque;
-use std::fmt;
-
-/// Everything [`infinite`] can fail with.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InfiniteError {
-    /// Reproduces `Infinite.infinite`'s `NullPointerException` (`docs/WALNUT-BUGS.md`
-    /// WB-002) on Java's *exact* trigger shape: a single state (`Q == 1`, so
-    /// `Trimmer.trimAutomaton`'s `Q <= 1` guard no-ops and trimming never runs), not
-    /// accepting, with at least one outgoing transition (necessarily a self-loop, the
-    /// only possible destination when `Q == 1`). See this module's docs for the full
-    /// derivation and empirical confirmation, and the table of the three sibling
-    /// `Q == 1` shapes that do *not* crash.
-    ///
-    /// Represented as a `Result::Err` here, deliberately **not** a `panic!`: Java's own
-    /// NPE is an unchecked `RuntimeException` that `Prover.dispatch`'s top-level
-    /// `catch (RuntimeException e)` recovers from (prints a stack trace, the session
-    /// continues) — the same WB-011/WB-012/WB-013 precedent `wr_logic::expr::ExprError::
-    /// RepeatedIdentifierMissingNumberSystem` follows for its own Java NPE.
-    DegenerateSelfLoop,
-}
-
-impl fmt::Display for InfiniteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            InfiniteError::DegenerateSelfLoop => write!(
-                f,
-                "automaton has a single, non-accepting, self-looping state (Java: \
-                 NullPointerException in Infinite.decode via findPath returning null, \
-                 see WB-002)"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for InfiniteError {}
 
 /// DFS visit state for [`find_cycle`]. Matches Java's `UNSEEN`/`ON_STACK`/`DONE` `int`
 /// constants (`Infinite.java:20-22`) one-for-one; a Rust enum purely for readability,
@@ -241,15 +206,14 @@ struct Cycle {
 }
 
 /// Returns a witness regex `prefix(cycle)*suffix` proving `a`'s language is infinite,
-/// `Ok(None)` if it's finite, or [`InfiniteError::DegenerateSelfLoop`] on the one input
-/// shape where Java's `infinite()` itself throws `NullPointerException` (WB-002).
-/// Ports `Infinite.infinite`/`infiniteTrimmed` (`Infinite.java:29-61`) — see this
-/// module's docs for the `Option<String>` payload, the trivial-automaton short-circuit,
-/// and the two guards (one pre-trim, one post-trim) that together reproduce Java's
-/// exact crash trigger without either under- or over-firing it.
-pub fn infinite(a: &Automaton) -> Result<Option<String>, InfiniteError> {
+/// or `None` if it's finite. Ports `Infinite.infinite`/`infiniteTrimmed`
+/// (`Infinite.java:29-61`, post-`aa4a241`) — see this module's docs for the
+/// `Option<String>` payload, the trivial-automaton short-circuit, and why the single
+/// guard below is enough to match Java's now-fixed behavior on every input, including
+/// WB-002's former crash trigger.
+pub fn infinite(a: &Automaton) -> Option<String> {
     if a.fa.is_true_false_automaton() {
-        return Ok(None);
+        return None;
     }
 
     // Checked BEFORE trimming, unlike Java's `infinite`/`infiniteTrimmed` (which trims
@@ -263,50 +227,31 @@ pub fn infinite(a: &Automaton) -> Result<Option<String>, InfiniteError> {
     // `Q`, is strictly more robust than Java (which only tolerates this for `Q <= 1`)
     // and changes no answer for any well-formed automaton.
     if a.fa.q == 0 || a.fa.q0 >= a.fa.q {
-        return Ok(None);
-    }
-
-    // Java's *exact* WB-002 trigger, checked on the UNTRIMMED automaton (matching
-    // `Trimmer.trimAutomaton`'s `Q <= 1` no-op -- a 1-state automaton never actually
-    // gets trimmed in Java). See this module's docs for the full derivation and the
-    // empirically-confirmed table of the four `Q == 1` sub-cases; only "not accepting,
-    // has an outgoing transition" crashes. `a.fa.q == 1` forces `a.fa.q0 == 0` (the
-    // `q0 >= q` guard above already ruled out anything else), so `a.fa.d[a.fa.q0]` is
-    // always in range here.
-    //
-    // NOTE: `a.fa.d[a.fa.q0]` is a `BTreeMap<i32, Vec<usize>>`; `.is_empty()` on the
-    // map only tests whether any SYMBOL KEY is present, not whether that key's
-    // destination `Vec` is actually non-empty. A `Fa` can have a symbol key mapped to
-    // an empty `Vec` (constructible via direct `Fa` manipulation -- `fa.rs`'s
-    // `canonicalize_prunes_entries_with_empty_destination_list` test builds exactly
-    // this shape, precisely because `canonicalize()` exists to prune it). That shape
-    // has NO real transition -- no self-loop at all -- so the guard must check for an
-    // actual non-empty destination, matching how `find_cycle`/`find_path` below already
-    // traverse `dests` (they don't check map non-emptiness either).
-    if a.fa.q == 1
-        && !a.fa.is_accepting(a.fa.q0)
-        && a.fa.d[a.fa.q0].values().any(|dests| !dests.is_empty())
-    {
-        return Err(InfiniteError::DegenerateSelfLoop);
+        return None;
     }
 
     let trimmed = trim::trim(&a.fa);
 
     // `infiniteTrimmed`'s own guard (`Infinite.java:43-45`) is checked again here for
     // fidelity to Java's structure, even though `trim`'s postcondition should make the
-    // second half unreachable now that the pre-trim checks above have run. Also: Java
+    // second half unreachable now that the guard above has run. Also: Java
     // additionally checks `fa.getQ0() < 0`; `q0: usize` makes that sub-case
     // unrepresentable in this port, so there is nothing left to check for it.
     if trimmed.q == 0 || trimmed.q0 >= trimmed.q {
-        return Ok(None);
+        return None;
     }
 
     // NOT a Java divergence -- see this module's docs, "`Q > 1` empty language was
     // never a divergence". Purely routes around this port's OWN `trim`'s
     // self-looping-canonical-shape choice for an empty language (any `Q`), which Java
     // reaches cleanly via a structurally different (zero-transition) mechanism.
+    // Since `aa4a241`, this guard also happens to be exactly what makes WB-002's former
+    // crash trigger (a single non-accepting, self-looping state -- always
+    // empty-language, since it has no accepting state at all) answer `None` here,
+    // matching Java's own `if (suffix == null) return "";` guard -- see this module's
+    // docs, "Porting the fix: deleting a guard, not adding one".
     if trimmed.is_language_empty() {
-        return Ok(None);
+        return None;
     }
 
     let mut visit_state = vec![VisitState::Unseen; trimmed.q];
@@ -314,29 +259,27 @@ pub fn infinite(a: &Automaton) -> Result<Option<String>, InfiniteError> {
     let mut input: Vec<Option<i32>> = vec![None; trimmed.q];
     previous[trimmed.q0] = Some(trimmed.q0);
 
-    let Some(cycle) = find_cycle(
+    let cycle = find_cycle(
         &trimmed,
         trimmed.q0,
         &mut visit_state,
         &mut previous,
         &mut input,
-    ) else {
-        return Ok(None);
-    };
+    )?;
 
     let prefix = symbols_on_path(trimmed.q0, cycle.start, &previous, &input);
     let suffix = find_path(&trimmed, cycle.start, |s| trimmed.is_accepting(s)).expect(
-        "unreachable: the pre-trim DegenerateSelfLoop guard plus trim's postcondition \
+        "unreachable: the post-trim is_language_empty guard plus trim's postcondition \
          together guarantee a path to acceptance from any state the (non-empty-language) \
          DFS can reach cycle.start through -- see this module's docs",
     );
 
-    Ok(Some(format!(
+    Some(format!(
         "{}({})*{}",
         decode_symbols(&prefix, a),
         decode_symbols(&cycle.symbols, a),
         decode_symbols(&suffix, a)
-    )))
+    ))
 }
 
 /// Runs DFS from `current` and returns the first directed cycle found. Ports
@@ -515,13 +458,13 @@ mod tests {
     #[test]
     fn trivial_true_automaton_is_finite() {
         let a = Automaton::true_false(true);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
     fn trivial_false_automaton_is_finite() {
         let a = Automaton::true_false(false);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     // --- Direct ports of `InfiniteTest.java`'s guard-clause characterization tests ---
@@ -533,7 +476,7 @@ mod tests {
         // flag -- exercised separately above).
         let fa = fa_with(0, 0, 0, vec![]);
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -542,7 +485,7 @@ mod tests {
         // (Java also covers Q0 < 0, which `q0: usize` makes unrepresentable here.)
         let fa = fa_with(1, 1, 1, vec![0]);
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -552,7 +495,7 @@ mod tests {
         let mut fa = fa_with(0, 2, 1, vec![0, 1]);
         add_transition(&mut fa, 0, 0, 1);
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -570,23 +513,27 @@ mod tests {
 
         // prefix = "" (q0 == cycle.start), cycle = "0" (the self-loop symbol),
         // suffix = "1","2" (the two BFS hops) -- byte-for-byte Java's expected output.
-        assert_eq!(infinite(&a), Ok(Some("([0])*[1][2]".to_string())));
+        assert_eq!(infinite(&a), Some("([0])*[1][2]".to_string()));
     }
 
-    // --- WB-002: Java's exact NPE trigger, reproduced as a `Result::Err` (see module docs) ---
+    // --- WB-002: Java's former NPE trigger, RESOLVED (see module docs) ---
 
     #[test]
-    fn single_state_self_loop_with_no_accepting_state_errors() {
-        // Java's own trigger, byte-for-byte: `Q == 1`, state 0 not accepting, with a
-        // self-loop. `InfiniteTest.testSingleStateSelfLoopWithNoAcceptingStateThrowsNPE`
-        // asserts the real `NullPointerException` for this exact shape (confirmed
-        // passing, `./mvnw -Dtest=Automata.FA.InfiniteTest test`, while authoring this
-        // fix); this port reproduces it as `InfiniteError::DegenerateSelfLoop` instead
-        // of an uncaught panic, per this module's docs.
+    fn single_state_self_loop_with_no_accepting_state_is_finite() {
+        // Java's own former crash trigger, byte-for-byte: `Q == 1`, state 0 not
+        // accepting, with a self-loop.
+        // `InfiniteTest.testSingleStateSelfLoopWithNoAcceptingStateIsFinite` (renamed
+        // from `...ThrowsNPE` by `walnut-java` commit `aa4a241`,
+        // `bugfix/wb-002-012-037-044`) now asserts `Infinite.infinite(fa, r)` equals
+        // `""` for exactly this shape (confirmed passing,
+        // `./mvnw -Dtest=Automata.FA.InfiniteTest test`) -- this test used to assert
+        // `Err(InfiniteError::DegenerateSelfLoop)`, this port's own recoverable
+        // reproduction of the NPE; it now asserts the correct `None` (finite),
+        // matching the fixed Java exactly, per this module's docs.
         let mut fa = fa_with(0, 1, 1, vec![0]); // single non-accepting state
         add_transition(&mut fa, 0, 0, 0); // self loop
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Err(InfiniteError::DegenerateSelfLoop));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -594,32 +541,38 @@ mod tests {
         // Sibling of the case above with the self-loop removed: `Q == 1`, not
         // accepting, but ZERO outgoing transitions. Empirically confirmed this does
         // NOT crash in Java (`findCycle` has nothing to traverse, reports no cycle,
-        // `infiniteTrimmed` returns `""` before ever reaching `findPath`/`decode`) --
-        // proving the port's guard fires on "has a self-loop", not merely "Q == 1 and
-        // not accepting". The language here is literally empty (`∅`), correctly finite.
+        // `infiniteTrimmed` returns `""` before ever reaching `findPath`/`decode`).
+        // Both this shape and the self-loop one above now answer `None` the same way,
+        // via the shared post-trim `is_language_empty()` guard (see module docs) --
+        // before WB-002 was fixed upstream, this test existed to prove the (now
+        // removed) pre-trim guard didn't over-fire on "Q == 1 and not accepting"
+        // alone. The language here is literally empty (`∅`), correctly finite.
         let fa = fa_with(0, 1, 1, vec![0]); // single non-accepting state, no transitions
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
     fn single_state_empty_destination_list_is_finite_not_an_error() {
-        // Regression test for a false-positive found by two independent adversarial
-        // reviews of the pre-trim guard above: `Q == 1`, not accepting, with a symbol
-        // key present in `fa.d[q0]` but mapped to an EMPTY destination `Vec` (the same
-        // shape `fa.rs`'s `canonicalize_prunes_entries_with_empty_destination_list`
-        // test builds, via direct `Fa` construction -- `canonicalize()` exists
-        // specifically to prune this). This is NOT a self-loop: there is no real
-        // transition at all, so `BTreeMap::is_empty()` (which only tests key
-        // presence, not destination non-emptiness) previously misfired here and
-        // returned `Err(DegenerateSelfLoop)` instead of the Java-correct `Ok(None)`
-        // ("" / finite -- `findCycle`'s inner loop over the empty destination list
-        // never executes, so it reports no cycle, same as the sibling
-        // `single_state_no_self_loop_is_finite_not_an_error` case above).
+        // `Q == 1`, not accepting, with a symbol key present in `fa.d[q0]` but mapped
+        // to an EMPTY destination `Vec` (the same shape `fa.rs`'s
+        // `canonicalize_prunes_entries_with_empty_destination_list` test builds, via
+        // direct `Fa` construction -- `canonicalize()` exists specifically to prune
+        // this). This is NOT a self-loop: there is no real transition at all.
+        //
+        // Originally a regression test for a false-positive two independent
+        // adversarial reviews found in the pre-trim `DegenerateSelfLoop` guard this
+        // module used to have (before WB-002 was fixed upstream and that guard was
+        // removed): `BTreeMap::is_empty()` only tests key presence, not destination
+        // non-emptiness, so that guard used to misfire on this exact shape. Kept as
+        // coverage now that the guard is gone -- the language here is empty
+        // regardless (`findCycle`'s inner loop over the empty destination list never
+        // executes, so it reports no cycle either), same as the sibling
+        // `single_state_no_self_loop_is_finite_not_an_error` case above.
         let mut fa = fa_with(0, 1, 1, vec![0]); // single non-accepting state
         fa.d[0].insert(0, vec![]); // symbol key present, but destination list empty
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -631,7 +584,7 @@ mod tests {
         let mut fa = fa_with(0, 1, 1, vec![1]); // single accepting state
         add_transition(&mut fa, 0, 0, 0); // self loop
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(Some("([0])*".to_string())));
+        assert_eq!(infinite(&a), Some("([0])*".to_string()));
     }
 
     #[test]
@@ -640,7 +593,7 @@ mod tests {
         // Java returns `""` (no cycle for `findCycle` to find).
         let fa = fa_with(0, 1, 1, vec![1]); // single accepting state, no transitions
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -648,15 +601,16 @@ mod tests {
         // NOT a Java divergence (see module docs, "`Q > 1` empty language was never a
         // divergence") -- Java's own `Trimmer.quotient` collapses this to a
         // zero-transition single state and answers "" cleanly too, just via a
-        // different mechanism than this port's `trim`. `Q > 1` here, unlike the
-        // `DegenerateSelfLoop`-triggering cases above, so the pre-trim guard must NOT
-        // fire; only the post-trim `is_language_empty` guard should.
+        // different mechanism than this port's `trim`. `Q > 1` here, so this exercises
+        // the same post-trim `is_language_empty` guard as the `Q == 1` cases above, on
+        // an input that only reaches it via real trimming rather than the
+        // `keep.is_empty()` collapse.
         let mut fa = fa_with(0, 3, 1, vec![0, 0, 0]); // no state is accepting
         add_transition(&mut fa, 0, 0, 1);
         add_transition(&mut fa, 1, 0, 2);
         add_transition(&mut fa, 2, 0, 1); // 1 <-> 2 is a live cycle, but unreachable to acceptance
         let a = single_track_automaton(fa, &[0]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     // --- Task-requested edge cases ---
@@ -673,7 +627,7 @@ mod tests {
         add_transition(&mut fa, 0, 1, 2);
         add_transition(&mut fa, 2, 0, 2); // dead self-loop, never reaches state 1
         let a = single_track_automaton(fa, &[0, 1]);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
     }
 
     #[test]
@@ -693,7 +647,7 @@ mod tests {
         }
         let alphabet: Vec<i32> = (0..(Q - 1) as i32).collect();
         let a = single_track_automaton(fa, &alphabet);
-        assert_eq!(infinite(&a), Ok(None));
+        assert_eq!(infinite(&a), None);
 
         // Sanity: this really is the claimed language (Q accepted words, all distinct).
         assert!(a.fa.accepts_word(&[]));
@@ -715,7 +669,7 @@ mod tests {
         add_transition(&mut fa, 1, 2, 2); // c
         let a = single_track_automaton(fa, &[0, 1, 2]);
 
-        assert_eq!(infinite(&a), Ok(Some("[0]([1])*[2]".to_string())));
+        assert_eq!(infinite(&a), Some("[0]([1])*[2]".to_string()));
     }
 
     // --- Multi-track witness format ---
@@ -748,6 +702,6 @@ mod tests {
             vec![Some(true), Some(true)],
         );
 
-        assert_eq!(infinite(&a), Ok(Some("([0, 1])*[1, 0]".to_string())));
+        assert_eq!(infinite(&a), Some("([0, 1])*[1, 0]".to_string()));
     }
 }
