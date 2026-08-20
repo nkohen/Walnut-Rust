@@ -367,10 +367,15 @@ bug costs a silent wrong answer somewhere downstream.
   by direct reading of `FA.java:107-124`, then **confirmed live** against the real `walnut-java` CLI
   (`Walnut-all.jar`) during adversarial review of the port: a hand-authored `.txt` with `q0 = 1`
   reproduces exactly the predicted wrong result end-to-end.
-- **Rust port:** `ported verbatim (quirk)` — `wr_core::fa::Fa::concat_states` reproduces this exactly
-  (documented in its doc comment), pinned by
-  `concat_states_quirk_uses_others_state_zero_not_others_q0`.
-- **Upstream:** not filed. Fix in Java would be reading `other`'s entries at its actual `q0`
+- **Rust port:** `fixed, matches walnut-java as of commit b5d462b` — `wr_core::fa::Fa::concat_states`
+  now grafts `other`'s transitions from `n.d[original_q + other.q0]` (not
+  `n.d[original_q]`), matching `star_states`'s existing correct pattern; pinned by
+  `concat_states_grafts_others_actual_q0_not_state_zero` (unit) and
+  `concat_states_computes_correct_concatenation_over_random_nfas` (property, replacing
+  the old quirk-pinning proptest), plus the combined WB-008+WB-009 differential test
+  `tests/differential/tests/java_bugfix_wb008_wb009.rs`.
+- **Upstream:** fixed in `walnut-java` commit `b5d462b` (branch `bugfix/wb-008-009`,
+  stacked on `bugfix/wb-002-012-037-044`) — reads `other`'s entries at its actual `q0`
   (shifted by `originalQ`), matching `starStates`'s pattern.
 - **Severity:** moderate-to-significant (raised from "moderate" after live confirmation) — silent
   wrong answer, reachable via a real CLI workflow (hand-authored or externally-generated `.txt`
@@ -399,12 +404,18 @@ bug costs a silent wrong answer somewhere downstream.
   (a plain, non-starred pair — the only such case in Walnut's own `IntegrationTest.java`,
   `test603`, asserts no language, so this never got caught upstream) produces a result whose second
   state is wrongly accepting, i.e. `L = {"0", "01"}` instead of the documented `{"01"}`.
-- **Rust port:** `ported verbatim (quirk)` — `wr_core::fa::Fa::concat_states` reproduces this exactly
-  (documented in its doc comment), pinned by
-  `concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon`.
-- **Upstream:** not filed. Fix in Java would un-mark the first operand's states as accepting inside
-  `concatStates` itself (or in a dedicated concat-only merge helper, not the shared
-  `mergeInTransitions`) before/after the graft.
+- **Rust port:** `fixed, matches walnut-java as of commit b5d462b` — `wr_core::fa::Fa::concat_states`
+  now sets each of `first`'s own accepting states' output to `other.is_accepting(other.q0)`
+  after the graft (not an unconditional clear — `first`'s final states correctly stay
+  accepting when `other` DOES accept epsilon), pinned by
+  `concat_states_clears_first_operands_accepting_flags_when_other_rejects_epsilon` and
+  `concat_states_keeps_first_operands_accepting_flags_when_other_accepts_epsilon` (both
+  directions), plus the combined WB-008+WB-009 differential test
+  `tests/differential/tests/java_bugfix_wb008_wb009.rs`.
+- **Upstream:** fixed in `walnut-java` commit `b5d462b` (branch `bugfix/wb-008-009`,
+  stacked on `bugfix/wb-002-012-037-044`) — un-marks the first operand's states as
+  accepting inside `concatStates` itself, setting each to `other.isAccepting(other.q0)`
+  rather than an unconditional clear.
 - **Severity:** significant — silent wrong answer on a very common shape (any `concat` whose second
   operand doesn't accept the empty string, which is the common case for non-star automata); worth
   prioritizing for upstream confirmation given how central `concat` is to word-automaton/morphism

@@ -811,12 +811,11 @@ mod tests {
 
     #[test]
     fn concat_of_two_automata_matches_the_concatenation_language() {
-        // NOTE: `docs/WALNUT-BUGS.md` WB-009 (`FA.concatStates` never un-marks the first
-        // operand's own accepting states) means the real, ported-verbatim language here
-        // is `L(A) ∪ L(A)·L(B)`, not the textbook `L(A)·L(B)` -- so "0" alone (from
-        // `L(A)` leaking through) is correctly ACCEPTED, not rejected. See
-        // `wr_core::fa::Fa::concat_states`'s own doc comment for the same quirk pinned
-        // at the `wr-core` layer.
+        // `docs/WALNUT-BUGS.md` WB-008/WB-009 (`FA.concatStates`'s wrong graft target
+        // and un-cleared accepting flags) were fixed in walnut-java commit `b5d462b`
+        // and ported to `wr_core::fa::Fa::concat_states` (see its doc comment) --
+        // the real language here is now the textbook `L(A)·L(B)`, so "0" alone must
+        // be REJECTED (epsilon is not in `L(B) = {"1"}`, so it can't leak through).
         let (session, dir) = temp_session("concat");
         let accepts_zero = single_symbol_automaton(0);
         let accepts_one = single_symbol_automaton(1);
@@ -829,8 +828,8 @@ mod tests {
         assert!(c.fa.accepts_word(&[0, 1]), "\"01\" must be accepted");
         assert!(!c.fa.accepts_word(&[1, 0]), "\"10\" must be rejected");
         assert!(
-            c.fa.accepts_word(&[0]),
-            "WB-009: \"0\" alone leaks through from L(A) and must be accepted too"
+            !c.fa.accepts_word(&[0]),
+            "WB-009 fixed: \"0\" alone must no longer leak through from L(A)"
         );
         fs::remove_dir_all(&dir).ok();
     }

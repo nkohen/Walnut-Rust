@@ -3174,8 +3174,11 @@ mod tests {
         };
 
         // --- concat. `L(a)·L(b)` contains "011" (= "01" then "1"); `L(b)·L(a)` cannot —
-        // everything in it starts with a `1`. (Both also carry WB-009's leak of the first
-        // operand's own language, which contains no "011" either way.)
+        // everything in it starts with a `1`. (WB-008/WB-009, `docs/WALNUT-BUGS.md`,
+        // fixed in walnut-java `b5d462b`: an earlier revision of this test's comment
+        // noted the pre-fix leak of the first operand's own language into the result;
+        // it contained no "011" either way, so these two assertions were unaffected by
+        // the fix and still pin the real, now-correct, concatenation language.)
         assert!(p.dispatch("concat ab a b;").unwrap());
         assert!(p.dispatch("concat ba b a;").unwrap());
         assert!(

@@ -408,44 +408,44 @@ impl Fa {
     /// Builds the raw (possibly-nondeterministic) concatenation state/transition
     /// additions onto `n`, which the caller must already have set to a clone of the
     /// FIRST operand automaton (mirrors Java's
-    /// `FA.concatStates(FA other, FA N, int originalQ)`, `FA.java:107-124`; see the
+    /// `FA.concatStates(FA other, FA N, int originalQ)`, `FA.java:107-131`; see the
     /// call site in `Main.Commands.Concat`, NOT in scope for this unit).
     ///
     /// Appends every state of `other`, shifting its transition destinations by
     /// `original_q` (the first operand's original state count — `other`'s states now
     /// live at indices `[original_q, original_q + other.q)` in `n`), then gives every
-    /// state that was accepting in the FIRST operand a copy of `other`'s initial
-    /// state's outgoing transitions — the concatenation NFA's "old final -> other's
-    /// q0" epsilon transition, again simulated by direct duplication (see
-    /// [`Fa::star_states`]'s doc comment for why).
+    /// state that was accepting in the FIRST operand a copy of `other`'s ACTUAL
+    /// initial state's (`other.q0`'s) outgoing transitions — the concatenation NFA's
+    /// "old final -> other's q0" epsilon transition, simulated by direct duplication
+    /// (see [`Fa::star_states`]'s doc comment for why) — and then fixes up those same
+    /// states' accepting flags to reflect what "reach here and stop" now means: a
+    /// match only if `other` itself accepts the empty string.
     ///
-    /// # Two genuine Walnut (Java) bugs, ported verbatim
+    /// # Two genuine Walnut (Java) bugs, fixed here to match walnut-java commit
+    /// `b5d462b` (`docs/WALNUT-BUGS.md` WB-008/WB-009 — see those entries for the
+    /// original buggy behavior this port used to reproduce verbatim, and their git
+    /// history / the pre-fix revision of this doc comment for how the quirks looked).
     ///
-    /// 1. **Wrong source state when `other.q0 != 0`.** The "other's initial state's
-    ///    outgoing transitions" above is, in Java, literally `N.t.getEntriesNfaD(originalQ)`
-    ///    — i.e. `other`'s state at *index* `0` (shifted), not `other.q0`. This is
-    ///    silently correct only when `other.q0 == 0` — true whenever `other` was
-    ///    round-tripped through `Writer/AutomatonWriter.java` (which canonizes before
-    ///    writing), but **not guaranteed in general**: `AutomatonReader.java` sets
-    ///    `q0` to whichever state is declared FIRST in a `.txt` file, so a hand-authored
-    ///    file that lists a non-zero state first reads back with `q0 != 0` with no
-    ///    canonicalize step in between — confirmed reproducible against the real
-    ///    Walnut CLI this way (`docs/WALNUT-BUGS.md` WB-008), not merely an in-memory
-    ///    corner case. Contrast [`Fa::star_states`] above, which correctly uses
-    ///    `automaton.q0` (not a hardcoded `0`). Pinned by
-    ///    `concat_states_quirk_uses_others_state_zero_not_others_q0`.
-    /// 2. **`first`'s old final states are never un-marked accepting.** The shared
-    ///    `merge_in_transitions` helper is correct for `star_states` (a starred
-    ///    automaton's old final states SHOULD remain accepting), but reusing it here
-    ///    means `first`'s pre-existing accepting states keep their accepting flag
-    ///    after concatenation, too. Whenever ε is NOT in `other`'s language, the raw
-    ///    concatenation automaton's language is `L(first) ∪ L(first)·L(other)`, not
-    ///    the documented `L(first)·L(other)` (`Help Documentation/Commands/Automata/concat.txt`:
-    ///    "accepts the concatenation of the inputs"). Pinned by
-    ///    `concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon`.
-    ///
-    /// Both are cataloged for `docs/WALNUT-BUGS.md` (not this crate's job to fix per
-    /// `CLAUDE.md`'s mechanical-port rule) and ported exactly as Java has them.
+    /// 1. **WB-008 — wrong source state when `other.q0 != 0`.** Java used to read
+    ///    `other`'s outgoing transitions at *index* `0` (shifted), not `other.q0`;
+    ///    silently correct only when `other.q0 == 0`, which is not guaranteed for a
+    ///    hand-authored `.txt` (`AutomatonReader` sets `q0` to whichever state is
+    ///    declared first in the file). Now grafts `n.d[original_q + other.q0]`,
+    ///    matching [`Fa::star_states`]'s existing (always-correct) use of
+    ///    `automaton.q0`. Pinned by `concat_states_grafts_others_actual_q0_not_state_zero`.
+    /// 2. **WB-009 — `first`'s old final states were never un-marked accepting.** The
+    ///    shared `merge_in_transitions` helper is correct for `star_states` (a
+    ///    starred automaton's old final states SHOULD remain accepting), but reusing
+    ///    it here left `first`'s pre-existing accepting states accepting after
+    ///    concatenation too, so whenever ε was NOT in `other`'s language the result
+    ///    accepted `L(first) ∪ L(first)·L(other)` instead of the documented
+    ///    `L(first)·L(other)`. Now every one of `first`'s own accepting states has its
+    ///    flag set to `other.is_accepting(other.q0)` — NOT an unconditional clear:
+    ///    when `other` DOES accept ε, `first`'s final states must stay accepting
+    ///    (`L(first)·L(other)` still contains `L(first)` itself in that case; a naive
+    ///    "always clear" would be a fresh, different bug). Pinned by
+    ///    `concat_states_clears_first_operands_accepting_flags_when_other_rejects_epsilon`
+    ///    and `concat_states_keeps_first_operands_accepting_flags_when_other_accepts_epsilon`.
     pub fn concat_states(other: &Fa, n: &mut Fa, original_q: usize) {
         // To access `other`'s states, just use `q`. To access them within `n`, use
         // `original_q + q`.
@@ -459,9 +459,20 @@ impl Fa {
             n.d.push(new_row);
         }
 
-        // See bug #1 above: this should arguably be `n.d[original_q + other.q0]`.
-        let source_entries = n.d[original_q].clone();
+        // Graft `other`'s ACTUAL q0 (not state-index-0 -- WB-008).
+        let source_entries = n.d[original_q + other.q0].clone();
         Fa::merge_in_transitions(n, original_q, &source_entries);
+
+        // The states just grafted onto (first's own final states) no longer mean
+        // "accept L(first) alone": stopping there now means "match a prefix of
+        // L(first), then read nothing more of other", which is only a concatenation
+        // match if other accepts epsilon (WB-009).
+        let other_accepts_epsilon = other.is_accepting(other.q0);
+        for q in 0..original_q {
+            if n.is_accepting(q) {
+                n.set_output_if_equal(q, other_accepts_epsilon);
+            }
+        }
 
         n.q = original_q + other.q;
     }
@@ -1050,18 +1061,14 @@ mod tests {
         dp[n]
     }
 
-    /// Ground truth for `concat_states`'s ACTUAL (quirky, see its doc comment)
-    /// behavior: `L(a) ∪ L(a)·L(b_from_index_0)`, i.e. `a`'s language leaks through
-    /// whole (WB-009) and the continuation is spliced from `b`'s state index `0`, not
-    /// `b.q0` (WB-008) — `b_index0` must already have `q0` forced to `0` by the
-    /// caller. This deliberately encodes the two ported bugs, not the documented
-    /// "correct" concatenation semantics — the point of this test is to pin the
-    /// quirks so a future refactor can't silently "fix" them without a test noticing.
-    fn concat_quirk_accepts(a: &Fa, b_index0: &Fa, word: &[i32]) -> bool {
-        if a.accepts_word(word) {
-            return true;
-        }
-        (0..=word.len()).any(|i| a.accepts_word(&word[..i]) && b_index0.accepts_word(&word[i..]))
+    /// Ground truth for `concat_states`'s (now-correct, post-WB-008/WB-009-fix)
+    /// behavior: `L(a)·L(b)` via a naive split-point search — independent of
+    /// `concat_states` itself, and independent of which state index `b`'s `q0`
+    /// happens to be (the whole point being tested; see `Fa::accepts_word`'s own
+    /// doc comment on why plain NFA simulation, not this helper, is what needs no
+    /// determinization).
+    fn concat_accepts(a: &Fa, b: &Fa, word: &[i32]) -> bool {
+        (0..=word.len()).any(|i| a.accepts_word(&word[..i]) && b.accepts_word(&word[i..]))
     }
 
     /// Hand-derived multi-state-seed case for `reverse` (adversarial-review finding:
@@ -1175,8 +1182,9 @@ mod tests {
     #[test]
     fn concat_states_builds_concatenation_nfa() {
         // "first" accepts exactly {"0"}; "other" accepts exactly {eps, "1"} (so
-        // eps is in L(other), which happens to mask the leaked-language quirk
-        // documented on `Fa::concat_states` and pinned below).
+        // eps is in L(other) -- exercises the "keep first's accepting flags"
+        // direction of WB-009's fix, since other.q0 == 0 here too so WB-008's
+        // graft-target fix is not separately exercised by this test).
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
@@ -1217,120 +1225,221 @@ mod tests {
         }
     }
 
+    // --- concatStates (FA.java:107-131), WB-008/WB-009: fixed in walnut-java commit
+    // b5d462b to match `docs/WALNUT-BUGS.md`; the four tests below mirror
+    // `FATest.java`'s four new WB-008/WB-009 tests one-for-one. Each was confirmed to
+    // FAIL against the pre-fix `concat_states` (the version documented in this file's
+    // git history / the pre-fix revision of `Fa::concat_states`'s doc comment) and
+    // PASS against the fixed version below.
+
     #[test]
-    fn concat_states_quirk_leaks_first_operands_language_when_second_lacks_epsilon() {
-        // Ported Walnut bug (candidate for docs/WALNUT-BUGS.md): `concatStates`
-        // reuses `mergeInTransitions`, which is correct for `starStates` (old final
-        // states of a starred automaton SHOULD remain accepting) but never clears
-        // `first`'s old accepting flags for concatenation. So whenever eps is NOT in
-        // the second operand's language, the raw concatenation-NFA's language is
-        // `L(first) union L(first).L(other)` instead of the documented
-        // `L(first).L(other)` -- L(first) leaks through, unminimized/undeterminized.
-        // Ported verbatim per CLAUDE.md's mechanical-port rule.
+    fn concat_states_grafts_others_actual_q0_not_state_zero() {
+        // WB-008: concat_states must graft the OTHER operand's actual q0's
+        // transitions onto the first operand's final states, not other's
+        // state-index-0 (which need not be the same state as q0). Build `other`
+        // with q0 != 0 and with state 0's transitions deliberately different from
+        // q0's, so a wrong graft is directly observable in the transition table --
+        // independent of WB-009's accepting-flag fix, which this test does not
+        // exercise (`other` has no accepting states at all).
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
             true_false: None,
             q0: 0,
-            q: 2,
-            alphabet_size: 2,
+            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
+            alphabet_size: 1,
             o: vec![0, 1],
             d: vec![d_first0, BTreeMap::new()],
         };
+
         let mut d_other0 = BTreeMap::new();
-        d_other0.insert(1, vec![1]);
+        d_other0.insert(0, vec![0]); // state 0 (NOT q0): 0 --0--> 0 (self loop)
+        let mut d_other1 = BTreeMap::new();
+        d_other1.insert(0, vec![1]); // state 1 (q0):     1 --0--> 1 (self loop)
         let other = Fa {
             true_false: None,
-            q0: 0,
+            q0: 1, // q0=1 (not 0!), Q=2, alphabet_size=1, no accepting states
             q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1], // q0 NOT accepting: eps is NOT in L(other)
-            d: vec![d_other0, BTreeMap::new()],
+            alphabet_size: 1,
+            o: vec![0, 0],
+            d: vec![d_other0, d_other1],
         };
-        let original_q = first.q;
+
+        let original_q = first.q; // 2 (states 0 and 1)
         let mut n = first.clone();
         Fa::concat_states(&other, &mut n, original_q);
 
-        // Correct concatenation {"0"}.{"1"} = {"01"} only:
-        assert!(n.accepts_word(&[0, 1]), "01 must be accepted");
-        // But the bare "0" is ALSO accepted -- documents the quirk, not the intended
-        // semantics ("first"'s own old-final-state acceptance was never cleared).
+        // The correct graft copies other's q0 (state 1)'s transitions, so on symbol
+        // 0 the grafted destination from first's final state (index 1) should be
+        // original_q + other.q0 = 2 + 1 = 3, not original_q + 0 = 2.
+        let dests = n.d[1]
+            .get(&0)
+            .expect("state 1 must have a symbol-0 transition");
         assert!(
-            n.accepts_word(&[0]),
-            "documents FA.concatStates' leaked-first-language quirk, see module docs"
+            dests.contains(&3),
+            "concat_states must graft other's actual q0 (WB-008): expected a \
+             transition to state 3, got {dests:?}"
+        );
+        assert!(
+            !dests.contains(&2),
+            "concat_states must not graft other's state-index-0 (the WB-008 bug): \
+             unexpected transition to state 2, got {dests:?}"
         );
     }
 
     #[test]
-    fn concat_states_quirk_uses_others_state_zero_not_others_q0() {
-        // Ported Walnut bug (candidate for docs/WALNUT-BUGS.md): `FA.concatStates`
-        // (FA.java:107-124) splices in `N.t.getEntriesNfaD(originalQ)` -- i.e.
-        // `other`'s state INDEX 0 shifted into `n` -- as the "continue into `other`"
-        // transitions for each of `first`'s old final states, rather than `other`'s
-        // actual initial state `other.q0`. This is silently correct only when
-        // `other.q0 == 0`, which is NOT guaranteed in general -- confirmed reachable
-        // via a hand-authored `.txt` file, since `AutomatonReader` sets `q0` to
-        // whichever state is declared first in the file, not necessarily state 0 (see
-        // this method's doc comment / docs/WALNUT-BUGS.md WB-008). Contrast
-        // `star_states`, which correctly uses `automaton.q0` (see
-        // `star_states_builds_kleene_star_nfa` above).
-        //
-        // `first` accepts exactly {"0"}. `other` (q0 = 1, NOT 0) accepts `0.1*`:
-        // q0=1 --0--> state 0 (accepting), and state 0 self-loops on symbol 1 while
-        // remaining accepting -- so state 0 is very much reachable, not a distractor.
-        // The mathematically correct concatenation is {"0"}.(0.1*) = "00", "001", ...
-        // -- in particular "00" must be accepted and "01" must NOT be. The ported bug
-        // instead splices state-INDEX-0's transitions (symbol 1, self-loop) onto
-        // `first`'s final state, so it's exactly backwards: "00" is rejected and "01"
-        // is accepted.
+    fn concat_states_clears_first_operands_accepting_flags_when_other_rejects_epsilon() {
+        // WB-009: concat_states must un-mark the first operand's own final states as
+        // accepting after grafting the second operand's transitions in (when
+        // epsilon is not in L(other)), so the concatenation doesn't leak L(first)
+        // into L(first)*L(other).
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
         let first = Fa {
             true_false: None,
             q0: 0,
-            q: 2,
-            alphabet_size: 2,
+            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
+            alphabet_size: 1,
             o: vec![0, 1],
             d: vec![d_first0, BTreeMap::new()],
         };
-        let mut d_other0 = BTreeMap::new();
-        d_other0.insert(1, vec![0]); // distractor: state 0 --1--> state 0, unreachable from q0=1
-        let mut d_other1 = BTreeMap::new();
-        d_other1.insert(0, vec![0]); // real: q0=1 --0--> state 0 (accepting)
         let other = Fa {
             true_false: None,
-            q0: 1,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 0],
-            d: vec![d_other0, d_other1],
+            q0: 0,
+            q: 1, // q0=0, Q=1, alphabet_size=1, no accepting states (rejects epsilon)
+            alphabet_size: 1,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
         };
-        assert!(other.accepts_word(&[0]), "sanity: L(other) = 0.1*");
-        assert!(!other.accepts_word(&[1]), "sanity: L(other) = 0.1*");
-        assert!(
-            other.accepts_word(&[0, 1]),
-            "sanity: L(other) = 0.1* (not just {{\"0\"}})"
-        );
-        assert!(
-            other.accepts_word(&[0, 1, 1]),
-            "sanity: L(other) = 0.1* (not just {{\"0\"}})"
-        );
 
         let original_q = first.q;
         let mut n = first.clone();
         Fa::concat_states(&other, &mut n, original_q);
 
-        // Documents the quirk: the mathematically correct "00" is rejected...
-        assert!(
-            !n.accepts_word(&[0, 0]),
-            "documents the quirk: the correct concatenation string is dropped"
+        assert_eq!(
+            n.o[1], 0,
+            "concat_states must clear the first operand's own accepting flag when \
+             other rejects epsilon (WB-009)"
         );
-        // ...while "01" (never in L(first).(0.1*)) is incorrectly accepted, because
-        // state-INDEX-0's symbol-1 self-loop was spliced in instead of q0's real
-        // symbol-0 transition.
-        assert!(
-            n.accepts_word(&[0, 1]),
-            "documents the quirk: a wrong string is accepted instead"
+    }
+
+    #[test]
+    fn concat_states_keeps_first_operands_accepting_flags_when_other_accepts_epsilon() {
+        // The flip side of WB-009's fix: when epsilon IS in L(other), first's
+        // merged final states must stay accepting (L(first)*L(other) still
+        // contains L(first) itself in that case) -- a naive unconditional "always
+        // clear" fix would be a fresh, different bug.
+        let mut d_first0 = BTreeMap::new();
+        d_first0.insert(0, vec![1]);
+        let first = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
+            alphabet_size: 1,
+            o: vec![0, 1],
+            d: vec![d_first0, BTreeMap::new()],
+        };
+        let other = Fa {
+            true_false: None,
+            q0: 0,
+            q: 1, // q0=0, Q=1, alphabet_size=1, state 0 accepting (accepts epsilon)
+            alphabet_size: 1,
+            o: vec![1],
+            d: vec![BTreeMap::new()],
+        };
+
+        let original_q = first.q;
+        let mut n = first.clone();
+        Fa::concat_states(&other, &mut n, original_q);
+
+        assert_eq!(
+            n.o[1], 1,
+            "concat_states must keep the first operand's own accepting flag when \
+             other accepts epsilon"
+        );
+    }
+
+    #[test]
+    fn concat_states_computes_correct_concatenated_language() {
+        // Combined regression test for WB-008 + WB-009 together, checked by
+        // semantic language equivalence via `wr_core::equiv` (per this project's
+        // CLAUDE.md rule: compare automata by language, not structure) -- the Rust
+        // analogue of `FATest.concatStates_computesCorrectConcatenatedLanguage`,
+        // which used Java's `EqualityUtils.faEqual`. L(first) = { w : w ends in
+        // '1' }. L(other) = Sigma^+ (any nonempty string), with other.q0 = 2 (not
+        // 0) so this exercises WB-008's graft-target fix too. Both languages were
+        // independently re-derived from the transition tables below, mirroring the
+        // Java test's own derivation.
+        let mut d_first0 = BTreeMap::new();
+        d_first0.insert(0, vec![0]);
+        d_first0.insert(1, vec![1]);
+        let mut d_first1 = BTreeMap::new();
+        d_first1.insert(0, vec![0]);
+        d_first1.insert(1, vec![0]);
+        let first = Fa {
+            true_false: None,
+            q0: 0,
+            q: 2, // q0=0, Q=2, alphabet {0,1}, state 1 accepting
+            alphabet_size: 2,
+            o: vec![0, 1],
+            d: vec![d_first0, d_first1],
+        };
+
+        let mut d_other0 = BTreeMap::new();
+        d_other0.insert(0, vec![0]);
+        d_other0.insert(1, vec![0]);
+        let mut d_other1 = BTreeMap::new();
+        d_other1.insert(0, vec![1]);
+        d_other1.insert(1, vec![1]);
+        let mut d_other2 = BTreeMap::new();
+        d_other2.insert(0, vec![1]);
+        d_other2.insert(1, vec![1]);
+        let other = Fa {
+            true_false: None,
+            q0: 2, // q0=2 (not 0!), Q=3, alphabet {0,1}, state 1 accepting
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 1, 0],
+            d: vec![d_other0, d_other1, d_other2],
+        };
+
+        let original_q = first.q;
+        let mut n = first.clone();
+        Fa::concat_states(&other, &mut n, original_q);
+        let new_initial: BTreeSet<usize> = [n.q0].into_iter().collect();
+        let actual = crate::determinize::subset_construction(&n, &new_initial);
+
+        // Hand-derived total DFA for L(first)*L(other) = { w : |w| >= 2 and w with
+        // its last character removed contains a '1' } -- a 1-symbol-delay
+        // construction, not derived from concat_states itself.
+        let mut e0 = BTreeMap::new();
+        e0.insert(0, vec![1]);
+        e0.insert(1, vec![2]);
+        let mut e1 = BTreeMap::new();
+        e1.insert(0, vec![1]);
+        e1.insert(1, vec![2]);
+        let mut e2 = BTreeMap::new();
+        e2.insert(0, vec![3]);
+        e2.insert(1, vec![4]);
+        let mut e3 = BTreeMap::new();
+        e3.insert(0, vec![3]);
+        e3.insert(1, vec![4]);
+        let mut e4 = BTreeMap::new();
+        e4.insert(0, vec![3]);
+        e4.insert(1, vec![4]);
+        let expected = Fa {
+            true_false: None,
+            q0: 0,
+            q: 5,
+            alphabet_size: 2,
+            o: vec![0, 0, 0, 1, 1],
+            d: vec![e0, e1, e2, e3, e4],
+        };
+
+        assert_eq!(
+            crate::equiv::language_equivalent(&actual, &expected),
+            Ok(true),
+            "concat should compute L(first)*L(other) exactly (WB-008 + WB-009)"
         );
     }
 
@@ -1350,15 +1459,13 @@ mod tests {
             prop_assert_eq!(n.accepts_word(&word), star_accepts(&a, &word));
         }
 
-        /// Pins `concat_states`' ACTUAL (quirky) language — `L(a) ∪ L(a)·L(b)` with
-        /// `b` read from state INDEX 0, not `b.q0` — against an independent ground
-        /// truth (`concat_quirk_accepts`), over random NFAs including `q0 != 0` on
-        /// both operands. This is deliberately NOT a "concat is correct" test (it
-        /// isn't, per WB-008/WB-009); it exists so a future refactor that
-        /// half-fixes one of the two documented bugs without updating both this test
-        /// AND the doc comment gets caught immediately.
+        /// Pins `concat_states`' now-CORRECT language (post-WB-008/WB-009 fix) —
+        /// `L(a)·L(b)` — against an independent ground truth (`concat_accepts`),
+        /// over random NFAs including `q0 != 0` on both operands (the exact shape
+        /// WB-008 needed a real `other.q0 != 0` to catch). A future regression that
+        /// reintroduces either bug would be caught here.
         #[test]
-        fn concat_states_matches_the_documented_quirks_exactly(
+        fn concat_states_computes_correct_concatenation_over_random_nfas(
             a in arb_nfa_with_q0(4, 2),
             b in arb_nfa_with_q0(4, 2),
             word in prop::collection::vec(0i32..2, 0..5),
@@ -1367,9 +1474,7 @@ mod tests {
             let mut n = a.clone();
             Fa::concat_states(&b, &mut n, original_q);
 
-            let mut b_index0 = b.clone();
-            b_index0.q0 = 0;
-            prop_assert_eq!(n.accepts_word(&word), concat_quirk_accepts(&a, &b_index0, &word));
+            prop_assert_eq!(n.accepts_word(&word), concat_accepts(&a, &b, &word));
         }
     }
 

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 738adf17082b2e12afc3fdc605359b84f94d2535f8e0526aed99bd3ad89fb1e7 # shrinks to a = Fa { q0: 0, q: 1, alphabet_size: 2, o: [1], d: [{0: [0]}], true_false: None }, b = Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{}], true_false: None }, word = []
