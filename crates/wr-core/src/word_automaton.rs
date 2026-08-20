@@ -292,16 +292,22 @@ pub fn apply_word_operator_with_ctx(
 /// faithful port of `FA.setFields`, which does **not** touch `q0`) leaves `word_a.fa.q0`
 /// at its STALE pre-reversal value. Real Walnut had a genuine bug here (never assigning
 /// `q0` afterward, so the stale value silently corrupted the result whenever it didn't
-/// already happen to equal `0` — see WB-016 for the full trigger and verification
-/// against the real `walnut-java` CLI), fixed upstream by `wordA.fa.setQ0(0);`
+/// already happen to equal `0` — a wrong-but-in-bounds result if the stale value still
+/// happened to index a real state after the rebuild, or a genuinely OUT-OF-BOUNDS index
+/// if the rebuild shrank the state count below the stale value, which propagates into a
+/// panic downstream in `minimize_self_with_output`'s subset construction; see WB-016 for
+/// the full trigger and verification against the real `walnut-java` CLI, and
+/// `reverse_wb016_out_of_bounds_q0_shape` below for the specific case that distinguishes
+/// the two), fixed upstream by `wordA.fa.setQ0(0);`
 /// immediately after `setFields` (`WordAutomaton.java:175`, commit `d6e9799` on
 /// `bugfix/wb-016`). Ported as the matching fix here: `word_a.fa.q0 = 0;` right after
 /// `set_fields`, below.
 ///
-/// The structurally identical omission in [`crate::logicalops::convert_lsd_base_to_root`]
+/// The structurally identical omission in `logicalops::convert_lsd_base_to_root`
 /// (`AutomatonLogicalOps.java:645`) is a SEPARATE, deliberately out-of-scope call site
 /// (different call path, not independently reproduced, not part of this fix) — see that
-/// function's own doc comment.
+/// function's own doc comment. (Plain backticks, not a link: the function is private to
+/// `logicalops`, so an intra-doc link here doesn't resolve.)
 ///
 /// # The deterministic-and-total precondition, checked only at `q0` — also ported verbatim
 ///

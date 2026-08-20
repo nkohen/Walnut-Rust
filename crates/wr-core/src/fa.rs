@@ -1793,8 +1793,10 @@ mod tests {
         // skipped the follow-up assignment would hit exactly this shape of corruption.
         // Rebuilding down to a single state here leaves the pre-existing `q0 = 1`
         // strictly OUT OF BOUNDS for the new `q = 1` -- exactly the shape of corruption
-        // WB-016 used to let `reverse_with_output` produce on real (in-bounds, but
-        // wrong) inputs, before the fix.
+        // WB-016 used to let `reverse_with_output` produce (a stale `q0` that shrinks
+        // out of range is genuinely out-of-bounds and panics downstream; one that merely
+        // still indexes a real-but-wrong state after the rebuild is "only" a wrong
+        // answer -- both are the same root cause, this test pins the out-of-bounds one).
         let mut fa = contains_one_dfa();
         fa.q0 = 1;
         let new_d = vec![BTreeMap::from([(0, vec![0])])];

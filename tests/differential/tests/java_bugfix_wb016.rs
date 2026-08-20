@@ -99,6 +99,25 @@ const WB016A: &str = "msd_2\n\n1 10\n0 -> 1\n1 -> 0\n\n0 20\n0 -> 0\n1 -> 1\n";
 /// `bugfix/wb-016` branch (commit `d6e9799`) per this file's own module docs.
 const WB016B_CAPTURED: &str = "lsd_2\n\n0 10\n0 -> 0\n1 -> 1\n\n1 20\n0 -> 1\n1 -> 0\n";
 
+/// A 3-state word automaton whose EVERY state shares the same output (`5`), so its
+/// reversal's BFS rebuild collapses to a SINGLE state (all three "which subset of
+/// outputs is reachable" configurations minimize down to one, since there's only ever
+/// one distinct output value). `q0` is declared as state `2` -- found by adversarial
+/// review of the `wb016_reverse_matches_fixed_java` case above: that case's reversal
+/// keeps the same state COUNT as the input, so a stale (un-updated) `q0` there would
+/// have stayed in-bounds, just wrong. This shape is the one that distinguishes
+/// "wrong answer" from "out of bounds": before the fix, `q0` stayed at its stale value
+/// `2` after the rebuild leaves only ONE state (index `0`), which is a genuinely
+/// out-of-bounds index that panics downstream in `minimize_self_with_output`'s subset
+/// construction -- the class of bug U30's fuzzing specifically targeted.
+const WB016_OOB_INPUT: &str =
+    "msd_2\n\n2 5\n0 -> 0\n1 -> 1\n\n0 5\n0 -> 1\n1 -> 2\n\n1 5\n0 -> 2\n1 -> 0\n";
+
+/// Real `walnut-java` output for `reverse oobr oob;` on [`WB016_OOB_INPUT`], captured
+/// against the fixed `bugfix/wb-016` branch (commit `d6e9799`, isolated worktree, same
+/// recipe as this file's other capture, JDK 19).
+const WB016_OOB_CAPTURED: &str = "lsd_2\n\n0 5\n0 -> 0\n1 -> 0\n";
+
 /// A process-scoped Walnut home tree plus a `Prover` over it (output sunk — this test
 /// only inspects the written `Word Automata Library/` file, not console/detail text).
 fn prover(tag: &str) -> (Prover, PathBuf) {
@@ -136,6 +155,16 @@ fn prover(tag: &str) -> (Prover, PathBuf) {
 /// a hand-authored word automaton whose `q0` is declared as a non-zero state index —
 /// exactly the input shape that made the bug observable (masked otherwise, since a
 /// `determinizeAndMinimize`/canonicalize pipeline always leaves `q0 == 0`).
+///
+/// This file compares by BYTE IDENTITY rather than `wr_core::equiv::language_equivalent`
+/// (the sibling `java_bugfix_wb008_wb009.rs`'s convention, and CLAUDE.md's general
+/// preference for semantic over structural comparison) — a deliberate exception, not an
+/// oversight: `equiv` has no DFAO-output-aware comparator (it answers boolean language
+/// membership, not "what does this state output"), and both test automata here have
+/// every state carrying a real, distinguishing output value, so a boolean-only
+/// equivalence check would be near-vacuous on exactly the property this bug is about.
+/// The direct `O(q0)` assertion below is the semantic check that actually matters here;
+/// the byte-identity assertion is a stronger, format-level cross-check on top of it.
 #[test]
 fn wb016_reverse_matches_fixed_java() {
     let (mut p, dir) = prover("wb016");
@@ -159,6 +188,35 @@ fn wb016_reverse_matches_fixed_java() {
     assert_eq!(
         ours.fa.o[ours.fa.q0], 10,
         "reversed DFAO's initial-state output must equal wb016a's own O(q0) = O(1) = 10"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// WB-016's OUT-OF-BOUNDS case (not just wrong-answer) — found missing by adversarial
+/// review of [`wb016_reverse_matches_fixed_java`] above, whose reversal happens to keep
+/// the same state count as the input, so a stale `q0` there would have stayed in bounds
+/// either way. [`WB016_OOB_INPUT`] rebuilds down to a SINGLE state (every input state
+/// shares one output value, so the BFS's "reachable subset of outputs" state space
+/// collapses to one configuration): pre-fix, the stale `q0 = 2` would have indexed
+/// past the end of a 1-state automaton, a genuinely out-of-bounds access that panics
+/// downstream in `minimize_self_with_output`'s subset construction rather than merely
+/// computing a wrong answer. Confirmed live against a fresh isolated-worktree build of
+/// `bugfix/wb-016` (JDK 19, same recipe as this file's other capture) — real Walnut and
+/// this port (with the fix applied) both survive and produce byte-identical output.
+#[test]
+fn wb016_reverse_out_of_bounds_q0_shape_matches_fixed_java() {
+    let (mut p, dir) = prover("wb016-oob");
+    fs::write(dir.join("Word Automata Library/oob.txt"), WB016_OOB_INPUT).unwrap();
+
+    p.dispatch("reverse oobr oob;").expect("reverse succeeds");
+
+    let ours_text =
+        fs::read_to_string(dir.join("Word Automata Library/oobr.txt")).expect("oobr.txt");
+    assert_eq!(
+        ours_text, WB016_OOB_CAPTURED,
+        "must be byte-identical to real walnut-java's fixed reverse output on the \
+         out-of-bounds-q0 shape (captured against bugfix/wb-016, commit d6e9799)"
     );
 
     fs::remove_dir_all(&dir).ok();
