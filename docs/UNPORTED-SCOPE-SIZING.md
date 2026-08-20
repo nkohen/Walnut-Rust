@@ -25,7 +25,9 @@ Pell branches of NumberSystem" phrasing is accurate about *negative*-base branch
 apply to Fibonacci/Pell at all — nothing to port there.
 
 The real dropped-item list is: CAS matrix export, negative-base numeration, `split`/`rsplit`,
-Ostrowski, and the OTF determinization family.
+Ostrowski, and the OTF determinization family. **Two of the five have since been ported: CAS
+matrix export (2026-08-19) and Ostrowski (2026-08-20).** Their sections below are kept, marked
+DONE, rather than deleted — the sizing versus the outcome is the useful record.
 
 ## Ranking (smallest → largest task)
 
@@ -50,7 +52,16 @@ what actually shipped.
   `BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md`), not the full trust-critical two-reviewer gate,
   since it doesn't touch `wr-core`/`wr-logic` decision-procedure code.
 
-### 2. Ostrowski numeration
+### 2. Ostrowski numeration — **DONE (2026-08-20)**
+
+> **Status: ported.** `wr_core::ostrowski` + `wr_cli::ost`, per
+> `docs/OSTROWSKI-DISPATCH.md`. The sizing below is kept as written (it was accurate: cleanly
+> additive, no change to an existing hardened path), with the one correction experience
+> produced — the Phase-0 gap was smaller than "real Phase-0 work needed" suggests. A fresh
+> JaCoCo run measured `Ostrowski.java` already at 96% line / 87% branch and `NodeState.java`
+> at 100%/95%; five added `@Test` methods took it to 99.6%/91.7%, both remaining misses being
+> one bytecode-instrumentation artifact. Golden fixture 625 now compares and passes.
+
 
 - **Java surface**: `Numeration/Ostrowski.java` (492 LOC) + `NodeState.java` (46 LOC) +
   `Commands/Ost.java` (25 LOC) ≈ **563 LOC**.

@@ -21,7 +21,7 @@ the raw import data, not taken on faith.
 | Files scanned | 32 |
 | Total LOC | 8,568 |
 | KEEP | 24 files (~6,460 LOC) |
-| DROP | 8 files (~1,616 LOC — Ostrowski/NodeState + all 5 CAS-export files + AutomatonMatrixWriter) |
+| DROP | ~~8 files (~1,616 LOC — Ostrowski/NodeState + all 5 CAS-export files + AutomatonMatrixWriter)~~ — **all 8 have since been UN-dropped and ported**: the 6 CAS-export files on 2026-08-19 (`docs/CAS-EXPORT-DISPATCH.md` → `wr_io::matrix_writer`), and `Numeration/Ostrowski.java` + `Numeration/NodeState.java` on 2026-08-19/20 (`docs/OSTROWSKI-DISPATCH.md` → `wr_core::ostrowski`, with `Main/Commands/Ost.java` → `wr_cli::ost`). Nothing in `Automata/` is DROP any more. |
 | DEFER (partial, within one file) | `FA/DeterminizationStrategies.java` — OTF-dependent strategy variants only |
 | New KEEP files not in DESIGN.md's original list | `Transducer.java`, `Search/ProductBFS.java`, `FA/BricsConverter.java`, `FA/Infinite.java`, `FA/Transitions*.java`, `FA/ValmariPartition.java` |
 | Cross-crate cycle beyond the known Automaton↔NumberSystem one | **Yes — a systemic one, see §3** |
@@ -66,8 +66,8 @@ the raw import data, not taken on faith.
 
 | File | LOC | Responsibility | KEEP/DROP | Target crate | Coupling out of subpackage | Ambiguous |
 |---|---|---|---|---|---|---|
-| `Numeration/NodeState.java` | 46 | `(state, startIndex, seenIndex)` search-node key, only consumed by `Ostrowski.java` | DROP | N/A | None | No |
-| `Numeration/Ostrowski.java` | 491 | Ostrowski (continued-fraction) numeration adder/comparison automata | DROP — confirmed; only callers (`DeterminizationStrategies`'s Ostrowski path, `Main/Commands/Ost.java`) are Ostrowski-only and drop with it | N/A | `Automata.*`, `Automata.FA.FA`, `Automata.Writer.AutomatonWriter`, `Main.Session`/`WalnutException` (all moot) | No |
+| `Numeration/NodeState.java` | 46 | `(state, startIndex, seenIndex)` search-node key, only consumed by `Ostrowski.java` | ~~DROP~~ **KEEP (un-dropped 2026-08-20)** — ported as a private `struct NodeState` inside `wr_core::ostrowski`; `Comparable` deliberately not ported (it has no observable effect, see that module's docs) | wr-core | None | No |
+| `Numeration/Ostrowski.java` | 491 | Ostrowski (continued-fraction) numeration representation/adder automata | ~~DROP~~ **KEEP (un-dropped 2026-08-20, `docs/OSTROWSKI-DISPATCH.md`)** — ported to `wr_core::ostrowski`. The original DROP analysis's key claim held up and is why the port was cleanly additive: it needs **no new `NumberSystem` consumption path** (`Ost` writes plain `msd_<name>.txt`/`msd_<name>_addition.txt`, which the already-KEEP custom-base loader reads verbatim — `msd_fib`/`msd_pell` in Walnut's shipped `Custom Bases/` are literally files this command produces), and nothing else in `Automata/` references it. | wr-core | `Automata.*`, `Automata.FA.FA` (in-crate); `Automata.Writer.AutomatonWriter`/`Main.Session`/`WalnutException` moved to the `wr-cli` half (`wr_cli::ost`) | No |
 | `Search/ProductBFS.java` | 406 | Generic shortest-witness BFS over `int[]`-tuple product states (pluggable step/accept functors) + a specialized DFA-product variant with reverse-reachability pruning | **KEEP — closes a real DESIGN.md gap.** Not a `ProductStrategies` alternative (that builds a full product; this does on-the-fly witness search); sole consumer is `Main/Commands/Test.java`'s `test` command ("first N accepted inputs") — a real research/verification primitive | wr-core | None beyond `net.automatalib` (`CompactDFA`,`Word`) in the specialized variant | No functionally; **port-design flag**: uses **static mutable fields** as a de facto singleton (`idOf`,`states`,`prevId`,`prevSym`,`q`) — not thread-safe/reentrant, must become owned local state in Rust, not a global |
 | `Writer/AutomatonWriter.java` | 175 | Writes `.txt` format, Graphviz `.gv`, Brics-style `.ba` | KEEP | wr-io | `Automata.Automaton`/`FA.FA`/`NumberSystem` (in-crate), `Main.Logging`/`UtilityMethods`/`WalnutException` (benign), `net.automatalib` (`CompactNFA`,`BAWriter`) | No |
 | `Writer/AutomatonMatrixWriter.java` | 188 | Walks transition table into a generic incidence-matrix rep, streams through a pluggable `MatrixEmitter`; drives all 4 CAS emitters | **DROP — confirmed CAS-export-only.** Sole caller across the whole codebase is `EvalDef.writeMatrices` (the `export` CAS-matrix feature); no internal algorithm (determinize/minimize/product) touches it | N/A | `Main.Logging`/`WalnutException` (moot) | No |
@@ -215,6 +215,12 @@ as a "quirk to preserve then fix later" instead, for strict mechanical-port disc
 `MatrixEmitter`) were investigated (not just assumed) and confirmed genuinely DROP — single-purpose,
 single-caller, no internal algorithm depends on them.
 
+**Superseded (2026-08-19/20): every file in this section has since been ported**, the CAS-export
+six per `docs/CAS-EXPORT-DISPATCH.md` and the Ostrowski pair per `docs/OSTROWSKI-DISPATCH.md`.
+The analysis above is what made both un-droppings cheap and additive rather than a redesign, so
+it is kept as-written rather than deleted: "single-purpose, single-caller, no internal algorithm
+depends on them" is exactly why neither port had to touch an already-hardened code path.
+
 ---
 
 ## 6. TO-CLASSIFY inline commands (DESIGN.md §3 / ROADMAP W7 item 1)
@@ -275,11 +281,15 @@ metacommand syntax (DESIGN.md §9 F3's subject) — the *mechanism* is KEEP (use
 strategy selection too), even though it can also select DEFERRED strategies (`CCL`/`CCLS`/OTF variants),
 same file-level-can't-cleanly-split situation as `DeterminizationStrategies.java` (§2).
 
-**DROP (new finding):** `Main/Commands/Ost.java` (confirmed by reading it — constructs `Ostrowski`
-representation/adder automata directly, no non-Ostrowski logic). Not previously listed anywhere (DESIGN.md
-§3's KEEP table doesn't mention it, and it's outside `Automata/` so §1-§5 didn't cover it) — it was found
-only because building the JaCoCo exclude list required enumerating all of `Main/Commands/`. Drops
-consistently with `Numeration/Ostrowski.java` (§2, already DROP).
+**~~DROP (new finding)~~ → KEEP (un-dropped 2026-08-20):** `Main/Commands/Ost.java` (confirmed by
+reading it — constructs `Ostrowski` representation/adder automata directly, no non-Ostrowski logic).
+Not previously listed anywhere (DESIGN.md §3's KEEP table doesn't mention it, and it's outside
+`Automata/` so §1-§5 didn't cover it) — it was found only because building the JaCoCo exclude list
+required enumerating all of `Main/Commands/`. It dropped consistently with
+`Numeration/Ostrowski.java` (§2), and it has now been **un-dropped with it**, ported to
+`wr_cli::ost` (`docs/OSTROWSKI-DISPATCH.md`). Golden fixture 625 — the corpus's only `ost` fixture,
+and its only fixture with two recorded automaton pairs — is compared and passing as of that date;
+`walnut-java/phase0-artifacts/subset-filter.json`'s row for it was flipped accordingly.
 
 **JaCoCo excludes wired in `walnut-java/pom.xml`'s `code-coverage` profile** (`report` execution): the 8
 already-confirmed-DROP `Automata/` files (§2/§5) + `Main/Commands/Ost.java` + `Main/Commands/Split.java`

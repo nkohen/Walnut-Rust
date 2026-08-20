@@ -47,16 +47,38 @@ The corpus lives in the sibling `walnut-java` oracle repo and is **not** vendore
 `WALNUT_JAVA_DIR` if the checkout is not beside this one. A run with no corpus fails loudly
 rather than passing silently.
 
-## Headline numbers (measured 2026-08-19, release build)
+## Headline numbers (measured 2026-08-20, release build)
 
 | | |
 |---|---|
 | fixtures replayed | **675** (the whole `IntegrationTest.L` list, in order) |
-| compared | **586** |
-| **pass** | **585** (99.8% of compared) |
+| compared | **587** |
+| **pass** | **586** (99.8% of compared) |
 | **fail** | **1** (in `KNOWN_DIVERGENCES`, a distinct root cause from the five closed below) |
-| skipped (excluded, each with a recorded reason) | **89** |
+| skipped (excluded, each with a recorded reason) | **88** |
 | timed out / not-run | **0** |
+
+**Fixture 625 (`ost test625 [0 3 1] [1 2];`) joined the compared set (2026-08-20)** when
+Ostrowski numeration was ported (`wr_core::ostrowski` + `wr_cli::ost`). It passes. Two
+things had to change together, both real work rather than a flag flip:
+
+* **The exclusion side, cross-repo**: `walnut-java/phase0-artifacts/subset-filter.json`'s
+  row for id 625 flipped to `"subset_relevant": true`, and — because
+  `support::load_fixtures` self-checks the manifest's own declared aggregates —
+  `subset_relevant_count` (591→592), `drop_relevant_count` (84→83) and
+  `drop_reason_counts.drop_command` (16→15) with it, plus the `schema_note`'s DROP-command
+  list. That file is generated Phase-0 metadata in the sibling oracle repo, edited
+  deliberately here, not regenerated.
+* **The harness side**: 625 is the ONLY fixture in the corpus with **two** recorded
+  automaton pairs — `Ost.ostCommand` returns the adder as `DEFAULT_TESTFILE` and the
+  representation automaton as `OST_REPR_TESTFILE`, and `IntegrationTest.loadTestCases`'
+  "hack for repr files" (`IntegrationTest.java:1026-1032`) probes for
+  `automaton_repr625.txt` and appends it as a second expected pair. `support::Expected`
+  gained an `automaton_repr_path` field and an `automaton_pair_count()`; the comparator's
+  step 4 now asserts the two counts agree and compares **positionally**, index by index,
+  mirroring Java's own `runSpecificTest` (`:947-961`) — it also checks each pair's LABEL,
+  since returning the right two automata under swapped labels would otherwise pass. The
+  expected count comes from what the corpus recorded, never from a hardcoded fixture id.
 
 **375, 376, 377, 378 and 379 closed (2026-08-19), unrelated to any change in what the port
 computes or logs.** These five were the "warm-vs-cold `PredicateEnv::number_system`
@@ -99,7 +121,8 @@ tests) and in `tests/golden/tests/support`'s `strip_construction_recordings` uni
 recursive constant construction, captured from Java's WARM session, which is a harness
 limitation this fix does not (and should not) address.
 
-Previous snapshot: 586 compared / 577 pass / 9 fail / 89 skipped. U28 (2026-08-17 through
+Previous snapshot: 586 compared / 585 pass / 1 fail / 89 skipped (2026-08-19), and
+before that 586 compared / 577 pass / 9 fail / 89 skipped. U28 (2026-08-17 through
 2026-08-19) closed two of the nine original `details` log-text divergences outright (628,
 637) and turned the remaining seven (375-379, 383) into ONE clearly-understood,
 honestly-documented root cause instead of the vaguer original nine — see "root cause 1" below

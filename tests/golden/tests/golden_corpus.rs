@@ -63,8 +63,13 @@
 //!
 //! # Exclusions (each recorded per-id in the report, never silent)
 //!
-//! 1. `subset-filter.json`'s 84 DROP-scope fixtures (negative-base numeration; `split`/
-//!    `rsplit`/`ost`).
+//! 1. `subset-filter.json`'s 83 DROP-scope fixtures (negative-base numeration; `split`/
+//!    `rsplit`). `ost` used to be in that list; Ostrowski numeration is now ported
+//!    (`wr_core::ostrowski` + `wr_cli::ost`), so fixture 625's row was flipped to
+//!    `subset_relevant` — with `subset-filter.json`'s own three aggregate counts updated
+//!    in the same edit, since `support::load_fixtures` self-checks them. 625 is the only
+//!    fixture in the corpus with TWO recorded automaton pairs (see the comparator's
+//!    step 4).
 //! 2. The deferred **OTF** determinization strategies `CCL`/`CCLS`/`BRZ_CCL`/`BRZ_CCLS`
 //!    (`docs/DESIGN.md` §9/§10 — an already-decided deferral). `SC` and plain `BRZ` are in
 //!    scope and are compared normally.
@@ -135,7 +140,7 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -147,6 +152,7 @@ use support::{
 use wr_cli::prover::Prover;
 use wr_cli::session::Session;
 use wr_cli::test_case::TestCase;
+use wr_core::automaton::Automaton;
 use wr_core::equiv::automaton_language_equivalent;
 use wr_core::logging::Logging;
 
@@ -1342,6 +1348,7 @@ fn a_known_divergence_only_excuses_its_own_declared_text_field() {
 fn an_error_where_the_corpus_records_success_is_not_a_text_only_failure() {
     let success = Expected {
         automaton_path: None,
+        automaton_repr_path: None,
         error: String::new(),
         details: String::new(),
         graph_viz: String::new(),
@@ -1420,6 +1427,7 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
 
     let expected_with_gv = |automaton_path: &Path| Expected {
         automaton_path: Some(automaton_path.to_path_buf()),
+        automaton_repr_path: None,
         error: String::new(),
         details: String::new(),
         graph_viz: "digraph G { rankdir = LR; }".to_string(),
@@ -1466,6 +1474,7 @@ fn a_text_mismatch_no_longer_pre_empts_the_automaton_comparison() {
         &session,
         &Expected {
             automaton_path: None,
+            automaton_repr_path: None,
             error: "Undefined variable: x".to_string(),
             details: String::new(),
             graph_viz: String::new(),
@@ -1649,23 +1658,83 @@ fn compare_test_case(
         failures.push((FailedHalf::Text(TextField::Details), why));
     }
 
-    // 4. automaton pairs (`:947-961`). `loadTestCases` always records exactly one pair for a
-    // subset-relevant fixture — the `automaton_repr` second pair only ever appears on the one
-    // Ostrowski fixture (id 625), which is DROP scope and never compared here.
+    // 4. automaton pairs (`:947-961`). `loadTestCases` records ONE pair for almost every
+    // fixture and TWO for the one `ost` fixture (id 625), whose `Ost.ostCommand` returns the
+    // adder as `DEFAULT_TESTFILE` and the representation automaton as `OST_REPR_TESTFILE`
+    // (`Ost.java:21-23`) — matching the order `loadTestCases` appends its own two
+    // (`IntegrationTest.java:1018-1032`). Java asserts the two lists' SIZES agree and then
+    // compares index by index (`:947-961`); so does this, positionally, and the expected
+    // count comes from what the corpus actually recorded, never from a hardcoded fixture id.
+    let expected_pairs = expected.automaton_pair_count();
     let actual_pairs = actual.automaton_pairs().len();
-    if actual_pairs != 1 {
+    if actual_pairs != expected_pairs {
         return fold_failures(
             failures,
             Verdict::fail(
                 FailedHalf::Automaton,
                 format!(
-                    "expected exactly one automaton pair (the corpus records one), got {actual_pairs}"
+                    "expected {expected_pairs} automaton pair(s) (the corpus records                      {expected_pairs}), got {actual_pairs}"
                 ),
             ),
         );
     }
-    let actual_automaton = actual.automaton_pairs()[0].automaton();
-    let automaton_verdict = match (&expected.automaton_path, actual_automaton) {
+    // The label on each pair is part of what `loadTestCases` records, and a port that
+    // returned the right two automata under swapped labels would still be wrong (the
+    // `ost` command's two automata are genuinely different objects: a 3-track adder and a
+    // 1-track representation automaton).
+    let expected_labels: &[&str] = if expected_pairs == 2 {
+        &[
+            wr_cli::test_case::DEFAULT_TESTFILE,
+            wr_cli::test_case::OST_REPR_TESTFILE,
+        ]
+    } else {
+        &[wr_cli::test_case::DEFAULT_TESTFILE]
+    };
+    for (i, expected_label) in expected_labels.iter().enumerate() {
+        let actual_label = actual.automaton_pairs()[i].filename();
+        if actual_label != *expected_label {
+            return fold_failures(
+                failures,
+                Verdict::fail(
+                    FailedHalf::Automaton,
+                    format!(
+                        "automaton pair #{i} is labelled {actual_label:?}, expected                          {expected_label:?}"
+                    ),
+                ),
+            );
+        }
+    }
+
+    let mut automaton_verdict = Verdict::Pass;
+    let expected_paths = [&expected.automaton_path, &expected.automaton_repr_path];
+    for (i, expected_path) in expected_paths.iter().take(expected_pairs).enumerate() {
+        let verdict = compare_one_automaton(
+            expected_path,
+            actual.automaton_pairs()[i].automaton(),
+            session,
+        );
+        automaton_verdict = match (automaton_verdict, verdict) {
+            (Verdict::Pass, v) => v,
+            (Verdict::Fail(mut a), Verdict::Fail(b)) => {
+                a.extend(b);
+                Verdict::Fail(a)
+            }
+            (kept, _) => kept,
+        };
+    }
+    fold_failures(failures, automaton_verdict)
+}
+
+/// One expected/actual automaton pair, compared by `wr_core::equiv` semantic
+/// equivalence — `EqualityUtils.faEqual(actualA.fa, expectedA.fa)`
+/// (`IntegrationTest.java:958`), extracted from `compare` so the two-pair `ost` fixture
+/// runs exactly the same comparison on BOTH of its pairs.
+fn compare_one_automaton(
+    expected_path: &Option<PathBuf>,
+    actual_automaton: Option<&Automaton>,
+    session: &Session,
+) -> Verdict {
+    match (expected_path, actual_automaton) {
         (None, None) => Verdict::Pass,
         (None, Some(_)) => Verdict::fail(
             FailedHalf::Automaton,
@@ -1683,14 +1752,11 @@ fn compare_test_case(
                 ) {
                     Ok(a) => a,
                     Err(e) => {
-                        return fold_failures(
-                            failures,
-                            Verdict::fail(
-                                FailedHalf::Automaton,
-                                format!(
-                                    "the recorded automaton {} could not be read: {e:?}",
-                                    path.display()
-                                ),
+                        return Verdict::fail(
+                            FailedHalf::Automaton,
+                            format!(
+                                "the recorded automaton {} could not be read: {e:?}",
+                                path.display()
                             ),
                         )
                     }
@@ -1720,8 +1786,7 @@ fn compare_test_case(
                 ),
             }
         }
-    };
-    fold_failures(failures, automaton_verdict)
+    }
 }
 
 /// Combines the mismatches collected so far with the automaton comparison's own verdict.

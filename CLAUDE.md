@@ -43,8 +43,10 @@ instead of something an agent quietly resolves mid-port.
 (∃ projection+determinize, ∀ = ¬∃¬), boolean/product ops, determinize (`SC` default + plain Brzozowski), Valmari
 minimize, reverse, quotient; `eval`/`def`/`reg`/`morphism`/`image`; the `.txt` automaton format (multi-track + NFA);
 CAS matrix export (`AutomatonMatrixWriter` + the Maple/MATLAB/Mathematica/Sage emitters, `wr_io::matrix_writer`,
-ported 2026-08-19 per `docs/CAS-EXPORT-DISPATCH.md` — see "Current status" below).
-**DROP:** Ostrowski / Fibonacci / Pell / negative-base numeration.
+ported 2026-08-19 per `docs/CAS-EXPORT-DISPATCH.md`); **Ostrowski numeration** (`ost` — `wr_core::ostrowski` +
+`wr_cli::ost`, ported 2026-08-20 per `docs/OSTROWSKI-DISPATCH.md`) — see "Current status" below for both.
+**DROP:** Fibonacci / Pell / negative-base numeration. (Fibonacci/Pell were never separate code — they are
+ordinary custom-base data files running through the already-KEEP loader; see `docs/UNPORTED-SCOPE-SIZING.md`.)
 **TO CLASSIFY (Phase 0):** `split`/`rsplit`/`join`/`transduce`/`convert`/`minimize`/`fixleadzero`/… — inline commands
 in `Prover.java` with no `Commands/` class; classify each KEEP/DROP against research need. See DESIGN.md §3.
 
@@ -1019,3 +1021,98 @@ correctly excused with the tightened gate), 28 new byte-for-byte matrix comparis
 genuinely run instead of being skipped. `cargo test --workspace` green throughout, `fmt`/
 `clippy` clean. Uncommitted — commit on explicit user request, per this project's standing
 git-hygiene rule.
+
+**Ostrowski numeration ported (`docs/OSTROWSKI-DISPATCH.md`, 2026-08-20) — `ost` is no
+longer DROP scope, and `Automata/` now has no DROP files left at all.** Plan at
+`~/.claude/plans/dusky-braiding-compass.md` (outside this repo; a v2, revised after a full
+adversarial review of v1 that found four blocking defects — a `wr-core`→`wr-io` crate
+dependency that would not have compiled, a missing `state_transitions` density fill that
+would have produced malformed automata, a vacuous property test, and a factual mix-up
+between two different `continue` statements — plus four more). Phase-0 coverage was driven
+first: a fresh JaCoCo run measured `Ostrowski.java` at 96% line / 87% branch, and five added
+`@Test` methods in `walnut-java`'s `OstrowskiTest.java` took it to 99.6%/91.7% (both
+remaining misses are one bytecode-instrumentation artifact of how a specific `||` compiles
+against a fixed table — not dead code).
+
+Landed: **`crates/wr-core/src/ostrowski.rs`** (`NodeState`, the fixed 7-state 4-input adder
+table, `Ostrowski` + its constructor, both BFS builders and every shared helper,
+`populate_automaton`/`init_automaton`/`handle_zero_state`) and **`crates/wr-cli/src/ost.rs`**
+(`Ost.ostCommand`: parse → construct → write repr → write adder, each write with its own
+already-exists guard, returning Java's two-`AutomatonFilenamePair` `TestCase`), plus the real
+`OST` dispatch arm in `prover.rs` (the last `ProverError::UnsupportedCommand` producer is
+gone) and `walnut_exception::number_system_already_exists`. Six deliberate divergences from
+the Java source, each stated in the module docs rather than left implicit: `Ostrowski::new`
+takes already-parsed `&[i32]` (`wr-core` cannot depend on `wr-io`'s `ParseMethods`, the same
+split `crate::morphism` already uses); `Option<(i32, i32)>` instead of the `99`/`NONE`
+sentinel; an unordered `HashMap` for `nodeToIndex` (audited: neither map is ever iterated, so
+`NodeState.compareTo` has no observable effect — `Ord` deliberately not implemented); a `Vec`
+for `indexToNode` (the keys really are dense, so `isReprFinal`'s `node != null` guard is
+provably dead); `state_transitions` kept dense **continuously** at every node allocation
+rather than by `populateAutomaton`'s blanket `putIfAbsent` sweep (that sweep is load-bearing,
+not filler — a node's row is created when it is pointed *to*, and `seenIndex == 1` nodes
+early-`continue` before ever being dequeued); and an explicit `set_canonized(true)` after
+`handle_zero_state`, which has no literal Java counterpart but *reproduces* one
+(`FA.canonizeInternal` sets the flag, `handleZeroState` then mutates `nfaD`/`O`/`Q` without
+resetting it, so `AutomatonWriter`'s own `canonize()` is a no-op — measured honestly: on all
+18 automata this port currently builds, re-canonicalizing would have been byte-identical
+anyway, so the flag is fidelity insurance, not a currently-observable fix, and its test says
+exactly that).
+
+**One genuine port defect found and fixed (not a Walnut bug, so no `WB-` entry — highest
+remains WB-042).** `d_max` is user-controlled through a `\d+`-only regex, and the adder's
+alphabet is `(d_max+1)^3`, so `ost bigone [1291] [1];` (the smallest cube exceeding
+`Integer.MAX_VALUE`) reaches the long-documented gap in `Automaton::determine_alphabet_size`
+— Java's `Math.multiplyExact` checks at **`int`** width, this port's at `usize`. Verified
+live against the real jar: Java writes `msd_bigone.txt`, then throws `ArithmeticException:
+integer overflow` and returns to the prompt. The port silently WRAPPED the `i32`
+transition-encode arithmetic in a **release** build (debug caught it only by accident, as
+`attempt to add with overflow`) and spent ~14 s writing a bogus `msd_bigone_addition.txt`.
+Fixed with an `int`-width check at exactly Java's call site
+(`assert_alphabet_size_fits_in_an_int`), scoped to this module on purpose — widening
+`determine_alphabet_size`'s own check is a separate cross-cutting decision. Mutation-verified
+in release, where it actually matters.
+
+**Testing, all four tiers.** *Tier 2*: every one of `OstrowskiTest.java`'s 15 methods
+replicated — the eight `testAgainstFile` cases as **byte-for-byte** comparisons of
+`wr_io::writer::write_txt` output against the very `.txt` fixtures Java's suite compares
+against (copied into `crates/wr-cli/tests/fixtures/ostrowski/`), which passed on the first
+run; the constructor/`NodeState`/throw cases in `wr-core` (`compareTo` deliberately not
+ported — it is unreachable API, and the inequality it stood for is asserted directly).
+*Tier 4*: a real, Walnut-independent oracle, replacing the plan's own vacuous first draft (a
+track-swap test that would have passed with the transition table zeroed out, since
+`addTransitions` is symmetric in `x`/`y` by construction) — the Ostrowski place values are
+derived from the continued fraction itself (`q[i] = a_i·q[i-1] + q[i-2]`, anchored by
+asserting they reproduce literal Fibonacci and Pell numbers), and four systems are swept
+exhaustively: the representation automaton accepts **exactly** the valid representations, the
+canonical words of each length enumerate **exactly** `0..q[len]`, and the adder accepts a
+canonical triple **iff** the values add up. Two findings from building it, both recorded in
+the test's own docs: the adder's language is deliberately WIDER than the sum relation (state
+0's `(0,0)` self-loop accepts `(0, w, w)` for any `w`) because Walnut always intersects it
+with the representation automaton via `all_reps` — so restricting the sweep to canonical
+triples is the real property, not a weakening; and mutating one `adder_transitions` entry or
+dropping the oracle's `b_i == a_i ⇒ b_{i-1} == 0` clause both fail the sweep loudly.
+*Tier 3*: `tests/differential/tests/ostrowski.rs`, four cases driven through the real
+`Prover::dispatch`, against a freshly captured `walnut-java` run (recipe in
+`tests/differential/CAPTURE.md`; captured twice independently, all nine files byte-identical)
+— covering both `preperiod[0] == 1` rotation branches, which no golden fixture reaches, and
+follow-up `eval`s over the freshly created bases. *Tier 1*: **golden fixture 625 now compares,
+and passes** — corpus moved from 586 compared / 585 pass to **587 compared / 586 pass
+(99.8%)**, 88 skipped, 0 timeouts, with the single pre-existing 383 divergence unchanged.
+
+That last one was two real work items, not a flag flip. **Harness side**: 625 is the corpus's
+only fixture with TWO recorded automaton pairs (`IntegrationTest.loadTestCases`' "hack for
+repr files"), so `support::Expected` gained an `automaton_repr_path` + `automaton_pair_count()`
+and the comparator a genuine positional two-pair branch mirroring Java's own `runSpecificTest`
+— including a per-pair LABEL check, since returning the right two automata under swapped
+labels would otherwise pass, and the expected count comes from what the corpus recorded rather
+than a hardcoded id. **Exclusion side (cross-repo)**: `walnut-java/phase0-artifacts/
+subset-filter.json`'s row for 625 flipped to `subset_relevant`, along with the three aggregate
+counts `support::load_fixtures` self-checks (`subset_relevant_count` 591→592,
+`drop_relevant_count` 84→83, `drop_reason_counts.drop_command` 16→15) and its `schema_note`.
+
+`cargo test --workspace` green (1580+ tests), `cargo fmt`/`clippy` clean, `cargo doc` clean of
+new warnings. `docs/BOUNDARY-MAP.md`, `docs/DESIGN.md`, `docs/UNPORTED-SCOPE-SIZING.md`,
+`docs/PHASE0-CONTINUATION-DISPATCH.md`, `docs/OSTROWSKI-DISPATCH.md` and
+`tests/golden/STATUS.md` all updated to match. **This unit has NOT yet been through the
+two-independent-adversarial-reviewer loop** (`wr-core` construction code — it is required
+before merge). Uncommitted in both repos, per this project's standing git-hygiene rule.

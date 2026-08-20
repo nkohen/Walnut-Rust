@@ -43,6 +43,7 @@ pub mod logicalops;
 pub mod minimize;
 pub mod morphism;
 pub mod numsys;
+pub mod ostrowski;
 pub mod product;
 pub mod quantify;
 pub mod regex;

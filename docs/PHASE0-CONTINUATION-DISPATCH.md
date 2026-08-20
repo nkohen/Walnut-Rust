@@ -72,7 +72,10 @@ subset-relevant) if and only if:
 - its `number_system[]` contains a genuine negative-base token (`msd_neg_*`/`lsd_neg_*` — there are 68
   such fixture-mentions across the corpus, per the manifest), **or**
 - its `commands_used[]` contains `split`, `rsplit`, or `ost` (Ostrowski) — the three DROP-confirmed
-  commands per BOUNDARY-MAP §6.
+  commands per BOUNDARY-MAP §6. **(Historical, as written at the time: `ost` was un-dropped and
+  ported on 2026-08-20 — `docs/OSTROWSKI-DISPATCH.md`. `subset-filter.json`'s single `ost` row,
+  fixture 625, was flipped to `subset_relevant` then, with the file's three aggregate counts and
+  its `schema_note`. Only `split`/`rsplit` remain DROP commands.)**
 - **`msd_fib`/`lsd_fib` alone do NOT make a fixture DROP-relevant** — see the §4.1 correction above. Don't
   re-derive this; it's already investigated and verified.
 

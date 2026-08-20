@@ -746,6 +746,14 @@ fn first_differing_index(a: &str, b: &str) -> usize {
 /// matrix address per emitter, as `automaton<i><extension>`.
 pub const MATRIX_EXTENSIONS: [&str; 4] = [".mpl", ".m", ".wl", ".sage"];
 
+/// `TestCase.OST_REPR_TESTFILE` (`TestCase.java:37`) — `DEFAULT_TESTFILE + "_repr"`,
+/// i.e. the `automaton_repr<i>.txt` half of `loadTestCases`' "hack for repr files"
+/// (`IntegrationTest.java:1026-1032`). Kept in sync with `wr_cli::test_case`'s own
+/// constant by [`crate::support::tests`] rather than imported, so a divergence between
+/// the harness's expectation and the port's answer is a test failure, not a silent
+/// rename on both sides at once.
+pub const OST_REPR_TESTFILE: &str = "automaton_repr";
+
 /// Everything `loadTestCases` records for one fixture, as raw text/paths — the automaton is
 /// left as a path so the caller can read it through the session's own custom-base resolver
 /// (Java's `new Automaton(path)` resolves number systems through the static `Session` for
@@ -753,14 +761,34 @@ pub const MATRIX_EXTENSIONS: [&str; 4] = [".mpl", ".m", ".wl", ".sage"];
 #[derive(Debug, Clone)]
 pub struct Expected {
     pub automaton_path: Option<PathBuf>,
+    /// The SECOND expected automaton pair, when the corpus recorded an
+    /// `automaton_repr<i>.txt` beside `automaton<i>.txt` — `loadTestCases`'
+    /// `TestCase.OST_REPR_TESTFILE` probe (`IntegrationTest.java:1028-1032`). Only the
+    /// `ost` command produces two pairs, so in the shipped corpus this is `Some` for
+    /// exactly one fixture (id 625); the harness derives the expected pair COUNT from
+    /// this field rather than hardcoding the id.
+    pub automaton_repr_path: Option<PathBuf>,
     pub error: String,
     pub details: String,
     pub graph_viz: String,
     pub matrix_output: Vec<String>,
 }
 
+impl Expected {
+    /// How many automaton pairs `loadTestCases` would have built for this fixture.
+    ///
+    /// Java always appends the `DEFAULT_TESTFILE` pair — even when `automaton<i>.txt`
+    /// does not exist, in which case the pair carries a `null` automaton
+    /// (`IntegrationTest.java:1019-1024`) — and appends the repr pair only when the
+    /// second file is on disk. So this is 1 or 2, never 0.
+    pub fn automaton_pair_count(&self) -> usize {
+        1 + usize::from(self.automaton_repr_path.is_some())
+    }
+}
+
 pub fn load_expected(corpus_root: &Path, id: usize) -> io::Result<Expected> {
     let automaton_path = corpus_root.join(format!("automaton{id}.txt"));
+    let automaton_repr_path = corpus_root.join(format!("{OST_REPR_TESTFILE}{id}.txt"));
     let mut matrix_output = Vec::with_capacity(MATRIX_EXTENSIONS.len());
     for ext in MATRIX_EXTENSIONS {
         matrix_output.push(read_from_file(
@@ -769,6 +797,7 @@ pub fn load_expected(corpus_root: &Path, id: usize) -> io::Result<Expected> {
     }
     Ok(Expected {
         automaton_path: automaton_path.is_file().then_some(automaton_path),
+        automaton_repr_path: automaton_repr_path.is_file().then_some(automaton_repr_path),
         error: read_from_file(&corpus_root.join(format!("error{id}.txt")))?,
         details: read_from_file(&corpus_root.join(format!("details{id}.txt")))?,
         graph_viz: read_from_file(&corpus_root.join(format!("gv{id}.gv")))?,
@@ -915,6 +944,19 @@ mod tests {
     use super::*;
 
     // -- normalize_message ----------------------------------------------------
+
+    // -- OST_REPR_TESTFILE ------------------------------------------------------
+
+    /// This harness's `OST_REPR_TESTFILE` and `wr_cli::test_case::OST_REPR_TESTFILE` are
+    /// two independent literals in two different crates: the first names the file
+    /// `IntegrationTest.loadTestCases` probes for on disk, the second the label the port's
+    /// own `ost` command puts on its second `TestCase` pair. They must agree, and a
+    /// rename of either alone has no compiler error to catch it — the same shape of pin
+    /// `matrix_extensions_agree_with_wr_io_emitters_order` below already establishes.
+    #[test]
+    fn ost_repr_testfile_agrees_with_the_ports_own_constant() {
+        assert_eq!(OST_REPR_TESTFILE, wr_cli::test_case::OST_REPR_TESTFILE);
+    }
 
     // -- MATRIX_EXTENSIONS / EMITTERS ------------------------------------------
 

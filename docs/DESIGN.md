@@ -52,7 +52,10 @@ This converts Walnut's weakest asset (moderate unit coverage — 92 tests) into 
 - Measurable speed-up over Walnut
 
 **Non-goals (for the initial subset)**
-- Ostrowski / Fibonacci / Pell / negative-base numeration systems.
+- ~~Ostrowski~~ / Fibonacci / Pell / negative-base numeration systems. (**Ostrowski was un-dropped and
+  ported 2026-08-20** — `docs/OSTROWSKI-DISPATCH.md`, `wr_core::ostrowski` + `wr_cli::ost`. Fibonacci/Pell
+  turned out never to be separate code at all — see `docs/UNPORTED-SCOPE-SIZING.md`. Negative base remains
+  dropped, and with it `split`/`rsplit`.)
 - ~~CAS matrix exports (Maple/Mathematica/Matlab/Sage) — Sage export can be revisited later.~~
   **Revisited and reversed 2026-08-19** (`.claude/plans/amber-transcribing-ledger.md`): CAS
   matrix export is now KEEP scope and ported (`crates/wr-io/src/matrix_writer.rs`). See that

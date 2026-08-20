@@ -397,3 +397,60 @@ The test compares `TestCase::matrix_output()`'s four strings against these four 
 trimmed, in `wr_io::matrix_writer::EMITTERS` order (Maple/MATLAB/Mathematica/Sage) — the same
 order `tests/golden`'s `MATRIX_EXTENSIONS` uses and the order this project's plan flagged as
 load-bearing for `matrix_output[i]` indexing.
+
+---
+
+# Ground-truth capture: the Ostrowski (`ost`) corpus (`fixtures/ostrowski/*.txt`)
+
+Used by `tests/ostrowski.rs` and by two `crates/wr-cli/src/prover.rs` unit tests. Nine
+files: the six `Custom Bases/` automata three `ost` commands write, plus the three
+`Automata Library/` results of the follow-up queries over the bases they created.
+
+## Commands
+
+```
+ost o [1 2] [3];
+ost rotsingle [] [1];
+ost numsys2 [0 3 1] [1 2];
+eval ostq1 "?msd_o Ex x+x=y";
+eval ostq2 "?msd_rotsingle Ax (x<3) => (x+1>x)";
+eval ostq3 "?msd_numsys2 Ex,y x+y=z & x=y";
+```
+
+The three `ost` invocations were chosen to cover the constructor's three distinct
+pre-period shapes — `[1, 2]` (the multi-digit `preperiod[0] == 1` rotation,
+`Ostrowski.java:105-107`), `[]` (copy-filled from the period, then the *single*-digit
+rotation at `:109-111`), and `[3, 1]` (no rotation; golden fixture 625's own arguments).
+Neither rotation branch is reachable from any fixture in the golden corpus.
+
+## How it was captured (reproducible)
+
+```bash
+cd ~/dev/walnut-java   # already built: target/Walnut-all.jar
+cat > "Command Files/ost_capture.txt" <<'EOF2'
+ost o [1 2] [3];
+ost rotsingle [] [1];
+ost numsys2 [0 3 1] [1 2];
+eval ostq1 "?msd_o Ex x+x=y";
+eval ostq2 "?msd_rotsingle Ax (x<3) => (x+1>x)";
+eval ostq3 "?msd_numsys2 Ex,y x+y=z & x=y";
+EOF2
+java -jar target/Walnut-all.jar ost_capture.txt < /dev/null
+S="Session/<timestamp>"
+cp "$S/Custom Bases/"*.txt          ~/dev/walnut-rs/tests/differential/fixtures/ostrowski/
+cp "$S/Result/ostq1.txt" "$S/Result/ostq2.txt" "$S/Result/ostq3.txt" \
+                                    ~/dev/walnut-rs/tests/differential/fixtures/ostrowski/
+```
+
+The command file and session directory were deleted from the `walnut-java` checkout
+afterward, per this file's established practice. **The capture was run twice,
+independently, and all nine files came out byte-identical both times** — `ost`'s output
+is deterministic, which is what lets the tests compare the two `Custom Bases/` files
+byte-for-byte rather than only semantically. That byte-level comparison is deliberate:
+`ost`'s entire observable output is the two files it writes, so a re-canonicalized-but-
+language-equivalent automaton would be a genuine divergence that `wr_core::equiv` could
+never see. The three query results are compared by `wr_core::equiv` semantic equivalence,
+per `CLAUDE.md`'s Prime Directive.
+
+`ostq2.txt` is the literal text `true` (a closed formula collapsing to the TRUE
+automaton); real Walnut also printed `TRUE` on stdout for it.

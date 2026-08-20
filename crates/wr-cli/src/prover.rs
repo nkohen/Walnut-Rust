@@ -23,10 +23,12 @@
 //! Every OTHER command name in Java's `RE_FOR_THE_LIST_OF_CMDS` has a real arm here that
 //! **matches its argument regex first** (so a malformed invocation still produces Walnut's
 //! own `Invalid use of the X command.`) and then returns
-//! [`ProverError::NotYetImplemented`] naming the unit that owns it, or
-//! [`ProverError::UnsupportedCommand`] for `ost` (Ostrowski numeration — DROP scope,
-//! `docs/BOUNDARY-MAP.md` §4.1). Each arm cites its `Prover.java` line so its owning unit
-//! can find its slot.
+//! [`ProverError::NotYetImplemented`] naming the unit that owns it. Each arm cites its
+//! `Prover.java` line so its owning unit can find its slot.
+//! [`ProverError::UnsupportedCommand`] currently has no producer: `ost` was its only one,
+//! and Ostrowski numeration is now ported ([`crate::ost`] + [`wr_core::ostrowski`]). The
+//! variant is kept because `split`/`rsplit` (still DROP scope, `docs/BOUNDARY-MAP.md`
+//! §4.1) have no arm at all yet and would use it.
 //!
 //! # Java statics → fields
 //!
@@ -130,6 +132,7 @@ use crate::join::{join_command, JoinError};
 use crate::macro_cmd::macro_command;
 use crate::meta_commands::{MetaCommandError, MetaCommands};
 use crate::morphism::{morphism_command_to, promote_command, MorphismCommandError};
+use crate::ost::{ost_command, OstError};
 use crate::prover_helper::{
     clear_screen_to, determine_in_library, export_automata_to, inf_from_address_to,
     ProverHelperError,
@@ -635,6 +638,8 @@ pub enum ProverError {
     Join(JoinError),
     /// `convert` (`crate::convert`).
     Convert(ConvertError),
+    /// `ost` (`crate::ost`).
+    Ost(OstError),
     /// **Port-specific.** A command this project deliberately does not implement.
     UnsupportedCommand {
         command: &'static str,
@@ -694,6 +699,7 @@ impl std::fmt::Display for ProverError {
             ProverError::Image(e) => write!(f, "{e}"),
             ProverError::Join(e) => write!(f, "{e}"),
             ProverError::Convert(e) => write!(f, "{e}"),
+            ProverError::Ost(e) => write!(f, "{e}"),
             // The recovered guard message, verbatim — the guard-authoring rule in
             // `wr_core::walnut_panic`'s docs makes it Walnut's own text wherever the
             // guard ported one.
@@ -782,6 +788,15 @@ impl LoggableError for ProverError {
             // The remaining `convertNS` failures, and `convertDFAOIntoFunction`, are
             // deliberately-thrown `WalnutException`s.
             ProverError::Convert(_) => true,
+            // `ost`: `ParseMethods.parseList`'s `UtilityMethods.parseInt` throws a plain
+            // `NumberFormatException` on an `int`-overflowing digit run (`ost o
+            // [99999999999] [1];` is regex-legal), same bucket as
+            // `ProverError::NumberFormat` below. Everything else `ost` can produce is a
+            // real `WalnutException` (`Ostrowski`'s two `assertValues` throws and
+            // `writeAutomaton`'s already-exists throw) or this port's own
+            // Result-propagating I/O idiom.
+            ProverError::Ost(OstError::Parse(_)) => false,
+            ProverError::Ost(_) => true,
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
@@ -851,6 +866,7 @@ prover_error_from! {
     ImageError => Image,
     JoinError => Join,
     ConvertError => Convert,
+    OstError => Ost,
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,13 +1357,20 @@ impl Prover {
                 self.morphism_command(s)?;
                 Ok(None)
             }
-            // `:541-543` -> `Ost.ostCommand`. Ostrowski numeration is DROP scope.
+            // `:541-543` -> `Ost.ostCommand`
             OST => {
-                match_or_fail(&patterns().ost, s, OST)?;
-                Err(ProverError::UnsupportedCommand {
-                    command: OST,
-                    reason: "Ostrowski numeration is out of scope; see docs/BOUNDARY-MAP.md",
-                })
+                let caps = match_or_fail(&patterns().ost, s, OST)?;
+                let name = group(&caps, s, GROUP_OST_NAME).unwrap_or("");
+                let preperiod = group(&caps, s, GROUP_OST_PREPERIOD).unwrap_or("");
+                let period = group(&caps, s, GROUP_OST_PERIOD).unwrap_or("");
+                Ok(Some(ost_command(
+                    &self.session,
+                    &mut self.logging,
+                    &mut self.out,
+                    name,
+                    preperiod,
+                    period,
+                )?))
             }
             // `:544-546` -> `Morphism.toWordAutomaton`
             PROMOTE => Ok(Some(self.promote_command(s)?)),
@@ -1932,6 +1955,11 @@ fn is_io_class_error(e: &ProverError) -> bool {
         | ProverError::Image(_)
         | ProverError::Join(_)
         | ProverError::Convert(_)
+        // `OstError::Io` exists only because `wr_io::writer` propagates where Java's
+        // `AutomatonWriter.writeToTxtFormat` catches its own `IOException` and merely
+        // logs it (`Ostrowski.writeAutomaton` therefore cannot let one escape at all) —
+        // the same reasoning `JoinError`/`ConvertError` get above.
+        | ProverError::Ost(_)
         // A recovered panic stands in for an unchecked `RuntimeException`, which is by
         // definition NOT the checked `IOException` Java's outer catch selects — so the
         // read loop must log it and read the next line, never end. This is the whole
@@ -3280,15 +3308,77 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// `ost` used to be the one `UnsupportedCommand` arm; it now really runs. The two
+    /// `Custom Bases/` files it writes are compared byte-for-byte against a fresh capture
+    /// of the real `walnut-java` CLI on the SAME command
+    /// (`tests/differential/fixtures/ostrowski/`, see `tests/differential/CAPTURE.md`) —
+    /// note `ost o [1 2] [3];` exercises the `preperiod[0] == 1` rotation branch
+    /// (`Ostrowski.java:105-107`), which golden fixture 625 (`[0 3 1] [1 2]`) does not.
     #[test]
-    fn ost_is_reported_as_out_of_scope_not_unimplemented() {
-        let (mut p, dir, _) = prover("ost");
+    fn ost_creates_a_custom_base_and_writes_both_files() {
+        let (mut p, dir, capture) = prover("ost");
+        assert!(p.dispatch("ost o [1 2] [3];").unwrap());
+
+        let bases = dir.join("Custom Bases");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/differential/fixtures/ostrowski");
+        for name in ["msd_o.txt", "msd_o_addition.txt"] {
+            assert_eq!(
+                fs::read_to_string(bases.join(name)).unwrap(),
+                fs::read_to_string(fixtures.join(name)).unwrap(),
+                "{name} differs from the real walnut-java capture"
+            );
+        }
+        // `Ostrowski.writeAutomaton`'s two `Writing to: …` lines reach the command's
+        // stdout sink, not the log.
+        let printed = capture.text();
+        assert_eq!(printed.matches("Writing to: ").count(), 2, "{printed:?}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second `ost` under the same name is `Ostrowski.writeAutomaton`'s already-exists
+    /// `WalnutException`, reported through dispatch — one command lost, not the session.
+    #[test]
+    fn a_repeated_ost_name_is_a_reported_error_not_a_crash() {
+        let (mut p, dir, _) = prover("ost-twice");
+        assert!(p.dispatch("ost o [1 2] [3];").unwrap());
         let err = p.dispatch("ost o [1 2] [3];").unwrap_err();
-        assert!(matches!(
-            err,
-            ProverError::UnsupportedCommand { command: "ost", .. }
-        ));
-        assert!(err.to_string().contains("out of scope"));
+        assert_eq!(err.to_string(), "Error: number system o already exists.");
+        assert!(err.is_handled(), "a WalnutException renders message-only");
+        // The session survives, exactly as `readBuffer`'s catch leaves it.
+        assert!(p.dispatch("ost o2 [1 2] [3];").unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The freshly-created base is immediately usable by a later command, which is the
+    /// whole point of `ost` — the answer is compared against the real `walnut-java`
+    /// output for the same two commands.
+    #[test]
+    fn an_ost_created_base_is_usable_by_a_later_eval() {
+        let (mut p, dir, _) = prover("ost-eval");
+        assert!(p.dispatch("ost o [1 2] [3];").unwrap());
+        assert!(p.dispatch("eval ostq1 \"?msd_o Ex x+x=y\";").unwrap());
+
+        let ours = wr_io::reader::read_automaton_txt_with_custom_base_resolver(
+            dir.join("Automata Library/ostq1.txt"),
+            p.session.paths(),
+        )
+        .expect("the result automaton reads back");
+        let theirs = wr_io::reader::read_automaton_txt_with_custom_base_resolver(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/differential/fixtures/ostrowski/ostq1.txt"),
+            p.session.paths(),
+        )
+        .expect("the captured walnut-java automaton reads back");
+        let (mut ours, mut theirs) = (ours, theirs);
+        ours.sort_label();
+        ours.fa.totalize(0);
+        theirs.fa.totalize(0);
+        assert!(
+            wr_core::equiv::automaton_language_equivalent(&ours, &theirs).unwrap(),
+            "?msd_o Ex x+x=y differs from real walnut-java"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

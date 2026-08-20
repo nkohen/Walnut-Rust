@@ -26,6 +26,7 @@ pub mod join;
 pub mod macro_cmd;
 pub mod meta_commands;
 pub mod morphism;
+pub mod ost;
 pub mod prover;
 pub mod prover_helper;
 pub mod quotient;

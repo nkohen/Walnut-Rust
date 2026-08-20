@@ -322,6 +322,12 @@ pub fn image_requires_unary_word_automaton(word_name: &str) -> String {
     format!("Image requires a unary word automaton: {word_name}")
 }
 
+/// `Ostrowski.writeAutomaton`'s inline throw (`Automata/Numeration/Ostrowski.java:232`) —
+/// the `ost` command refusing to overwrite an existing `Custom Bases/` file.
+pub fn number_system_already_exists(name: &str) -> String {
+    format!("Error: number system {name} already exists.")
+}
+
 /// `Join.joinCommand`'s inline throw (`Main/Commands/Join.java:53`).
 pub fn join_input_count_mismatch(automaton_name: &str) -> String {
     format!(
