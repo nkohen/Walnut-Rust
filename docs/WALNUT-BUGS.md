@@ -815,14 +815,20 @@ bug costs a silent wrong answer somewhere downstream.
   2026-08-12, while working out `reverseWithOutput`'s subset-construction dependencies (it needed
   `FA.setFields`, not yet ported) — reading the method line-by-line to port it surfaced the missing
   `setQ0` call, then confirmed empirically per above before logging.
-- **Rust port:** `ported verbatim (quirk)` — `word_automaton::reverse_with_output` calls
-  `Fa::set_fields` (itself a faithful, no-`q0`-touching port of `FA.setFields`) and likewise never
-  assigns `fa.q0` afterward. Flagged inline in both `Fa::set_fields`'s and
-  `word_automaton::reverse_with_output`'s doc comments (citing this entry), and pinned by a
-  dedicated test, `reverse_with_output_wb016_wrong_q0_on_non_zero_initial_state`, which reproduces
-  the exact empirical shape above inside the Rust port and asserts it reproduces the SAME wrong
-  answer Java gives (not the corrected one) — per the mechanical-port rule, this is a case where
-  the test's job is to pin the bug, not catch a regression from it.
+- **Rust port:** `fixed, matches walnut-java as of commit d6e9799` — `word_automaton::
+  reverse_with_output_with_ctx` now assigns `word_a.fa.q0 = 0;` immediately after the
+  `Fa::set_fields` rebuild call, mirroring Java's fix (`wordA.fa.setQ0(0);` right after
+  `setFields`, `WordAutomaton.java:175`, commit `d6e9799` on `bugfix/wb-016`). `Fa::set_fields`
+  itself is unchanged (still a faithful, no-`q0`-touching port of `FA.setFields` — the fix lives at
+  the call site, same as Java). The pinning test (formerly `reverse_with_output_wb016_wrong_q0_on_
+  non_zero_initial_state`, asserting the WRONG value) was flipped, not deleted, to
+  `reverse_with_output_wb016_q0_is_correct_on_non_zero_initial_state`, asserting the mathematically
+  correct output (`10`, per Theorem 4.3.3) on the same non-zero-`q0` input. A new differential test,
+  `tests/differential/tests/java_bugfix_wb016.rs`, confirms the fixed Rust `reverse` command's
+  output is byte-identical to real `walnut-java`'s captured fixed output on a hand-authored
+  `q0 != 0` word-automaton `.txt` file. The sibling instance in `logicalops::
+  convert_lsd_base_to_root` (`AutomatonLogicalOps.java:645`, `convertLsdBaseToRoot`) remains
+  unfixed, deliberately out of this fix's scope (see that function's own doc comment).
 - **Upstream:** not filed. A one-line fix: `wordA.fa.setQ0(0);` immediately after the `setFields`
   call at `:175` (new state `0` is always the correct new initial state, by the BFS-root argument
   above — no further computation needed, just setting the field). The `AutomatonLogicalOps.

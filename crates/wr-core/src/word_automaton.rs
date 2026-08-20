@@ -284,20 +284,24 @@ pub fn apply_word_operator_with_ctx(
 /// deterministic even if the input was an NFA (it never is, in practice — see the
 /// precondition note below).
 ///
-/// # WB-016 (`docs/WALNUT-BUGS.md`) — `q0` is never updated after the rebuild
+/// # WB-016 (`docs/WALNUT-BUGS.md`) — `q0` is now set after the rebuild (fixed)
 ///
-/// Ported **verbatim**, including a genuine Walnut bug found while porting this exact
-/// method: after the subset-construction rebuild below (`Fa::set_fields`), the new
-/// state `0` is ALWAYS the correct new initial state (it's the BFS root, pushed before
-/// the loop starts, and `new_o`/`new_d` are built in BFS order) — but neither Java's
-/// `FA.setFields` nor this method (in either language) ever assigns `q0`, so it keeps
-/// its STALE pre-reversal value. This is usually masked (`canonicalize` always leaves
-/// `q0 == 0`, and most DFAOs reach this method via a canonicalizing pipeline where that
-/// already holds), but is a real, empirically confirmed silent-wrong-answer bug
-/// whenever the input's `q0` is not already `0` — e.g. a hand-authored `.txt`
-/// word-automaton file, a fully supported Walnut input path. See WB-016 for the full
-/// trigger and verification against the real `walnut-java` CLI. NOT fixed here per
-/// `CLAUDE.md`'s mechanical-port rule — `q0` is left exactly as stale as Java leaves it.
+/// After the subset-construction rebuild below (`Fa::set_fields`), the new state `0` is
+/// ALWAYS the correct new initial state (it's the BFS root, pushed before the loop
+/// starts, and `new_o`/`new_d` are built in BFS order) — but `Fa::set_fields` (a
+/// faithful port of `FA.setFields`, which does **not** touch `q0`) leaves `word_a.fa.q0`
+/// at its STALE pre-reversal value. Real Walnut had a genuine bug here (never assigning
+/// `q0` afterward, so the stale value silently corrupted the result whenever it didn't
+/// already happen to equal `0` — see WB-016 for the full trigger and verification
+/// against the real `walnut-java` CLI), fixed upstream by `wordA.fa.setQ0(0);`
+/// immediately after `setFields` (`WordAutomaton.java:175`, commit `d6e9799` on
+/// `bugfix/wb-016`). Ported as the matching fix here: `word_a.fa.q0 = 0;` right after
+/// `set_fields`, below.
+///
+/// The structurally identical omission in [`crate::logicalops::convert_lsd_base_to_root`]
+/// (`AutomatonLogicalOps.java:645`) is a SEPARATE, deliberately out-of-scope call site
+/// (different call path, not independently reproduced, not part of this fix) — see that
+/// function's own doc comment.
 ///
 /// # The deterministic-and-total precondition, checked only at `q0` — also ported verbatim
 ///
@@ -406,7 +410,11 @@ pub fn reverse_with_output_with_ctx(
     }
 
     word_a.fa.set_fields(new_states.len(), new_o, new_d);
-    // See WB-016 above: `q0` is deliberately NOT set here, matching Java exactly.
+    // WB-016 (`docs/WALNUT-BUGS.md`), fixed upstream in `d6e9799` (`bugfix/wb-016`):
+    // `set_fields` doesn't touch `q0`, and the BFS root is always the new state `0`
+    // (pushed before the loop, `new_o`/`new_d` built in BFS order) -- so that's the
+    // correct new initial state.
+    word_a.fa.q0 = 0;
 
     if reverse_msd {
         logicalops::flip_ns(word_a);
@@ -672,22 +680,22 @@ mod tests {
         assert_eq!(a.fa.o[a.fa.q0], 10);
     }
 
-    /// **WB-016** (`docs/WALNUT-BUGS.md`): the SAME automaton as the test above, just
-    /// with its two states relabeled so `q0` is `1` instead of `0`, isomorphic in every
-    /// other respect. A correct reversal would still report `10` at the empty string
-    /// (Theorem 4.3.3 doesn't care how states are numbered) — but this pins the REAL,
-    /// verbatim-ported Walnut bug: `q0` is never updated after the rebuild, so the
-    /// wrong state ends up treated as initial. This test asserts the WRONG value,
-    /// matching real `walnut-java`'s own empirically-confirmed output, per
-    /// `CLAUDE.md`'s mechanical-port rule (pin the bug, don't silently fix it).
+    /// **WB-016** (`docs/WALNUT-BUGS.md`), fixed upstream in `walnut-java` commit
+    /// `d6e9799` (`bugfix/wb-016`): the SAME automaton as the test above, just with its
+    /// two states relabeled so `q0` is `1` instead of `0`, isomorphic in every other
+    /// respect. Before the fix, `q0` was never updated after the rebuild, so the wrong
+    /// state ended up treated as initial and this test pinned the WRONG value (`20`),
+    /// matching real (pre-fix) `walnut-java`'s own empirically-confirmed output, per
+    /// `CLAUDE.md`'s mechanical-port rule. Now that the fix is ported
+    /// (`word_a.fa.q0 = 0;` right after `set_fields`), this asserts the mathematically
+    /// correct value instead: Theorem 4.3.3 doesn't care how states are numbered, so
+    /// this must agree with the sibling test above (`10`).
     #[test]
-    fn reverse_with_output_wb016_wrong_q0_on_non_zero_initial_state() {
+    fn reverse_with_output_wb016_q0_is_correct_on_non_zero_initial_state() {
         // state 1 (q0), output 10, 0->1, 1->0; state 0, output 20, 0->0, 1->1.
         let mut a = word_automaton(1, &[20, 10], &[[0, 1], [1, 0]]);
         reverse_with_output(&mut a, false);
-        // Faithful (buggy) Rust output: 20, not the mathematically-correct 10 (see the
-        // sibling test above, which uses the isomorphic q0==0 layout and gets 10).
-        assert_eq!(a.fa.o[a.fa.q0], 20);
+        assert_eq!(a.fa.o[a.fa.q0], 10);
     }
 
     // -------------------------------------------------------------------

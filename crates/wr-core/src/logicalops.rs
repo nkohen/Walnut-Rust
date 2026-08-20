@@ -2188,11 +2188,17 @@ fn convert_msd_base_to_exponent(
 ///
 /// `newStates[0]` is the BFS root `(A.fa.getQ0(), [])`, so `0` is always the correct new
 /// initial state, but neither `FA.setFields` nor this method assigns `q0` (the same
-/// omission as `docs/WALNUT-BUGS.md` WB-016, in a different method). Not filed as its own
-/// bug because it is unreachable: this method's ONLY caller invokes it immediately after
-/// `WordAutomaton.reverseWithOutput` (`:505`), whose closing `minimizeSelfWithOutput` ->
-/// `combine` -> `forceCanonize` always leaves `q0 == 0` (`FA.canonizeInternal` assigns
-/// `q0 = permutationMap.get(q0)`, and the map sends `q0` to `0`). Ported verbatim anyway.
+/// omission WB-016 (`docs/WALNUT-BUGS.md`) documented in `word_automaton::
+/// reverse_with_output` — that sibling instance has since been fixed, see its own doc
+/// comment; this one has not). Not filed as its own bug because it is unreachable: this
+/// method's ONLY caller invokes it immediately after `WordAutomaton.reverseWithOutput`
+/// (`:505`), whose closing `minimizeSelfWithOutput` -> `combine` -> `forceCanonize`
+/// always leaves `q0 == 0` (`FA.canonizeInternal` assigns `q0 = permutationMap.get(q0)`,
+/// and the map sends `q0` to `0`) — true regardless of whether `reverseWithOutput`'s own
+/// `q0` bug is fixed, since `forceCanonize` renumbers from WHATEVER `q0` currently holds.
+/// Ported verbatim anyway. Deliberately left unfixed here (WB-016's own upstream fix,
+/// `walnut-java` commit `d6e9799`/`bugfix/wb-016`, explicitly scopes this sibling out —
+/// "a different call path, not independently reproduced" — as separate, later work).
 ///
 /// # Panics
 ///

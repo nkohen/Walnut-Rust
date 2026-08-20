@@ -731,9 +731,14 @@ impl Fa {
     }
 
     /// `FA.setFields(int newStates, IntList newO, List<Int2ObjectRBTreeMap<IntList>> newD)`
-    /// (`FA.java:547-551`). Note this does **not** touch `q0` — faithfully: see
-    /// `WordAutomaton::reverse_with_output`'s doc comment (WB-016) for the one call
-    /// site where that omission is a genuine Walnut bug, ported verbatim.
+    /// (`FA.java:547-551`). Note this does **not** touch `q0` — faithfully. This omission
+    /// used to be a genuine Walnut bug at its `word_automaton::reverse_with_output` call
+    /// site (WB-016, `docs/WALNUT-BUGS.md`), fixed upstream (commit `d6e9799`,
+    /// `bugfix/wb-016`) and ported: that call site now explicitly sets `q0 = 0`
+    /// immediately after calling this function, rather than this function being changed
+    /// to do it itself (matching Java's fix, which is at the call site too). The
+    /// structurally identical omission in `logicalops::convert_lsd_base_to_root` remains
+    /// unfixed, deliberately out of that PR's scope — see its own doc comment.
     pub fn set_fields(
         &mut self,
         new_q: usize,
@@ -1782,12 +1787,14 @@ mod tests {
     fn set_fields_replaces_q_o_and_d_but_leaves_q0_untouched() {
         // Pins WB-016 (`docs/WALNUT-BUGS.md`): `set_fields` faithfully does NOT touch
         // `q0`, matching `FA.setFields` exactly -- callers that need a fresh `q0` after
-        // a full rebuild (like `word_automaton::reverse_with_output` SHOULD, per the
-        // bug entry) must set it themselves; this port doesn't add that call either.
+        // a full rebuild must set it themselves. `word_automaton::reverse_with_output`
+        // now does exactly that (WB-016 is fixed there, at the call site, per Java's own
+        // fix shape) -- but `set_fields` itself is unchanged, and any OTHER caller that
+        // skipped the follow-up assignment would hit exactly this shape of corruption.
         // Rebuilding down to a single state here leaves the pre-existing `q0 = 1`
         // strictly OUT OF BOUNDS for the new `q = 1` -- exactly the shape of corruption
-        // WB-016 documents `reverse_with_output` producing on real (in-bounds, but
-        // wrong) inputs.
+        // WB-016 used to let `reverse_with_output` produce on real (in-bounds, but
+        // wrong) inputs, before the fix.
         let mut fa = contains_one_dfa();
         fa.q0 = 1;
         let new_d = vec![BTreeMap::from([(0, vec![0])])];
