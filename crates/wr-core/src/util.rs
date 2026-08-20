@@ -503,6 +503,16 @@ mod tests {
     /// recursing back into `commonRoot(a, 0 / a)` = `commonRoot(a, 0)`, unchanged).
     /// Must terminate cleanly here rather than hang — this test would itself hang (or
     /// stack-overflow) forever without the `a == 0 || b == 0` guard.
+    ///
+    /// **Now also matches walnut-java's own fix, verbatim.** `walnut-java` commit
+    /// `92776e9` (branch `bugfix/wb-002-012-037-044`) added the exact same guard, at the
+    /// exact same place in the recursion, and its `UtilityMethodsTest.
+    /// testCommonRootWithAZeroOperandDoesNotHangOrThrow` asserts these same five pairs.
+    /// `commonRoot` has no reachable trigger through any real command on either engine
+    /// (see `docs/WALNUT-BUGS.md` WB-012's "Severity" note), so this regression test —
+    /// re-verified against that fixed Java test rather than only reasoned from source —
+    /// is this entry's full port-workflow closure; there is no CLI command to
+    /// differentially test.
     #[test]
     fn common_root_zero_guard_terminates_cleanly() {
         assert_eq!(common_root(-3, 0), NO_COMMON_ROOT);

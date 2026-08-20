@@ -532,9 +532,14 @@ bug costs a silent wrong answer somewhere downstream.
   neither operand is zero (provable by construction — the new check is a no-op unless
   `a == 0 || b == 0` — and spot-checked directly against an unguarded reference reimplementation over
   the full `[-6, 20]²` grid in `common_root_matches_unguarded_reference_away_from_zero`).
-- **Upstream:** not filed. Fix in Java would be an explicit `a == 0 || b == 0` early return (mirroring
-  the Rust guard), placed before the `a > b` swap so both the negative-`a` hang and the
-  positive-`a`/zero-`b` `ArithmeticException` are replaced with a clean, documented `NO_COMMON_ROOT`.
+- **Upstream:** **fixed**, `walnut-java` commit `92776e9` (branch `bugfix/wb-002-012-037-044`):
+  `UtilityMethods.commonRoot` gained an explicit `a == 0 || b == 0` early return (placed after the
+  pre-existing `a == b` check, before the `a > b` swap — the exact shape this entry's "fix in Java
+  would be" note already predicted), replacing both the negative-`a` hang and the
+  positive-`a`/zero-`b` `ArithmeticException` with a clean, documented `NO_COMMON_ROOT`.
+  `UtilityMethodsTest.testCommonRootWithAZeroOperandDoesNotHangOrThrow` pins all five
+  `(a, b)` pairs (`(-3,0)`, `(0,-3)`, `(3,0)`, `(0,3)`, `(0,0)`); verified live,
+  `./mvnw -Dtest=Main.UtilityMethodsTest test` green on that branch.
 - **Severity:** low in Java — `commonRoot`'s only caller is `AutomatonLogicalOps.java:482` inside
   `convertNS`, and its two arguments there are `fromBase` (from `NumberSystem.parseBase()`, which
   itself rejects anything `<= 1`) and the `toBase` the `convert` command's regex captured as
@@ -545,6 +550,24 @@ bug costs a silent wrong answer somewhere downstream.
   `wr_core::logicalops::convert_ns`, so `common_root` now has a live caller in this port too. The
   reachability argument above is unchanged (`convert_ns`'s callers supply an already-validated
   `from_base`), and the guarded divergence continues to apply.
+- **Resolved (2026-08-20):** upstream fixed as described above (commit `92776e9`). **Rust port:
+  Case A — already computed/reported the same thing Java now does, and now also matches the
+  fixed Java exactly, as of commit `92776e9`.** `wr_core::util::common_root`'s pre-existing
+  `a == 0 || b == 0` guard sits at exactly the same place in the recursion as Java's new guard
+  (after `a == b`, before the `a > b` swap) and returns the same `NO_COMMON_ROOT` sentinel for
+  every one of the five pairs Java's new test asserts — already pinned, byte-for-byte, by
+  `common_root_zero_guard_terminates_cleanly` before this unit; no functional code change was
+  needed. This entry's own "Rust port" note above already described the guard as a *deliberate
+  divergence*; it is more precise to now call it a divergence that happened to anticipate Java's
+  own eventual fix exactly. As this note's own "Severity" paragraph explains, `commonRoot` has no
+  reachable trigger through any real command on either engine (`convertNS`'s callers always supply
+  an already-validated base), so there is no CLI command to differentially test — per
+  `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`'s downstream-port-workflow step 4, the existing regression
+  test (now re-verified against the fixed Java unit test, not just reasoned from source, and
+  cross-referencing this fix's commit sha directly in its own doc comment) is the full
+  port-workflow closure for this entry; unlike WB-002/037/044, no differential test file exists
+  for this one, since there is nothing through the real `Prover` dispatch surface to run it
+  against.
 
 ---
 
