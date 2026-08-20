@@ -778,11 +778,17 @@ impl LoggableError for ProverError {
             // `NumberSystem`'s "Number system msd_k is not defined."
             ProverError::Morphism(_) => true,
 
-            // WB-037: `subautomata.remove(0)` on an empty list is
-            // `IndexOutOfBoundsException`.
-            ProverError::Join(JoinError::NoAutomataSpecified) => false,
+            // WB-037 fixed upstream (`Join.java` now guards `subautomata.isEmpty()` before
+            // `remove(0)`, raising a real `WalnutException` instead of the old
+            // `IndexOutOfBoundsException`) — `JoinError::NoAutomataSpecified` now belongs in
+            // the same bucket as every other `Join` throw below, not its own `false` arm.
+            // Found live by adversarial review: this arm was left stale when the message text
+            // was updated to match, so the port rendered the new message on the WRONG channel
+            // (kind-prefixed stderr, matching the OLD unhandled-exception classification)
+            // instead of the plain stdout line real (fixed) Walnut now prints.
+            //
             // The label-count throw (`Join.java:53`) and the shared-label alphabet throw
-            // (`ProductStrategies.java:281`) are both real `WalnutException`s.
+            // (`ProductStrategies.java:281`) are both real `WalnutException`s too.
             ProverError::Join(_) => true,
 
             // `Integer.parseInt(m.group(GROUP_CONVERT_BASE))` (`Prover.java:740`) —
@@ -2651,10 +2657,6 @@ mod tests {
                 "validateFile throws IllegalArgumentException",
             ),
             (
-                ProverError::Join(JoinError::NoAutomataSpecified),
-                "WB-037 is an IndexOutOfBoundsException",
-            ),
-            (
                 ProverError::Convert(ConvertError::InvalidBase("x".to_string())),
                 "Integer.parseInt throws NumberFormatException",
             ),
@@ -2683,6 +2685,11 @@ mod tests {
                     automaton_name: "A".to_string(),
                 }),
                 "Join.java:53's inline WalnutException",
+            ),
+            (
+                ProverError::Join(JoinError::NoAutomataSpecified),
+                "WB-037 fixed upstream: Join.java now throws a real WalnutException before \
+                 the old IndexOutOfBoundsException site",
             ),
             (
                 ProverError::Join(JoinError::AlphabetMismatch {

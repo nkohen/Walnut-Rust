@@ -140,4 +140,6 @@ fn wb002_degenerate_self_loop_automaton_matches_fixed_java() {
         "must match real walnut-java's fixed output verbatim (captured against \
          bugfix/wb-002-012-037-044, commit aa4a241)"
     );
+
+    fs::remove_dir_all(&dir).ok();
 }

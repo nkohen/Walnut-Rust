@@ -271,24 +271,23 @@ fn strip_whitespace(s: &str) -> String {
 /// uses (`commonRoot(b, a)` / `commonRoot(a, b / a)`) — the recursion depth is
 /// `O(log b)`, no real stack-depth concern for any input this port ever sees.
 ///
-/// **Deliberate divergence, logged as `docs/WALNUT-BUGS.md` WB-012.** Java's
-/// `commonRoot(a, 0)` for negative `a` (or the symmetric `commonRoot(0, a)`, which
-/// swaps into the same shape) recurses forever: `0 % a == 0` in Java for any nonzero
-/// `a`, so it calls `commonRoot(a, 0 / a)` = `commonRoot(a, 0)` again — identical
-/// arguments every call. In Java this eventually throws `StackOverflowError` (loud,
-/// if slow); in Rust the self-recursive call with unchanged arguments is exactly the
-/// shape LLVM turns into a genuinely infinite loop in a release build — a silent
-/// hang, which this project's stated discipline treats as strictly worse than a
-/// crash. `a == 0` xor `b == 0` (with the other nonzero) also has no coherent
-/// "common root" answer in Java either way — it degenerates to a `/ by zero`
-/// `ArithmeticException` one recursion level up the `a > b` swap instead of hanging,
-/// but faithfully reproducing either failure mode (a crash-shaped one and a
-/// hang-shaped one, for what's really the same input case) isn't a coherent goal for
-/// a hang-intolerant test suite. So both guard cleanly to [`NO_COMMON_ROOT`] here
-/// instead of recursing — this is the sole intentional behavioral divergence in this
-/// function, not fixing anything about the a,b != 0 arithmetic itself. `a == b == 0`
-/// is unaffected (already returned by the `a == b` check above, matching Java, which
-/// returns `0` for `commonRoot(0, 0)` without ever reaching the problematic branch).
+/// **WB-012, fixed upstream as of `walnut-java` commit `92776e9` (branch
+/// `bugfix/wb-002-012-037-044`) — no longer a divergence.** `commonRoot(a, 0)` for
+/// negative `a` (or the symmetric `commonRoot(0, a)`, which swaps into the same shape)
+/// used to recurse forever in Java: `0 % a == 0` for any nonzero `a`, so it called
+/// `commonRoot(a, 0 / a)` = `commonRoot(a, 0)` again — identical arguments every call,
+/// eventually a `StackOverflowError`. `a == 0` xor `b == 0` (with the other nonzero)
+/// also had no coherent "common root" answer either way — it degenerated to a
+/// `/ by zero` `ArithmeticException` one recursion level up the `a > b` swap instead of
+/// hanging. This port had already guarded both shapes to [`NO_COMMON_ROOT`] *before*
+/// Java's own fix landed (originally logged as a deliberate divergence, since the
+/// self-recursive call with unchanged arguments is exactly the shape LLVM turns into a
+/// genuinely infinite loop in a release build — a silent hang, worse than Java's loud
+/// crash). Java's fix (`92776e9`) added the identical guard at the identical place, so
+/// the code below is now a faithful port, not a divergence: `a == 0 || b == 0` returns
+/// [`NO_COMMON_ROOT`] on both engines. `a == b == 0` is unaffected either way (already
+/// returned by the `a == b` check above, matching Java's `commonRoot(0, 0) == 0`,
+/// which never reaches this guard).
 pub fn common_root(a: i32, b: i32) -> i32 {
     if a == 1 || b == 1 {
         return NO_COMMON_ROOT;
@@ -506,9 +505,11 @@ mod tests {
     ///
     /// **Now also matches walnut-java's own fix, verbatim.** `walnut-java` commit
     /// `92776e9` (branch `bugfix/wb-002-012-037-044`) added the exact same guard, at the
-    /// exact same place in the recursion, and its `UtilityMethodsTest.
-    /// testCommonRootWithAZeroOperandDoesNotHangOrThrow` asserts these same five pairs.
-    /// `commonRoot` has no reachable trigger through any real command on either engine
+    /// exact same place in the recursion. Its own
+    /// `UtilityMethodsTest.testCommonRootWithAZeroOperandDoesNotHangOrThrow` asserts five
+    /// of these seven pairs (`(-3,0)`, `(0,-3)`, `(3,0)`, `(0,3)`, `(0,0)` — a strict
+    /// subset; it does not cover the `±1,0` pairs this test also checks). `commonRoot`
+    /// has no reachable trigger through any real command on either engine
     /// (see `docs/WALNUT-BUGS.md` WB-012's "Severity" note), so this regression test —
     /// re-verified against that fixed Java test rather than only reasoned from source —
     /// is this entry's full port-workflow closure; there is no CLI command to

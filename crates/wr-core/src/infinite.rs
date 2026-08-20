@@ -118,16 +118,17 @@
 //! separately-reviewed choice unrelated to this file). Left unguarded, that would mean
 //! the DFS below "finds" a self-loop cycle on *any* empty-language input post-trim and
 //! then fails the suffix search exactly like Java's real `Q == 1` crash case — a shape
-//! [`find_path`] would hit as a `None` this file would otherwise have to `.expect(..)`
-//! away incorrectly. So [`infinite`] still keeps a `trimmed.is_language_empty()` guard
-//! *after* trimming (returning `None`), purely to route around this port's own
-//! trim's self-looping-canonical-shape choice — not to emulate anything about Java,
-//! which never reaches its DFS at all for `Q > 1` empty-language input. That guard is
-//! not a divergence: it changes no answer Java gives (Java already answers `""` there
-//! too, just via a different mechanism), it only prevents this port's differently-shaped
-//! trim result from tripping an unrelated internal invariant below.
+//! [`find_path`] would hit as a `None`, which (below) now correctly returns `None`
+//! rather than panicking, but only after running the DFS to exhaustion first. So
+//! [`infinite`] still keeps a `trimmed.is_language_empty()` guard *after* trimming
+//! (returning `None` immediately, before the DFS runs at all), purely to route around
+//! this port's own trim's self-looping-canonical-shape choice — not to emulate anything
+//! about Java, which never reaches its DFS at all for `Q > 1` empty-language input.
+//! That guard is not a divergence: it changes no answer Java gives (Java already
+//! answers `""` there too, just via a different mechanism), it's purely an early exit
+//! for this port's differently-shaped trim result.
 //!
-//! ## Porting the fix: deleting a guard, not adding one
+//! ## Porting the fix: the literal guard, not just an invariant
 //!
 //! Before `aa4a241`, this port faithfully reproduced Java's crash as a `Result::Err`
 //! (`InfiniteError::DegenerateSelfLoop`), checked on the untrimmed input *before*
@@ -136,35 +137,36 @@
 //! more faithfully ported as a recoverable `Result` than an uncaught Rust `panic!`.
 //!
 //! Now that Java itself answers `""` for this exact shape, that pre-trim guard is
-//! simply **removed** — and, unlike a typical bug port, no *replacement* guard was
-//! needed, because [`infinite`] already had a second, unrelated guard that happens to
-//! produce the exact same answer for this exact input: the `trimmed.is_language_empty()`
-//! check *after* trimming (see "`Q > 1` empty language was never a divergence" above).
-//! A single non-accepting, self-looping state has no accepting state at all, so its
-//! language is empty regardless of `Q` — [`crate::trim::trim`] collapses it (like any
-//! other empty-language input, any `Q`) to this port's canonical fully self-looping
-//! 1-state sink via its `keep.is_empty()` branch, and the post-trim guard answers
-//! `None` before the DFS ever runs. That guard predates this fix and was never about
-//! WB-002 (it exists to route around this port's own `trim`'s self-looping-canonical-
-//! shape choice, described above) — it just happens to *also* be the correct answer
-//! for the input WB-002's crash used to live on, once the pre-trim short-circuit that
-//! used to intercept it first is gone.
+//! removed, and [`infinite`]'s DFS ending now carries the literal port of Java's own
+//! fix — `if (suffix == null) return "";` (`Infinite.java:59-65`) — as a real
+//! a real `find_path(..)?` early return, not an `.expect(..)` backed only by
+//! an argument that it can never fire. An earlier draft of this fix relied purely on
+//! that argument (deleting the pre-trim guard and trusting a second, unrelated guard —
+//! see below — to produce the same answer by coincidence); an adversarial reviewer
+//! correctly flagged that as under-porting `aa4a241`: the argument is sound *today*, but
+//! it depends on a *different*, separately-reviewed divergence in [`crate::trim`] (its
+//! `Q <= 1` no-op is deliberately not ported — that module's own docs) that this file
+//! does not own and that could change independently of anything here. Carrying the
+//! literal guard means this file matches Java's fix regardless of what happens to that
+//! unrelated divergence later, rather than silently starting to panic if it's ever
+//! closed.
+//!
+//! [`infinite`] already had a second, unrelated guard that also happens to produce the
+//! right answer for WB-002's specific trigger, before the DFS ever runs: the
+//! `trimmed.is_language_empty()` check *after* trimming (see "`Q > 1` empty language was
+//! never a divergence" above). A single non-accepting, self-looping state has no
+//! accepting state at all, so its language is empty regardless of `Q` —
+//! [`crate::trim::trim`] collapses it (like any other empty-language input, any `Q`) to
+//! this port's canonical fully self-looping 1-state sink via its `keep.is_empty()`
+//! branch, and that guard answers `None` before the DFS ever runs, on this specific
+//! trigger. That guard predates this fix and was never about WB-002 — it exists to route
+//! around this port's own `trim`'s self-looping-canonical-shape choice, described above.
+//! So in practice WB-002's exact trigger is caught earlier, by that guard; the DFS-ending
+//! guard this section is about is what makes the fix hold for every OTHER shape Java's
+//! `suffix == null` case can reach too, not just this one.
 //!
 //! `docs/WALNUT-BUGS.md`'s WB-002 entry is updated alongside this module: `fixed,
 //! matches walnut-java as of commit aa4a241`.
-//!
-//! With the pre-trim guard gone, `find_path`'s "no target found" case (Java's `null`)
-//! remains provably unreachable, for the same reason as before: every `q` either
-//! collapses via `keep.is_empty()` (caught by the post-trim `is_language_empty()`
-//! guard) or survives trim's real reachability computation, which by construction
-//! keeps only states that are both forward-reachable from `q0` and backward-
-//! co-reachable to an accepting state (`trim.rs`'s own module docs). `find_cycle` only
-//! ever visits states reachable from `q0` in the trimmed automaton, so `cycle.start` is
-//! backward-co-reachable to acceptance by construction, and a BFS from a
-//! backward-co-reachable state is guaranteed to discover *some* accepting state. This
-//! is asserted via `.expect(..)`, not silently `unwrap`ped, so a violation (should
-//! either invariant above ever regress) is a loud, diagnosable panic rather than a
-//! silent wrong answer.
 //!
 //! # Witness string format (Tier-1-fixture-comparable — get this exact)
 //!
@@ -268,11 +270,15 @@ pub fn infinite(a: &Automaton) -> Option<String> {
     )?;
 
     let prefix = symbols_on_path(trimmed.q0, cycle.start, &previous, &input);
-    let suffix = find_path(&trimmed, cycle.start, |s| trimmed.is_accepting(s)).expect(
-        "unreachable: the post-trim is_language_empty guard plus trim's postcondition \
-         together guarantee a path to acceptance from any state the (non-empty-language) \
-         DFS can reach cycle.start through -- see this module's docs",
-    );
+    // `if (suffix == null) return "";` (`Infinite.java:59-65`, added by `aa4a241` to fix
+    // WB-002) -- ported as the literal guard, not left as a bare `.expect(..)` backed
+    // only by an invariant argument. See this module's docs, "Porting the fix: the
+    // literal guard, not just an invariant" -- the invariant argument is still true
+    // TODAY (this is provably unreachable given `trim`'s current postcondition and the
+    // post-trim `is_language_empty` guard above), but it depends on a DIFFERENT,
+    // separately-reviewed divergence in `crate::trim` that this file does not own and
+    // that could change independently of anything here.
+    let suffix = find_path(&trimmed, cycle.start, |s| trimmed.is_accepting(s))?;
 
     Some(format!(
         "{}({})*{}",

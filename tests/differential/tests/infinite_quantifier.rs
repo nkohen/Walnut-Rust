@@ -110,6 +110,20 @@ fn infinite_quantifier_infinite_language_matches_real_walnut_both_directions() {
     assert_verdict("?lsd_2 Ix x>=5", true);
 }
 
+/// `Ix (x<5 & x>10)` — an UNSATISFIABLE body (zero witnesses), so FALSE. Added after an
+/// adversarial review of `wr_core::infinite::infinite`'s WB-002 fix (the `Result` ->
+/// plain `Option` signature change this file's own
+/// `infinite_quantifier_mixed_numeration_system_matches_real_walnut_output` test already
+/// references) found that no test anywhere drove `I` over an empty-language body through
+/// the REAL end-to-end eval dispatch this helper uses — only through `token.rs`'s
+/// internal `act_logical` unit-test harness (`infinite_quantifier_on_an_empty_language_is_false`)
+/// or `wr_core::infinite`'s own hand-built-`Fa` unit tests. Confirmed live against the
+/// real `walnut-java` CLI: `eval t8 "?msd_2 Ix (x<5 & x>10)";` prints `FALSE`.
+#[test]
+fn infinite_quantifier_empty_language_matches_real_walnut() {
+    assert_verdict("?msd_2 Ix (x<5 & x>10)", false);
+}
+
 /// Base 3 instead of base 2, so a base-specific digit-decode bug in
 /// `remove_leading_zeros_helper`'s reversal branch can't hide behind base 2's degenerate
 /// digit-equals-index alphabet.
