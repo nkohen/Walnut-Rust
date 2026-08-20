@@ -2334,6 +2334,52 @@ bug costs a silent wrong answer somewhere downstream.
 
 ---
 
+## WB-044 — `split`/`rsplit` on a TRUE/FALSE automaton dies with a raw `IndexOutOfBoundsException` instead of a diagnostic
+
+- **Where:** `Main/Commands/Split.java:57` (`Automaton N = subautomata.remove(0);`), reached
+  with an empty `subautomata` list from `:51-53`.
+- **What:** a trivial (`true`/`false`) automaton has no output vector — `M.fa.getO()` is
+  empty — so `outputs` is empty, `WordAutomaton.uncombine(M, outputs)` returns an empty
+  list, and `subautomata.remove(0)` throws
+  `java.lang.IndexOutOfBoundsException: Index 0 out of bounds for length 0`. The user typed
+  a perfectly ordinary command (`split out T[+];` where `T.txt` contains `true`) and gets a
+  JDK stack trace rather than one of the four `WalnutException`s this very method already
+  raises for its other bad-input cases ("Automaton … does not exist.", "Cannot split without
+  inputs.", "Cannot process split automaton with no inputs.", "Split automaton has incorrect
+  number of inputs."). `processSplit`'s own `getAlphabetSize() == 0` guard (`:73-75`) is the
+  check that *would* have caught it, but it never runs — the crash happens in
+  `processSplitCommand`, one frame above, before any subautomaton is processed.
+- **Confirmed live:** run against `target/Walnut-all.jar` in a scratch Walnut home whose
+  `Automata Library/T.txt` is the single line `true`:
+
+  ```text
+  split out T[+];
+  java.lang.IndexOutOfBoundsException: Index 0 out of bounds for length 0
+  	at java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:64)
+  ```
+
+  `Prover.readBuffer` catches it and the REPL survives, so this is a bad diagnostic rather
+  than a lost session.
+- **Found:** the `split`/`rsplit` port (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`, Layer B),
+  2026-08-20, by running the same input through both engines rather than by reading the
+  source.
+- **Rust port:** ported verbatim — `wr_cli::split::process_split_command` performs the same
+  unguarded `remove(0)`, which panics and is recovered by `Prover::caught` (this port's
+  stand-in for Java's `catch (RuntimeException)`), so the session survives exactly as Java's
+  does. **The message text differs**: Rust's `Vec::remove` says `removal index (is 0) should
+  be < len (is 0)` where the JVM says `Index 0 out of bounds for length 0`. That is the
+  pre-existing, documented `ProverError::Thrown` divergence (see `Prover::caught`'s docs),
+  not a new one, and no golden fixture compares this text. Pinned by
+  `wr_cli::split`'s `split_on_a_true_automaton_recovers_like_java_does`.
+- **Upstream:** not filed. Fixing it would mean adding a guard Java does not have (most
+  naturally hoisting `processSplit`'s `getAlphabetSize() == 0` check, or its own message,
+  up into `processSplitCommand`), i.e. a deliberate divergence needing explicit sign-off per
+  `CLAUDE.md`'s log-then-decide process.
+- **Severity:** cosmetic. Both engines refuse the command and both survive; only the
+  diagnostic quality is wrong.
+
+---
+
 ## Dead code / doc-vs-implementation mismatches (tracked in `PROGRESS.md`, not duplicated here)
 
 Several Phase 0 findings are confirmed-dead code or javadoc/implementation mismatches with **no

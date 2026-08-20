@@ -701,6 +701,7 @@ name = "wr-cli"
 version = "0.0.0"
 dependencies = [
  "mimalloc",
+ "num-bigint",
  "proptest",
  "regex-automata",
  "wr-core",

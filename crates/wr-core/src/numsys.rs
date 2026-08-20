@@ -55,17 +55,23 @@
 //!   `NumberSystem::multiplication`'s (`:986-994`), and
 //!   `NumberSystem::division`'s two operand selections (`:1046-1048`).
 //!
-//! ### Still absent: the base-change surface (Layer B, `split`/`rsplit`)
+//! ### The base-change surface (Layer B, `split`/`rsplit`)
 //!
 //! `baseNBaseChange` (`:568-601`), `setBaseChangeAutomaton` (`:443-468`),
 //! `determineNegativeNS` (`:219-230`), the `baseChange` field and
-//! `UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) are still not ported. They are not part of
-//! the numeration system a user can write in a formula: `determineNegativeNS`'s own
-//! javadoc says "Currently used ONLY in split command", and `setBaseChangeAutomaton`'s
-//! `isNeg == false` arms were found dead by Phase 0 besides
-//! (`docs/WALNUT-BUGS.md`'s dead-code section;
+//! `UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) landed with Layer B, as
+//! `base_n_base_change`, [`NumberSystem::set_base_change_automaton`],
+//! [`negative_ns_name`] + [`base_change_candidate_names`], and
+//! [`NumberSystem::base_change`]. They are NOT part of the numeration system a user can
+//! write in a formula — `determineNegativeNS`'s own javadoc says "Currently used ONLY in
+//! split command" — which is why they are a separate layer from the arithmetic surface
+//! above and why nothing in `eval`/`def`/`reg` touches them.
+//!
+//! `setBaseChangeAutomaton`'s `isNeg == false` arms are ported but were found dead by
+//! Phase 0 (`docs/WALNUT-BUGS.md`'s dead-code section;
 //! `NumberSystemTest.testBaseChangeOnAPositiveNumberSystemCannotCompare` can only reach
-//! them by reflection).
+//! them by reflection) — `determineNegativeNS`, the only production caller, always calls
+//! it on a system that is already negative.
 //!
 //! ## U5 (Phase 3a): file-backed custom bases, I/O-free
 //!
@@ -297,9 +303,12 @@ pub const UNDERSCORE_ADDITION_AUTOMATON: &str = "_addition.txt";
 /// `NumberSystem.UNDERSCORE_LESS_THAN_AUTOMATON` (`:84`).
 pub const UNDERSCORE_LESS_THAN_AUTOMATON: &str = "_less_than.txt";
 
-// `NumberSystem.UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`) is NOT ported yet: the whole
-// base-change surface (`setBaseChangeAutomaton`, `baseNBaseChange`, `determineNegativeNS`)
-// exists only to serve the `split`/`rsplit` command, and is Layer B of this unit.
+/// `NumberSystem.NEG_UNDERSCORE` (`:77`) — the prefix `determineNegativeNS` (`:226`) and
+/// `setBaseChangeAutomaton` (`:450`) build a negative base's name out of. Distinct from
+/// [`UNDERSCORE_NEG_UNDERSCORE`], which is the `isNeg` *test*.
+pub const NEG_UNDERSCORE: &str = "neg_";
+/// `NumberSystem.UNDERSCORE_BASE_CHANGE_AUTOMATON` (`:82`).
+pub const UNDERSCORE_BASE_CHANGE_AUTOMATON: &str = "_base_change.txt";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -387,6 +396,13 @@ pub enum NumSysError {
     /// `"All 3 inputs of the addition automaton must have the same alphabet: base " + name`
     /// (`:357-362`).
     AdditionAlphabetsDiffer(String),
+    /// `WalnutException.numberSystemCannotCompare` — `"Number system cannot be
+    /// compared."` (`WalnutException.java:105-107`), thrown by `setBaseChangeAutomaton`
+    /// (`:464`) when no base-change automaton could be found or built. Phase 0 confirmed
+    /// this arm is only reachable by reflection in Java's own test suite: its sole
+    /// production caller, `determineNegativeNS`, always hands it a name whose base is
+    /// `^neg_\d+$` or a shipped `_base_change.txt`.
+    NumberSystemCannotCompare,
     /// `UNDERSCORE_LESS_THAN_AUTOMATON + " must have exactly 2 inputs: base " + name`
     /// (`:383-385`).
     LessThanInputCount(String),
@@ -469,6 +485,9 @@ impl fmt::Display for NumSysError {
                 f,
                 "{UNDERSCORE_LESS_THAN_AUTOMATON} must have exactly 2 inputs: base {name}"
             ),
+            NumSysError::NumberSystemCannotCompare => {
+                write!(f, "Number system cannot be compared.")
+            }
             NumSysError::LessThanAlphabetMismatch(name) => write!(
                 f,
                 "Inputs of {UNDERSCORE_LESS_THAN_AUTOMATON} must have the same alphabet as \
@@ -789,6 +808,73 @@ pub fn parse_base_of(name: &str) -> Result<i32, NumSysError> {
     Ok(base)
 }
 
+/// The NAME half of `NumberSystem.determineNegativeNS()` (`:219-230`).
+///
+/// Java's method builds a `NumberSystem`; this returns only the name to build it from,
+/// because constructing one may need `Custom Bases/` files and `wr-core` performs no file
+/// I/O (`wr_cli::split` resolves the name through the session's `PredicateEnv`, then calls
+/// [`NumberSystem::set_base_change_automaton`] — together those two are Java's `:219-229`).
+///
+/// The quirk Java's own `NumberSystemTest.testMakeNeg` pins with the comment *"double
+/// negative... remains negative. By design. ?"*: an ALREADY-negative system returns
+/// itself, so `msd_neg_3` maps to `msd_neg_3`, not to `msd_neg_neg_3`.
+pub fn negative_ns_name(name: &str) -> Result<String, NumSysError> {
+    if name.contains(UNDERSCORE_NEG_UNDERSCORE) {
+        // `if (isNeg) negativeNumberSystem = this;` (`:221-222`).
+        return Ok(name.to_string());
+    }
+    let msd_or_lsd = determine_msd_or_lsd(name)?;
+    let base = determine_base(name);
+    // `new NumberSystem(msdOrLsd + UNDERSCORE_NEG_UNDERSCORE + base)` (`:226`).
+    Ok(format!("{msd_or_lsd}{UNDERSCORE_NEG_UNDERSCORE}{base}"))
+}
+
+/// The two `Custom Bases/*_base_change.txt` files `setBaseChangeAutomaton`'s single
+/// `loadAutomatonOrNull` probe (`:445-453`) considers, as `(main, complement)` — the
+/// base-change twin of [`custom_base_candidate_names`].
+///
+/// It is NOT the same computation, which is exactly why it is its own function.
+/// `setBaseChangeAutomaton` passes `loadAutomatonOrNull` a doctored name and a doctored
+/// base (`:450-453`):
+///
+/// ```text
+/// negBaseNoLead = "neg_" + base                                  // "neg_10"
+/// mainName      = isNeg ? name : (msdOrLsd + "_" + negBaseNoLead) // "msd_neg_10"
+/// compBase      = isNeg ? base : negBaseNoLead                    // "neg_10"
+/// ```
+///
+/// and `loadAutomatonOrNull` then forms `mainName + ext` and
+/// `(isMsd ? "lsd" : "msd") + "_" + compBase + ext`. So for `msd_neg_fib` the pair is
+/// `msd_neg_fib_base_change.txt` / `lsd_neg_fib_base_change.txt` — and note the second is
+/// the *opposite direction, same base*, to be language-reversed by
+/// [`CustomBaseCandidates::resolve`] exactly like the adder's complement.
+///
+/// The `!isNeg` arms are ported but dead in production (see
+/// [`NumberSystem::set_base_change_automaton`]); they exist so the name computation is a
+/// faithful port rather than a specialization.
+pub fn base_change_candidate_names(name: &str) -> Result<(String, String), NumSysError> {
+    let msd_or_lsd = determine_msd_or_lsd(name)?;
+    let is_msd = msd_or_lsd == MSD;
+    let is_neg = name.contains(UNDERSCORE_NEG_UNDERSCORE);
+    let base = determine_base(name);
+    let neg_base_no_lead = format!("{NEG_UNDERSCORE}{base}");
+    let main_name = if is_neg {
+        name.to_string()
+    } else {
+        format!("{msd_or_lsd}_{neg_base_no_lead}")
+    };
+    let comp_base = if is_neg {
+        base.to_string()
+    } else {
+        neg_base_no_lead
+    };
+    let complement_direction = if is_msd { LSD } else { MSD };
+    Ok((
+        format!("{main_name}{UNDERSCORE_BASE_CHANGE_AUTOMATON}"),
+        format!("{complement_direction}_{comp_base}{UNDERSCORE_BASE_CHANGE_AUTOMATON}"),
+    ))
+}
+
 /// `NumberSystem.isNSDiffering` (`:179-192`) — do two per-track number-system lists
 /// (with their alphabets) disagree? Used by `Main/Commands/Union.java:58` and
 /// `Main/Commands/Concat.java:64` to decide whether two operands can be combined.
@@ -1006,6 +1092,77 @@ fn base_neg_n_less_than(n: i32, is_msd: bool) -> Automaton {
     less_than
 }
 
+/// `NumberSystem.baseNBaseChange(int n)` (`:568-601`) — two tracks over `{0..n-1}`,
+/// accepting iff track 0, read as a base-`n` numeral, and track 1, read as a
+/// base-`(-n)` one, denote the same integer.
+///
+/// **Built least-significant-digit first**, which is the opposite of every other
+/// construction in this file. `setBaseChangeAutomaton` (`:457-461`) therefore reverses it
+/// when `isMsd`, where the adder and comparator reverse when `!isMsd`. Getting that
+/// backwards is silent — the two directions have different languages but the same shape —
+/// so it has its own test.
+///
+/// The state numbering is Java's and is opaque without the invariant it encodes. Reading
+/// lsd-first, after `k` digits let `x_k`/`y_k` be the two prefix values and write
+/// `y_k - x_k = c · n^k`; the step is `c' = (c + b·(-1)^k - a) / n`, and `c` stays in
+/// `{0, -1}` while the parity of `k` has to be tracked separately — four states:
+///
+/// | state | `(c, k mod 2)` | Java's transitions |
+/// |-------|----------------|--------------------|
+/// | 0 (accepting) | `(0, even)` | `i == j` → 1 |
+/// | 1 (accepting) | `(0, odd)` | `i == 0 && j == 0` → 0; `i + j == n` → 2 |
+/// | 2 | `(-1, even)` | `i + 1 == j` → 1; `i == n-1 && j == 0` → 3 |
+/// | 3 | `(-1, odd)` | `i + j == n - 1` → 2 |
+///
+/// Acceptance is `c == 0`, i.e. outputs `[1, 1, 0, 0]` — exactly Java's
+/// `IntList.of(1,1,0,0)`. Every one of Java's six `addNewTransition` lines is accounted
+/// for, and no two collide on a `(state, symbol)` pair (state 1's two arms need
+/// `i+j == 0` versus `i+j == n`; state 2's need `i+1 == j` versus `i == n-1 && j == 0`),
+/// which matters because `addNewTransition` REPLACES rather than appends.
+///
+/// Java builds this with the ONE-argument `initBasicAutomaton(IntList)` overload (no
+/// alphabets, no number systems) and then adds two of each by hand, taking their names
+/// from the NEGATIVE system's own `determineBaseNameUnderscore()` — hence
+/// `base_name_underscore` here rather than a bare `is_msd`, so the caller cannot
+/// accidentally pass the positive system's direction.
+fn base_n_base_change(n: i32, is_msd: bool) -> Automaton {
+    let alphabet: Vec<i32> = (0..n).collect();
+    let mut base_change = init_basic_automaton(vec![1, 1, 0, 0], 2, &alphabet, is_msd);
+    // `baseChange.getNS().add(new NumberSystem(baseNameUnderScore + n))` (`:572-573`).
+    let prefix = if is_msd {
+        MSD_UNDERSCORE
+    } else {
+        LSD_UNDERSCORE
+    };
+    base_change.set_ns_names(vec![
+        Some(format!("{prefix}{n}")),
+        Some(format!("{prefix}{NEG_UNDERSCORE}{n}")),
+    ]);
+    let mut l = 0i32;
+    for j in 0..n {
+        for i in 0..n {
+            if i == 0 && j == 0 {
+                add_new_transition(&mut base_change.fa, 1, 0, l);
+            }
+            if i == j {
+                add_new_transition(&mut base_change.fa, 0, 1, l);
+            } else if i + 1 == j {
+                add_new_transition(&mut base_change.fa, 2, 1, l);
+            }
+            if i + j == n {
+                add_new_transition(&mut base_change.fa, 1, 2, l);
+            } else if i + j == n - 1 {
+                add_new_transition(&mut base_change.fa, 3, 2, l);
+            }
+            if i == n - 1 && j == 0 {
+                add_new_transition(&mut base_change.fa, 2, 3, l);
+            }
+            l += 1;
+        }
+    }
+    base_change
+}
+
 /// `NumberSystem.lexicographicLessThan(List<Integer> alphabet)` (`:417-433`) — two
 /// tracks, accepting iff track 0 is lexicographically less than track 1.
 ///
@@ -1116,9 +1273,19 @@ impl CustomBaseCandidates {
 /// `Default::default()` (every candidate absent) reproduces the pre-U5, no-file-loading
 /// behavior exactly, which is what [`NumberSystem::new`] passes.
 ///
-/// There is deliberately no `_base_change.txt` slot: that whole surface is dropped (see
-/// this module's docs), and its sole production caller (`determineNegativeNS`, for the
-/// DROP-scope `split` command) is negative-base-only.
+/// There is deliberately no `_base_change.txt` slot, and the reason is NOT that the
+/// base-change surface is dropped — it is ported (see this module's docs and
+/// [`NumberSystem::set_base_change_automaton`]). It is that `setBaseChangeAutomaton` is a
+/// separate, manually-invoked step in Java too (`:108-110`: "baseChange must be
+/// initialized manually"), reached only from `determineNegativeNS` and so only from
+/// `split`/`rsplit` — never from the constructor this struct feeds. It therefore takes its
+/// own [`CustomBaseCandidates`] parameter rather than riding along here, so an ordinary
+/// `NumberSystem` construction never probes for a base-change file it will not use.
+///
+/// (This paragraph said "that whole surface is dropped" until 2026-08-20; it was missed
+/// when `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`'s Layer B ported the surface, and was
+/// caught by adversarial review rather than by a test — which is the honest reason it is
+/// spelled out at length now.)
 ///
 /// Nothing here covers `setEqualityAutomaton`: **Java never file-loads the equality
 /// automaton** (`:403-409` takes only an alphabet and always builds the diagonal
@@ -1213,6 +1380,14 @@ pub struct NumberSystem {
     ///   `ParseMethods.parseAlphabetDeclaration` → `getComputeIfAbsent`) only ever touches
     ///   *other* instances (and, per `docs/WALNUT-BUGS.md` WB-014, blows up if it does).
     all_representations: Option<Rc<Automaton>>,
+    /// `NumberSystem.baseChange` (`:115`, `public` in Java too): two inputs `(a, b)`,
+    /// accepting iff `a` in the positive base equals `b` in the negative base.
+    ///
+    /// `None` until [`NumberSystem::set_base_change_automaton`] is called — Java's own
+    /// comment at `:108-110` says it "must be initialized manually", and its only
+    /// production caller is `determineNegativeNS` (`:228`), i.e. `split`/`rsplit`. So this
+    /// is `None` for every number system a formula ever builds.
+    base_change: Option<Automaton>,
     /// `constantsDynamicTable`/`multiplicationsDynamicTable`/`divisionsDynamicTable`
     /// (`:126-128`). Java uses `HashMap`; these are `BTreeMap` because [`BigInt`] is
     /// `Ord` and nothing here ever *iterates* them (so `PORTING.md`'s
@@ -1376,6 +1551,9 @@ impl NumberSystem {
             less_than,
             equality,
             all_representations,
+            // `baseChange` is NOT set by the constructor (Java `:108-110`: "must be
+            // initialized manually") -- see `set_base_change_automaton`.
+            base_change: None,
             constants_dynamic_table: RefCell::new(BTreeMap::new()),
             multiplications_dynamic_table: RefCell::new(BTreeMap::new()),
             divisions_dynamic_table: RefCell::new(BTreeMap::new()),
@@ -1572,6 +1750,70 @@ impl NumberSystem {
     /// binding. See that method's docs — the difference is unobservable.
     pub fn all_representations(&self) -> Option<&Rc<Automaton>> {
         self.all_representations.as_ref()
+    }
+
+    /// `NumberSystem.baseChange` (`:115`) — `None` until
+    /// [`NumberSystem::set_base_change_automaton`] has run. Java exposes the field
+    /// directly; this is the accessor, read by `wr_cli::split`.
+    pub fn base_change(&self) -> Option<&Automaton> {
+        self.base_change.as_ref()
+    }
+
+    /// `NumberSystem.setBaseChangeAutomaton()` (`:443-468`), with the one
+    /// `loadAutomatonOrNull` probe (`:453`) lifted out into a caller-supplied
+    /// [`CustomBaseCandidates`], exactly as
+    /// [`NumberSystem::with_custom_base_files`] does for the other three — `wr-core`
+    /// performs no file I/O. Use [`base_change_candidate_names`] to compute the two file
+    /// names, so Java's unusual naming (see that function) is not re-derived at the call
+    /// site.
+    ///
+    /// Java's `if (baseChange != null) return;` memo guard (`:444`) is ported: calling
+    /// this twice is a no-op, which is what makes `determineNegativeNS` idempotent.
+    ///
+    /// **The reverse runs when `isMsd`** (`:457-461`), the OPPOSITE of every other
+    /// construction in this file, because `base_n_base_change` builds lsd-first. Java
+    /// brackets that one call in `disablePrint`/`enablePrint`; ported, including WB-039's
+    /// non-nesting behaviour.
+    ///
+    /// `applyAllRepresentations()` (`:467`) runs on BOTH paths, loaded or programmatic.
+    /// It is a no-op for a programmatic base (no all-representations file exists for
+    /// `msd_neg_2`), and real for a file-backed one — `msd_neg_fib_base_change.txt`'s
+    /// header declares `msd_fib msd_neg_fib`, both of which ship an all-reps file.
+    pub fn set_base_change_automaton(
+        &mut self,
+        loaded: CustomBaseCandidates,
+        logging: &mut crate::logging::Logging,
+    ) -> Result<(), NumSysError> {
+        // `if (baseChange != null) return;` (`:444`).
+        if self.base_change.is_some() {
+            return Ok(());
+        }
+        let base = determine_base(&self.name);
+        let mut base_change = match loaded.resolve() {
+            Some(loaded) => loaded,
+            None => {
+                // `if (UtilityMethods.parseNegNumber(base) > 1)` (`:455`).
+                let neg = crate::util::try_parse_neg_number(base)
+                    .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
+                if neg <= 1 {
+                    // `if (baseChange == null) throw numberSystemCannotCompare();`
+                    // (`:463-465`) -- the arm a POSITIVE base falls into, which Phase 0
+                    // found is only reachable by reflection in Java's own test suite.
+                    return Err(NumSysError::NumberSystemCannotCompare);
+                }
+                let mut a = base_n_base_change(neg, self.is_msd);
+                if self.is_msd {
+                    logging.disable_print();
+                    reverse(&mut a, false);
+                    logging.enable_print();
+                }
+                a
+            }
+        };
+        // `baseChange.applyAllRepresentations()` (`:467`).
+        base_change.apply_all_representations(logging);
+        self.base_change = Some(base_change);
+        Ok(())
     }
 
     /// `NumberSystem.getAlphabet()` (`:257-259`) — `addition.richAlphabet.getA().get(0)`.
@@ -4679,6 +4921,286 @@ mod tests {
                         "msd_neg_2: {x}/{k} == {y}?"
                     );
                 }
+            }
+        }
+    }
+
+    // =========================================================================
+    // The base-change surface (Layer B: `split`/`rsplit`)
+    // =========================================================================
+
+    /// `NumberSystemTest.testMakeNeg` (`:116-127`) — the name half, which is all
+    /// [`negative_ns_name`] is (see its docs on why the object half moved to `wr-cli`).
+    /// Includes the "double negative... remains negative. By design. ?" quirk Java's own
+    /// test pins.
+    #[test]
+    fn negative_ns_name_matches_determine_negative_ns() {
+        assert_eq!(negative_ns_name("msd_3").unwrap(), "msd_neg_3");
+        assert_eq!(negative_ns_name("lsd_3").unwrap(), "lsd_neg_3");
+        assert_eq!(negative_ns_name("msd_fib").unwrap(), "msd_neg_fib");
+        // Already negative -> unchanged, NOT `msd_neg_neg_3`.
+        assert_eq!(negative_ns_name("msd_neg_3").unwrap(), "msd_neg_3");
+        assert_eq!(negative_ns_name("lsd_neg_fib").unwrap(), "lsd_neg_fib");
+        // `determineMsdOrLsd` throws without a `_`; here that is `MalformedName`.
+        assert_eq!(
+            negative_ns_name("bogus").unwrap_err(),
+            NumSysError::MalformedName("bogus".to_string())
+        );
+    }
+
+    /// [`base_change_candidate_names`] against the two shapes Java's `:445-453` produces.
+    /// The `msd_neg_fib` row is checkable against reality: `walnut-java`'s
+    /// `Custom Bases/` really does ship `msd_neg_fib_base_change.txt` and really does not
+    /// ship `lsd_neg_fib_base_change.txt`.
+    #[test]
+    fn base_change_candidate_names_match_javas_doctored_naming() {
+        assert_eq!(
+            base_change_candidate_names("msd_neg_fib").unwrap(),
+            (
+                "msd_neg_fib_base_change.txt".to_string(),
+                "lsd_neg_fib_base_change.txt".to_string()
+            )
+        );
+        assert_eq!(
+            base_change_candidate_names("lsd_neg_3").unwrap(),
+            (
+                "lsd_neg_3_base_change.txt".to_string(),
+                "msd_neg_3_base_change.txt".to_string()
+            )
+        );
+        // The `!isNeg` arms (dead in production): the "neg_" is INSERTED into both names.
+        assert_eq!(
+            base_change_candidate_names("msd_10").unwrap(),
+            (
+                "msd_neg_10_base_change.txt".to_string(),
+                "lsd_neg_10_base_change.txt".to_string()
+            )
+        );
+    }
+
+    /// `NumberSystemTest.testBaseChangeOnAPositiveNumberSystemCannotCompare` (`:396-410`).
+    /// Java needs reflection to reach this (the method is private and its only caller
+    /// hands it a negative system); here the method is `pub`, so the test is direct — but
+    /// the arm is equally unreachable in production, and this pins that reaching it is
+    /// still a clean error rather than a bogus automaton.
+    #[test]
+    fn base_change_on_a_positive_number_system_cannot_compare() {
+        let mut ns = NumberSystem::new("msd_10").unwrap();
+        assert_eq!(
+            ns.set_base_change_automaton(
+                CustomBaseCandidates::default(),
+                &mut crate::logging::Logging::new()
+            )
+            .unwrap_err(),
+            NumSysError::NumberSystemCannotCompare
+        );
+        assert!(ns.base_change().is_none());
+    }
+
+    /// Java's `if (baseChange != null) return;` memo guard (`:444`), which is what makes
+    /// `determineNegativeNS` idempotent — `NumberSystemTest.
+    /// testNegativeFibonacciBaseChangeComesFromACustomBaseFile` (`:377-393`) asserts the
+    /// second call hands back the very same instance.
+    #[test]
+    fn set_base_change_automaton_is_idempotent() {
+        let mut ns = NumberSystem::new("msd_neg_3").unwrap();
+        let log = &mut crate::logging::Logging::new();
+        ns.set_base_change_automaton(CustomBaseCandidates::default(), log)
+            .unwrap();
+        let first = ns.base_change().unwrap().clone();
+        // A second call with DIFFERENT (here: still empty) candidates must not rebuild.
+        ns.set_base_change_automaton(CustomBaseCandidates::default(), log)
+            .unwrap();
+        assert_eq!(ns.base_change().unwrap().fa.q, first.fa.q);
+        assert_eq!(ns.base_change().unwrap().fa.d, first.fa.d);
+    }
+
+    /// `NumberSystemTest.testLsdNegativeNumberSystemGetsABaseChangeAutomaton` (`:361-374`)
+    /// plus the structural half of `testMakeNeg`: two tracks, both over `{0..n-1}`, named
+    /// after the POSITIVE and NEGATIVE systems in that order.
+    #[test]
+    fn a_negative_number_system_gets_a_two_track_base_change_automaton() {
+        for (name, is_msd) in [("msd_neg_3", true), ("lsd_neg_3", false)] {
+            let mut ns = NumberSystem::new(name).unwrap();
+            assert_eq!(ns.is_msd(), is_msd, "{name}");
+            ns.set_base_change_automaton(
+                CustomBaseCandidates::default(),
+                &mut crate::logging::Logging::new(),
+            )
+            .unwrap();
+            let bc = ns.base_change().unwrap();
+            assert_eq!(bc.alphabet, vec![vec![0, 1, 2], vec![0, 1, 2]], "{name}");
+            let prefix = if is_msd { "msd" } else { "lsd" };
+            assert_eq!(
+                bc.track_ns_names(),
+                vec![Some(format!("{prefix}_3")), Some(format!("{prefix}_neg_3"))],
+                "{name}"
+            );
+        }
+    }
+
+    /// The FILE branch of `setBaseChangeAutomaton` (`:453`), which every other test in
+    /// this section misses because they all pass `CustomBaseCandidates::default()` — i.e.
+    /// they only ever exercise the programmatic `baseNBaseChange` fallback.
+    ///
+    /// Added after adversarial review flagged exactly that gap: the one base-change file
+    /// Walnut actually ships (`Custom Bases/msd_neg_fib_base_change.txt`) is the only
+    /// input that reaches this branch in production, and nothing at the `wr-core` level
+    /// was reading a supplied candidate at all. (`wr-cli`'s
+    /// `tests/differential/tests/split_command.rs::
+    /// split_over_a_custom_base_loads_its_shipped_base_change_file` covers it end-to-end
+    /// against real `walnut-java` output; this is the unit-level twin, so the branch is
+    /// pinned in the crate that owns it too.)
+    ///
+    /// Both halves matter and are asserted separately: that a supplied `main` candidate is
+    /// USED (not silently ignored in favour of the programmatic construction), and that a
+    /// supplied `complement` is used AND language-reversed, which is
+    /// `CustomBaseCandidates::resolve`'s contract and the only way `lsd_neg_fib` resolves
+    /// at all, since Walnut ships no `lsd_neg_fib_base_change.txt`.
+    #[test]
+    fn a_supplied_base_change_file_is_used_instead_of_the_programmatic_construction() {
+        let log = &mut crate::logging::Logging::new();
+        // A deliberately DIFFERENT automaton from anything `base_n_base_change(3)` builds:
+        // one state, accepting, self-looping on the diagonal only.
+        let marker = || {
+            let mut a = init_basic_automaton(vec![1], 2, &[0, 1, 2], true);
+            add_new_transition(&mut a.fa, 0, 0, 0);
+            a
+        };
+        let programmatic = {
+            let mut ns = NumberSystem::new("msd_neg_3").unwrap();
+            ns.set_base_change_automaton(CustomBaseCandidates::default(), log)
+                .unwrap();
+            ns.base_change().unwrap().clone()
+        };
+        // `base_n_base_change(3)` builds 4 states, and `msd_neg_3` then REVERSES it
+        // (`:457-461`), which redeterminizes — hence 5, not 4. Either way it is nothing
+        // like the 1-state marker below, which is the point of measuring it.
+        assert_eq!(
+            programmatic.fa.q, 5,
+            "the fallback is the reversed 4-state build"
+        );
+        assert_eq!(
+            NumberSystem::new("lsd_neg_3")
+                .map(|mut ns| {
+                    ns.set_base_change_automaton(CustomBaseCandidates::default(), log)
+                        .unwrap();
+                    ns.base_change().unwrap().fa.q
+                })
+                .unwrap(),
+            4,
+            "…and the unreversed lsd direction is the raw 4-state build"
+        );
+
+        // `main` present -> used AS-IS, never reversed (Java's `loadAutomatonOrNull`
+        // returns the main file untouched).
+        let mut ns = NumberSystem::new("msd_neg_3").unwrap();
+        ns.set_base_change_automaton(
+            CustomBaseCandidates {
+                main: Some(marker()),
+                complement: None,
+            },
+            log,
+        )
+        .unwrap();
+        let loaded = ns.base_change().unwrap();
+        assert_eq!(
+            loaded.fa.q, 1,
+            "the supplied file must win over the fallback"
+        );
+        assert_eq!(loaded.fa.d, marker().fa.d, "…and be used unmodified");
+
+        // `complement` only -> used, and language-REVERSED. `marker()` self-loops on one
+        // symbol from its single accepting start state, so its language is closed under
+        // reversal; use an asymmetric two-state automaton instead, or the assertion would
+        // pass either way.
+        let asymmetric = || {
+            let mut a = init_basic_automaton(vec![0, 1], 2, &[0, 1, 2], true);
+            add_new_transition(&mut a.fa, 0, 1, 0);
+            add_new_transition(&mut a.fa, 1, 1, 4);
+            a
+        };
+        let mut expected = asymmetric();
+        reverse(&mut expected, false);
+        let mut ns = NumberSystem::new("msd_neg_3").unwrap();
+        ns.set_base_change_automaton(
+            CustomBaseCandidates {
+                main: None,
+                complement: Some(asymmetric()),
+            },
+            log,
+        )
+        .unwrap();
+        let loaded = ns.base_change().unwrap().clone();
+        assert!(
+            same_language(&loaded, &expected),
+            "a complement-only candidate must be the REVERSED file"
+        );
+        assert!(
+            !same_language(&loaded, &asymmetric()),
+            "…and reversing it must be observable, or this test proves nothing"
+        );
+    }
+
+    /// Tier-4: **the base-change automaton really is the base-`n` ⟷ base-`(-n)` identity**,
+    /// EXHAUSTIVELY over every pair of equal-length digit words, in BOTH directions.
+    ///
+    /// This is the property that pins `set_base_change_automaton`'s inverted reverse —
+    /// `base_n_base_change` is built lsd-first, so Java reverses when `isMsd`, the opposite
+    /// of the adder and comparator. A port that copied the usual `if (!isMsd)` would build
+    /// two automata that are each other's mirror, both plausible-looking, and only a test
+    /// that reads real digit words in a known direction can tell them apart.
+    ///
+    /// The positive-base oracle is the same Horner fold as [`value_msd`], widened to `i64`
+    /// so it can be compared against [`value_msd_neg`] without a cast at the comparison.
+    #[test]
+    fn base_change_automaton_relates_base_n_to_base_minus_n() {
+        fn value_base_n(digits: &[i32], n: i32) -> i64 {
+            digits
+                .iter()
+                .fold(0i64, |acc, &d| acc * i64::from(n) + i64::from(d))
+        }
+        for n in [2, 3] {
+            let len = if n == 2 { 6 } else { 4 };
+            let words = all_neg_base_words(n, len);
+            for (name, is_msd) in [
+                (format!("msd_neg_{n}"), true),
+                (format!("lsd_neg_{n}"), false),
+            ] {
+                let mut ns = NumberSystem::new(&name).unwrap();
+                ns.set_base_change_automaton(
+                    CustomBaseCandidates::default(),
+                    &mut crate::logging::Logging::new(),
+                )
+                .unwrap();
+                let mut bc = ns.base_change().unwrap().clone();
+                bc.bind(names(&["p", "q"]));
+                let mut accepted = 0usize;
+                for x in &words {
+                    for y in &words {
+                        // The words are always written most-significant-digit first; an
+                        // `lsd` automaton reads them reversed.
+                        let (fx, fy): (Vec<i32>, Vec<i32>) = if is_msd {
+                            (x.clone(), y.clone())
+                        } else {
+                            (
+                                x.iter().rev().copied().collect(),
+                                y.iter().rev().copied().collect(),
+                            )
+                        };
+                        let word = word_by_label(&bc, &[("p", &fx), ("q", &fy)]);
+                        let got = accepts_tuples(&bc, &word);
+                        assert_eq!(
+                            got,
+                            value_base_n(x, n) == value_msd_neg(y, n),
+                            "{name}: {x:?} (base {n} = {}) vs {y:?} (base -{n} = {})",
+                            value_base_n(x, n),
+                            value_msd_neg(y, n)
+                        );
+                        accepted += usize::from(got);
+                    }
+                }
+                assert!(accepted > 0, "{name}: swept no accepting pair");
             }
         }
     }

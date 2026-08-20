@@ -24,6 +24,10 @@ wr-cts = { path = "../wr-cts" }
 # numbering, which is what lets `Prover.java`'s `static int GROUP_… = 20` constants be ported
 # as literal group indices.
 regex-automata.workspace = true
+# `NumberSystem.arithmetic(String, String, BigInteger, Ops)`'s signature, reached by
+# `crate::split`'s port of `Split.java:112` (`arithmetic(…, 0, PLUS)`). Same workspace pin
+# `wr-core`/`wr-logic` already use; see the `[workspace.dependencies]` entry.
+num-bigint.workspace = true
 # U33: the global allocator, registered in `src/main.rs` (the `walnut-rs` BINARY only -- the
 # `wr_cli` LIBRARY neither registers nor forces one, so an embedder keeps its own choice).
 # `#[global_allocator]` is a whole-program, link-time selection, so this is the one place the

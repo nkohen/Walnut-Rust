@@ -398,17 +398,24 @@ pub fn defined_name(command_script: &str) -> Option<String> {
 /// # Why the seeded `Global` library does NOT count as "the name is available"
 ///
 /// An earlier draft of this rule exempted a name that already exists in the seeded `Global`
-/// tree, on the theory that the fixture could read the seed copy instead. Concretely wrong,
-/// and the corpus proves it: `Global/Word Automata Library/test444.txt` exists — but it is a
-/// leftover from a previous Java run of fixture 444, `rsplit test444[+][+] test440;`, whose
-/// output is DROP-scope because `rsplit` is (see `docs/BOUNDARY-MAP.md` §6). A name a DROP
+/// tree, on the theory that the fixture could read the seed copy instead. That was
+/// concretely wrong, and the corpus proved it: `Global/Word Automata Library/test444.txt`
+/// exists — but it is a leftover from a previous Java run of fixture 444,
+/// `rsplit test444[+][+] test440;`, so it is a DROP fixture's own output. A name a DROP
 /// fixture defines is unavailable no matter which copy is on disk.
 ///
-/// (Its header is `msd_neg_2`, and until 2026-08-20 that was a second, independent reason
-/// this port could not even read the seed copy. Negative-base numeration is ported now
-/// — `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A — so the header no longer disqualifies
-/// it and the `rsplit` command alone does. The rule and the classifier are unchanged: both
-/// are driven by `subset_relevant`, not by whether the file happens to parse.)
+/// **That example no longer applies, and is kept only because it is what the rule was
+/// derived from.** Fixture 444 was DROP for two independent reasons — its `msd_neg_2`
+/// header and the `rsplit` command — and both were removed on 2026-08-20 by
+/// `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`'s two layers. As of then `subset-filter.json`
+/// records `drop_relevant_count: 0`, so this function returns an EMPTY map against the real
+/// corpus and the `Global`-seed question is moot in practice.
+///
+/// The rule and the classifier are unchanged, and deliberately so: both are driven by
+/// `subset_relevant`, not by whether a file happens to parse or by any hardcoded id, so a
+/// future DROP decision re-arms them automatically. The unit tests below still exercise
+/// every branch, against synthetic fixtures rather than the real manifest — which is why
+/// they keep passing while the real-corpus result is empty.
 ///
 /// `global_library_names` is therefore no longer consulted for the availability decision; it
 /// is kept as a parameter (and asserted against) purely so the harness can report when the two

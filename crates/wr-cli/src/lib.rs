@@ -34,6 +34,7 @@ pub mod reg;
 pub mod reverse;
 pub mod session;
 pub mod simple_transforms;
+pub mod split;
 pub mod test_case;
 pub mod test_command;
 pub mod transduce;

@@ -553,6 +553,78 @@ fn reverse_prints_detail_text_matching_real_walnut() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// `split` — the SIXTEENTH call site of the same bug, found by adversarial review of
+/// `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`'s Layer B, months after this backlog item
+/// nominally closed the class.
+///
+/// `crate::split::process_split` threaded the caller's real `Logging` into every `and`,
+/// `arithmetic_const_c`, `combine` and `apply_all_representations` call — and then used
+/// the plain `wr_core::quantify::quantify` wrapper, which substitutes a throwaway
+/// `Logging::new()`, for exactly one primitive. The whole per-subautomaton
+/// `quantifying:` / `quantified:` / `fixing leading zeros:` / `fixed leading zeros:`
+/// block therefore vanished (23 lines on the two-track case below, live-diffed against
+/// the real jar).
+///
+/// **No golden fixture would ever have caught this**: none of the corpus's 15
+/// `split`/`rsplit` fixtures carries a `::` suffix (checked against
+/// `phase0-artifacts/test-manifest.json`). That is precisely why this file exists.
+///
+/// Real `walnut-java` console output for `split slout sl[+][-];::` over
+/// `?msd_2 x < y`, the four `quantify`-owned line kinds (there are two subautomata, so
+/// the block appears twice):
+///
+/// ```text
+/// quantifying:1 states
+///   Minimizing: 1 states.
+///   Minimized:1 states - 0ms.
+/// quantified:1 states - 0ms
+/// fixing leading zeros:1 states
+///  Determinizing [#0, strategy: SC]: 1 states
+///  Determinized: 1 states - 1ms
+///  Minimizing: 1 states.
+///  Minimized:1 states - 0ms.
+/// fixed leading zeros:1 states - 2ms
+/// ```
+#[test]
+fn split_prints_the_quantify_detail_text_real_walnut_does() {
+    let (session, dir) = temp_session("split");
+    let mut prover = fresh_prover(session);
+    dispatch_and_get_details(&mut prover, "eval sl \"?msd_2 x < y\";");
+
+    let details = dispatch_and_get_details(&mut prover, "split slout sl[+][-];::");
+    for expected in [
+        "quantifying:",
+        "quantified:",
+        "fixing leading zeros:",
+        "fixed leading zeros:",
+    ] {
+        assert!(
+            details.contains(expected),
+            "split's detailed_log must contain {expected:?} -- this is the exact line \
+             class the throwaway-`Logging::new()` bug swallowed; got:\n{details}"
+        );
+    }
+    // Two subautomata (`uncombine` over the operand's two distinct outputs), so the block
+    // really does appear twice -- a single occurrence would mean the real `Logging`
+    // reached one call and not the other.
+    assert_eq!(
+        details.matches("fixed leading zeros:").count(),
+        2,
+        "one `fixing/fixed leading zeros` block per subautomaton; got:\n{details}"
+    );
+    // Same known open gap as `reverse` above: `ctx` is `None` on every non-`eval`/`def`
+    // path. Java prints `Determinizing [#0…]`/`[#1…]`/`[#2…]` inside this very block, so
+    // this assertion also records that split's metacommand INDICES differ from Java's --
+    // see `crate::split::process_split`'s own comment on that deliberate boundary.
+    assert!(
+        !details.contains("Determinizing ["),
+        "known open gap (U32-scoped): if this now fails the gap was closed and this \
+         assertion, plus `crate::split::process_split`'s comment, should be updated \
+         rather than deleted; got:\n{details}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
 /// `concat` (`automaton_ops.rs`'s `concat_pair` + `concat_command`'s fold) — two
 /// separate adversarial-review findings in one command: `concat_pair` called the plain
 /// `determinize_and_minimize()` (throwing away its own `Logging` internally) despite

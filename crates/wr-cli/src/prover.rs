@@ -144,6 +144,7 @@ use crate::session::{Session, SessionPaths, PROMPT, WALNUT_VERSION};
 use crate::simple_transforms::{
     fix_lead_zero_command, fix_trail_zero_command, minimize_command, SimpleTransformError,
 };
+use crate::split::SplitError;
 use crate::test_case::TestCase;
 use crate::test_command::{test_command_to, TestError};
 use crate::transduce::TransduceCommandError;
@@ -640,6 +641,8 @@ pub enum ProverError {
     Convert(ConvertError),
     /// `ost` (`crate::ost`).
     Ost(OstError),
+    /// `split`/`rsplit` (`crate::split`).
+    Split(SplitError),
     /// **Port-specific.** A command this project deliberately does not implement.
     UnsupportedCommand {
         command: &'static str,
@@ -700,6 +703,7 @@ impl std::fmt::Display for ProverError {
             ProverError::Join(e) => write!(f, "{e}"),
             ProverError::Convert(e) => write!(f, "{e}"),
             ProverError::Ost(e) => write!(f, "{e}"),
+            ProverError::Split(e) => write!(f, "{e}"),
             // The recovered guard message, verbatim — the guard-authoring rule in
             // `wr_core::walnut_panic`'s docs makes it Walnut's own text wherever the
             // guard ported one.
@@ -797,6 +801,18 @@ impl LoggableError for ProverError {
             // Result-propagating I/O idiom.
             ProverError::Ost(OstError::Parse(_)) => false,
             ProverError::Ost(_) => true,
+            // Every message `Split.java` produces is a real `WalnutException` — with ONE
+            // exception, which is why this is not a blanket claim: `Ops.fromSymbol`
+            // (`ArithmeticOperator.java:70`) throws `IllegalArgumentException`, not a
+            // `WalnutException`, so the port's matching `SplitError::Core("Unknown
+            // arithmetic operator: …")` renders message-only here where Java would print
+            // the exception-kind prefix. Unreachable on BOTH engines through the real
+            // dispatch — `RE_FOR_INPUT_IN_split_CMD` can only capture `""`/`"+"`/`"-"` —
+            // so it is a latent inconsistency, not a live divergence; named here so a
+            // future change that makes the path reachable has to confront it.
+            // `SplitError::Io` is this port's own Result-propagating idiom and lands in
+            // the same bucket `JoinError`/`ConvertError`/`OstError` already use.
+            ProverError::Split(_) => true,
             // `Integer.parseInt`'s `NumberFormatException` — not a `WalnutException`,
             // same bucket as `MetaCommandError::NumberFormat`.
             ProverError::NumberFormat(_) => false,
@@ -867,6 +883,7 @@ prover_error_from! {
     JoinError => Join,
     ConvertError => Convert,
     OstError => Ost,
+    SplitError => Split,
 }
 
 // ---------------------------------------------------------------------------
@@ -1412,19 +1429,29 @@ impl Prover {
             // `:556-558` -> `Split.processSplitCommand(…, true, …)`. Note the error name
             // Java uses here is `REVERSE_SPLIT` ("reverse split"), not "rsplit".
             RSPLIT => {
-                match_or_fail(&patterns().rsplit, s, REVERSE_SPLIT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: RSPLIT,
-                    unit: "U24",
-                })
+                let caps = match_or_fail(&patterns().rsplit, s, REVERSE_SPLIT)?;
+                Ok(Some(crate::split::process_split_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    true,
+                    group(&caps, s, GROUP_RSPLIT_AUTOMATA).unwrap_or(""),
+                    group(&caps, s, GROUP_RSPLIT_NAME).unwrap_or(""),
+                    group(&caps, s, GROUP_RSPLIT_INPUT).unwrap_or(""),
+                )?))
             }
             // `:559-561` -> `Split.processSplitCommand(…, false, …)`
             SPLIT => {
-                match_or_fail(&patterns().split, s, SPLIT)?;
-                Err(ProverError::NotYetImplemented {
-                    command: SPLIT,
-                    unit: "U24",
-                })
+                let caps = match_or_fail(&patterns().split, s, SPLIT)?;
+                Ok(Some(crate::split::process_split_command(
+                    &self.session,
+                    &mut self.logging,
+                    s,
+                    false,
+                    group(&caps, s, GROUP_SPLIT_AUTOMATA).unwrap_or(""),
+                    group(&caps, s, GROUP_SPLIT_NAME).unwrap_or(""),
+                    group(&caps, s, GROUP_SPLIT_INPUT).unwrap_or(""),
+                )?))
             }
             // `:562-564` -> `Star.star`
             STAR => {
@@ -1960,6 +1987,7 @@ fn is_io_class_error(e: &ProverError) -> bool {
         // logs it (`Ostrowski.writeAutomaton` therefore cannot let one escape at all) —
         // the same reasoning `JoinError`/`ConvertError` get above.
         | ProverError::Ost(_)
+        | ProverError::Split(_)
         // A recovered panic stands in for an unchecked `RuntimeException`, which is by
         // definition NOT the checked `IOException` Java's outer catch selects — so the
         // read loop must log it and read the next line, never end. This is the whole
@@ -2549,6 +2577,26 @@ mod tests {
             )))),
             "convertCommand declares no throws IOException at all"
         );
+        // `split`/`rsplit`: `Split.processSplitCommand` declares no `throws IOException`
+        // either -- `SplitError::Io` exists only because this port's `write_automata`
+        // propagates where Java's `Automaton.writeAutomata` catches its own `IOException`
+        // and merely logs it. Same reasoning as `Join`/`Convert` above; added after
+        // adversarial review pointed out `Split` was the one sibling variant with no
+        // regression test pinning it.
+        assert!(
+            !is_io_class_error(&ProverError::Split(SplitError::Io(io::Error::other(
+                "boom"
+            )))),
+            "processSplitCommand declares no throws IOException at all"
+        );
+        // …and the same for its three non-I/O variants, so the whole enum is pinned rather
+        // than one arm of it.
+        for e in [
+            ProverError::Split(SplitError::Walnut("boom".to_string())),
+            ProverError::Split(SplitError::Core("boom".to_string())),
+        ] {
+            assert!(!is_io_class_error(&e), "{e} must not end the read loop");
+        }
     }
 
     /// The OTHER half of the same distinction, on the other classifier: `is_handled`
@@ -3290,12 +3338,13 @@ mod tests {
         // `convert`/`export`/`image`/`inf`/`join`/`morphism`/`promote` are U24's own
         // batch (implemented as of this unit, see `every_command_pattern_pins_its_group_indices`'s
         // siblings and each command's own `dispatch`-level test below) and are
-        // therefore no longer in this list.
-        let cases = [
-            ("help;", "U22"),
-            ("rsplit S [+] T;", "U24"),
-            ("split S T [+];", "U24"),
-        ];
+        // therefore no longer in this list. `split`/`rsplit` left it on 2026-08-20, when
+        // Layer B of `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` implemented them
+        // (`crate::split`) -- their replacement tripwire is
+        // `split_and_rsplit_reach_a_real_handler_not_a_stub` below, which is what keeps
+        // this test's original purpose (catching a "parses and silently discards" arm)
+        // alive for them.
+        let cases = [("help;", "U22")];
         for (command, unit) in cases {
             let err = p.dispatch(command).unwrap_err();
             match err {
@@ -3305,6 +3354,32 @@ mod tests {
                 other => panic!("{command}: expected NotYetImplemented, got {other}"),
             }
         }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tripwire `split`/`rsplit` inherit from
+    /// `every_unimplemented_command_has_an_arm_that_reports_its_owning_unit`, which they
+    /// left when Layer B implemented them: both must reach a REAL handler, not a stub and
+    /// not a silent success. `S`/`T` do not exist, so the handler's own first check —
+    /// `Split.java:32`'s "Automaton … does not exist." — is what proves the arm is wired
+    /// to `crate::split` and not to a `NotYetImplemented`.
+    ///
+    /// Note `rsplit`'s operand is the FOURTH group and `split`'s is the second (Java's
+    /// `GROUP_RSPLIT_AUTOMATA = 4` vs `GROUP_SPLIT_AUTOMATA = 2`), and the two commands
+    /// put `T` in different POSITIONS (`split S T [+]` vs `rsplit S [+] T`) precisely so
+    /// that both reporting `T` — rather than one of them reporting `S` — is itself a check
+    /// that the group indices are not swapped.
+    #[test]
+    fn split_and_rsplit_reach_a_real_handler_not_a_stub() {
+        let (mut p, dir, _) = prover("splitwired");
+        assert_eq!(
+            p.dispatch("split S T [+];").unwrap_err().to_string(),
+            "Automaton T does not exist."
+        );
+        assert_eq!(
+            p.dispatch("rsplit S [+] T;").unwrap_err().to_string(),
+            "Automaton T does not exist."
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

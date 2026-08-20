@@ -74,9 +74,14 @@ what actually shipped.
   start.
 - **Demand signal**: thin — only 1 golden fixture (`drop_command:ost`) references it.
 
-### 3. Negative-base numeration + `split`/`rsplit` — **negative base PORTED (2026-08-20); `split`/`rsplit` still open**
+### 3. Negative-base numeration + `split`/`rsplit` — **DONE (2026-08-20), both halves**
 
-> **Status: half done, deliberately split in two.** `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` sequenced this
+> **Status: ported, in two deliberately separate layers and two separate commits, each
+> through its own two-independent-adversarial-reviewer round.** Layer B's review found one
+> real defect (a throwaway `Logging` swallowing `split`'s whole `quantify` detail-log
+> block, invisible to every golden fixture); see
+> `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`'s status block, which also records that Layer B
+> skipped the dispatch's plan-review step. `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` sequenced this
 > as Layer A (negative-base numeration alone — 68 of the 83 fixtures, no `split`) then Layer B
 > (`baseChange`/`determineNegativeNS`/`baseNBaseChange` + `Split.java` — the remaining 15). **Layer A is
 > landed**: `crates/wr-core/src/numsys.rs` has `base_neg_n_addition`/`base_neg_n_less_than`, the full
@@ -85,6 +90,17 @@ what actually shipped.
 > pass**, with all 68 negative-base fixtures green on the first run. **WB-043** was found and logged in
 > the process (a genuine `arithmetic(String, String, BigInteger, MINUS)` operator bug in Java, latent —
 > unreachable from every production call site — ported verbatim).
+>
+> **Layer B is landed too**: `wr_core::numsys` gained `base_n_base_change` /
+> `set_base_change_automaton` / `negative_ns_name` / `base_change_candidate_names` (the
+> `NumberSystem` surface that exists only to serve these two commands), and
+> `crates/wr-cli/src/split.rs` is `Split.java`. Tier 1 finished at **675 compared / 674 pass**
+> — every fixture in the corpus is now compared, nothing is DROP-scope-excluded, and the only
+> remaining failure is the long-standing text-only fixture 383. Phase 0 for this half was real
+> work rather than a formality: `Split.java` was still behind a stale `pom.xml` JaCoCo exclude
+> and had NO unit test at all (87.9% line / 81.0% branch, every error path dead plus the
+> non-DFAO load branch), so `walnut-java` got a new `SplitTest.java` (10 tests, taking it to
+> 100% / 97.6%) before any Rust was written.
 >
 > The sizing below was **accurate about the demand signal and pessimistic about the risk.** "Re-threading
 > sign-handling through already-hardened call sites and re-validating that whole stack" turned out to be
@@ -134,9 +150,12 @@ what actually shipped.
 
 ## If picking one up next
 
-CAS export, Ostrowski, and negative-base numeration are all done. **What is left of this list is
-`split`/`rsplit` (15 fixtures) and OTF (0 fixtures).** `split`/`rsplit` is now a much smaller job than
-item 3 originally sized, because Layer A already shipped the negative number system it operates on:
-what remains is `NumberSystem`'s base-change surface (`baseNBaseChange` / `setBaseChangeAutomaton` /
-`determineNegativeNS`, ~90 LOC) plus `Split.java`'s 123 LOC of composition over primitives `wr-core`
-already has. OTF should stay deferred absent a new workload that demonstrably needs it.
+**Items 1, 2 and 3 are all done** — CAS export, Ostrowski, negative-base numeration, and
+`split`/`rsplit`. **The only thing left on this list is OTF (item 4), and its demand signal is a
+documented zero**: 0 golden fixtures require it, and Phase 0 Item 7 confirmed empirically that no
+query in the real corpus needs a non-`SC`/`BRZ` strategy to terminate. It should stay deferred
+absent a new research workload that demonstrably needs it — the honest read there remains "don't",
+not "rank it low".
+
+With item 3 closed, `walnut-java`'s `Automata/` and `Main/Commands/` have no unported file left,
+and the golden corpus has no DROP-scope exclusion at all (675 of 675 fixtures compared).

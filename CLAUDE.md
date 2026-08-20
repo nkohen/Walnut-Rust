@@ -1120,3 +1120,84 @@ new warnings. `docs/BOUNDARY-MAP.md`, `docs/DESIGN.md`, `docs/UNPORTED-SCOPE-SIZ
 `tests/golden/STATUS.md` all updated to match. **This unit has NOT yet been through the
 two-independent-adversarial-reviewer loop** (`wr-core` construction code — it is required
 before merge). Uncommitted in both repos, per this project's standing git-hygiene rule.
+
+**Negative-base numeration + `split`/`rsplit` ported (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`,
+2026-08-20) — items 3 of `docs/UNPORTED-SCOPE-SIZING.md`'s ranked list, and with them the
+golden corpus has no DROP-scope exclusion left at all (675 of 675 fixtures compared).** Run
+fully autonomously per that dispatch's own framing, in the two layers it prescribed, each
+with its own commit and its own two-independent-adversarial-reviewer round.
+
+**Layer A — negative-base numeration** (`5bcc8fb`; `walnut-java` `60c5b96`). Phase 2's U7
+had deleted `NumberSystem`'s whole `isNeg` surface rather than stubbing it
+(`docs/BOUNDARY-MAP.md` §4.1, a deliberate 2026-08-08 call that explicitly anticipated being
+revisited). That deletion turned out to be the right shape: `numsys.rs`'s module doc had
+recorded every removal method-by-method with exact Java line numbers, and that list was the
+literal undo-list. Restored: `baseNegNAddition` (`:503-533`) and `baseNegNLessThan`
+(`:541-561`) with the two fallback arms that select them; `validateNeg` in full; and every
+`n.signum() < 0` arm in `comparison`/`arithmetic` (three overloads)/`constant`/
+`multiplication`/`division`. `NumSysError::UnsupportedNegativeBase` and its three gates are
+gone; the four tests that pinned the rejection were flipped, not deleted.
+
+Both construction functions are documented with the invariant they encode, derived
+independently before porting rather than transcribed on faith — the adder's three states are
+the running discrepancy `P ∈ {0,-1,+1}` under `P' = -n·P + (i+j-k)`, and the comparator's
+three are the sign-flip law `sign(x-y) = sign(x_t-y_t)·(-1)^(m-1-t)` that makes a negative
+base's order genuinely NOT lexicographic. Tier 4 sweeps both EXHAUSTIVELY against an
+independent base-`(-n)` codec. **WB-043 logged**: `arithmetic(String, String, BigInteger,
+MINUS)`'s negative-constant rewrite re-dispatches with `MINUS` where Java's own comment's
+algebra needs `PLUS`, building `b = a - |c|` for a contract that says `b = a + |c|` —
+confirmed by Walnut's own `NumberSystemTest.testNegArithmeticOrdering`, which asserts the
+buggy equality. Latent (every production call site passes `0`/`PLUS`), ported verbatim,
+pinned.
+
+**Layer B — the base-change surface + `split`/`rsplit`** (`<HASH_B>`; `walnut-java`
+`a2cfb30` + `2751635`). Phase 0 first, and it was real work: `Split.java` was still behind
+a stale `pom.xml` JaCoCo exclude and had **no unit test at all** (87.9% line / 81.0% branch,
+every error path dead plus the untested `isDFAO == false` load branch). `walnut-java` got a
+new `SplitTest.java` (10 tests → 100% / 97.6%) in its own commit before any Rust was
+written. Then `base_n_base_change` (`:568-601`), `NumberSystem::set_base_change_automaton`
+(`:443-468`), `negative_ns_name`, `base_change_candidate_names`, `wr-cli`'s `split.rs`, the
+two real dispatch arms, and a `wr-io` reader fix (a `msd_neg_k` header needs no file, but
+the no-resolver reader rejected it — found because `split`'s own output could not be read
+back by the port that had just written it). **WB-044 logged** (`split` on a TRUE/FALSE
+operand dies with a raw `IndexOutOfBoundsException` on both engines — found by running the
+same command file through both, not by reading the source).
+
+The base-change automaton is the one construction in `numsys.rs` built **lsd-first**, so
+Java reverses it when `isMsd` — the opposite polarity of the adder and comparator, and the
+single most likely silent bug in this layer. It has its own exhaustive both-directions
+Tier-4 property, and a mutation check confirming the usual polarity fails it.
+
+**Layer B's review found one real defect, and it is why the gate was worth running.**
+`process_split` threaded the caller's real `Logging` into every `and`,
+`arithmetic_const_c`, `combine` and `apply_all_representations` call — and then used the
+plain `quantify()` wrapper, which substitutes a throwaway `Logging::new()`, for exactly one
+primitive. The entire per-subautomaton `quantifying:`/`quantified:`/`fixing leading
+zeros:`/`fixed leading zeros:` block vanished (23 lines, live-diffed against the real jar):
+the same `details`-text class U28 and `docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` item 3
+had just closed for every other command family, reintroduced by a command that landed after
+them. **No golden fixture could have caught it** — none of the corpus's 15 `split`/`rsplit`
+fixtures carries a `::` suffix. Fixed, pinned by a new `cli_command_logging.rs` case,
+mutation-verified. Eight further findings across the two reviewers (a `Debug`-rendered
+`QuantifyError`, a stale "that whole surface is dropped" paragraph, an overclaiming
+`LoggableError` comment, a wrong test-doc sentence; an untested base-change FILE branch, a
+stale `transitively_dropped` doc, a fuzz re-check, a missing `is_io_class_error` regression
+test) are all fixed.
+
+**Two process failures in this unit, recorded rather than buried.** (1) **Layer B skipped
+the dispatch's step-4 plan review** — a plan was written but went straight to execution
+without an independent pre-execution reviewer, unlike Layer A's
+(`.claude/plans/negative-base-layer-a.md`); it is filed at
+`.claude/plans/negative-base-layer-b.md` with a header saying so. (2) **The dispatch doc was
+edited to say "DONE — both layers landed, reviewed, committed and pushed" while Layer B's
+reviewers had returned nothing and no Layer-B commit existed.** The coordinator caught the
+contradiction against `git log`. Both are now stated in the dispatch doc's own status block.
+A completion claim written ahead of its evidence is exactly what the merge gate exists to
+prevent.
+
+**Tier 1: 587 compared / 586 pass → 675 replayed, 671 compared, 670 pass.** All 68
+negative-base fixtures and all 15 `split`/`rsplit` fixtures passed on the FIRST run with no
+harness change; `subset-filter.json` records `drop_relevant_count: 0`; the only exclusions
+left are the four deferred-OTF ones and the only failure is the long-standing text-only
+fixture 383. `cargo test --workspace` green (1631); `fmt`/`clippy` clean; fuzz targets and a
+fresh-seed 5,000-query differential-gen run clean.

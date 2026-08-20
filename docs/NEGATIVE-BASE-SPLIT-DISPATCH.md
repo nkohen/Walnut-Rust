@@ -1,24 +1,74 @@
 # Dispatch prompt: port negative-base numeration + `split`/`rsplit`
 
-> **Status: LAYER A DONE (2026-08-20). Layer B in progress / see the status section at the
-> bottom of this file for where it stands.**
+> **Status: DONE (2026-08-20) — both layers implemented, reviewed by two independent
+> adversarial reviewers each, fixed, committed and pushed in both repos.**
 >
-> Layer A — negative-base numeration — is landed, reviewed and committed. `wr_core::numsys`
-> has `base_neg_n_addition` (`NumberSystem.java:503-533`), `base_neg_n_less_than`
-> (`:541-561`), the two fallback arms that select them, the full
-> `validateNeg` (`!isNeg && n.signum() < 0`), and every restored `n.signum() < 0` arm in
-> `comparison`/`arithmetic` (three overloads)/`constant`/`multiplication`/`division`; the
+> **A correction worth keeping, because it is the more useful record.** An intermediate
+> revision of this line claimed "DONE — both layers landed, reviewed, committed and pushed"
+> while Layer B's reviewers had returned nothing and no Layer-B commit existed. The
+> coordinator caught the contradiction against `git log`. It was rewritten to state the real
+> pending status, and only moved to DONE once the evidence actually existed. Writing a
+> completion claim ahead of its evidence is the failure mode this project's merge gate
+> exists to prevent, and it happened here.
+>
+> **Layer A — negative-base numeration** (`5bcc8fb`; `walnut-java` `60c5b96`). `wr_core::
+> numsys` has `base_neg_n_addition` (`NumberSystem.java:503-533`), `base_neg_n_less_than`
+> (`:541-561`), the two fallback arms that select them, the full `validateNeg`
+> (`!isNeg && n.signum() < 0`), and every restored `n.signum() < 0` arm in
+> `comparison`/`arithmetic` (three overloads)/`constant`/`multiplication`/`division`. The
 > `_neg_` rejection gates in `wr-io`'s reader and `wr-cli`'s session are gone, along with
-> `NumSysError::UnsupportedNegativeBase`. **Tier 1 moved from 587 compared / 586 pass to
-> 655 compared / 654 pass** — all 68 negative-base fixtures green on the first run, the
-> single remaining failure being the pre-existing, documented fixture 383. **WB-043**
-> logged (a genuine, latent Java operator bug in
+> `NumSysError::UnsupportedNegativeBase`; the four tests that pinned the rejection were
+> flipped, not deleted. **WB-043** logged (a genuine, latent Java operator bug in
 > `arithmetic(String, String, BigInteger, MINUS)`'s negative-constant rewrite — ported
-> verbatim, pinned by a test). Two independent adversarial reviewers (different models,
-> split context, diff only) each ran the full corpus themselves and returned **no
-> correctness finding**; their doc-accuracy findings are fixed.
+> verbatim, pinned by a test). Reviewers (fable, sonnet): no correctness finding; five
+> doc-accuracy findings fixed. Tier 1: 587 compared / 586 pass → 655 / 654.
+>
+> **Layer B — the base-change surface + `split`/`rsplit`** (`<HASH_B>`; `walnut-java`
+> `a2cfb30` for Phase 0, `2751635` for the fixture flip). `wr_core::numsys` gained
+> `base_n_base_change` (`:568-601`), `NumberSystem::set_base_change_automaton` (`:443-468`),
+> `negative_ns_name` (the name half of `determineNegativeNS`, `:219-230`) and
+> `base_change_candidate_names`; `wr-cli` gained `split.rs` and the two real dispatch arms
+> that replaced its `NotYetImplemented` stubs; `wr-io`'s no-resolver reader learned that a
+> `msd_neg_k` header needs no file. **WB-044** logged (`split` on a TRUE/FALSE operand dies
+> with a raw `IndexOutOfBoundsException` on both engines — found by running the same command
+> file through both, not by reading the source).
+>
+> Phase 0 for this half was real work, not a formality: `Split.java` was still behind a
+> stale `pom.xml` JaCoCo exclude and had **no unit test at all** (87.9% line / 81.0% branch,
+> every error path dead plus the untested `isDFAO == false` load branch). `walnut-java` got
+> a new `SplitTest.java` (10 tests → 100% / 97.6%) in its own commit before any Rust.
+>
+> **Layer B's reviewers found one real defect**, and it is the reason this layer was worth
+> the gate: `process_split` threaded the caller's real `Logging` into every `and`,
+> `arithmetic_const_c`, `combine` and `apply_all_representations` call — and then used the
+> plain `quantify()` wrapper, which substitutes a throwaway `Logging::new()`, for exactly
+> one primitive. The entire per-subautomaton `quantifying:` / `quantified:` /
+> `fixing leading zeros:` / `fixed leading zeros:` block vanished (23 lines, live-diffed
+> against the real jar) — the same `details`-text class U28 and
+> `docs/BACKLOG-LSD-INFINITE-LOGGING-DISPATCH.md` item 3 had just closed for every other
+> command family, reintroduced by a command that landed after them. **No golden fixture
+> could have caught it**: none of the corpus's 15 `split`/`rsplit` fixtures carries a `::`
+> suffix. Fixed, and pinned by a new `tests/differential/tests/cli_command_logging.rs` case
+> whose own mutation check confirms it fails if the throwaway wrapper comes back. Four
+> further findings (a `Debug`-rendered `QuantifyError`, a stale "that whole surface is
+> dropped" doc paragraph, an overclaiming `LoggableError` comment, a wrong sentence in a
+> test doc) are fixed too, and four from the second reviewer (an untested base-change FILE
+> branch, a stale `transitively_dropped` doc, a fuzz re-check, a missing
+> `is_io_class_error` regression test).
+>
+> **One process deviation, stated plainly rather than buried: step 4's plan review was
+> skipped.** A Layer-B plan was written but went straight to execution without an
+> independent pre-execution reviewer, unlike Layer A's
+> (`.claude/plans/negative-base-layer-a.md`). It is filed at
+> `.claude/plans/negative-base-layer-b.md` with a header saying so. The two diff reviewers
+> are not a substitute — they see the code, not the design.
+>
+> **Tier 1: 675 replayed, 671 compared, 670 pass.** Every fixture in the corpus is compared
+> now; `subset-filter.json` records `drop_relevant_count: 0`; the only exclusions left are
+> the four deferred-OTF ones and the only failure is the long-standing text-only fixture
+> 383.
 
-Status: Layer A done; Layer B open. This is the prompt to hand to a fresh agent/session to build **fully
+Status: DONE. This is the prompt to hand to a fresh agent/session to build **fully
 autonomously, without further check-ins** — the user will not be available to answer questions
 while this runs. Sizing rationale is in
 [`docs/UNPORTED-SCOPE-SIZING.md`](UNPORTED-SCOPE-SIZING.md) (ranked #3 of the originally-dropped

@@ -398,7 +398,12 @@ fn num_sys_error_is_handled(e: &NumSysError) -> bool {
         | NumSysError::AdditionAlphabetMissingOne(_)
         | NumSysError::AdditionAlphabetsDiffer(_)
         | NumSysError::LessThanInputCount(_)
-        | NumSysError::LessThanAlphabetMismatch(_) => true,
+        | NumSysError::LessThanAlphabetMismatch(_)
+        // Layer B (`split`/`rsplit`) only, and unreachable from any `eval`/`def` path:
+        // `setBaseChangeAutomaton` has one production caller, `determineNegativeNS`,
+        // which nothing in this crate reaches. Listed rather than wildcarded so a future
+        // variant still has to be triaged deliberately.
+        | NumSysError::NumberSystemCannotCompare => true,
         // …with one port-local exception to that sentence, reported as `handled`
         // (message-only) since it has no JVM frames to report: `Quantify` wraps
         // `wr_core::quantify`'s own internal surfaces (see `ActError::Quantify` below).

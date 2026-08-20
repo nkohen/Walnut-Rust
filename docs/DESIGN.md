@@ -58,8 +58,10 @@ This converts Walnut's weakest asset (moderate unit coverage — 92 tests) into 
   **Negative-base numeration was un-dropped and ported 2026-08-20** — `docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`
   Layer A, restoring `NumberSystem`'s `isNeg` surface to `wr_core::numsys`; `msd_neg_k`/`lsd_neg_k`/
   `msd_neg_fib`/`lsd_neg_fib` all work in `eval`/`def`/`reg`, and the corpus's 68 negative-base fixtures
-  are compared and passing. `split`/`rsplit` — and with them the `baseChange` surface that exists only to
-  serve those two commands — remain dropped; that is Layer B of the same dispatch.)
+  are compared and passing. **`split`/`rsplit` — and with them the `baseChange` surface that exists only
+  to serve those two commands — were un-dropped the same day** as Layer B of that dispatch
+  (`crates/wr-cli/src/split.rs`); all 15 of the corpus's `split`/`rsplit` fixtures compare and pass
+  with it. )
 - ~~CAS matrix exports (Maple/Mathematica/Matlab/Sage) — Sage export can be revisited later.~~
   **Revisited and reversed 2026-08-19** (`.claude/plans/amber-transcribing-ledger.md`): CAS
   matrix export is now KEEP scope and ported (`crates/wr-io/src/matrix_writer.rs`). See that

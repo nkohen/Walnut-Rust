@@ -52,11 +52,20 @@ rather than passing silently.
 | | |
 |---|---|
 | fixtures replayed | **675** (the whole `IntegrationTest.L` list, in order) |
-| compared | **655** |
-| **pass** | **654** (99.8% of compared) |
+| compared | **671** |
+| **pass** | **670** (99.9% of compared) |
 | **fail** | **1** (in `KNOWN_DIVERGENCES`, a distinct root cause from the five closed below) |
-| skipped (excluded, each with a recorded reason) | **20** |
+| skipped (excluded, each with a recorded reason) | **4** |
 | timed out / not-run | **0** |
+
+**The 15 `split`/`rsplit` fixtures joined the compared set (2026-08-20)**, hours after the 68
+negative-base ones below, when Layer B of the same dispatch ported the commands themselves
+(`crates/wr-cli/src/split.rs` plus `wr_core::numsys`'s base-change surface). All 15 pass on
+the first run. **`subset-filter.json` now has no dropped fixture at all** — `drop_relevant_count`
+is 0 — so the only exclusions left in this harness are the four deferred-OTF ones, which are a
+determinization-strategy decision (DESIGN.md §10), not a scope boundary. Fixture 448's
+`skip-transitive-drop-dep[test444…447]` entry is gone with them: its dependencies are compared
+now.
 
 **The 68 negative-base fixtures joined the compared set (2026-08-20)** when negative-base
 numeration was ported (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md` Layer A —
@@ -181,14 +190,13 @@ Skip breakdown:
 
 | count | reason |
 |---|---|
-| 15 | `skip-drop-scope[drop_command]` (`split`/`rsplit`) |
 | 4 | `skip-otf-deferred[CCL / CCLS / BRZ_CCL / BRZ_CCLS]` |
-| 1 | `skip-transitive-drop-dep[test444,test445,test446,test447]` (fixture 448) |
 
-(Two categories are gone from this table rather than reduced: `ost` left
-`skip-drop-scope[drop_command]` on 2026-08-20 when Ostrowski landed, and
-`skip-drop-scope[negative_base_number_system]` — 68 fixtures — left it the same day when
-negative-base numeration did.)
+(Everything else that used to be in this table is gone rather than reduced, all of it on
+2026-08-19/20: `skip-drop-scope[drop_command]` lost `ost` when Ostrowski landed and then
+`split`/`rsplit` when Layer B did, `skip-drop-scope[negative_base_number_system]` — 68
+fixtures — went with Layer A, and `skip-transitive-drop-dep` went with the `rsplit` fixtures
+it pointed at.)
 
 Partial comparisons (compared, but not in full — recorded per id in the run report):
 

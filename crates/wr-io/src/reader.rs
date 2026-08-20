@@ -447,7 +447,9 @@ impl CustomBaseResolver for CustomBasesDir<'_> {
 /// `.txt` grammar); relabel via `automaton.label` after loading if needed.
 ///
 /// A custom-base header (`msd_fib`, ...) is [`ReadError::UnsupportedNumeration`] here —
-/// use [`read_automaton_txt_with_custom_bases`] to resolve those.
+/// use [`read_automaton_txt_with_custom_bases`] to resolve those. A NEGATIVE base
+/// (`msd_neg_2`) is not one of those: real Walnut builds it programmatically from no file
+/// at all, so it loads here too (see `custom_base_token`).
 pub fn read_automaton_txt<P: AsRef<Path>>(path: P) -> Result<Automaton, ReadError> {
     read_automaton_txt_impl(path.as_ref(), None, &mut BTreeSet::new(), None)
 }
@@ -1230,6 +1232,22 @@ fn numeric_base(name: &str, rest: &str) -> Result<Option<i32>, ReadError> {
     Ok(Some(base))
 }
 
+/// `k` for a `<msd|lsd>_neg_<k>` name with `k > 1`, else `None` — the base-`(-k)` twin of
+/// [`numeric_base`], used only by [`custom_base_token`]'s no-resolver shortcut.
+///
+/// Overflow is `None` rather than an error, which lands the name back on
+/// [`ReadError::UnsupportedNumeration`]. That is deliberate and narrow: without a resolver
+/// there is nothing further to try anyway, and the RESOLVER path (the one production uses)
+/// reports the same input as `NumSysError::BaseNotAnI32` through `NumberSystem`'s own
+/// constructor, which is where that distinction is worth making.
+fn neg_base(word: &str) -> Option<i32> {
+    let rest = word
+        .strip_prefix(numsys::MSD_UNDERSCORE)
+        .or_else(|| word.strip_prefix(numsys::LSD_UNDERSCORE))?;
+    let base = wr_core::util::try_parse_neg_number(rest).ok()?;
+    (base > 1).then_some(base)
+}
+
 /// The non-numeric-base fallback shared by both `msd_`/`lsd_`-prefixed branches of
 /// [`parse_ns_token`]: without a resolver, preserves the pre-U13
 /// [`ReadError::UnsupportedNumeration`] behavior exactly (every existing caller/test).
@@ -1243,6 +1261,24 @@ fn custom_base_token(
     in_progress: &mut BTreeSet<String>,
 ) -> Result<NsTrack, ReadError> {
     let Some(resolver) = custom_bases else {
+        // A NEGATIVE base (`msd_neg_2`) is not a custom base: `NumberSystem`'s constructor
+        // builds its adder and comparator programmatically from
+        // `UtilityMethods.parseNegNumber(base) > 1` (`NumberSystem.java:327-328`,
+        // `:372-373`), reading no file — exactly like `msd_2`. So it must resolve here too,
+        // or this reader would reject a header real Walnut accepts with an empty
+        // `Custom Bases/`. (With a resolver, the `load_custom_base` path below already
+        // handles it AND honours a user-supplied override file, so this shortcut is only
+        // for the no-resolver convenience API.)
+        if let Some(base) = neg_base(word) {
+            return Ok(NsTrack {
+                msd: word.starts_with(numsys::MSD_UNDERSCORE),
+                alphabet: (0..base).collect(),
+                name: word.to_string(),
+                // Never a restriction: an all-representations file is a FILE, and there is
+                // no resolver to read one with.
+                all_reps: None,
+            });
+        }
         return Err(ReadError::UnsupportedNumeration(word.to_string()));
     };
     let ns = load_custom_base(word, resolver, in_progress)?;
@@ -2773,6 +2809,49 @@ mod tests {
     /// token is no longer special-cased here at all: it resolves exactly like any other
     /// custom base, which means `msd_neg_fib` (not `^neg_\d+$`) genuinely needs its files
     /// and `msd_neg_2` (which is) does not.
+    /// The no-resolver twin of the test below: [`read_automaton_txt`] must accept a
+    /// `msd_neg_k`/`lsd_neg_k` header even though it can read no `Custom Bases/` file,
+    /// because real Walnut needs none either — `NumberSystem`'s constructor builds that
+    /// adder and comparator programmatically. `msd_neg_fib` (not `^neg_\d+$`) genuinely
+    /// does need files and so stays `UnsupportedNumeration` here.
+    ///
+    /// Found while writing `tests/differential/tests/split_command.rs`: `split`'s output
+    /// over a negative base is headed `msd_neg_2`, and the plain reader refused to read
+    /// back a file the port had just written.
+    #[test]
+    fn a_negative_base_header_needs_no_resolver() {
+        let dir = std::env::temp_dir().join(format!("wr-io-test-neghdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("neg.txt");
+        std::fs::write(&path, "msd_neg_2 lsd_neg_3\n\n0 1\n0 0 -> 0\n").unwrap();
+        let a = read_automaton_txt(&path).expect("a negative base needs no Custom Bases file");
+        assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
+        assert_eq!(a.msd, vec![Some(true), Some(false)]);
+        assert_eq!(
+            a.track_ns_names(),
+            vec![Some("msd_neg_2".to_string()), Some("lsd_neg_3".to_string())]
+        );
+
+        // …and the file-backed negative base is still not readable without a resolver.
+        std::fs::write(&path, "msd_neg_fib\n\n0 1\n0 -> 0\n").unwrap();
+        assert!(matches!(
+            read_automaton_txt(&path),
+            Err(ReadError::UnsupportedNumeration(ref n)) if n == "msd_neg_fib"
+        ));
+        // Neither is a base of 1, or one that overflows `int`.
+        for header in ["msd_neg_1", "msd_neg_99999999999"] {
+            std::fs::write(&path, format!("{header}\n\n0 1\n0 -> 0\n")).unwrap();
+            assert!(
+                matches!(
+                    read_automaton_txt(&path),
+                    Err(ReadError::UnsupportedNumeration(_))
+                ),
+                "{header}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn custom_base_negative_names_resolve_like_any_other_base() {
         let dir = std::env::temp_dir().join(format!("wr-io-test-cb-neg-{}", std::process::id()));
