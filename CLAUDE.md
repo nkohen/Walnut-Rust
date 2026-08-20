@@ -1150,7 +1150,7 @@ confirmed by Walnut's own `NumberSystemTest.testNegArithmeticOrdering`, which as
 buggy equality. Latent (every production call site passes `0`/`PLUS`), ported verbatim,
 pinned.
 
-**Layer B — the base-change surface + `split`/`rsplit`** (`<HASH_B>`; `walnut-java`
+**Layer B — the base-change surface + `split`/`rsplit`** (`c887388`; `walnut-java`
 `a2cfb30` + `2751635`). Phase 0 first, and it was real work: `Split.java` was still behind
 a stale `pom.xml` JaCoCo exclude and had **no unit test at all** (87.9% line / 81.0% branch,
 every error path dead plus the untested `isDFAO == false` load branch). `walnut-java` got a

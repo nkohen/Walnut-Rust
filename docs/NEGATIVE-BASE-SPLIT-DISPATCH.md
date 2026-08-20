@@ -23,7 +23,7 @@
 > verbatim, pinned by a test). Reviewers (fable, sonnet): no correctness finding; five
 > doc-accuracy findings fixed. Tier 1: 587 compared / 586 pass → 655 / 654.
 >
-> **Layer B — the base-change surface + `split`/`rsplit`** (`<HASH_B>`; `walnut-java`
+> **Layer B — the base-change surface + `split`/`rsplit`** (`c887388`; `walnut-java`
 > `a2cfb30` for Phase 0, `2751635` for the fixture flip). `wr_core::numsys` gained
 > `base_n_base_change` (`:568-601`), `NumberSystem::set_base_change_automaton` (`:443-468`),
 > `negative_ns_name` (the name half of `determineNegativeNS`, `:219-230`) and
