@@ -38,6 +38,7 @@
 use std::io::Write;
 
 use wr_core::automaton::Automaton;
+use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::Logging;
 use wr_core::numsys::{MSD_UNDERSCORE, UNDERSCORE_ADDITION_AUTOMATON};
 use wr_core::ostrowski::{Ostrowski, OstrowskiError};
@@ -104,6 +105,14 @@ impl From<std::io::Error> for OstError {
 /// `out` receives `Ostrowski.writeAutomaton`'s `System.out.println("Writing to: …")`
 /// (`Ostrowski.java:229`) — the one command in this crate that announces its own write
 /// this way, matching Java (no other write call site in `Main/` prints a line like it).
+///
+/// `ctx` is the same `shouldPrintDetails()`-gated `DeterminizeContext` `eval`/`def`
+/// thread through (`Prover`'s `OST` dispatch arm builds it exactly like the `ED` arm
+/// does) — `ost` calls `determinize` twice (repr, then adder), and
+/// `DeterminizationStrategies.determinize` reads `Prover.mainProver.metaCommands` on
+/// *every* such call once `shouldPrintDetails()` holds, `ost`'s included. The caller
+/// owes `None` exactly when `shouldPrintDetails()` is false, same contract as
+/// [`wr_core::automaton::Automaton::determinize_and_minimize_with_ctx`].
 pub fn ost_command(
     session: &Session,
     logging: &mut Logging,
@@ -111,6 +120,7 @@ pub fn ost_command(
     name: &str,
     preperiod: &str,
     period: &str,
+    mut ctx: Option<&mut dyn DeterminizeContext>,
 ) -> Result<TestCase, OstError> {
     let preperiod = parse_digits(preperiod)?;
     let period = parse_digits(period)?;
@@ -119,7 +129,7 @@ pub fn ost_command(
     let mut ostr = Ostrowski::new(name, &preperiod, &period)?;
 
     // `Automaton repr = ostr.createRepresentationAutomaton();` (`:16`)
-    let mut repr = ostr.create_representation_automaton(logging);
+    let mut repr = ostr.create_representation_automaton(ctx.as_deref_mut(), logging);
     // `String msdName = NumberSystem.MSD_UNDERSCORE + name;` (`:17`)
     let msd_name = format!("{MSD_UNDERSCORE}{name}");
     // `Ostrowski.writeAutomaton(name, msdName + Prover.TXT_EXTENSION, repr);` (`:18`)
@@ -131,8 +141,9 @@ pub fn ost_command(
         &mut repr,
     )?;
 
-    // `Automaton adder = ostr.createAdderAutomaton();` (`:19`)
-    let mut adder = ostr.create_adder_automaton(logging);
+    // `Automaton adder = ostr.createAdderAutomaton();` (`:19`) — last use of `ctx`, so
+    // moved rather than reborrowed.
+    let mut adder = ostr.create_adder_automaton(ctx, logging);
     // `Ostrowski.writeAutomaton(name, msdName + NumberSystem.UNDERSCORE_ADDITION_AUTOMATON,
     //  adder);` (`:20`)
     write_automaton(
@@ -256,11 +267,11 @@ mod tests {
         let mut logging = Logging::new();
         test_against_file(
             &format!("{MSD_UNDERSCORE}{name}{TXT_EXTENSION}"),
-            &mut ost.create_representation_automaton(&mut logging),
+            &mut ost.create_representation_automaton(None, &mut logging),
         );
         test_against_file(
             &format!("{MSD_UNDERSCORE}{name}{UNDERSCORE_ADDITION_AUTOMATON}"),
-            &mut ost.create_adder_automaton(&mut logging),
+            &mut ost.create_adder_automaton(None, &mut logging),
         );
     }
 
@@ -353,7 +364,15 @@ mod tests {
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
         let mut out: Vec<u8> = Vec::new();
-        let r = ost_command(session, &mut logging, &mut out, name, preperiod, period);
+        let r = ost_command(
+            session,
+            &mut logging,
+            &mut out,
+            name,
+            preperiod,
+            period,
+            None,
+        );
         (r, String::from_utf8(out).unwrap())
     }
 
@@ -517,7 +536,7 @@ mod tests {
         let mut ost = Ostrowski::new("justunder", &[1290], &[1]).expect("valid");
         assert_eq!(ost.d_max(), 1289);
         let mut logging = Logging::new();
-        let _ = ost.create_representation_automaton(&mut logging);
+        let _ = ost.create_representation_automaton(None, &mut logging);
         drop(session2);
 
         fs::remove_dir_all(&dir).ok();

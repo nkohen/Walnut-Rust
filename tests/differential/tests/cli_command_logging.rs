@@ -1027,3 +1027,61 @@ fn reg_over_a_custom_base_prints_the_construction_detail_text_real_walnut_does()
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// `ost` (`crates/wr-cli/src/ost.rs`/`crates/wr-core/src/ostrowski.rs`) — the test gap
+/// both adversarial reviewers of the Ostrowski port flagged: no tier anywhere exercised
+/// `ost …::`, which is exactly what let a real `correctness-risk` finding ship
+/// undetected. Unlike every OTHER command family in this file, `ost` gets a REAL
+/// `DeterminizeContext` threaded through (same as `eval`/`def` — see `Prover`'s `OST`
+/// dispatch arm and its comment on the `shouldPrintDetails()` gate), because
+/// `DeterminizationStrategies.determinize` reads `Prover.mainProver.metaCommands` on
+/// every `determinize` call once `shouldPrintDetails()` holds, `ost`'s two included —
+/// there is no `ctx.is_some()`-gated line missing here the way finding 1 above documents
+/// for `rightquo`/`leftquo`/`fixleadzero`/`reverse`.
+///
+/// Real `walnut-java` `getDetailedLog()` for `ost g3 [0 3 1] [1 2]::` (captured live,
+/// `Main.Prover` run directly from a scratch home directory so timestamps/state counts
+/// are exactly what the command produces, `Result/global_log.txt`):
+///
+/// ```text
+///  Trimmed to: 19 states.
+///  Determinizing [#0, strategy: SC]: 19 states
+///  Determinized: 29 states - 7ms
+///  Minimizing: 29 states.
+///  Minimized:12 states - 3ms.
+///  Trimmed to: 52 states.
+///  Determinizing [#1, strategy: SC]: 52 states
+///  Determinized: 63 states - 2ms
+///  Minimizing: 63 states.
+///  Minimized:29 states - 3ms.
+/// ```
+///
+/// The two `Determinizing [#N, strategy: SC]` lines are the ones that silently vanished
+/// before this fix (`ostrowski.rs`'s `populate_automaton` hardcoded `ctx: None`); their
+/// presence here is the actual regression pin, not just "some detail text exists".
+#[test]
+fn ost_prints_detail_text_matching_real_walnut() {
+    let (session, dir) = temp_session("ost");
+    let mut prover = fresh_prover(session);
+
+    let details = dispatch_and_get_details(&mut prover, "ost g3 [0 3 1] [1 2]::");
+    for expected in [
+        " Trimmed to: 19 states.",
+        " Determinizing [#0, strategy: SC]: 19 states",
+        " Determinized: 29 states",
+        " Minimizing: 29 states.",
+        " Minimized:12 states",
+        " Trimmed to: 52 states.",
+        " Determinizing [#1, strategy: SC]: 52 states",
+        " Determinized: 63 states",
+        " Minimizing: 63 states.",
+        " Minimized:29 states",
+    ] {
+        assert!(
+            details.contains(expected),
+            "ost's detailed_log must contain {expected:?}; got:\n{details}"
+        );
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}

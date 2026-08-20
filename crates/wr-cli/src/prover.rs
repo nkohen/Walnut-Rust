@@ -117,6 +117,7 @@ use wr_core::logicalops::ConvertNsError;
 use wr_core::morphism::MorphismError;
 use wr_core::util::validate_file;
 use wr_core::walnut_panic::{catch_walnut_panic_detailed, CaughtPanic};
+use wr_io::parse_methods::ParseMethodsError;
 use wr_logic::predicate_env::FreshIdentifiers;
 
 use crate::alphabet::{alphabet_command, AlphabetError};
@@ -834,7 +835,16 @@ impl LoggableError for ProverError {
         match self {
             ProverError::InvalidFile(_) => "java.lang.IllegalArgumentException".to_string(),
             ProverError::NumberFormat(_)
-            | ProverError::AutomatonOps(AutomatonOpsError::NumberFormat(_)) => {
+            | ProverError::AutomatonOps(AutomatonOpsError::NumberFormat(_))
+            // `ost o [99999999999] [1];` — `ParseMethods.parseList`'s
+            // `UtilityMethods.parseInt` overflowing `int`, same bucket as the two arms
+            // above (see `OstError::Parse`'s doc and this function's `is_handled` arm
+            // just above `ProverError::Ost(_) => true`). Found by adversarial review:
+            // `is_handled()` already routed this down the message-only path, but
+            // `kind()` had no matching arm, so it fell through to the generic
+            // `"Main.WalnutException"` instead of the real
+            // `java.lang.NumberFormatException` Java reports.
+            | ProverError::Ost(OstError::Parse(ParseMethodsError::NumberFormat(_))) => {
                 "java.lang.NumberFormatException".to_string()
             }
             // `RichAlphabet.encode`'s corrupt index (WB-010); see `QuotientError::Runtime`.
@@ -1380,6 +1390,16 @@ impl Prover {
                 let name = group(&caps, s, GROUP_OST_NAME).unwrap_or("");
                 let preperiod = group(&caps, s, GROUP_OST_PREPERIOD).unwrap_or("");
                 let period = group(&caps, s, GROUP_OST_PERIOD).unwrap_or("");
+                // Same `shouldPrintDetails()` gate as the `ED` arm above (`:1574`) --
+                // `ost` calls `determinize` twice (repr, then adder), and
+                // `DeterminizationStrategies.determinize` reads
+                // `Prover.mainProver.metaCommands` on every such call once
+                // `shouldPrintDetails()` holds, `ost`'s included.
+                let ctx: Option<&mut dyn DeterminizeContext> = if self.print_details {
+                    Some(&mut self.meta_commands)
+                } else {
+                    None
+                };
                 Ok(Some(ost_command(
                     &self.session,
                     &mut self.logging,
@@ -1387,6 +1407,7 @@ impl Prover {
                     name,
                     preperiod,
                     period,
+                    ctx,
                 )?))
             }
             // `:544-546` -> `Morphism.toWordAutomaton`
@@ -1559,8 +1580,19 @@ impl Prover {
         // module's docs above). Java reads `Prover.mainProver.metaCommands` from inside
         // the determinization dispatcher, but only when `Logging.shouldPrintDetails()`
         // holds -- with its own comment explaining why ("several silent automata
-        // creations for NS, Ostrowski, and other caches"). `Logging.shouldPrintDetails()`
-        // is `printEnabled && printDetails`; this port splits those two halves:
+        // creations for NS, Ostrowski, and other caches"). **That Java comment is about
+        // NumberSystem's OWN internal constructions** (the `disablePrint`/`enablePrint`
+        // bracket, `printEnabled`'s half below) -- it is NOT license to give a top-level
+        // command's OWN determinizations a permanent `None`. `ost`'s dispatch arm
+        // (below) needs this exact same gate, freshly built from `self.print_details`,
+        // for the same reason this arm does: an earlier version of this port
+        // misread this comment and hardcoded `None` for `ost`, silently dropping its
+        // `Determinizing […]` detail lines and its `[strategy]`/`[export]` metacommand
+        // support -- caught by adversarial review, not by any test, because nothing
+        // exercised `ost …::` (see `crate::ost`'s tests and
+        // `tests/differential/tests/cli_command_logging.rs`).
+        // `Logging.shouldPrintDetails()` is `printEnabled && printDetails`; this port
+        // splits those two halves:
         //
         // * `printDetails` is `self.print_details`, set by `parse_setup` from the `::`
         //   suffix -- and `MetaCommands::parse_meta_commands` has ALREADY refused any
@@ -2675,6 +2707,31 @@ mod tests {
         ] {
             assert!(e.is_handled(), "{why}");
         }
+    }
+
+    /// The `kind()` half of the same `ost`-overflow case
+    /// `an_i32_overflowing_digit_is_a_parse_error_not_a_panic` (`crate::ost`'s own tests)
+    /// already pins `is_handled() == false` for. Found by adversarial review of the
+    /// Ostrowski port: `is_handled()` correctly routes `Ost(Parse(NumberFormat(_)))` down
+    /// the "not a `WalnutException`" path, but `kind()` had no matching arm and fell
+    /// through to the generic `"Main.WalnutException"`, rendering the wrong exception
+    /// class name where real Walnut reports `java.lang.NumberFormatException`. Built
+    /// through the real `parse_list` call site (not a hand-rolled error value), matching
+    /// how `ost o [99999999999] [1];`'s `parse_digits` actually produces it.
+    #[test]
+    fn ost_overflow_renders_as_a_number_format_exception() {
+        let parse_err = wr_io::parse_methods::parse_list("99999999999")
+            .expect_err("i32-overflowing digit run must fail to parse");
+        assert!(
+            matches!(parse_err, ParseMethodsError::NumberFormat(_)),
+            "{parse_err:?}"
+        );
+        let e = ProverError::Ost(OstError::Parse(parse_err));
+        assert!(
+            !e.is_handled(),
+            "NumberFormatException is not a WalnutException"
+        );
+        assert_eq!(e.kind(), "java.lang.NumberFormatException");
     }
 
     // ------------------------------------------------------------- parseSetup

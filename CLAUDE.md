@@ -1117,9 +1117,54 @@ counts `support::load_fixtures` self-checks (`subset_relevant_count` 591→592,
 `cargo test --workspace` green (1580+ tests), `cargo fmt`/`clippy` clean, `cargo doc` clean of
 new warnings. `docs/BOUNDARY-MAP.md`, `docs/DESIGN.md`, `docs/UNPORTED-SCOPE-SIZING.md`,
 `docs/PHASE0-CONTINUATION-DISPATCH.md`, `docs/OSTROWSKI-DISPATCH.md` and
-`tests/golden/STATUS.md` all updated to match. **This unit has NOT yet been through the
-two-independent-adversarial-reviewer loop** (`wr-core` construction code — it is required
-before merge). Uncommitted in both repos, per this project's standing git-hygiene rule.
+`tests/golden/STATUS.md` all updated to match. Landed as commit `6dd139b`.
+
+**The two-independent-adversarial-reviewer loop this unit's own commit shipped without ran
+2026-08-20**, closing a real merge-gate gap this status log had been carrying (`wr-core`
+construction code needs it before merge, and this entry had said so without anyone acting on
+it). Two split-context reviewers (Opus, Fable — different from each other and from the
+commit's own author), given only the diff, each independently found the same headline defect
+plus one reviewer-specific one:
+
+- **`correctness-risk` (both reviewers, confirmed live against the real jar):** `ost …::`
+  silently dropped Java's `Determinizing [#n, strategy: S]` detail lines AND (Opus's fuller
+  repro) ignored `[strategy …]`/`[export …]` metacommands entirely, including failing to
+  write the `[export]` pre-determinization dump file — `wr_core::ostrowski::populate_automaton`
+  hardcoded `ctx: None` instead of threading the same `shouldPrintDetails()`-gated
+  `DeterminizeContext` `eval`/`def` already thread (U32). Root cause: a nearby comment about
+  *`NumberSystem`'s own* internal `disablePrint` bracket was misread as license for `ost`'s
+  *own* top-level determinizations to always pass `None`. Fixed by threading
+  `Option<&mut dyn DeterminizeContext>` through `create_representation_automaton`/
+  `create_adder_automaton`/`populate_automaton` (`wr-core`) and building it in the `OST`
+  dispatch arm exactly like the `ED` arm (`wr-cli`); the misleading comment corrected in
+  place. No test anywhere had exercised `ost …::` — closed with a new differential test
+  (`tests/differential/tests/cli_command_logging.rs`) against a fresh live capture, and
+  mutation-verified (reverting the fix makes the new test fail).
+- **`correctness-risk` (Opus):** `ProverError::kind()` had no arm for
+  `Ost(OstError::Parse(ParseMethodsError::NumberFormat(_)))`, rendering the generic
+  `Main.WalnutException` instead of `java.lang.NumberFormatException` for `ost o
+  [99999999999] [1];`'s int-overflow case — `is_handled()` already routed it correctly,
+  `kind()` just had no matching arm. Fixed and mutation-verified.
+- **`test-gap` (Opus):** the Tier-4 property sweep's two anti-vacuity tripwires
+  (`accepted > max_len` / `adder_accepted > max_len`) were themselves vacuous — the all-zeros
+  word is valid at every length regardless of any other bug, so both bounds held
+  unconditionally. Replaced with exact derived counts (`sum(q[len])` and
+  `sum(q[len]*(q[len]+1)/2)`), independently re-derived from the place-value oracle, not from
+  the automaton under test; mutation-verified (a deliberately doubled counter is caught by the
+  new assertion and was NOT caught by the old one).
+- **`style` (both):** two malformed diagnostic format strings in
+  `tests/golden/tests/golden_corpus.rs` (long literal-space runs from a botched line-wrap);
+  a doc claiming Java reads `period.getInt(0)` "three times" where it reads it twice; a
+  `# Panics` doc overclaiming exact fidelity to Java's exception rendering (the recovery
+  *point* matches, the *rendering channel/class-name* doesn't — a pre-existing
+  `Prover::caught` limitation, not new here). All fixed; the panic-doc overclaim also grew a
+  note on a second, narrower divergence Fable found (an absurdly large `d_max`, past
+  `u64::MAX`'s cube root, panics one call site earlier with a different message).
+
+Re-verified after fixes: `cargo test --workspace` green, `fmt`/`clippy` clean, golden corpus
+unchanged at 670/671 (the one pre-existing WB-039 divergence, fixture 383, still the only
+failure — no regression). Uncommitted — commit on the user's explicit request, per this
+project's standing git-hygiene rule.
 
 **Negative-base numeration + `split`/`rsplit` ported (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`,
 2026-08-20) — items 3 of `docs/UNPORTED-SCOPE-SIZING.md`'s ranked list, and with them the

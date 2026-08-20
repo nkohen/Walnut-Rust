@@ -297,8 +297,8 @@ impl Ostrowski {
                 preperiod[0] = preperiod[1] + 1;
                 preperiod.remove(1);
             } else {
-                // Java reads `period.getInt(0)` three times, all BEFORE the two
-                // mutations below change it — so all three see the same original value.
+                // Java reads `period.getInt(0)` twice, both BEFORE the two mutations
+                // below change it — so both reads see the same original value.
                 let p0 = period[0];
                 preperiod[0] = p0 + 1;
                 period.push(p0);
@@ -351,18 +351,35 @@ impl Ostrowski {
     }
 
     /// `Ostrowski.createRepresentationAutomaton()` (`:139-144`).
-    pub fn create_representation_automaton(&mut self, logging: &mut Logging) -> Automaton {
+    ///
+    /// `ctx` is the same `shouldPrintDetails()`-gated `DeterminizeContext` every other
+    /// top-level command's determinization threads through (see `wr-cli`'s `OST` dispatch
+    /// arm) — `DeterminizationStrategies.determinize` reads `Prover.mainProver.metaCommands`
+    /// for strategy selection and the pre-determinization `[export]` dump on **every**
+    /// `shouldPrintDetails()` call, `ost`'s two included; the caller owes `None` exactly
+    /// when `shouldPrintDetails()` is false, same contract as
+    /// `Automaton::determinize_and_minimize_with_ctx`.
+    pub fn create_representation_automaton(
+        &mut self,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut Logging,
+    ) -> Automaton {
         let mut repr = self.init_automaton(1);
         self.perform_repr_bfs();
-        self.populate_automaton(&mut repr, Self::is_repr_final, logging);
+        self.populate_automaton(&mut repr, Self::is_repr_final, ctx, logging);
         repr
     }
 
-    /// `Ostrowski.createAdderAutomaton()` (`:146-151`).
-    pub fn create_adder_automaton(&mut self, logging: &mut Logging) -> Automaton {
+    /// `Ostrowski.createAdderAutomaton()` (`:146-151`). See
+    /// [`Ostrowski::create_representation_automaton`]'s doc on `ctx`.
+    pub fn create_adder_automaton(
+        &mut self,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
+        logging: &mut Logging,
+    ) -> Automaton {
         let mut adder = self.init_automaton(3);
         self.perform_adder_bfs();
-        self.populate_automaton(&mut adder, Self::is_adder_final, logging);
+        self.populate_automaton(&mut adder, Self::is_adder_final, ctx, logging);
         adder
     }
 
@@ -427,6 +444,7 @@ impl Ostrowski {
         &mut self,
         automaton: &mut Automaton,
         is_state_final: fn(&NodeState) -> bool,
+        ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
         logging: &mut Logging,
     ) {
         automaton.fa.q = self.total_nodes;
@@ -448,7 +466,7 @@ impl Ostrowski {
                 .push(std::mem::take(&mut self.state_transitions[q]));
         }
 
-        automaton.determinize_and_minimize_with_ctx(None, logging);
+        automaton.determinize_and_minimize_with_ctx(ctx, logging);
 
         // We need to canonize and remove the first state. The automaton will work with
         // this state as well, but it is useless. This happens because the Automaton
@@ -760,11 +778,29 @@ impl Ostrowski {
 /// [`Automaton::determine_alphabet_size`]'s own check to `i32` would change behavior for
 /// every caller in the crate, which is a separate, cross-cutting decision.
 ///
+/// This guard runs at `init_automaton`'s call site, AFTER `Automaton::new`'s own
+/// `compute_encoder` has already built the per-track encoding multipliers — so it
+/// cannot catch an alphabet size so large `compute_encoder`'s `usize` multiplication
+/// itself overflows first (`d_max` past roughly 2.64 million, i.e. `(d_max+1)^3` past
+/// `u64::MAX`; found by adversarial review, not fixed, since both engines still error
+/// and survive on an input this far outside anything `ost`'s intended use produces).
+/// That earlier panic's message (`"encoder overflow …"`) differs from this guard's, an
+/// additional instance of the same message-channel divergence documented on this
+/// function's own `# Panics` section below, not a new one.
+///
 /// # Panics
 ///
 /// With Java's `ArithmeticException` message verbatim, per
 /// [`crate::walnut_panic`]'s guard-authoring rule — `wr_cli::prover::Prover::caught`
-/// recovers it exactly where `Prover.readBuffer`'s `catch (RuntimeException)` does.
+/// recovers it at the same call site `Prover.readBuffer`'s `catch (RuntimeException)`
+/// does. **The recovery POINT matches; the RENDERING does not** (found by adversarial
+/// review, not fixed here — a pre-existing `Prover::caught` limitation, not new to
+/// `ost`): Java reports `java.lang.ArithmeticException: integer overflow` to stderr
+/// with a stack trace, while this port's `ProverError::Thrown { .. }` renders as a
+/// bare `integer overflow` to stdout (`is_handled() == true`, so it never reaches
+/// `kind()`'s exception-class-name path). Verified live (`ost e13 [1291] [1];`) — the
+/// on-disk outcome (`msd_bigone.txt` written, `msd_bigone_addition.txt` not) and
+/// session survival both match; only the message channel/formatting doesn't.
 fn assert_alphabet_size_fits_in_an_int(alphabet_size: usize) {
     if i32::try_from(alphabet_size).is_err() {
         panic!("integer overflow");
@@ -876,8 +912,8 @@ mod tests {
         // confirming the rotated preperiod/period is a valid input to the rest of the
         // BFS/automaton-construction pipeline, not just to the constructor.
         let mut logging = Logging::new();
-        assert!(on.create_representation_automaton(&mut logging).fa.q > 0);
-        assert!(on.create_adder_automaton(&mut logging).fa.q > 0);
+        assert!(on.create_representation_automaton(None, &mut logging).fa.q > 0);
+        assert!(on.create_adder_automaton(None, &mut logging).fa.q > 0);
     }
 
     /// The OTHER rotation branch (`Ostrowski.java:105-107`), which `OstrowskiTest` only
@@ -1002,9 +1038,11 @@ mod tests {
         let mut ost = Ostrowski::new("fib", &[0, 2], &[1]).expect("valid");
         let mut logging = Logging::new();
         assert!(ost
-            .create_representation_automaton(&mut logging)
+            .create_representation_automaton(None, &mut logging)
             .is_canonized());
-        assert!(ost.create_adder_automaton(&mut logging).is_canonized());
+        assert!(ost
+            .create_adder_automaton(None, &mut logging)
+            .is_canonized());
     }
 
     // -----------------------------------------------------------------------
@@ -1152,11 +1190,22 @@ mod tests {
         let period_index = ost.period_index();
         let d_max = ost.d_max();
         let mut logging = Logging::new();
-        let repr = ost.create_representation_automaton(&mut logging);
-        let adder = ost.create_adder_automaton(&mut logging);
+        let repr = ost.create_representation_automaton(None, &mut logging);
+        let adder = ost.create_adder_automaton(None, &mut logging);
 
         let mut accepted = 0usize;
         let mut adder_accepted = 0usize;
+        // Exact expected totals, derived independently of both the automaton and the
+        // per-length existence/uniqueness assertion below (which already establishes
+        // `canonical.len() == q[len]` for each length, but never sums across lengths or
+        // predicts the adder count). `accepted`'s total is just `sum(q[len])`.
+        // `adder_accepted`'s total per length is the number of pairs `(a, b)` with
+        // `0 <= a, b < q[len]` and `a + b < q[len]` (since canonical values enumerate
+        // `0..q[len]` bijectively, and any in-range sum has exactly one canonical `z`
+        // representing it) -- a plain "how many pairs sum below the ceiling" count,
+        // `q(q+1)/2`.
+        let mut expected_accepted: i128 = 0;
+        let mut expected_adder_accepted: i128 = 0;
         for len in 0..=max_len {
             let all = words(d_max, len);
             for w in &all {
@@ -1192,6 +1241,8 @@ mod tests {
                 "{name}: canonical words of length {len} do not enumerate 0..{}",
                 q[len]
             );
+            expected_accepted += q[len];
+            expected_adder_accepted += q[len] * (q[len] + 1) / 2;
 
             // The adder, over aligned (equal-length, zero-padded) CANONICAL triples --
             // see this function's doc comment for why the restriction is the property,
@@ -1217,12 +1268,18 @@ mod tests {
                 }
             }
         }
-        // Tripwires against a vacuous sweep (e.g. an oracle that rejects everything, or
-        // an alphabet/encoding mix-up that makes every run die on the first symbol).
-        assert!(accepted > max_len, "{name}: sweep accepted almost nothing");
-        assert!(
-            adder_accepted > max_len,
-            "{name}: adder sweep confirmed almost no sums"
+        // Exact tripwires (not just "more than a trivial floor" -- the all-zeros word is
+        // valid at every length regardless, which made the previous `> max_len` bound
+        // pass unconditionally and catch nothing). A broken oracle (e.g. one that
+        // accepts almost nothing) or a broken automaton (wrong language) now has to
+        // land on this exact derived count to go undetected.
+        assert_eq!(
+            accepted as i128, expected_accepted,
+            "{name}: sweep accepted count doesn't match sum(q[len])"
+        );
+        assert_eq!(
+            adder_accepted as i128, expected_adder_accepted,
+            "{name}: adder sweep accepted count doesn't match sum(q[len]*(q[len]+1)/2)"
         );
     }
 

@@ -1674,9 +1674,7 @@ fn compare_test_case(
             failures,
             Verdict::fail(
                 FailedHalf::Automaton,
-                format!(
-                    "expected {expected_pairs} automaton pair(s) (the corpus records                      {expected_pairs}), got {actual_pairs}"
-                ),
+                format!("expected {expected_pairs} automaton pair(s), got {actual_pairs}"),
             ),
         );
     }
@@ -1700,7 +1698,7 @@ fn compare_test_case(
                 Verdict::fail(
                     FailedHalf::Automaton,
                     format!(
-                        "automaton pair #{i} is labelled {actual_label:?}, expected                          {expected_label:?}"
+                        "automaton pair #{i} is labelled {actual_label:?}, expected {expected_label:?}"
                     ),
                 ),
             );

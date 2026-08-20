@@ -14,6 +14,16 @@ from 586 compared / 585 pass to 587 compared / 586 pass, with the single pre-exi
 divergence unchanged. No new `docs/WALNUT-BUGS.md` entry was warranted (highest remains WB-042):
 nothing found in `Ostrowski.java` produced wrong output or crashed on a plausible input.
 
+**Update (2026-08-20, same day): the two-independent-adversarial-reviewer loop this commit
+shipped without — required before merge for `wr-core` construction code — ran and found real
+issues, all fixed.** See `CLAUDE.md`'s "Current status" entry for the full account: the
+headline finding (both reviewers) was that `ost …::` silently dropped `ctx` threading
+(`DeterminizeContext`), so `Determinizing […]`/`[strategy]`/`[export]` support was missing —
+now fixed, matching `eval`/`def`'s pattern. Also fixed: a missing `ProverError::kind()` arm
+(wrong exception class name on the int-overflow error), a vacuous Tier-4 anti-vacuity
+tripwire (replaced with an exact derived count), and several doc/style issues. Golden corpus
+re-verified unchanged (670/671, same single 383 divergence) after the fixes.
+
 The prompt below is preserved as the record of what was asked for.
 
 Sizing rationale is in [`docs/UNPORTED-SCOPE-SIZING.md`](UNPORTED-SCOPE-SIZING.md) (ranked #2 —
