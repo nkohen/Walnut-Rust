@@ -47,6 +47,16 @@ The corpus lives in the sibling `walnut-java` oracle repo and is **not** vendore
 `WALNUT_JAVA_DIR` if the checkout is not beside this one. A run with no corpus fails loudly
 rather than passing silently.
 
+**Fixtures 603/604 now require the sibling `walnut-java` checkout to be at or past commit
+`b5d462b`** (`docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`'s PR-2, WB-008/WB-009's `concatStates`
+fix — found by adversarial review of that unit's Rust-side branch, which regenerated those
+two fixtures' expected `.txt` output to match the corrected concatenation semantics). Running
+this corpus against a `walnut-java` checkout that predates that commit (e.g. plain `main`)
+will fail 603/604 as an apparent, unexplained Rust regression — it isn't one; it's the two
+engines disagreeing about which fixture output is *correct*, and `main`'s is the buggy one.
+Every other fixture is unaffected (verified: their `concat` operands' second automaton always
+declares state 0 first and accepts epsilon, so both bug shapes are no-ops there).
+
 ## Headline numbers (measured 2026-08-20, release build)
 
 | | |

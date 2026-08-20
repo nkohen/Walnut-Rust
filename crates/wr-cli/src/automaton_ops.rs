@@ -815,7 +815,8 @@ mod tests {
         // and un-cleared accepting flags) were fixed in walnut-java commit `b5d462b`
         // and ported to `wr_core::fa::Fa::concat_states` (see its doc comment) --
         // the real language here is now the textbook `L(A)·L(B)`, so "0" alone must
-        // be REJECTED (epsilon is not in `L(B) = {"1"}`, so it can't leak through).
+        // be REJECTED: because epsilon is not in `L(B) = {"1"}`, `L(A)` no longer
+        // leaks through on its own (WB-009's old behavior).
         let (session, dir) = temp_session("concat");
         let accepts_zero = single_symbol_automaton(0);
         let accepts_one = single_symbol_automaton(1);

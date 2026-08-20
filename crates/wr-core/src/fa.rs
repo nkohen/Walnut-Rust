@@ -421,10 +421,12 @@ impl Fa {
     /// states' accepting flags to reflect what "reach here and stop" now means: a
     /// match only if `other` itself accepts the empty string.
     ///
-    /// # Two genuine Walnut (Java) bugs, fixed here to match walnut-java commit
-    /// `b5d462b` (`docs/WALNUT-BUGS.md` WB-008/WB-009 — see those entries for the
-    /// original buggy behavior this port used to reproduce verbatim, and their git
-    /// history / the pre-fix revision of this doc comment for how the quirks looked).
+    /// # Two genuine Walnut (Java) bugs
+    ///
+    /// Fixed here to match walnut-java commit `b5d462b` (`docs/WALNUT-BUGS.md`
+    /// WB-008/WB-009 — see those entries for the original buggy behavior this port
+    /// used to reproduce verbatim, and their git history / the pre-fix revision of
+    /// this doc comment for how the quirks looked).
     ///
     /// 1. **WB-008 — wrong source state when `other.q0 != 0`.** Java used to read
     ///    `other`'s outgoing transitions at *index* `0` (shifted), not `other.q0`;
@@ -446,6 +448,11 @@ impl Fa {
     ///    "always clear" would be a fresh, different bug). Pinned by
     ///    `concat_states_clears_first_operands_accepting_flags_when_other_rejects_epsilon`
     ///    and `concat_states_keeps_first_operands_accepting_flags_when_other_accepts_epsilon`.
+    ///    Matching Java's `setOutputIfEqual(int, boolean)`, this writes a plain `0`/`1`
+    ///    — a `first`-operand accepting state with a DFAO output `> 1` (e.g. `2`) has
+    ///    that output collapsed to `1` here, not preserved. `concat` is a plain-DFA
+    ///    (boolean-language) operation in both engines, so this is the correct,
+    ///    Java-faithful behavior for it, not a new gap.
     pub fn concat_states(other: &Fa, n: &mut Fa, original_q: usize) {
         // To access `other`'s states, just use `q`. To access them within `n`, use
         // `original_q + q`.
@@ -1226,8 +1233,12 @@ mod tests {
     }
 
     // --- concatStates (FA.java:107-131), WB-008/WB-009: fixed in walnut-java commit
-    // b5d462b to match `docs/WALNUT-BUGS.md`; the four tests below mirror
-    // `FATest.java`'s four new WB-008/WB-009 tests one-for-one. Each was confirmed to
+    // b5d462b to match `docs/WALNUT-BUGS.md`; the four tests below cover the same four
+    // cases `FATest.java`'s four new WB-008/WB-009 tests do, though not one-for-one --
+    // the first three build `first` with a non-accepting state 0 plus an accepting
+    // state 1 (Q=2), where Java's use Q=1 directly; the extra state makes these
+    // strictly stronger (it also exercises that a non-accepting state is correctly
+    // left untouched by the flag fixup), not weaker. Each was confirmed to
     // FAIL against the pre-fix `concat_states` (the version documented in this file's
     // git history / the pre-fix revision of `Fa::concat_states`'s doc comment) and
     // PASS against the fixed version below.
@@ -1365,11 +1376,15 @@ mod tests {
         // semantic language equivalence via `wr_core::equiv` (per this project's
         // CLAUDE.md rule: compare automata by language, not structure) -- the Rust
         // analogue of `FATest.concatStates_computesCorrectConcatenatedLanguage`,
-        // which used Java's `EqualityUtils.faEqual`. L(first) = { w : w ends in
-        // '1' }. L(other) = Sigma^+ (any nonempty string), with other.q0 = 2 (not
-        // 0) so this exercises WB-008's graft-target fix too. Both languages were
-        // independently re-derived from the transition tables below, mirroring the
-        // Java test's own derivation.
+        // which used Java's `EqualityUtils.faEqual`. L(first) = { w : w ends in an
+        // ODD-length run of '1's } (state 1's `1`-transition goes back to state 0,
+        // NOT a self-loop -- an earlier revision of this comment said "ends in '1'",
+        // which is wrong; caught by adversarial review, corrected here without
+        // touching the automaton itself, since the assertions below are still
+        // correct for the language as actually built). L(other) = Sigma^+ (any
+        // nonempty string), with other.q0 = 2 (not 0) so this exercises WB-008's
+        // graft-target fix too. Both languages were independently re-derived from
+        // the transition tables below, mirroring the Java test's own derivation.
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![0]);
         d_first0.insert(1, vec![1]);

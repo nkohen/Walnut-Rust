@@ -19,8 +19,13 @@
 //! One query triggers both: `other`'s `q0` must be a state OTHER than index 0 (WB-008),
 //! and `other` must not accept the empty string (WB-009).
 //!
-//! `wb008009a` (the first operand) accepts exactly the strings over `{0,1}` that END IN
-//! `1`. `wb008009b` (the second operand) is hand-authored with its `q0` declared FIRST
+//! `wb008009a` (the first operand) accepts exactly the strings over `{0,1}` that end in
+//! an ODD-length run of `1`s (state 1's `1`-transition goes back to state 0, not a
+//! self-loop, so "11" is rejected — an earlier revision of this comment said "end in
+//! `1`", which is wrong; caught by adversarial review of the sibling regression test in
+//! `crates/wr-core/src/fa.rs`, corrected here without touching the fixture, since the
+//! captured/asserted behavior below is still correct for the language as actually
+//! built). `wb008009b` (the second operand) is hand-authored with its `q0` declared FIRST
 //! in the file as state `2` (not `0`) — `AutomatonReader` sets `q0` to whichever state
 //! is declared first, and since this automaton is already deterministic and total, no
 //! auto-determinize/minimize on read renumbers it back to `q0 == 0` (see
