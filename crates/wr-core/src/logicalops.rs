@@ -894,27 +894,36 @@ pub fn right_quotient(
 ///
 /// # Panics
 ///
-/// If `A`'s alphabet is not a subset of `B`'s (`:242-244`, `WalnutException` message
+/// If `B`'s alphabet is not a subset of `A`'s (`:242-244`, `WalnutException` message
 /// ported verbatim).
 ///
-/// # A genuine Walnut (Java) defect this path carries (candidate for `docs/WALNUT-BUGS.md`)
+/// # WB-010 (`docs/WALNUT-BUGS.md`) — the alphabet-subset guard used to run backwards (fixed)
 ///
-/// The guard above checks `isSubsetA(A, B)` — "`A` ⊆ `B`" (`:242`). But the
-/// `rightQuotient(M1, M2, true)` it then performs (`:248`) re-encodes `M2`'s (= `B`'s)
-/// symbols under `M1`'s (= `A`'s) alphabet, which needs the OPPOSITE containment,
-/// `B` ⊆ `A` — that is exactly what `rightQuotient`'s own guard (`:182`) would have
-/// demanded, and it is precisely the guard `skipSubsetCheck = true` disables. The two
-/// agree only when the alphabets are equal as sets. So `leftquo` on `A` over `{0,1}`
-/// and `B` over `{0,1,2}` passes `leftQuotient`'s check, then hands `RichAlphabet.encode`
+/// The guard above now checks `isSubsetA(B, A)` — "`B` ⊆ `A`". **Before the fix**
+/// (upstream `walnut-java` commit `c5ff914` on `bugfix/wb-010`) it checked
+/// `isSubsetA(A, B)` instead — the OPPOSITE of what the delegated
+/// `rightQuotient(M1, M2, skipSubsetCheck=true)` call (`:248`) actually needs: that call
+/// re-encodes `M2`'s (= `B`'s) symbols under `M1`'s (= `A`'s) alphabet
+/// (`RichAlphabet.encode`, `:193-207`), which is only safe when `B`'s alphabet ⊆ `A`'s —
+/// exactly the direction `rightQuotient`'s own guard (`:182`) checks, and exactly the
+/// guard `skipSubsetCheck = true` disables. The two directions coincide only when the
+/// alphabets are equal as sets.
+///
+/// The old, backwards guard had two symptoms, both now fixed: `leftquo` on `A` over
+/// `{0,1}` and `B` over `{0,1,2}` used to pass the check, then hand `RichAlphabet.encode`
 /// (`RichAlphabet.java:110-116`) a digit its `A.get(i).indexOf(...)` cannot find,
-/// yielding `-1` and a silently corrupt (possibly negative) symbol id. Reachable from
-/// the plain CLI: `Main/Commands/Quotient.java:17-23` reads both automata from `.txt`
-/// files with no alphabet normalization in between.
+/// yielding `-1` and a silently corrupt (possibly negative) symbol id in Java (this
+/// crate turned it into a clean [`Automaton::encode`] panic instead, a pre-existing
+/// improvement over Java's silent `indexOf == -1` — see `automaton.rs`'s doc comment on
+/// `encode`); and, in the other direction, a genuinely valid pair like `A` over
+/// `{0,1,2}`, `B` over `{0,1}` (where `B ⊆ A` holds but the alphabets aren't equal as
+/// sets) used to be wrongly REJECTED. Reachable from the plain CLI either way:
+/// `Main/Commands/Quotient.java:17-23` reads both automata from `.txt` files with no
+/// alphabet normalization in between.
 ///
-/// This port surfaces it as a **panic** rather than a corrupt encoding, because
-/// [`Automaton::encode`] already panics on a digit absent from its track's alphabet — a
-/// pre-existing, documented improvement of this crate over Java's silent `indexOf ==
-/// -1` (see `automaton.rs`'s doc comment on `encode`), not a fix introduced here.
+/// Fixed to match Java's fix (`c5ff914`) exactly: `is_subset_alphabet(&b.alphabet,
+/// &a.alphabet)` instead of `is_subset_alphabet(&a.alphabet, &b.alphabet)`, with the
+/// corresponding message.
 pub fn left_quotient(
     a: &Automaton,
     b: &Automaton,
@@ -929,8 +938,8 @@ pub fn left_quotient(
         a.fa.q, b.fa.q
     ));
     assert!(
-        is_subset_alphabet(&a.alphabet, &b.alphabet),
-        "First A's alphabet must be a subset of the second A's alphabet for left quotient."
+        is_subset_alphabet(&b.alphabet, &a.alphabet),
+        "Second A's alphabet must be a subset of the first A's alphabet for left quotient."
     );
 
     let m1 = reverse_and_canonize(a, logging);
@@ -4489,10 +4498,16 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "First A's alphabet must be a subset of the second A's alphabet for left quotient."
+        expected = "Second A's alphabet must be a subset of the first A's alphabet for left quotient."
     )]
-    fn left_quotient_panics_when_the_first_alphabet_is_not_a_subset() {
-        // Replicates AutomatonLogicalOpsTest.testLeftQuotientThrowsWhenFirstAlphabetNotSubset.
+    fn left_quotient_panics_when_the_second_alphabet_is_not_a_subset() {
+        // Replicates AutomatonLogicalOpsTest.testLeftQuotientThrowsWhenSecondAlphabetNotSubset
+        // (renamed from testLeftQuotientThrowsWhenFirstAlphabetNotSubset by WB-010's fix,
+        // c5ff914). Track-count mismatch (2 vs 1) means `is_subset_alphabet` fails
+        // immediately regardless of direction, so this case alone can't distinguish a
+        // correct-direction check from a backwards one -- see
+        // `left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset`
+        // (WB-010) for that.
         let a = Automaton::new(
             Fa {
                 true_false: None,
@@ -4510,33 +4525,70 @@ mod tests {
         let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
     }
 
+    /// **WB-010** (`docs/WALNUT-BUGS.md`), fixed upstream in `walnut-java` commit
+    /// `c5ff914` (`bugfix/wb-010`): before the fix, this exact shape -- `A`'s alphabet a
+    /// strict SUPERset of `B`'s, arity 1 on both sides -- was wrongly REJECTED, because
+    /// the old (backwards) guard required `A ⊆ B`, not `B ⊆ A`. Replicates
+    /// `AutomatonLogicalOpsTest.testLeftQuotientComputesCorrectResultWhenSecondAlphabetIsASubset`.
     #[test]
-    #[should_panic(
-        expected = "First A's alphabet must be a subset of the second A's alphabet for left quotient."
-    )]
-    fn left_quotient_subset_guard_is_direction_sensitive() {
-        // Same mutation-tested gap as `right_quotient_subset_guard_is_direction_sensitive`,
-        // mirrored: arity 1 on both sides, A's alphabet a strict SUPERset of B's, so
-        // only `isSubsetA(A, B)` (AutomatonLogicalOps.java:242) rejects it.
+    fn left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset() {
+        // A over {0,1,2}, language exactly {"1", "00", "01"}: q0=a0; a0-0->a1, a0-1->a2;
+        // a1-0->a3, a1-1->a4; outputs [0,0,1,1,1] (a2, a3, a4 accept).
         let a = Automaton::new(
             Fa {
                 true_false: None,
                 q0: 0,
-                q: 1,
+                q: 5,
                 alphabet_size: 3,
-                o: vec![0],
-                d: vec![BTreeMap::new()],
+                o: vec![0, 0, 1, 1, 1],
+                d: vec![
+                    BTreeMap::from([(0, vec![1]), (1, vec![2])]),
+                    BTreeMap::from([(0, vec![3]), (1, vec![4])]),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ],
             },
             vec![vec![0, 1, 2]],
             vec!["x".to_string()],
             vec![Some(true)],
         );
-        let b = single_track(exactly_one(), Some(true));
+        // B over {0,1} (a genuine subset of A's alphabet, not equal to it as a set),
+        // language exactly {"0"}: b0-0->b1; outputs [0, 1].
+        let b = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 2,
+                o: vec![0, 1],
+                d: vec![BTreeMap::from([(0, vec![1])]), BTreeMap::new()],
+            },
+            vec![vec![0, 1]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
         assert!(
             is_subset_alphabet(&b.alphabet, &a.alphabet),
-            "the OPPOSITE containment does hold, so a swapped guard would pass"
+            "sanity: the real precondition (B subset A) genuinely holds here"
         );
-        let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
+        assert!(
+            !is_subset_alphabet(&a.alphabet, &b.alphabet),
+            "sanity: but the alphabets are NOT equal as sets -- the old (backwards) \
+             guard would have wrongly rejected this pair"
+        );
+
+        let m = left_quotient(&a, &b, &mut crate::logging::Logging::new());
+
+        // L(B) \ L(A) = { z : exists w in L(B), wz in L(A) } = { z : "0"+z in L(A) }:
+        // "0"+"" = "0" not in L(A); "0"+"0" = "00" in L(A) => "0" accepted; "0"+"1" =
+        // "01" in L(A) => "1" accepted.
+        assert!(!m.fa.accepts_word(&[]), "empty string should be rejected");
+        assert!(m.fa.accepts_word(&[0]), "\"0\" should be accepted");
+        assert!(m.fa.accepts_word(&[1]), "\"1\" should be accepted");
+        assert!(!m.fa.accepts_word(&[2]), "\"2\" should be rejected");
+        assert!(!m.fa.accepts_word(&[0, 0]), "\"00\" should be rejected");
+        assert!(!m.fa.accepts_word(&[0, 1]), "\"01\" should be rejected");
     }
 
     #[test]
@@ -4577,33 +4629,31 @@ mod tests {
         );
     }
 
-    /// The exact panic text WB-010 produces on this shape. `Automaton::encode_with`'s
-    /// out-of-alphabet guard (`automaton.rs`), reached through `right_quotient`'s
-    /// internal re-encode of `B` into `A`'s digit space: `B`'s digit `2` has no
-    /// counterpart in `A`'s `{0, 1}`. Shared with
-    /// `left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure`,
-    /// which must distinguish THIS failure from any other panic.
-    const WB_010_PANIC: &str = "digit 2 not in track 0's alphabet";
+    /// The exact panic text the (now-fixed) guard produces on WB-010's own trigger
+    /// shape. Shared with
+    /// `left_quotient_rejects_the_wb_010_shape_before_any_computation`, which must
+    /// distinguish THIS failure (the guard's own, correct-direction rejection) from any
+    /// other panic.
+    const WB_010_GUARD_PANIC: &str =
+        "Second A's alphabet must be a subset of the first A's alphabet for left quotient.";
 
+    /// **WB-010** (`docs/WALNUT-BUGS.md`), fixed upstream in `walnut-java` commit
+    /// `c5ff914` (`bugfix/wb-010`). Before the fix, `A` over `{0,1}`/`B` over `{0,1,2}`
+    /// passed the (backwards) guard -- `is_subset_alphabet(&a.alphabet, &b.alphabet)` is
+    /// true -- and then panicked deep inside `right_quotient`'s internal re-encode when
+    /// it hit `B`'s digit `2`, which has no counterpart in `A`'s alphabet (this crate's
+    /// [`Automaton::encode`] turns Java's silent `indexOf == -1` corruption into a clean
+    /// panic -- see this function's doc comment -- but the underlying guard defect was
+    /// the same either way). After the fix, the guard itself -- now checking
+    /// `is_subset_alphabet(&b.alphabet, &a.alphabet)` -- catches this exact shape and
+    /// rejects it CLEANLY, before `right_quotient`/the internal re-encode ever runs.
+    /// Replicates
+    /// `AutomatonLogicalOpsTest.testLeftQuotientRejectsWhenSecondAlphabetIsNotActuallyASubset`.
     #[test]
-    #[should_panic(expected = "digit 2 not in track 0's alphabet")]
-    fn left_quotient_panics_on_the_wb_010_trigger_the_guard_misses() {
-        // Pins WB-010 (docs/WALNUT-BUGS.md) directly, not just the guard's DIRECTION:
-        // the two `*_direction_sensitive` tests above only show `left_quotient`'s
-        // guard rejects inputs Java's guard would also reject (faithful direction).
-        // Neither demonstrates the actual defect -- an input the guard WRONGLY
-        // ACCEPTS because `A`'s alphabet genuinely is a subset of `B`'s (as sets),
-        // while `right_quotient`'s internal re-encode still needs the OPPOSITE
-        // containment. A over {0,1}, B over {0,1,2}: `is_subset_alphabet(&a.alphabet,
-        // &b.alphabet)` is true (the guard passes, matching Java), but B's digit `2`
-        // has no counterpart in A's alphabet, so the internal re-encode panics (this
-        // crate's improvement over Java's silent `indexOf == -1` corruption -- see
-        // this function's doc comment). A regression that "fixed" the guard direction
-        // (forbidden without explicit sign-off, `CLAUDE.md`) would make this test
-        // panic with a DIFFERENT message (the guard's own assert) instead of
-        // `Automaton::encode`'s; a regression that silently swallowed the encode
-        // panic would make it stop panicking at all -- either way this test would
-        // catch it, unlike the two direction-only tests above.
+    #[should_panic(
+        expected = "Second A's alphabet must be a subset of the first A's alphabet for left quotient."
+    )]
+    fn left_quotient_rejects_the_wb_010_trigger_cleanly() {
         let a = Automaton::new(
             Fa {
                 true_false: None,
@@ -4617,14 +4667,14 @@ mod tests {
             vec!["x".to_string()],
             vec![Some(true)],
         );
-        // `b` must have a REACHABLE, ACCEPTING run over digit 2 -- a bare self-loop
-        // on a non-accepting state disappears entirely under `reverse_and_canonize`
-        // (nothing was accepting, so `Fa::reverse` seeds the reversal with an EMPTY
-        // initial set and the whole automaton collapses to a transitionless
-        // 1-state rejector, silently removing the problematic digit before
-        // `right_quotient` ever sees it -- a real mistake this test caught only by
-        // actually running it, not by reasoning about it). L(b) = {"2"}: state0
-        // (non-accepting, initial) --2--> state1 (accepting, dead end).
+        // The exact automaton `left_quotient_panics_on_the_wb_010_trigger_the_guard_misses`
+        // (this test's pre-fix name) used, kept unchanged: L(b) = {"2"}, state0
+        // (non-accepting, initial) --2--> state1 (accepting, dead end). Before the fix,
+        // `b`'s transitions mattered (the panic only fired if digit `2` survived
+        // `reverse_and_canonize` to reach the internal re-encode). After the fix, the
+        // guard rejects on the ALPHABETS alone, before any of `b`'s transitions are
+        // ever inspected -- so this shape is no longer load-bearing, just preserved for
+        // continuity with the bug's original repro.
         let b = Automaton::new(
             Fa {
                 true_false: None,
@@ -4640,12 +4690,12 @@ mod tests {
         );
         assert!(
             is_subset_alphabet(&a.alphabet, &b.alphabet),
-            "sanity: leftQuotient's own guard (A subset B) passes"
+            "sanity: the OLD (backwards) guard (A subset B) would have wrongly passed"
         );
         assert!(
             !is_subset_alphabet(&b.alphabet, &a.alphabet),
-            "sanity: but the containment rightQuotient's re-encode actually needs \
-             (B subset A) does NOT hold"
+            "sanity: the containment the FIXED guard (and rightQuotient's re-encode) \
+             actually needs (B subset A) does NOT hold -- so the fixed guard rejects"
         );
         let _ = left_quotient(&a, &b, &mut crate::logging::Logging::new());
     }
@@ -4863,9 +4913,12 @@ mod tests {
         }
 
         /// Tier-4: `leftQuotient` against the brute-force set-theoretic quotient, on the
-        /// EQUAL-alphabet shape — the one shape on which WB-010's wrong-direction guard
-        /// is coincidentally right (see `left_quotient`'s doc comment), so naive
-        /// quotient semantics genuinely do apply and the port must compute them.
+        /// EQUAL-alphabet shape — the shape naive quotient semantics apply to
+        /// regardless of guard direction (both directions of `is_subset_alphabet`
+        /// coincide when the alphabets are equal as sets), so the port must compute
+        /// them here whether the guard is correct or (pre-WB-010-fix) backwards. See
+        /// `left_quotient_matches_the_brute_force_quotient_on_a_proper_subset_alphabet`
+        /// below for the shape that only the fixed guard admits.
         #[test]
         fn left_quotient_matches_the_brute_force_quotient_on_equal_alphabets(
             a in arb_partial_automaton_over(4, vec![0, 1]),
@@ -4886,46 +4939,56 @@ mod tests {
             }
         }
 
-        /// Tier-4 **on WB-010's guarded shape**: `A` over `{0,1}`, `B` over `{0,1,2}`, so
-        /// `leftQuotient`'s `isSubsetA(A, B)` guard PASSES while the containment the
-        /// internal `rightQuotient` re-encode actually needs (`B ⊆ A`) does not hold.
-        /// `left_quotient_panics_on_the_wb_010_trigger_the_guard_misses` above pins one
-        /// hand-built input that reaches the resulting failure; this property covers the
-        /// whole shape, and it deliberately does NOT assert naive quotient semantics
-        /// everywhere — that would report the deliberately-ported-verbatim WB-010 quirk
-        /// as a test failure.
-        ///
-        /// What it asserts instead is the exact two-sided contract:
-        ///
-        /// * whenever the port **answers**, the answer is the textbook left quotient
-        ///   (over `A`'s own digit alphabet — the space `rightQuotient`'s re-encode maps
-        ///   `B` into); and
-        /// * the port may **fail** only on this documented shape. Since the generator
-        ///   here always produces `B ⊄ A`, the interesting half of that is enforced by
-        ///   the sibling property above, which uses equal alphabets and admits no
-        ///   failure at all.
-        ///
-        /// The panic is caught rather than predicted: whether `B`'s digit-`2` transitions
-        /// survive `left_quotient`'s internal `reverse_and_canonize` (and so reach the
-        /// re-encode at all) depends on `Fa::reverse`'s accepting-state seeding, which
-        /// no cheap syntactic predicate over `B` gets right — the hand-built pin above
-        /// records that exact mistake being made and caught. `cargo test`'s harness
-        /// captures the caught panic's message, so this produces no output noise.
-        ///
-        /// **But WHICH panic is checked, not assumed.** A measured 39% of the generated
-        /// case space (779 of 2,001, one-off instrumented run) takes the failure branch,
-        /// so "any panic counts as WB-010" would
-        /// silently absorb an unrelated regression — a genuinely different panic (an
-        /// index-out-of-bounds in `reverse`, an arithmetic overflow, a broken invariant
-        /// assert) is a real signal, not a documented quirk. The caught payload is
-        /// therefore downcast and matched against [`WB_010_PANIC`], the same text the
-        /// hand-built pin above asserts, and anything else FAILS the property. A
-        /// confirmed WB-010 firing then ends the case as a tracked proptest **rejection**
-        /// (see the comment at that site) rather than as a silent pass, so a shape change
-        /// that pushed the rejection rate to 100% would abort the run instead of leaving
-        /// the property vacuously green.
+        /// Tier-4, added by **WB-010**'s fix (`docs/WALNUT-BUGS.md`, upstream
+        /// `walnut-java` commit `c5ff914` on `bugfix/wb-010`): `leftQuotient` against
+        /// the brute-force set-theoretic quotient, on the shape only the FIXED guard
+        /// admits — `B`'s alphabet a genuine but non-equal subset of `A`'s (`A` over
+        /// `{0,1,2}`, `B` over `{0,1}`). Before the fix this shape was wrongly REJECTED
+        /// outright (the old guard required `A ⊆ B`, false here since `A`'s alphabet is
+        /// strictly larger); the hand-built
+        /// `left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset`
+        /// pins one such input, this property covers the whole shape.
         #[test]
-        fn left_quotient_on_the_wb_010_shape_is_either_correct_or_the_documented_failure(
+        fn left_quotient_matches_the_brute_force_quotient_on_a_proper_subset_alphabet(
+            a in arb_partial_automaton_over(3, vec![0, 1, 2]),
+            b in arb_partial_automaton_over(3, vec![0, 1]),
+        ) {
+            let mut a = a;
+            let mut b = b;
+            a.fa = crate::trim::trim(&a.fa);
+            b.fa = crate::trim::trim(&b.fa);
+            prop_assert!(is_subset_alphabet(&b.alphabet, &a.alphabet));
+            prop_assert!(
+                !is_subset_alphabet(&a.alphabet, &b.alphabet),
+                "keep this shape genuinely non-equal-alphabet, or it collapses into \
+                 the sibling equal-alphabet property above"
+            );
+
+            let m = left_quotient(&a, &b, &mut crate::logging::Logging::new());
+            for z in all_digit_words(&[0, 1, 2], 3) {
+                prop_assert_eq!(
+                    accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &z),
+                    brute_force_left_quotient(&a, &b, &[0, 1, 2], &z),
+                    "left quotient disagrees on z = {:?}", z
+                );
+            }
+        }
+
+        /// Tier-4 **on WB-010's own guarded shape, now fixed**: `A` over `{0,1}`, `B`
+        /// over `{0,1,2}`. Before the fix (`docs/WALNUT-BUGS.md`, `walnut-java` commit
+        /// `c5ff914`), `leftQuotient`'s backwards `isSubsetA(A, B)` guard PASSED on this
+        /// shape while the containment the internal `rightQuotient` re-encode actually
+        /// needed (`B ⊆ A`) did not hold — sometimes succeeding, sometimes panicking
+        /// deep inside the re-encode, depending on whether `B`'s out-of-`A`-alphabet
+        /// digits survived `reverse_and_canonize` (see this file's git history, pre-fix
+        /// revision, for that property in its original "either correct or the
+        /// documented failure" form). After the fix the guard itself — now checking
+        /// `isSubsetA(B, A)` — rejects EVERY input on this shape, deterministically,
+        /// before any of the quotient machinery runs: since the generator here always
+        /// produces `B ⊄ A` (checked below), the fixed guard's own precondition can
+        /// never hold, so the panic is not merely likely but syntactically guaranteed.
+        #[test]
+        fn left_quotient_rejects_the_wb_010_shape_before_any_computation(
             a in arb_partial_automaton_over(3, vec![0, 1]),
             b in arb_partial_automaton_over(3, vec![0, 1, 2]),
         ) {
@@ -4933,62 +4996,35 @@ mod tests {
             let mut b = b;
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
-            prop_assert!(is_subset_alphabet(&a.alphabet, &b.alphabet));
             prop_assert!(!is_subset_alphabet(&b.alphabet, &a.alphabet));
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 left_quotient(&a, &b, &mut crate::logging::Logging::new())
             }));
-            let m = match outcome {
-                Ok(m) => m,
-                Err(payload) => {
-                    // Only the DOCUMENTED failure is allowed here. `panic!`'s payload is
-                    // a `String` for a formatted message and a `&'static str` for a
-                    // literal one, so both are tried before giving up.
-                    let msg = payload
-                        .downcast_ref::<String>()
-                        .map(String::as_str)
-                        .or_else(|| payload.downcast_ref::<&'static str>().copied())
-                        .unwrap_or("<non-string panic payload>")
-                        .to_string();
-                    prop_assert_eq!(
-                        &msg, WB_010_PANIC,
-                        "left_quotient panicked, but NOT with WB-010's documented \
-                         out-of-alphabet re-encode failure -- this is an unexpected \
-                         regression, not the ported quirk"
-                    );
-                    // WB-010 fired, confirmed by its own message. Ported verbatim;
-                    // nothing more to check on this input.
-                    //
-                    // This is a tracked REJECTION, not a bare `return Ok(())`: proptest
-                    // counts an early return as an ordinary PASS, so if a future change
-                    // made every generated case take this branch the property would go
-                    // silently vacuous and stay green forever. As a rejection, starving
-                    // it aborts the run instead. Same reasoning, and same remedy, as the
-                    // `prop_assume!` on
-                    // `convert_ns_to_a_power_of_two_base_preserves_the_integer_language`;
-                    // `prop_assume!` itself does not fit here because the skip is
-                    // post-`catch_unwind` control flow, not a boolean guard over the
-                    // inputs.
-                    //
-                    // Mutation-verified: making `left_quotient` panic with this exact
-                    // message on EVERY input turns this property from a silent all-pass
-                    // into `Test aborted: Too many global rejects / successes: 0`.
-                    // ("Global", not "local": proptest counts a rejection raised from the
-                    // test body — `prop_assume!` and this `reject` alike — against
-                    // `max_global_rejects`.)
-                    return Err(proptest::test_runner::TestCaseError::reject(
-                        "WB-010's documented re-encode failure fired",
+            let payload = match outcome {
+                Ok(_) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(
+                        "left_quotient must be rejected by its own guard on this shape, \
+                         but it returned a result -- the fixed guard is no longer \
+                         enforcing B's-alphabet-subset-of-A's",
                     ));
                 }
+                Err(payload) => payload,
             };
-            for z in all_digit_words(&[0, 1], 4) {
-                prop_assert_eq!(
-                    accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &z),
-                    brute_force_left_quotient(&a, &b, &[0, 1], &z),
-                    "left quotient disagrees on z = {:?}", z
-                );
-            }
+            // `panic!`'s payload is a `String` for a formatted message and a
+            // `&'static str` for a literal one -- both tried before giving up.
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or("<non-string panic payload>")
+                .to_string();
+            prop_assert_eq!(
+                &msg, WB_010_GUARD_PANIC,
+                "left_quotient panicked, but NOT with the fixed guard's own subset \
+                 message -- this is an unexpected regression (e.g. reaching the \
+                 internal re-encode unguarded again), not the expected clean rejection"
+            );
         }
     }
 

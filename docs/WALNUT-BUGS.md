@@ -446,19 +446,45 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** Phase 2, U5 (`logicalops.rs`'s `AutomatonLogicalOps` port), 2026-08-09, while porting
   `leftQuotient`/`rightQuotient`. Confirmed by direct reading of the guard logic and the
   re-encoding direction it's meant to protect — not yet run against a live Java reproduction.
-- **Rust port:** `ported verbatim (quirk)` — `wr_core::logicalops::left_quotient` reproduces the
-  same wrong-direction guard. Note the FAILURE MODE differs from Java's, faithfully inheriting an
-  earlier, deliberate crate-wide improvement (not something introduced for this bug):
-  `Automaton::encode` already panics on an out-of-alphabet digit (`PORTING.md`'s error-mapping
-  table calls for a hard error over Java's silent `List.indexOf`-returns-`-1` corruption), so this
-  port surfaces the same underlying guard defect as a clean panic instead of a silently wrong
-  automaton.
-- **Upstream:** not filed. Fix in Java would be checking `isSubsetA(B, A)` (or, more robustly,
-  requiring the alphabets be equal as sets, matching how same-labeled-track merges elsewhere in
-  this codebase are guarded) before the `rightQuotient(reverse(A), reverse(B), true)` call.
-- **Severity:** moderate — silent wrong answer in Java (this port turns it into a clean panic, not
-  a fix); reachable whenever `leftquo`'s two operands have genuinely different (non-equal-as-sets)
-  alphabets, which is a plausible real usage shape, not a contrived corner case.
+- **Rust port:** `fixed, matches walnut-java as of commit c5ff914` — `wr_core::logicalops::
+  left_quotient`'s guard now checks `is_subset_alphabet(&b.alphabet, &a.alphabet)` instead of
+  `is_subset_alphabet(&a.alphabet, &b.alphabet)`, mirroring Java's fix (`isSubsetA(B, A)` instead
+  of `isSubsetA(A, B)`, `AutomatonLogicalOps.java:242`, commit `c5ff914` on `bugfix/wb-010`), with
+  the corresponding message ("Second A's alphabet must be a subset of the first A's alphabet for
+  left quotient."). `right_quotient`'s own guard is unchanged (it already checked the correct
+  direction; `leftQuotient`'s duplicated, backwards check was the entire defect). Three existing
+  tests were flipped, not deleted: `left_quotient_panics_when_the_first_alphabet_is_not_a_subset` →
+  `left_quotient_panics_when_the_second_alphabet_is_not_a_subset` (message direction only, replicating
+  Java's own test rename); the direction-sensitivity test that used to assert a wrongly-rejected
+  valid pair now panicking (`left_quotient_subset_guard_is_direction_sensitive`) is now
+  `left_quotient_computes_the_correct_result_when_the_second_alphabet_is_a_subset`, asserting the
+  correct computed quotient on that same pair instead (`A` over `{0,1,2}`, `B` over `{0,1}`); and
+  the WB-010 trigger pin (`left_quotient_panics_on_the_wb_010_trigger_the_guard_misses`, which used
+  to assert the encode-panic failure mode) is now
+  `left_quotient_rejects_the_wb_010_trigger_cleanly`, asserting the guard's own clean rejection
+  instead. The Tier-4 property that used to assert "either the textbook quotient or WB-010's
+  documented failure" on the guarded shape is now
+  `left_quotient_rejects_the_wb_010_shape_before_any_computation`, asserting deterministic clean
+  rejection (the fixed guard's own precondition can never hold on that shape, so the failure is no
+  longer probabilistic); a new sibling property,
+  `left_quotient_matches_the_brute_force_quotient_on_a_proper_subset_alphabet`, adds genuine
+  coverage of the shape the fix newly makes computable (`B`'s alphabet a proper, non-equal subset
+  of `A`'s) against an independent brute-force oracle. A new differential test,
+  `tests/differential/tests/java_bugfix_wb010.rs`, confirms the fixed Rust `leftquo` command's
+  output is byte-identical to real `walnut-java`'s captured fixed output on WB-010's own trigger
+  shape (now cleanly rejected on both engines). `wr-cli`'s `quotient.rs` (`LEFT_QUOTIENT_SUBSET_
+  MESSAGE`, `QuotientError::Runtime`'s doc comment, and
+  `left_quotient_reports_a_mismatched_alphabet_as_an_error_not_a_panic`) updated to match — that
+  test's WB-010-shaped input now reports `QuotientError::Walnut` (a clean rejection), not
+  `QuotientError::Runtime` (the old encode-panic path), though the `Runtime` variant itself is kept
+  as the general any-other-panic recovery boundary.
+- **Upstream:** fixed, `walnut-java` commit `c5ff914` on branch `bugfix/wb-010` (local, not yet
+  pushed/opened as of this writing) — checks `isSubsetA(B, A)` before the
+  `rightQuotient(reverse(A), reverse(B), true)` call, with a corresponding message.
+- **Severity:** moderate — silent wrong answer in Java (this port turned it into a clean panic, not
+  a fix) before the fix; reachable whenever `leftquo`'s two operands have genuinely different
+  (non-equal-as-sets) alphabets, which is a plausible real usage shape, not a contrived corner case.
+  Now fixed on both engines.
 
 ---
 

@@ -32,17 +32,19 @@ pub enum QuotientError {
     /// `RuntimeException` that is not a `WalnutException` — hence rendered by
     /// `Prover`'s handler with a stack-trace header rather than message-only.
     ///
-    /// The known live instance is `docs/WALNUT-BUGS.md` **WB-010**: Java's `leftQuotient`
-    /// checks the subset guard in the wrong direction, so a genuinely-mismatched pair
-    /// slips past it and dies later inside `RichAlphabet.encode` — an
-    /// `ArrayIndexOutOfBoundsException` in Java, this crate's own
-    /// `"digit N not in track i's alphabet"` panic here. **Known text gap**: the panic
-    /// message this carries is walnut-rs's wording, not the JVM's
-    /// `"Index -1 out of bounds for length …"`, because the two implementations fail at
-    /// different points for different reasons (Java corrupts an index and indexes an
-    /// array with it; `Automaton::encode` refuses up front — a documented, pre-existing
-    /// improvement of this crate over Java's silent `indexOf == -1`). Only the
-    /// report-and-continue *behavior* is matched.
+    /// **Historical note (`docs/WALNUT-BUGS.md` WB-010, fixed as of `walnut-java` commit
+    /// `c5ff914` on `bugfix/wb-010`, and matched here in `wr_core::logicalops::
+    /// left_quotient`):** the known live instance of this variant used to be `leftQuotient`
+    /// checking its subset guard in the wrong direction, letting a genuinely-mismatched
+    /// pair slip past it to die later inside `RichAlphabet.encode` — an
+    /// `ArrayIndexOutOfBoundsException` in Java, this crate's own `"digit N not in track
+    /// i's alphabet"` panic. With the fix, `left_quotient`'s own guard now catches that
+    /// exact shape (`B`'s alphabet ⊄ `A`'s) before the re-encode ever runs, reporting it
+    /// as [`QuotientError::Walnut`] instead — so `left_quotient_command` is not currently
+    /// known to reach `Runtime` on any input. The variant is kept regardless, as the
+    /// generic "any other panic" recovery boundary this file's module doc describes; a
+    /// genuinely different, currently-unknown panic inside either quotient primitive
+    /// would still land here rather than killing the process.
     Runtime(String),
 }
 
@@ -69,9 +71,11 @@ impl QuotientError {
 /// `AutomatonLogicalOps.rightQuotient`'s guard message, as `wr_core::logicalops` spells it.
 const RIGHT_QUOTIENT_SUBSET_MESSAGE: &str =
     "Second A's alphabet must be a subset of the first A's alphabet for right quotient.";
-/// `AutomatonLogicalOps.leftQuotient`'s guard message, as `wr_core::logicalops` spells it.
+/// `AutomatonLogicalOps.leftQuotient`'s guard message, as `wr_core::logicalops` spells
+/// it. Direction fixed by WB-010 (`docs/WALNUT-BUGS.md`, `walnut-java` commit `c5ff914`
+/// on `bugfix/wb-010`): "second" (`B`), not "first" (`A`).
 const LEFT_QUOTIENT_SUBSET_MESSAGE: &str =
-    "First A's alphabet must be a subset of the second A's alphabet for left quotient.";
+    "Second A's alphabet must be a subset of the first A's alphabet for left quotient.";
 
 impl std::fmt::Display for QuotientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -338,11 +342,14 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The `leftquo` half. `left_quotient`'s own guard is WB-010's wrong-direction one,
-    /// so this pair slips past it and dies deeper, inside `Automaton::encode` — Java's
-    /// equivalent is an uncaught `ArrayIndexOutOfBoundsException`, also caught by the
-    /// REPL. Either way the command must fail and the session must survive; see
-    /// [`QuotientError::Runtime`] on the message-text gap.
+    /// The `leftquo` half. `A` over `{0,1}`, `B` over `{0,1,2}` is exactly WB-010's own
+    /// trigger shape (`docs/WALNUT-BUGS.md`): before the fix (`walnut-java` commit
+    /// `c5ff914` on `bugfix/wb-010`), `left_quotient`'s backwards guard let this pair
+    /// through and it died deeper, inside `Automaton::encode` (Java's equivalent: an
+    /// uncaught `ArrayIndexOutOfBoundsException`) — reported as [`QuotientError::Runtime`].
+    /// After the fix, the guard itself (now checking the correct direction) rejects this
+    /// shape cleanly, reported as [`QuotientError::Walnut`] instead. Either way the
+    /// command must fail and the session must survive.
     #[test]
     fn left_quotient_reports_a_mismatched_alphabet_as_an_error_not_a_panic() {
         let (session, dir) = temp_session("left-mismatch");
@@ -359,8 +366,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, QuotientError::Walnut(_) | QuotientError::Runtime(_)),
-            "must be a recovered error, not a process-killing panic; got {err:?}"
+            matches!(err, QuotientError::Walnut(_)),
+            "the fixed guard rejects this shape cleanly (WB-010); got {err:?}"
+        );
+        assert_eq!(err.to_string(), LEFT_QUOTIENT_SUBSET_MESSAGE);
+        assert!(
+            err.is_walnut_exception(),
+            "Java (post-fix) throws a WalnutException here, so it renders message-only"
         );
         assert!(!dir.join("Automata Library").join("c.txt").exists());
         fs::remove_dir_all(&dir).ok();

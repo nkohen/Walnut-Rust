@@ -853,7 +853,11 @@ impl LoggableError for ProverError {
             | ProverError::Ost(OstError::Parse(ParseMethodsError::NumberFormat(_))) => {
                 "java.lang.NumberFormatException".to_string()
             }
-            // `RichAlphabet.encode`'s corrupt index (WB-010); see `QuotientError::Runtime`.
+            // `RichAlphabet.encode`'s corrupt index -- WB-010's own trigger (`docs/
+            // WALNUT-BUGS.md`) used to reach this via `leftQuotient`'s backwards guard,
+            // fixed as of `walnut-java` commit `c5ff914`/`bugfix/wb-010` (ported: see
+            // `QuotientError::Runtime`'s doc comment for the historical note). Kept as
+            // the general mapping for any other panic that still reaches this variant.
             ProverError::Quotient(QuotientError::Runtime(_)) => {
                 "java.lang.ArrayIndexOutOfBoundsException".to_string()
             }
