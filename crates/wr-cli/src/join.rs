@@ -49,16 +49,20 @@
 //! does not, and a `join` operand read straight from a library file could in principle
 //! be non-deterministic before whatever earlier step produced it).
 //!
-//! # WB-037 (`docs/WALNUT-BUGS.md`): a `join` with zero automata crashes
+//! # WB-037 (`docs/WALNUT-BUGS.md`): a `join` with zero automata used to crash — fixed
 //!
-//! `Join.joinCommand`'s `Automaton N = subautomata.remove(0);` (`:58`) has no empty-list
+//! `Join.joinCommand`'s `Automaton N = subautomata.remove(0);` (`:58`) had no empty-list
 //! guard: `join J;` (syntactically valid — `Prover.RE_FOR_join_CMD`'s automata group is
-//! `(...)*`, zero-or-more) reaches this line with an empty `subautomata` and throws
-//! `IndexOutOfBoundsException: Index 0 out of bounds for length 0`, confirmed live
-//! against real `walnut-java`. [`join_command`] reproduces this as
+//! `(...)*`, zero-or-more) reaches this line with an empty `subautomata` and used to
+//! throw `IndexOutOfBoundsException: Index 0 out of bounds for length 0`, confirmed
+//! live against real `walnut-java`. [`join_command`] always reproduced this as
 //! [`JoinError::NoAutomataSpecified`] — a `Result::Err`, not a `panic!`, per the
 //! WB-002/033/034/035/036 precedent for a genuine, unguarded Java `RuntimeException`
-//! that `Prover.dispatch`'s top-level catch recovers from.
+//! that `Prover.dispatch`'s top-level catch recovers from — so no behavioral change was
+//! needed here. **Fixed upstream** in `walnut-java` commit `50636f4` (branch
+//! `bugfix/wb-002-012-037-044`), which adds exactly this guard, raising
+//! `WalnutException("Cannot join without any automata specified.")`; this port's own
+//! message is now updated to match that text verbatim.
 //!
 //! # Mismatched alphabets under a shared label: an `Err`, never a panic
 //!
@@ -107,7 +111,8 @@ pub enum JoinError {
     /// supplied for an automaton doesn't match its real track count.
     LabelMismatch { automaton_name: String },
     /// WB-037 (`docs/WALNUT-BUGS.md`, see module docs): `join` was given zero
-    /// automata.
+    /// automata. Message text is verbatim `Join.java`'s post-`50636f4` guard
+    /// (`WalnutException("Cannot join without any automata specified.")`).
     NoAutomataSpecified,
     /// Two of the joined automata give the same variable name two different alphabets
     /// — `ProductStrategies.computeSameInputs`'s `WalnutException` (`:281-283`), which
@@ -129,11 +134,11 @@ impl std::fmt::Display for JoinError {
             JoinError::LabelMismatch { automaton_name } => {
                 write!(f, "{}", msg::join_input_count_mismatch(automaton_name))
             }
-            JoinError::NoAutomataSpecified => write!(
-                f,
-                "join requires at least one automaton (WB-037: real Walnut throws \
-                 IndexOutOfBoundsException for this shape)"
-            ),
+            // Verbatim `Join.java`'s post-`50636f4` guard (WB-037, fixed upstream — see
+            // module docs).
+            JoinError::NoAutomataSpecified => {
+                write!(f, "Cannot join without any automata specified.")
+            }
             // Verbatim `ProductStrategies.java:281-283`.
             JoinError::AlphabetMismatch { .. } => write!(
                 f,
@@ -580,11 +585,20 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// WB-037, fixed upstream in `walnut-java` commit `50636f4`
+    /// (`bugfix/wb-002-012-037-044`): this port already rejected "zero automata" as a
+    /// clean `Result::Err` rather than a panic, so no behavioral change was needed here
+    /// — this test now also pins the exact message text, matching the fixed Java
+    /// verbatim (previously an invented, differently-worded message).
     #[test]
     fn join_command_wb037_zero_automata_is_rejected_not_a_panic() {
         let (session, dir) = temp_session("empty");
         let err = join_command(&session, &mut sink_logging(), "join J ;", "", "J").unwrap_err();
         assert!(matches!(err, JoinError::NoAutomataSpecified));
+        assert_eq!(
+            err.to_string(),
+            "Cannot join without any automata specified."
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

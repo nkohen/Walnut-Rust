@@ -1929,17 +1929,30 @@ bug costs a silent wrong answer somewhere downstream.
   `subautomata.remove(0)`/`new LinkedList<>(subautomata)` do when the regex-captured automata blob
   contains zero `name[x]...` matches — confirmed against the real jar before logging, per this
   project's "verify, don't guess" standard.
-- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err`
+- **Rust port:** was `ported verbatim (quirk)`, represented as an explicit `Result::Err`
   (`wr_cli::join::JoinError::NoAutomataSpecified`) rather than an uncaught panic — the same
   WB-002/033/034/035/036 reasoning: Java's own `IndexOutOfBoundsException` is an unchecked
   `RuntimeException` `Prover.dispatch`'s top-level catch recovers from, so a Rust `panic!` (which
   would abort this port's process, absent a `catch_unwind` boundary it doesn't have) is *less*
   faithful, not more. Pinned by `join_command_wb037_zero_automata_is_rejected_not_a_panic`.
-- **Upstream:** not filed. A one-line guard (`if (subautomata.isEmpty()) throw new
-  WalnutException("join requires at least one automaton");`, or similar) would fix it in Java.
+- **Upstream:** **fixed**, `walnut-java` commit `50636f4` (branch `bugfix/wb-002-012-037-044`):
+  `Join.joinCommand` gained exactly the guard predicted below (`if (subautomata.isEmpty()) throw
+  new WalnutException("Cannot join without any automata specified.");`), placed immediately before
+  the `remove(0)` call.
 - **Severity:** low — a loud crash, not a silently wrong answer, and only reachable by typing a
   `join` command with no operands at all (a command that could do nothing useful even if it
   succeeded).
+- **Resolved (2026-08-20):** upstream fixed as described above (commit `50636f4`; verified live,
+  `join J ;` now prints `Cannot join without any automata specified.` cleanly, no stack trace).
+  **Rust port: Case A — already computed/reported a clean, recoverable `Result::Err`, never the
+  raw Java crash, and now also matches the fixed Java exactly, as of commit `50636f4`.** No
+  functional change: `join_command` already returned `JoinError::NoAutomataSpecified` before this
+  unit. The only change is the message TEXT, updated from this port's own previously-invented
+  wording ("join requires at least one automaton…") to Java's exact fixed string, verbatim —
+  `join_command_wb037_zero_automata_is_rejected_not_a_panic` now additionally pins that text.
+  Differential coverage against a live capture from the fixed branch:
+  `tests/differential/tests/java_bugfix_wb037.rs`'s
+  `wb037_join_with_zero_automata_matches_fixed_java`.
 
 ---
 
