@@ -73,8 +73,9 @@ pub enum TransduceCommandError {
     /// file-reading command in this crate gets (`crate::session::FileLibraries::
     /// read_library_automaton`).
     ReadAutomaton(PredicateEnvError),
-    /// `wr_core::transducer::TransduceError`, unchanged — including WB-034/WB-035's
-    /// already-typed variants and the port-specific
+    /// `wr_core::transducer::TransduceError`, unchanged — including WB-034's
+    /// already-typed variant, the `NoTransducerTransition`/`NoTransducerOutput` renderings
+    /// of Java's two uncaught `createMap`/`sigma` NPEs, and the port-specific
     /// `TransduceError::Exploded` resource verdict (see the module docs).
     Transduce(TransduceError),
     /// See `crate::automaton_output::write_automata`'s docs for why this propagates
@@ -490,10 +491,14 @@ mod tests {
     /// A **partial transducer**: `Transducer Library/PARTIAL.txt` declares `{0, 1}` but
     /// state `1` has no transition on letter `1`. The file is perfectly well-formed --
     /// `read_transducer_txt` accepts it, and `transduce_non_deterministic`'s only
-    /// compatibility guard looks at the transducer's state `0` (WB-035), which is total
-    /// here -- so nothing rejects it before the BFS reaches the hole.
+    /// compatibility guard looks at the transducer's state `0` -- a ported-verbatim
+    /// quirk, unrelated to WB-035's fix -- which is total here, so nothing rejects it
+    /// before the BFS reaches the hole. This is the ONE input shape that still reaches
+    /// `wr_core::transducer::TransduceError::NoTransducerTransition` now that WB-035's
+    /// shifted-alphabet dead-state trigger is fixed.
     ///
-    /// Real Walnut throws `NullPointerException` there (`Transducer.java:400`), which
+    /// Real Walnut throws `NullPointerException` there (`Transducer.java:480`,
+    /// `:400` pre-fix), which
     /// `Prover.dispatch`'s `catch (RuntimeException)` prints before returning to the
     /// prompt. This is the shape U26 makes reachable from an ordinary user-supplied
     /// `.txt`, and `wr-cli` has no `catch_unwind` anywhere in `read_buffer`/`dispatch`, so

@@ -126,13 +126,74 @@
 //! behavior can pass its own budget to
 //! [`Transducer::transduce_non_deterministic_with_budget`].
 //!
-//! # WB-035: `minOutput` is used both as an encoded INPUT symbol and as an OUTPUT marker
+//! # WB-035 (FIXED): `minOutput` was used both as an encoded INPUT symbol and as an
+//! # OUTPUT marker
 //!
-//! See `docs/WALNUT-BUGS.md`. `transduceNonDeterministic`'s partial-automaton path
-//! (`:303-323`) picks `minOutput` — a value from **`M`'s output alphabet** — and uses
-//! it, unencoded, as (a) an encoded input symbol of the transducer and (b) the marker
-//! output whose states are deleted from the *result*. Both are category errors that
-//! only work by coincidence; both are ported verbatim and pinned by tests below.
+//! See `docs/WALNUT-BUGS.md`. `transduceNonDeterministic`'s partial-automaton path used
+//! to pick `minOutput` — a value from **`M`'s output alphabet** — and use it, unencoded,
+//! as (a) an encoded input symbol of the transducer and (b) the marker output whose
+//! states are deleted from the *result*. Both are category errors that only work by
+//! coincidence (`A[0] == [0..k-1]` makes position == value, and `min(M.O) == 0` makes
+//! `minOutput == -1`, which `List.indexOf` also returns for an absent value); shift
+//! either and (a) silently clobbers a real letter of the transducer or crashes, and (b)
+//! silently deletes real states of the result.
+//!
+//! **Fixed upstream** in `walnut-java` commit `7f54eff` (branch `bugfix/wb-035`, stacked
+//! on `bugfix/wb-038`), and ported here with the same design, not a simplified one:
+//!
+//! * half (a) — the dead state is **relabelled** to a value strictly below both `M`'s
+//!   outputs and the transducer's input alphabet
+//!   ([`Transducer::dead_letter_outside_input_alphabet`]), that value is **appended** to
+//!   the (cloned) transducer's input-alphabet track
+//!   ([`Transducer::append_input_letter`]), and the *encoded position* it lands at — not
+//!   the raw value — keys the transition table and `sigma`. The freshness makes "no real
+//!   letter of the transducer is ever clobbered" an invariant of this method rather than
+//!   a consequence of an invariant two files away. **What it is not is an observable
+//!   difference** — see "on the freshness half, honestly" below;
+//! * half (b) — the removal marker is one below every value the transducer can emit
+//!   ([`Transducer::marker_outside_output_alphabet`]), derived from `sigma` alone and not
+//!   from `M`'s outputs at all. The alternative WB-035's entry floated — a parallel
+//!   "is dead" flag instead of an output sentinel — was rejected upstream and is not
+//!   ported: [`Transducer::transduce_msd_deterministic`] runs
+//!   [`crate::word_automaton::minimize_self_with_output`] before returning, which merges
+//!   and renumbers states, so any index-keyed dead-state set computed inside is
+//!   invalidated by it. To survive minimization a dead marker has to be something
+//!   minimization refuses to merge across — i.e. a distinct output value. The mechanism
+//!   was sound; only its choice of value was wrong.
+//!
+//! Neither value is anything a user declared, and neither is observable afterwards: the
+//! alphabet extension goes into the local clone, and the marked states are pruned by
+//! `removeStatesWithOutputRebuild` + `forceCanonize` before the result is returned. A
+//! **total** input automaton never enters this branch at all and is byte-identically
+//! unaffected. See the `wb035_*` tests below, which pin the fixed answers against real
+//! `walnut-java` output captured from the fixed branch.
+//!
+//! ## On the freshness half, honestly
+//!
+//! Half (b) is load-bearing: mutate the marker by one and four tests here fail, including
+//! the Tier-4 property. Half (a)'s *freshness* is not, and this port measured that rather
+//! than inheriting the claim. Replacing the relabel-and-append with the minimal
+//! "just encode `min(M.O) - 1`" variant leaves **every** test in this module green,
+//! including the Tier-4 property at 20,000 cases — the same negative result the upstream
+//! author got from a 400-case randomized differential (46 of which hit the discriminating
+//! condition, `min(M.O) - 1` already being a letter of the transducer's alphabet).
+//!
+//! The upstream commit attributes that to luck. It is not: the two agree *by construction*
+//! in this call shape. `encode_input(v)` is `A[0].indexOf(v)`, so the entry the minimal
+//! variant overwrites is the entry of the letter `min(M.O) - 1` **itself** — and the only
+//! keys anything ever reads back out of `t_new` are `encode_input(o)` for outputs `o` of
+//! `M_new`, i.e. `M`'s own outputs (all strictly greater) plus the dead state's. So the
+//! clobbered entry is precisely the one the dead state was going to consult, clobbered
+//! with exactly the self-loop it wanted. When `min(M.O) - 1` is *not* a letter,
+//! `indexOf` answers `-1`, which no real position can equal, and the two agree trivially.
+//!
+//! The freshness is still ported, and still worth having: it is what upstream does (the
+//! mechanical-port rule), and it converts "no real letter is clobbered" from a two-step
+//! argument about `add_distinguished_dead_state`'s choice of output into a local
+//! invariant of this one method. It is pinned directly, by
+//! `wb035_the_dead_letter_is_outside_the_transducers_input_alphabet`, rather than left as
+//! untested defence — which is the right shape for a guarantee that no end-to-end answer
+//! can currently distinguish.
 //!
 //! # WB-034: a track with no number system NPEs before the transduction even starts
 //!
@@ -211,8 +272,8 @@ pub enum TransduceError {
     /// [`TransduceError::NotSingleInput`] (a trivial automaton has no tracks at all,
     /// so its track count is `0 != 1`).
     TrivialAutomaton,
-    /// **WB-035**, half one, as a *rejection* rather than a panic.
-    /// `Transducer.createMap` (`:400`) does
+    /// Java's uncaught `createMap` NPE, as a *rejection* rather than a panic.
+    /// `Transducer.createMap` (`:480`, `:400` before WB-035's fix) does
     /// `getNfaStateDests(mapSoFar.get(j), encoded).getInt(0)` with no null check, so a
     /// transducer that has no transition on the encoded symbol it is asked for throws
     ///
@@ -223,14 +284,24 @@ pub enum TransduceError {
     /// ```
     ///
     /// which `Prover.dispatch`'s top-level `catch (RuntimeException)` prints and
-    /// recovers from — the REPL keeps going. Two inputs reach it, both from ordinary
-    /// hand-authored library files: WB-035's shifted-alphabet dead-state path, and a
-    /// **partial** (well-formed but non-total) `Transducer Library/*.txt` — a state
-    /// missing a transition on one letter of its own declared alphabet. Since `transduce`
-    /// is now reachable from user-supplied files (U26), a Rust `panic!` here would unwind
-    /// out of a REPL that has no `catch_unwind` and kill the whole session, which is a
-    /// strictly worse divergence than Java's. Same treatment and the same reasoning as
+    /// recovers from — the REPL keeps going. Since `transduce` is reachable from
+    /// user-supplied files (U26), a Rust `panic!` here would unwind out of a REPL that has
+    /// no `catch_unwind` and kill the whole session, which is a strictly worse divergence
+    /// than Java's. Same treatment and the same reasoning as
     /// [`TransduceError::NoNumberSystem`] (WB-034) and WB-033/WB-013.
+    ///
+    /// # Still reachable after WB-035's fix — from ONE input shape, not two
+    ///
+    /// This variant used to have two triggers. WB-035's shifted-alphabet dead-state path
+    /// was one of them, and that one is **gone**: the dead letter now gets an encoded
+    /// position of its own, so the lookup `createMap` makes for it always resolves. What
+    /// remains, unchanged and still exercised by
+    /// `a_partial_transducer_is_a_clean_error_not_a_panic`, is a **partial** (well-formed
+    /// but non-total) `Transducer Library/*.txt` — a state missing a transition on one
+    /// letter of its own declared alphabet. That reaches here with a perfectly total input
+    /// automaton and no dead state involved at all, because
+    /// [`Transducer::transduce_non_deterministic`]'s only compatibility guard checks the
+    /// transducer's state `0` alone (a quirk ported verbatim, unrelated to WB-035's fix).
     ///
     /// One sub-case is knowingly approximated: an *empty* destination list (rather than a
     /// missing one) is `getInt(0)` on an empty `IntList`, i.e. Java's
@@ -526,9 +597,10 @@ impl Transducer {
     /// Java's `getNfaStateDests(...).getInt(0)` throws
     /// `NullPointerException`/`IndexOutOfBoundsException` in exactly those two cases,
     /// uncaught, and `transduceNonDeterministic`'s only guard against it (`:276-281`)
-    /// checks the transducer's state `0` alone — this is one of WB-035's two confirmed
-    /// manifestations, and is also what a partial transducer `.txt` hits. See that
-    /// variant's doc for why this is a `Result::Err` and not a `panic!`.
+    /// checks the transducer's state `0` alone — which is what a partial transducer `.txt`
+    /// hits. (It used to be WB-035's crash half as well; that trigger is gone now that the
+    /// dead letter has an encoded position of its own.) See that variant's doc for why
+    /// this is a `Result::Err` and not a `panic!`.
     fn create_map(
         &self,
         m_fa: &Fa,
@@ -935,9 +1007,10 @@ impl Transducer {
         }
 
         // Check that the output alphabet of the automaton is compatible with the input
-        // alphabet of the transducer. NOTE (ported verbatim): Java checks the
-        // transducer's state `0` only — not its `q0`, and not every state. See
-        // `create_map`'s doc and WB-035 for the crash that leaves reachable.
+        // alphabet of the transducer. NOTE (ported verbatim, and NOT part of WB-035's
+        // fix): Java checks the transducer's state `0` only — not its `q0`, and not every
+        // state. See `create_map`'s doc for the crash that leaves reachable on a partial
+        // transducer.
         for &output in &m.fa.o {
             let encoded = self.encode_input(output);
             if !self.automaton.fa.d[0].contains_key(&encoded) {
@@ -975,27 +1048,38 @@ impl Transducer {
             n = self.transduce_msd_deterministic_with_budget(m, logging, budget)?;
         } else {
             let mut m_new = m.clone();
+            // We are in the `!totalized` branch, so this always adds a state, whose
+            // output is one less than every other output of `M`
+            // ([`Fa::add_distinguished_dead_state`]).
             m_new.fa.add_distinguished_dead_state();
-
-            // after transducing, all states with this minimum output will be removed.
-            let min_output = m_new.fa.determine_min_output();
+            let dead_state_output = m_new.fa.determine_min_output();
 
             let mut t_new = self.clone();
 
-            // WB-035, half one: `min_output` is an output value of `M`, used here
-            // straight as an ENCODED INPUT SYMBOL of the transducer, with none of the
-            // `encode_input` indirection every other site in this file applies.
+            // The transducer is only ever consulted through `encode_input` for an output
+            // value of `M` — see `create_map` and the per-state output read in
+            // `transduce_msd_deterministic`. That is `A[0].indexOf(v)`: a *position* in
+            // the transducer's input alphabet, not the value itself. So the dead state
+            // needs a letter of the transducer's own input alphabet that no real letter
+            // shares, and the marker used to find (and delete) the dead states afterwards
+            // needs to be a value outside the transducer's own *output* alphabet, since
+            // that is where the result's outputs come from. `dead_state_output` is
+            // neither. See WB-035, and this module's docs for the full account.
+            let dead_letter = Self::dead_letter_outside_input_alphabet(&t_new, dead_state_output);
+            Self::relabel_states_with_output(&mut m_new.fa, dead_state_output, dead_letter);
+            let encoded_dead_letter = Self::append_input_letter(&mut t_new, dead_letter);
+            let dead_marker = Self::marker_outside_output_alphabet(&t_new.sigma);
+
             for q in 0..t_new.automaton.fa.q {
-                t_new.automaton.fa.d[q].insert(min_output, vec![q]);
-                t_new.sigma[q].insert(min_output, min_output);
+                t_new.automaton.fa.d[q].insert(encoded_dead_letter, vec![q]);
+                t_new.sigma[q].insert(encoded_dead_letter, dead_marker);
             }
 
             n = t_new.transduce_msd_deterministic_with_budget(&m_new, logging, budget)?;
 
-            // WB-035, half two: and here as a marker in the RESULT's output alphabet,
-            // which is the transducer's, not `M`'s — so a transducer that can
-            // legitimately emit `min_output` has its real states deleted.
-            logicalops::remove_states_with_output_rebuild(&mut n.fa, min_output);
+            // after transducing, all states carrying this marker as their output are
+            // removed.
+            logicalops::remove_states_with_output_rebuild(&mut n.fa, dead_marker);
             n.force_canonize();
         }
 
@@ -1006,6 +1090,90 @@ impl Transducer {
         logging.dedent();
 
         Ok(n)
+    }
+
+    /// `Transducer.deadLetterOutsideInputAlphabet` (`:359-365`, added by WB-035's fix) —
+    /// a value that is neither a letter of `t`'s input alphabet nor an output of the
+    /// automaton being transduced, for use as the distinguished dead state's output
+    /// (which [`Transducer::transduce_msd_deterministic`] then reads as an input letter
+    /// of `t`).
+    ///
+    /// `dead_state_output` is already one less than every original output of `M`, so
+    /// anything strictly below it is too; taking the minimum with `t`'s own alphabet also
+    /// puts it outside that.
+    ///
+    /// # Panics
+    ///
+    /// If the transducer declares no tracks at all, matching Java's `A.get(0)`
+    /// `IndexOutOfBoundsException` — the same pre-existing exposure
+    /// [`Transducer::encode_input`] documents.
+    fn dead_letter_outside_input_alphabet(t: &Transducer, dead_state_output: i32) -> i32 {
+        let mut min = dead_state_output;
+        for &letter in &t.automaton.alphabet[0] {
+            min = min.min(letter);
+        }
+        min - 1
+    }
+
+    /// `Transducer.markerOutsideOutputAlphabet` (`:375-383`, added by WB-035's fix) — a
+    /// value outside `sigma`'s value range, for use as the marker identifying the states
+    /// of the transduced automaton that came from the dead state. Every output of that
+    /// automaton is a value of `sigma`, so no genuine state can carry this one.
+    ///
+    /// The running minimum starts at `0` rather than at the first output, so that this is
+    /// always negative and is well defined for a transducer that emits nothing at all.
+    fn marker_outside_output_alphabet(sigma: &[BTreeMap<i32, i32>]) -> i32 {
+        let mut min = 0;
+        for state_outputs in sigma {
+            for &output in state_outputs.values() {
+                min = min.min(output);
+            }
+        }
+        min - 1
+    }
+
+    /// `Transducer.relabelStatesWithOutput` (`:385-392`, added by WB-035's fix). Used
+    /// only to move the freshly added dead state's output off `min(M.O) - 1` and onto
+    /// [`Transducer::dead_letter_outside_input_alphabet`]'s value; that value is strictly
+    /// below every other output of `M`, so no real state is ever the `from` here.
+    fn relabel_states_with_output(fa: &mut Fa, from: i32, to: i32) {
+        for output in &mut fa.o {
+            if *output == from {
+                *output = to;
+            }
+        }
+    }
+
+    /// `Transducer.appendInputLetter` (`:403-411`, added by WB-035's fix) — append
+    /// `letter` to `t`'s input alphabet and return its encoding. The letter must not
+    /// already be in that alphabet, so that appending it neither moves an existing
+    /// letter's index nor gives it an index a real letter already has;
+    /// [`Transducer::dead_letter_outside_input_alphabet`] is what guarantees that.
+    ///
+    /// # The alphabet-sharing hazard Java has and this port does not
+    ///
+    /// Java's version has to copy the track before extending it: `RichAlphabet.clone()`
+    /// is shallow, sharing its per-track `List<Integer>`s with the original, so a
+    /// `newTrack.add(...)` in place would extend the alphabet of the `Transducer` this
+    /// one was cloned from — which `Session` caches and hands out again. **That hazard
+    /// does not transfer**: this crate's alphabet is a plain `Vec<Vec<i32>>` and
+    /// `#[derive(Clone)]` deep-copies it, so `self.clone()` in
+    /// [`Transducer::transduce_non_deterministic_with_budget`] already produced an
+    /// independent track and this push cannot reach the caller's transducer. Verified,
+    /// not assumed, by `wb035_the_dead_letter_and_marker_never_escape_the_construction`.
+    ///
+    /// [`Automaton::setup_encoder`] and [`Automaton::determine_alphabet_size`] are the
+    /// port's `richAlphabet.setupEncoder()` / `setAlphabetSize(determineAlphabetSize())`.
+    /// Neither is read by the transduction itself (which only ever goes through
+    /// [`Transducer::encode_input`], a direct `position` scan of track `0`), but leaving
+    /// a mutated alphabet with a stale encoder behind is exactly the trap
+    /// `determine_alphabet_size`'s own doc warns about, so both are refreshed here as
+    /// Java does.
+    fn append_input_letter(t: &mut Transducer, letter: i32) -> i32 {
+        t.automaton.alphabet[0].push(letter);
+        t.automaton.setup_encoder();
+        t.automaton.determine_alphabet_size();
+        t.encode_input(letter)
     }
 }
 
@@ -1118,22 +1286,35 @@ mod tests {
     ///
     /// Positions live inside `h^k(q0)` for a fixed word length `k`, so the letter at
     /// position `i` is `m`'s output on the `k`-digit representation of `i`, and the
-    /// position of `word` is its base-2 value. `m` must be total.
-    fn dekking_oracle(t: &Transducer, m: &Automaton, k: u32, word: &[i32]) -> i32 {
+    /// position of `word` is its base-2 value.
+    ///
+    /// `m` may be **partial**, and `None` is what a partial `m` means: Walnut's dead-state
+    /// mechanism (`FA.addDistinguishedDeadState` plus the self-loop
+    /// `transduce_non_deterministic` installs for it) routes every undefined position to a
+    /// distinguished state that loops the transducer in place and emits the removal
+    /// marker — so an undefined position CONTRIBUTES NOTHING to the running transducer
+    /// state, and an undefined position `n` leaves the result undefined at `n` (its state
+    /// carries the marker and the transition into it is pruned). Both halves are
+    /// modelled here directly from that design; nothing in this function knows how the
+    /// dead letter or the marker are actually chosen, which is the point — WB-035 was
+    /// precisely a wrong choice of both.
+    fn dekking_oracle(t: &Transducer, m: &Automaton, k: u32, word: &[i32]) -> Option<i32> {
         assert_eq!(word.len(), k as usize);
-        let letter_at = |i: u32| -> i32 {
+        let letter_at = |i: u32| -> Option<i32> {
             let mut s = m.fa.q0;
             for sym in msd_digits(i, k) {
-                s = m.fa.d[s][&sym][0];
+                s = *m.fa.d[s].get(&sym)?.first()?;
             }
-            m.fa.o[s]
+            Some(m.fa.o[s])
         };
         let position = word.iter().fold(0u32, |acc, &b| acc * 2 + b as u32);
         let mut ts = t.automaton.fa.q0;
         for i in 0..position {
-            ts = t.automaton.fa.d[ts][&t.encode_input(letter_at(i))][0];
+            if let Some(letter) = letter_at(i) {
+                ts = t.automaton.fa.d[ts][&t.encode_input(letter)][0];
+            }
         }
-        t.sigma[ts][&t.encode_input(letter_at(position))]
+        letter_at(position).map(|letter| t.sigma[ts][&t.encode_input(letter)])
     }
 
     /// Walks a deterministic word automaton and returns the output at the state
@@ -1275,7 +1456,7 @@ mod tests {
             let word = msd_digits(n, k);
             assert_eq!(
                 word_output(&c, &word),
-                Some(dekking_oracle(&t, &reference, k, &word)),
+                dekking_oracle(&t, &reference, k, &word),
                 "S_3 transduction of Thue-Morse at position {n}"
             );
         }
@@ -1450,13 +1631,18 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// State `0` has no transition on symbol `1`, so `isTotalized` is false and the
-    /// dead-state path runs. The transducer here emits `5`/`1`, neither of which
-    /// collides with `min(M.O) - 1 == -1`, so the result is CORRECT: it keeps exactly
-    /// the input's defined transitions, with outputs relabelled `0 -> 5`, `1 -> 1`.
+    /// dead-state path runs. The result keeps exactly the input's defined transitions,
+    /// with outputs relabelled `0 -> 5`, `1 -> 1`. This shape was already correct before
+    /// WB-035's fix — the transducer emits `5`/`1`, neither of which collides with
+    /// `min(M.O) - 1 == -1` — which is what makes it the *control* for
+    /// `wb035_a_transducer_output_colliding_with_the_marker_keeps_every_real_state`, whose
+    /// only difference is that one output value. It must therefore be unchanged by the
+    /// fix, and is.
     ///
     /// Empirically cross-checked against the real `walnut-java` CLI (2026-08-13,
-    /// `target/Walnut-all.jar`), which produces `0 5 / 0 -> 1`, `1 1 / 0 -> 1, 1 -> 0`
-    /// — three transitions.
+    /// `target/Walnut-all.jar`, and re-captured 2026-08-21 against both the pre- and
+    /// post-fix jars), which produces `0 5 / 0 -> 1`, `1 1 / 0 -> 1, 1 -> 0` — three
+    /// transitions, identically on both.
     #[test]
     fn partial_automaton_transduces_through_the_dead_state_path() {
         let mut logging = Logging::new();
@@ -1534,64 +1720,275 @@ mod tests {
         }
     }
 
-    /// **WB-035** (`docs/WALNUT-BUGS.md`), half two. Literally the same input
-    /// automaton as the test above, and a transducer differing only in ONE output
-    /// value: `5` becomes `-1`, which happens to equal `min(M.O) - 1`, the marker the
-    /// dead-state path uses. Real, reachable states are then silently deleted — here
-    /// the `1 -> 0` transition, which the input defines and which the sibling test
-    /// above (identical in every other respect) keeps.
+    /// Asserts the exact shape of a transduction result: per-state output, and per-state
+    /// `(symbol, destination)` pairs in symbol order. The `[o] [d]` rendering is the same
+    /// one `TransducerTest.java`'s WB-035 cases assert on, so an expectation can be read
+    /// straight across from there.
+    fn assert_shape(c: &Automaton, outputs: &[i32], d: &[&[(i32, usize)]]) {
+        assert_eq!(c.fa.o, outputs.to_vec(), "outputs");
+        assert_eq!(c.fa.q, d.len(), "state count");
+        for (q, row_expected) in d.iter().enumerate() {
+            let actual: Vec<(i32, usize)> = c.fa.d[q]
+                .iter()
+                .map(|(&sym, dests)| {
+                    assert_eq!(dests.len(), 1, "state {q} on symbol {sym} must be a DFA");
+                    (sym, dests[0])
+                })
+                .collect();
+            assert_eq!(actual, row_expected.to_vec(), "state {q}");
+        }
+    }
+
+    /// **WB-035** (`docs/WALNUT-BUGS.md`), half two, **fixed**. Literally the same input
+    /// automaton as the test above, and a transducer differing only in ONE output value:
+    /// `5` becomes `-1`, which happens to equal `min(M.O) - 1`. Pre-fix that value was
+    /// also the marker handed to `remove_states_with_output_rebuild`, so the real,
+    /// reachable state carrying it was deleted along with the dead ones and the result
+    /// lost the `1 -> 0` transition the input defines (two transitions where the sibling
+    /// control above, identical in every other respect, gets three).
     ///
-    /// This asserts the WRONG answer, matching real `walnut-java`'s empirically
-    /// confirmed output, per `CLAUDE.md`'s mechanical-port rule.
+    /// The marker is now derived from the transducer's own `sigma` and sits strictly below
+    /// every value it can emit, so nothing real can collide with it. Expectation captured
+    /// live from the FIXED jar (`bugfix/wb-035`, `7f54eff`): `transduce wb035neg WB035NEG
+    /// WB035P;` gives `0 -1 / 0 -> 1` and `1 1 / 0 -> 1, 1 -> 0`, i.e. the same three
+    /// transitions as the control, differing only in the one output value. Against the
+    /// PRE-fix jar (`601a9d2`) the same command gives `1 1 / 0 -> 1` — the divergence this
+    /// test used to pin.
     #[test]
-    fn wb035_partial_automaton_loses_states_whose_output_collides_with_the_marker() {
+    fn wb035_a_transducer_output_colliding_with_the_marker_keeps_every_real_state() {
         let mut logging = Logging::new();
         let t = transducer(&[0, 1], &[&[(0, 0, -1), (1, 0, 1)]]);
         let mut m = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
 
         let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
 
-        // Faithful (buggy) result: `0 -1 / 0 -> 1`, `1 1 / 0 -> 1` -- TWO transitions,
-        // not the three the sibling test gets. The mathematically correct answer would
-        // additionally have `1 -> 0` from the output-1 state.
-        assert_eq!(c.fa.q, 2);
-        assert_eq!(transition_count(&c), 2);
+        assert_shape(&c, &[-1, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+        assert_eq!(transition_count(&c), 3);
         assert_eq!(word_output(&c, &[]), Some(-1));
         assert_eq!(word_output(&c, &[0]), Some(1));
         assert_eq!(
             word_output(&c, &[0, 1]),
-            None,
-            "WB-035: this transition is real in the input but is deleted by the marker collision"
+            Some(-1),
+            "this transition is real in the input; pre-fix the marker collision deleted it"
         );
+        // The one genuinely undefined transition of the input stays undefined.
+        assert_eq!(word_output(&c, &[1]), None);
+
+        // And the control from WB-035's own entry, whose ONLY difference is the
+        // non-colliding output value, must still give the same shape.
+        let control = transducer(&[0, 1], &[&[(0, 0, 5), (1, 0, 1)]]);
+        let mut m = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+        let c = control
+            .transduce_non_deterministic(&mut m, &mut logging)
+            .unwrap();
+        assert_shape(&c, &[5, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
     }
 
-    /// **WB-035**, half one: the same root cause reached through the *input* side. The
-    /// transducer's alphabet is `{1, 2}` and `M`'s outputs are `{1, 2}`, so the
-    /// compatibility check passes — but `min(M.O) - 1 == 0` is installed as a raw
-    /// encoded symbol (`0`, i.e. the letter `1`, clobbering a real transition), while
-    /// `create_map` looks the dead state's output up via `encode([0]) == -1`. Real
-    /// Walnut throws `NullPointerException` at `Transducer.java:400` (empirically
-    /// confirmed, 2026-08-13).
+    /// The same half (two) with `min(M.O) == 1` rather than `0`, so the marker is `0` and
+    /// the `List.indexOf`-returns-`-1` coincidence that made half (one) harmless does not
+    /// apply either. The transducer legitimately emits `0` on letter `1`; pre-fix that
+    /// real state was deleted, giving `0 0 / 0 -> 1`, `1 8 / 0 -> 1` (two transitions).
     ///
-    /// This port answers with [`TransduceError::NoTransducerTransition`] at the same
-    /// point, carrying Java's own NPE text — not a `panic!`, because Java's NPE is a
-    /// `RuntimeException` its REPL catches and continues past, whereas a Rust panic would
-    /// unwind out of a `wr-cli` session that has no `catch_unwind` and kill the process.
+    /// Captured live from the fixed jar as `transduce wb035col WB035COL WB035P12;`, and
+    /// from the pre-fix jar for the buggy shape above.
     #[test]
-    fn wb035_shifted_alphabet_errors_where_java_npes() {
+    fn wb035_marker_collision_with_a_nonzero_minimum_output() {
+        let mut logging = Logging::new();
+        let t = transducer(&[0, 1, 2], &[&[(0, 0, 4), (1, 0, 0), (2, 0, 8)]]);
+        let mut m = word_automaton(&[1, 2], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        assert_shape(&c, &[0, 8], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+    }
+
+    /// **WB-035**, half one, **fixed**: the same root cause reached through the *input*
+    /// side. The transducer's alphabet is `{1, 2}` and `M`'s outputs are `{1, 2}`, so the
+    /// compatibility check passes — but `min(M.O) - 1 == 0` used to be installed as a raw
+    /// encoded symbol (`0`, i.e. the letter `1`, clobbering a real transition) while
+    /// `create_map` looked the dead state's output up via `encode([0]) == -1`, which was
+    /// never written. Real Walnut threw `NullPointerException` at `Transducer.java:400`
+    /// (confirmed live pre-fix, 2026-08-13 and again 2026-08-21); this port answered with
+    /// [`TransduceError::NoTransducerTransition`] at the same point.
+    ///
+    /// The dead letter now gets a position of its own at the end of a *copy* of the
+    /// transducer's alphabet track, so the lookup resolves. Expectation captured live from
+    /// the fixed jar as `transduce wb035shift WB035SHIFT WB035P12;` → `0 7 / 0 -> 1`,
+    /// `1 8 / 0 -> 1, 1 -> 0`; against the pre-fix jar the same command wrote no file at
+    /// all and printed the NPE above.
+    #[test]
+    fn wb035_shifted_alphabet_transduces_where_java_used_to_npe() {
         let mut logging = Logging::new();
         let t = transducer(&[1, 2], &[&[(1, 0, 7), (2, 0, 8)]]);
         let mut m = word_automaton(&[1, 2], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        assert_shape(&c, &[7, 8], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+
+        // Independent check of that expectation, and the reason it is the RIGHT answer
+        // rather than merely a different one: shifting `M`'s outputs and the transducer's
+        // input alphabet down by one gives an isomorphic problem that lands in the
+        // coincidence the bug depended on (`A[0] == [0..k-1]` and `min(M.O) == 0`), so it
+        // already worked pre-fix. The two must agree up to that relabelling.
+        let shifted_t = transducer(&[0, 1], &[&[(0, 0, 7), (1, 0, 8)]]);
+        let mut shifted_m = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+        let shifted_c = shifted_t
+            .transduce_non_deterministic(&mut shifted_m, &mut logging)
+            .unwrap();
+        assert_eq!(c.fa.o, shifted_c.fa.o);
+        assert_eq!(c.fa.d, shifted_c.fa.d);
+    }
+
+    /// Half one again, in its purely **silent** form — the shape that shows why merely
+    /// encoding `min(M.O) - 1` would not have been a structural fix. `M`'s outputs are
+    /// `{2, 3}` and the transducer's alphabet is `{1, 2, 3}`, so the dead state's output
+    /// is `1` — a raw value that happens to be a valid *encoded* symbol, namely the
+    /// position of the letter `2`, AND a genuine letter of the transducer's own alphabet.
+    ///
+    /// Pre-fix the dead-state self-loop overwrote letter `2`'s `sigma` entry (so the state
+    /// that should have output `8` got the marker `1` instead), the dead state's own
+    /// lookup silently resolved to letter `1`'s real entry (output `7`, so it was never
+    /// removed), and the result was a three-state `[1, 9, 7]` automaton with the real and
+    /// dead states swapped — no exception anywhere. Captured live from both jars
+    /// (`transduce wb035s123 WB035S123 WB035P23;`).
+    #[test]
+    fn wb035_the_dead_letter_does_not_clobber_a_real_letter_of_the_transducer() {
+        let mut logging = Logging::new();
+        let t = transducer(&[1, 2, 3], &[&[(1, 0, 7), (2, 0, 8), (3, 0, 9)]]);
+        let mut m = word_automaton(&[2, 3], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        assert_shape(&c, &[8, 9], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+    }
+
+    /// The overwhelmingly common case, pinned so the fix cannot have moved it: a TOTAL
+    /// input automaton never enters the dead-state branch at all, so none of WB-035's
+    /// machinery runs. Same `NEG` transducer whose `-1` output breaks the partial case
+    /// above. Captured live from both jars (`transduce wb035tot WB035NEG WB035T;`) — the
+    /// two are identical.
+    #[test]
+    fn wb035_a_totalized_input_automaton_is_unaffected() {
+        let mut logging = Logging::new();
+        let t = transducer(&[0, 1], &[&[(0, 0, -1), (1, 0, 1)]]);
+        let mut m = word_automaton(&[0, 1], &[&[(0, 1), (1, 1)], &[(0, 1), (1, 0)]]);
+
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
+        assert_shape(&c, &[-1, 1], &[&[(0, 1), (1, 1)], &[(0, 1), (1, 0)]]);
+    }
+
+    /// Neither internal value the fix introduces is anything a user declared, so neither
+    /// may be observable afterwards — not on the transducer (which `wr_cli::Session`
+    /// hands out again) and not on the transduced automaton.
+    ///
+    /// This is also where the port's one *deliberate* divergence from the Java fix's shape
+    /// is checked. Java's `appendInputLetter` must build a copy of the alphabet track
+    /// because `RichAlphabet.clone()` shares its per-track lists with the original; this
+    /// crate's `Vec<Vec<i32>>` is deep-cloned by `#[derive(Clone)]`, so the `t_new =
+    /// self.clone()` one screenful up already isolates it and the push cannot escape. That
+    /// is asserted here rather than argued: `t`'s own alphabet, alphabet size and
+    /// reusability are all checked after the call.
+    #[test]
+    fn wb035_the_dead_letter_and_marker_never_escape_the_construction() {
+        let mut logging = Logging::new();
+        let t = transducer(&[0, 1], &[&[(0, 0, -1), (1, 0, 1)]]);
+        let mut m = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+
+        let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
+
         assert_eq!(
-            t.transduce_non_deterministic(&mut m, &mut logging)
-                .unwrap_err(),
-            TransduceError::NoTransducerTransition
+            t.automaton.alphabet,
+            vec![vec![0, 1]],
+            "T's alphabet is intact"
         );
+        assert_eq!(t.automaton.fa.alphabet_size, 2);
         assert_eq!(
-            TransduceError::NoTransducerTransition.to_string(),
-            "Cannot invoke \"it.unimi.dsi.fastutil.ints.IntList.getInt(int)\" because the return \
-             value of \"Automata.FA.Transitions.getNfaStateDests(int, int)\" is null"
+            t.automaton.fa.d[0].keys().copied().collect::<Vec<_>>(),
+            [0, 1]
         );
+        assert_eq!(t.sigma[0].keys().copied().collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(c.alphabet, vec![vec![0, 1]], "the RESULT's alphabet is M's");
+        assert_eq!(c.fa.alphabet_size, 2);
+        // Every output of the result is one the transducer actually declares.
+        assert_eq!(c.fa.o, vec![-1, 1]);
+
+        // ...and the transducer is still usable: transducing again yields the identical
+        // result. (A shared-alphabet mutation would show up as a second run over a
+        // three-letter alphabet.)
+        let mut m2 = word_automaton(&[0, 1], &[&[(0, 1)], &[(0, 1), (1, 0)]]);
+        let c2 = t
+            .transduce_non_deterministic(&mut m2, &mut logging)
+            .unwrap();
+        assert_eq!(c.fa.o, c2.fa.o);
+        assert_eq!(c.fa.d, c2.fa.d);
+    }
+
+    /// The structural invariant behind half one, asserted directly rather than through an
+    /// end-to-end answer: the letter the dead state is given must be one the transducer
+    /// does not already have, so that appending it can never take a real letter's position
+    /// and the self-loop written for it can never overwrite a real letter's transition or
+    /// output. Merely *encoding* the dead state's own output — the minimal fix WB-035's
+    /// entry originally suggested — does not give that.
+    #[test]
+    fn wb035_the_dead_letter_is_outside_the_transducers_input_alphabet() {
+        // `{1, 2, 3}` against `M.O == {2, 3}`: the dead state's own output is `1`, which
+        // IS a letter of this alphabet. The chosen dead letter must dodge it.
+        let shift123 = transducer(&[1, 2, 3], &[&[(1, 0, 7), (2, 0, 8), (3, 0, 9)]]);
+        assert_eq!(
+            Transducer::dead_letter_outside_input_alphabet(&shift123, 1),
+            0
+        );
+
+        let runsum = runsum2();
+        assert_eq!(
+            Transducer::dead_letter_outside_input_alphabet(&runsum, -1),
+            -2
+        );
+        // Below the alphabet even when the dead state's own output is far above it.
+        assert_eq!(
+            Transducer::dead_letter_outside_input_alphabet(&runsum, 40),
+            -1
+        );
+
+        // The general property, over every shape this module's helper can build.
+        for t in [&shift123, &runsum] {
+            for dead_state_output in [-5, -1, 0, 1, 40] {
+                let letter = Transducer::dead_letter_outside_input_alphabet(t, dead_state_output);
+                assert!(
+                    !t.automaton.alphabet[0].contains(&letter),
+                    "dead letter {letter} is already in {:?}",
+                    t.automaton.alphabet[0]
+                );
+                assert!(letter < dead_state_output);
+            }
+        }
+    }
+
+    /// The structural invariant behind half two: the marker handed to
+    /// `remove_states_with_output_rebuild` must be a value no state of the transduced
+    /// automaton can carry, and every such state's output is a value of `sigma`.
+    #[test]
+    fn wb035_the_marker_is_below_every_output_the_transducer_can_emit() {
+        let neg = transducer(&[0, 1], &[&[(0, 0, -1), (1, 0, 1)]]);
+        assert_eq!(Transducer::marker_outside_output_alphabet(&neg.sigma), -2);
+
+        let high = transducer(&[0, 1], &[&[(0, 0, 7), (1, 0, 8)]]);
+        assert_eq!(Transducer::marker_outside_output_alphabet(&high.sigma), -1);
+
+        // The running minimum starts at 0, so the marker is negative (and defined) even
+        // for a transducer that emits nothing at all.
+        assert_eq!(Transducer::marker_outside_output_alphabet(&[]), -1);
+
+        for t in [&neg, &high, &runsum2()] {
+            let marker = Transducer::marker_outside_output_alphabet(&t.sigma);
+            for state_outputs in &t.sigma {
+                for &output in state_outputs.values() {
+                    assert!(marker < output, "marker {marker} vs output {output}");
+                }
+            }
+        }
     }
 
     /// A **partial transducer**: `{0, 1}` declared, but state `1` has no transition on
@@ -2112,81 +2509,104 @@ mod tests {
     }
     // ---------------------------------------------------- Tier-4 property (Phase 4, U31)
 
-    /// A TOTAL random single-track `msd_2` DFAO: every state has a destination on both
-    /// digits, and every output is in `{0, 1}`.
+    /// A random single-track `msd_2` DFAO paired with a TOTAL transducer it is
+    /// compatible with, generated together because the two alphabets have to line up.
     ///
-    /// Totality is the load-bearing constraint. `transduceNonDeterministic` routes a total
-    /// `M` straight to `transduceMsdDeterministic` and never enters the dead-state branch,
-    /// which is where `docs/WALNUT-BUGS.md` **WB-035** lives — its `minOutput` marker is
-    /// used both as an un-encoded transducer INPUT symbol and as a marker in the RESULT's
-    /// output alphabet, and it is ported verbatim as a bug. A mathematical oracle
-    /// disagrees with the port BY DESIGN on every WB-035 trigger, so a generator that
-    /// reached that branch would drown the genuine Dekking-construction signal this
-    /// property exists to check. (WB-035 has three dedicated tests of its own above,
-    /// including the one-value-different control; it is covered, just not here.)
+    /// # Why this is one strategy and what it deliberately does NOT constrain
     ///
-    /// `msd = Some(true)` for the same class of reason: the lsd direction reverses `M`
-    /// before transducing and reverses the result afterwards, which is a different code
-    /// path with its own (separately closed) history.
-    fn arb_total_msd_dfao(q_max: usize) -> impl Strategy<Value = Automaton> {
-        (1..=q_max).prop_flat_map(move |q| {
-            let o = prop::collection::vec(0i32..=1, q);
-            let trans = prop::collection::vec(prop::collection::vec(0usize..q, 2), q);
-            (o, trans).prop_map(move |(o, trans)| {
-                let d: Vec<BTreeMap<i32, Vec<usize>>> = trans
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .enumerate()
-                            .map(|(sym, &dest)| (sym as i32, vec![dest]))
-                            .collect()
-                    })
-                    .collect();
-                Automaton::new(
-                    Fa {
-                        true_false: None,
-                        q0: 0,
-                        q,
-                        alphabet_size: 2,
-                        o,
-                        d,
-                    },
-                    vec![vec![0, 1]],
-                    vec!["x".to_string()],
-                    vec![Some(true)],
-                )
-            })
-        })
-    }
+    /// Before WB-035's fix this pair was two strategies, both of which had to be pinned to
+    /// the exact coincidence the bug depended on: `M` had to be **total** (so the
+    /// dead-state branch was never entered at all) and the transducer's alphabet had to be
+    /// `{0, 1}` with non-negative outputs (so `indexOf(v) == v` and no emitted value could
+    /// equal `min(M.O) - 1`). Outside that box a mathematical oracle disagreed with the
+    /// port BY DESIGN, since the port faithfully reproduced the bug — so the generator had
+    /// to stay inside it or drown the genuine Dekking-construction signal.
+    ///
+    /// **All three constraints are gone now**, and each removal is a real widening onto
+    /// what WB-035 used to break:
+    ///
+    /// * `M` may be **partial** — each state's transition on each digit is independently
+    ///   present or absent — so most cases genuinely take the dead-state path
+    ///   (`add_distinguished_dead_state` → the relabelled dead letter → the marker →
+    ///   `remove_states_with_output_rebuild`). [`dekking_oracle`] models what a partial
+    ///   `M` means (undefined positions contribute nothing; an undefined position leaves
+    ///   the result undefined there) without knowing how either value is chosen.
+    /// * `M`'s outputs are `{offset, offset + 1}` for a shifted `offset`, so
+    ///   `min(M.O) - 1` is not pinned to `-1` and `encode_input` is not the identity.
+    /// * the transducer's alphabet is that same pair, **optionally widened downwards** to
+    ///   `{offset - 1, offset, offset + 1}` — which is exactly the discriminating
+    ///   condition for half (1)'s freshness requirement: `min(M.O) - 1` is then already a
+    ///   letter of the transducer's own alphabet, so a fix that merely *encoded* it (as
+    ///   WB-035's entry originally suggested) would land the dead letter on a real
+    ///   letter's position and clobber it.
+    /// * the transducer's outputs range over `-2..=2`, so it can legitimately emit
+    ///   `min(M.O) - 1` — half (2)'s trigger.
+    ///
+    /// What is still constrained, and why: the **transducer** is total (every state has a
+    /// transition and a `sigma` entry for every letter of its alphabet), which keeps
+    /// `create_map`/`sigma` out of [`TransduceError::NoTransducerTransition`]/
+    /// [`TransduceError::NoTransducerOutput`] — Java's two uncaught NPEs on a partial
+    /// transducer, ported as rejections and pinned by their own tests above, and unrelated
+    /// to WB-035. And `msd = Some(true)`: the lsd direction reverses `M` before
+    /// transducing and reverses the result afterwards, a different code path with its own
+    /// (separately closed) history.
+    fn arb_dfao_and_transducer(
+        m_max: usize,
+        t_max: usize,
+    ) -> impl Strategy<Value = (Automaton, Transducer)> {
+        (-2i32..=2, prop::bool::ANY, 1..=m_max, 1..=t_max).prop_flat_map(
+            move |(offset, wide, mq, tq)| {
+                // `M`: outputs in `{offset, offset + 1}`, each transition independently
+                // present or absent. `present` is biased 3:1 towards "present" so a
+                // generated `M` still usually has enough live structure to be interesting
+                // rather than collapsing to a one-transition automaton.
+                let o = prop::collection::vec(0i32..=1, mq);
+                let dests = prop::collection::vec(prop::collection::vec(0usize..mq, 2), mq);
+                let present =
+                    prop::collection::vec(prop::collection::vec(prop::bool::weighted(0.75), 2), mq);
+                // The transducer's alphabet, and the letters `M` can actually emit.
+                let alphabet: Vec<i32> = if wide {
+                    vec![offset - 1, offset, offset + 1]
+                } else {
+                    vec![offset, offset + 1]
+                };
+                let width = alphabet.len();
+                let t_dests = prop::collection::vec(prop::collection::vec(0usize..tq, width), tq);
+                let t_outs = prop::collection::vec(prop::collection::vec(-2i32..=2, width), tq);
 
-    /// A TOTAL transducer over the input alphabet `{0, 1}` — every state has a transition
-    /// AND a `sigma` entry for both letters — with NON-NEGATIVE outputs.
-    ///
-    /// Totality keeps `createMap`/`sigma` out of `TransduceError::NoTransducerTransition`/
-    /// `NoTransducerOutput` (Java's two uncaught NPEs on a partial transducer, ported as
-    /// rejections and pinned by their own tests); the `{0, 1}` alphabet matches the
-    /// generated `M`'s output values exactly, so `transduceNonDeterministic`'s
-    /// compatibility guard passes and `encode_input` is the identity — the coincidence
-    /// WB-035's half (1) depends on, kept deliberately intact here so this property is
-    /// about the construction and not about that quirk.
-    fn arb_total_transducer(q_max: usize) -> impl Strategy<Value = Transducer> {
-        (1..=q_max).prop_flat_map(move |q| {
-            let dests = prop::collection::vec(prop::collection::vec(0usize..q, 2), q);
-            let outs = prop::collection::vec(prop::collection::vec(0i32..=2, 2), q);
-            (dests, outs).prop_map(move |(dests, outs)| {
-                let rows: Vec<Vec<(i32, usize, i32)>> = dests
-                    .iter()
-                    .zip(outs.iter())
-                    .map(|(drow, orow)| {
-                        (0..2)
-                            .map(|letter| (letter as i32, drow[letter], orow[letter]))
-                            .collect()
-                    })
-                    .collect();
-                let borrowed: Vec<&[(i32, usize, i32)]> = rows.iter().map(Vec::as_slice).collect();
-                transducer(&[0, 1], &borrowed)
-            })
-        })
+                (o, dests, present, t_dests, t_outs).prop_map(
+                    move |(o, dests, present, t_dests, t_outs)| {
+                        let m_rows: Vec<Vec<(i32, usize)>> = dests
+                            .iter()
+                            .zip(present.iter())
+                            .map(|(drow, prow)| {
+                                (0..2)
+                                    .filter(|&sym| prow[sym])
+                                    .map(|sym| (sym as i32, drow[sym]))
+                                    .collect()
+                            })
+                            .collect();
+                        let m_borrowed: Vec<&[(i32, usize)]> =
+                            m_rows.iter().map(Vec::as_slice).collect();
+                        let outputs: Vec<i32> = o.iter().map(|&bit| offset + bit).collect();
+                        let m = word_automaton(&outputs, &m_borrowed);
+
+                        let t_rows: Vec<Vec<(i32, usize, i32)>> = t_dests
+                            .iter()
+                            .zip(t_outs.iter())
+                            .map(|(drow, orow)| {
+                                (0..width)
+                                    .map(|i| (alphabet[i], drow[i], orow[i]))
+                                    .collect()
+                            })
+                            .collect();
+                        let t_borrowed: Vec<&[(i32, usize, i32)]> =
+                            t_rows.iter().map(Vec::as_slice).collect();
+                        (m, transducer(&alphabet, &t_borrowed))
+                    },
+                )
+            },
+        )
     }
 
     proptest! {
@@ -2207,7 +2627,15 @@ mod tests {
         /// ```
         ///
         /// i.e. `N`'s output at `n` is what the transducer emits when it reaches position
-        /// `n` of the sequence, having already consumed positions `0 … n-1`.
+        /// `n` of the sequence, having already consumed positions `0 … n-1` — with a
+        /// **partial** `M`'s undefined positions dropped from that sequence (they are the
+        /// distinguished dead state, whose letter loops the transducer in place), and
+        /// `N(w)` itself undefined when `a_n` is.
+        ///
+        /// Since WB-035's fix this covers the dead-state path too — see
+        /// [`arb_dfao_and_transducer`] for the three constraints that used to be forced on
+        /// the generator by the port's faithful reproduction of that bug, all of which are
+        /// now lifted.
         ///
         /// The oracle is [`dekking_oracle`] — written for a prior unit in this same
         /// module, and reused here rather than duplicated. It walks `M` once per position
@@ -2225,8 +2653,7 @@ mod tests {
         /// the automaton is being asked about.
         #[test]
         fn transduction_matches_a_step_by_step_oracle(
-            m in arb_total_msd_dfao(3),
-            t in arb_total_transducer(2),
+            (m, t) in arb_dfao_and_transducer(3, 2),
             k in 1usize..=3,
             n_raw in 0usize..8,
         ) {
@@ -2264,13 +2691,11 @@ mod tests {
             // copy exists.)
             let expected = dekking_oracle(&t, &original, k as u32, &word);
 
-            // And read N at the same position.
-            let mut state = n_auto.fa.q0;
-            for &digit in &word {
-                state = n_auto.fa.d[state][&digit][0];
-            }
+            // And read N at the same position — `None` where the walk falls off a missing
+            // transition, which is what a partial `M` produces and what the oracle above
+            // predicts independently.
             prop_assert_eq!(
-                n_auto.fa.o[state], expected,
+                word_output(&n_auto, &word), expected,
                 "transduction disagrees at position {} of the width-{} sequence", n, k
             );
         }

@@ -1698,25 +1698,118 @@ bug costs a silent wrong answer somewhere downstream.
     (Transducer.java:400)`. Files used: `PARTIAL12.txt` = `0 1 / 0 -> 1` then `1 2 / 0 -> 1, 1 -> 0`;
     `SHIFT.txt` = `{1, 2}` then state `0` with `1 -> 0 / 7`, `2 -> 0 / 8`.
 - **Why it's usually invisible:** the shipped `Transducer Library` transducers (`RUNSUM2`/`RUNSUM3`/
-  `RUNSUM4`) all declare `{0, 1, …}` alphabets and emit only non-negative outputs, and the word
-  automata they are used on (Thue-Morse and friends) are total, so the dead-state branch is never
-  taken at all. Both halves need a partial input automaton *plus* either a non-`0`-based input
-  alphabet or a transducer output equal to `min(M.O) - 1`.
+  `RUNSUM4`) all declare `{0, 1, …}` alphabets and emit only non-negative outputs, so both halves
+  land in the coincidence that makes them harmless. Both need a partial input automaton *plus*
+  either a non-`0`-based input alphabet or a transducer output equal to `min(M.O) - 1`.
+
+  **Correction (2026-08-21, while porting the upstream fix).** An earlier version of this bullet
+  additionally claimed the shipped corpus never takes the dead-state branch *at all*, because "the
+  word automata they are used on (Thue-Morse and friends) are total". That is **wrong**, and both
+  engines' authors measured it rather than arguing it. Upstream's sweep reports 8 of 24
+  transducer/word-automaton combinations entering the branch; this port ran its own, broader sweep
+  — all of `RUNSUM2`/`RUNSUM3`/`RUNSUM4` against every file in Walnut's shipped
+  `Word Automata Library` that passes `transduce`'s single-track + compatibility guards, **95
+  combinations, of which 32 add a distinguished dead state and go through exactly this code**,
+  covering 12 distinct word automata: `F`, `FASQ`, `FASQ1`, `FTM`, `KP`, `LUCAS`, `NA`, `R`, `RF`,
+  `TR`, `V`, `X4` (mostly Fibonacci-style bases, where not every digit pair is legal). Every one of
+  the 32 is in the safe-coincidence case (`{0, 1, …}` alphabet, non-negative outputs, `min(M.O) ==
+  0`), and all 95 results were confirmed **byte-identical** between this port's pre-fix and
+  post-fix code — so the corpus is genuinely unaffected, but "unreachable" was never the reason,
+  and that zero-regression check is a real check rather than a vacuous one.
 - **Found:** Phase 3b, U20 (`crates/wr-core/src/transducer.rs`, the `Transducer` port), 2026-08-13,
   while working out why the port could not use `Automaton::encode` (which panics on an
   out-of-alphabet digit) for `:188`/`:277`/`:397` — tracing that dependency on Java's silent
   `indexOf` → `-1` surfaced the un-encoded `minOutput` two lines away. Both manifestations were then
   reproduced against the real CLI before logging.
-- **Rust port:** `ported verbatim (bug)`. `Transducer::transduce_non_deterministic` writes
-  `min_output` straight into `t_new.automaton.fa.d[q]`/`t_new.sigma[q]` and passes it straight to
-  `logicalops::remove_states_with_output_rebuild`, with both halves flagged inline citing this entry;
-  `Transducer::encode_input` is a deliberate local port of `RichAlphabet.encode`'s `indexOf` → `-1`
-  fallback (see this module's docs) rather than a call to `Automaton::encode`, precisely so half (1)
-  reproduces rather than being masked by a different panic. Pinned by three tests in that module:
-  `wb035_partial_automaton_loses_states_whose_output_collides_with_the_marker` (asserts the WRONG
-  two-transition result), `partial_automaton_transduces_through_the_dead_state_path` (the
-  one-value-different control, asserting the correct three-transition result), and
-  `wb035_shifted_alphabet_errors_where_java_npes` (the same point Java NPEs).
+- **Rust port:** `fixed, matches walnut-java as of commit 7f54eff` (PR-9 of
+  `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`, branch `bugfix/wb-035`, stacked on `bugfix/wb-038`).
+
+  **The design ported, both halves, mirroring upstream rather than a simplification.**
+  `Transducer::transduce_non_deterministic_with_budget`'s dead-state branch now computes two
+  distinct values instead of reusing one. Half (1): the freshly added dead state is *relabelled*
+  from `min(M.O) - 1` to a value strictly below both `M`'s outputs and the transducer's input
+  alphabet (`Transducer::dead_letter_outside_input_alphabet`), that value is *appended* to the
+  local clone's input-alphabet track (`Transducer::append_input_letter`, which also refreshes the
+  encoder and alphabet size as Java's `setupEncoder`/`setAlphabetSize` pair does), and the
+  **encoded position** it lands at — not the raw value — keys the transition table and `sigma`.
+  Half (2): the removal marker is one below every value the transducer can emit
+  (`Transducer::marker_outside_output_alphabet`, a running minimum seeded at `0` so it is negative
+  and defined even for a transducer that emits nothing), derived from `sigma` alone and not from
+  `M`'s outputs at all. The "parallel is-dead flag" alternative this entry used to float is
+  **not** ported, for upstream's reason: `transduce_msd_deterministic` runs
+  `word_automaton::minimize_self_with_output` before returning, which merges and renumbers states,
+  invalidating any index-keyed dead set — a distinct OUTPUT value is what survives minimization.
+  The mechanism was sound; only its choice of value was wrong.
+
+  **One thing measured rather than inherited: the freshness half is not observable here.**
+  Replacing the relabel-and-append with the minimal "just encode `min(M.O) - 1`" variant leaves
+  every test in `wr-core` green, including the Tier-4 property at 20,000 cases — the same negative
+  result upstream got from its own 400-case randomized differential. Upstream attributes that to
+  the sweep not hitting the discriminating condition; on this port's call shape the two agree *by
+  construction*, and `crates/wr-core/src/transducer.rs`'s module docs carry the argument (the entry
+  the minimal variant overwrites is the entry of the letter `min(M.O) - 1` itself, which is exactly
+  the entry the dead state was going to consult, and nothing else ever reads a key that is not
+  `encode_input` of an output of `M`). The freshness is ported anyway — it is what upstream does,
+  and it makes "no real letter is clobbered" a local invariant rather than a two-step argument
+  about `add_distinguished_dead_state`'s choice of output — and it is pinned *structurally*, by
+  `wb035_the_dead_letter_is_outside_the_transducers_input_alphabet`, rather than left as untested
+  defence.
+
+  **`TransduceError::NoTransducerTransition` is still reachable, and stays.** It used to have two
+  triggers; WB-035's shifted-alphabet dead-state path was one, and that one is gone (the dead
+  letter now has an encoded position of its own, so `create_map`'s lookup for it always resolves).
+  The other remains, unchanged and still exercised by
+  `a_partial_transducer_is_a_clean_error_not_a_panic` in `wr-core` and
+  `a_partial_transducer_file_is_a_clean_error_not_a_process_killing_panic` in `wr-cli`: a
+  **partial** (well-formed but non-total) `Transducer Library/*.txt`, which reaches the same
+  `createMap` hole with a perfectly total input automaton and no dead state involved, because
+  `transduceNonDeterministic`'s only compatibility guard checks the transducer's state `0` alone (a
+  separate ported-verbatim quirk, untouched by this fix). So neither that variant nor its `sigma`
+  twin `NoTransducerOutput` becomes dead, and the U26 reasoning below still stands verbatim.
+
+  **Tests flipped, none deleted; six added.**
+  `wb035_partial_automaton_loses_states_whose_output_collides_with_the_marker` (which asserted the
+  WRONG two-transition result) is now
+  `wb035_a_transducer_output_colliding_with_the_marker_keeps_every_real_state`, asserting the
+  correct three-transition answer plus the one-value-different control inline;
+  `wb035_shifted_alphabet_errors_where_java_npes` is now
+  `wb035_shifted_alphabet_transduces_where_java_used_to_npe`, asserting the successful `[7, 8]`
+  result and cross-checking it against an isomorphic shifted-down-by-one problem that already
+  worked pre-fix; `partial_automaton_transduces_through_the_dead_state_path` (the control) is
+  unchanged and still green. New: `wb035_marker_collision_with_a_nonzero_minimum_output`,
+  `wb035_the_dead_letter_does_not_clobber_a_real_letter_of_the_transducer` (the purely silent
+  three-state `[1, 9, 7]` shape), `wb035_a_totalized_input_automaton_is_unaffected`,
+  `wb035_the_dead_letter_and_marker_never_escape_the_construction` (which is also where the port's
+  one deliberate divergence from upstream's shape is checked — Java's `appendInputLetter` must copy
+  the alphabet track because `RichAlphabet.clone()` shares its per-track lists, whereas this
+  crate's `Vec<Vec<i32>>` is deep-cloned by `#[derive(Clone)]`, so the hazard does not transfer;
+  asserted rather than assumed), and the two structural-invariant tests
+  `wb035_the_dead_letter_is_outside_the_transducers_input_alphabet` /
+  `wb035_the_marker_is_below_every_output_the_transducer_can_emit`.
+
+  **The Tier-4 property's WB-035 carve-out is removed entirely.** `arb_total_msd_dfao` /
+  `arb_total_transducer` were pinned to exactly the coincidence the bug depended on — total `M`,
+  `{0, 1}` alphabet, non-negative outputs — because a mathematical oracle disagreed with the port
+  BY DESIGN outside it. They are replaced by one `arb_dfao_and_transducer` strategy that generates
+  **partial** `M`s, shifted output ranges, transducer alphabets optionally widened downwards to
+  include `min(M.O) - 1`, and negative transducer outputs; `dekking_oracle` now returns
+  `Option<i32>`, modelling what a partial `M` means (undefined positions contribute nothing to the
+  running transducer state; an undefined position leaves the result undefined there) without
+  knowing how either internal value is chosen. Measured coverage over 2,000 cases: 1,332 enter the
+  dead-state branch, 870 have `min(M.O) - 1` in the transducer's alphabet, 606 have the transducer
+  emitting `min(M.O) - 1`, 433 both. Mutation-verified: the full pre-fix code fails 5 tests
+  including this property, and an off-by-one marker fails 4.
+
+  End-to-end coverage against the fixed jar is `tests/differential/tests/java_bugfix_wb035.rs`;
+  the capture recipe (both jars, pre- and post-fix) is in `tests/differential/CAPTURE.md`.
+
+  **Historical (pre-fix) Rust-port note, kept for the record.** `Transducer::
+  transduce_non_deterministic` wrote `min_output` straight into `t_new.automaton.fa.d[q]`/
+  `t_new.sigma[q]` and passed it straight to `logicalops::remove_states_with_output_rebuild`, with
+  both halves flagged inline citing this entry. `Transducer::encode_input` remains a deliberate
+  local port of `RichAlphabet.encode`'s `indexOf` → `-1` fallback (see that module's docs) rather
+  than a call to `Automaton::encode`, and is NOT changed by this fix — Java's encoder keeps those
+  semantics too, and the fix is in the caller, not the encoder.
 
   **Updated Phase 3b, U26 review (2026-08-15).** The crash half is now a
   `TransduceError::NoTransducerTransition` carrying Java's own NPE text, not a Rust `panic!` — the
@@ -1730,17 +1823,26 @@ bug costs a silent wrong answer somewhere downstream.
   strictly worse divergence than the error. Same reasoning and same treatment as WB-034/WB-033/WB-013
   in this very file. The `sigma` twin one line earlier (`Transducer.java:187`'s unboxing NPE) got the
   same treatment as `TransduceError::NoTransducerOutput`.
-- **Upstream:** not filed. The fix is not one line, which is part of why this is logged rather than
-  resolved here. Half (1) is mechanical — encode before use (`richAlphabet.encode(List.of(minOutput))`
-  at `:315-316`, matching `:397`) — but that alone is not enough, because the encoded symbol may
-  still collide with a real letter; the dead letter really wants to be a *fresh* symbol appended to
-  the transducer's input alphabet. Half (2) needs a marker outside the transducer's output alphabet
-  (e.g. `min(sigma values) - 1`, or a parallel "is dead" flag rather than an output sentinel) instead
-  of reusing `M`'s.
-- **Severity:** **high** where it applies — half (2) is a silent wrong answer in `transduce`'s core
-  construction, half (1) is an uncaught crash, and both are reachable from ordinary hand-authored
-  library files with no adversarial shape. Narrow in practice: only partial (non-total) input
-  automata reach the branch at all.
+
+- **Upstream:** fixed, `walnut-java` commit `7f54eff` (branch `bugfix/wb-035`, stacked on
+  `bugfix/wb-038`). `transduceNonDeterministic`'s dead-state branch gained four helpers —
+  `deadLetterOutsideInputAlphabet`, `markerOutsideOutputAlphabet`, `relabelStatesWithOutput` and
+  `appendInputLetter` — and now relabels the dead state onto a letter below both `M`'s outputs and
+  the transducer's alphabet, appends that letter to a **copy** of the transducer's input-alphabet
+  track (`RichAlphabet.clone()` shallow-shares its per-track lists, and `Session` hands the cached
+  `Transducer` out again), keys the self-loop on its encoded position, and marks the resulting dead
+  states with a value below the transducer's own output alphabet. `TransducerTest.java` gained
+  eight tests: the two manifestations from this entry, two further silent shapes constructed while
+  designing the fix, a totalized-input control, a leak test, and direct tests of the two freshness
+  computations — all mutation-verified against the pre-fix code. No corpus fixture needed flipping
+  (all eight `transduce` fixtures, `test527`–`test534`, run on total word automata), and the 24
+  shipped transducer/word-automaton combinations are byte-identical pre/post — including the ones
+  that really do take the dead-state branch, per the correction above.
+- **Severity:** **high** where it applied — half (2) was a silent wrong answer in `transduce`'s
+  core construction, half (1) an uncaught crash, and both were reachable from ordinary
+  hand-authored library files with no adversarial shape. Narrow in practice: only partial
+  (non-total) input automata reach the branch at all — though, per the correction above, that is
+  a real 8-of-24 slice of the shipped corpus, not the empty set this entry once claimed.
 
 ---
 

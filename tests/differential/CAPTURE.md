@@ -808,3 +808,106 @@ only `ok.txt` and `alive.txt` — where against the PRE-fix jar it also held
 
 The command files and the six hand-authored library files were deleted from the isolated
 worktree afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb035.rs`
+
+Captured 2026-08-21 for `tests/differential/tests/java_bugfix_wb035.rs`, verifying
+`wr_core::transducer`'s port of WB-035's real upstream fix (`walnut-java` commit
+`7f54eff`, branch `bugfix/wb-035`, stacked on `bugfix/wb-038` (`601a9d2`)) — **not
+mainline**, per this project's now-standard practice for these follow-up units.
+
+Unlike the recipes above, **both** the fixed commit and its parent were built and run.
+This unit's whole claim is a before/after difference in a silent wrong answer, so the
+"before" was measured here rather than taken from the upstream commit message.
+`bugfix/wb-035` was already checked out at the main `~/dev/walnut-java` working tree, so
+both worktrees are added by commit hash (detached), not by branch name:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb035     7f54eff
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb035-pre 601a9d2
+# in each worktree:
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+printf 'msd_2\n0 0\n0 -> 1\n\n1 1\n0 -> 1\n1 -> 0\n' > "Word Automata Library/WB035P.txt"
+printf 'msd_2\n0 1\n0 -> 1\n\n1 2\n0 -> 1\n1 -> 0\n' > "Word Automata Library/WB035P12.txt"
+printf 'msd_2\n0 2\n0 -> 1\n\n1 3\n0 -> 1\n1 -> 0\n' > "Word Automata Library/WB035P23.txt"
+printf 'msd_2\n0 0\n0 -> 1\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 0\n' > "Word Automata Library/WB035T.txt"
+printf '{0, 1}\n\n0\n0 -> 0 / -1\n1 -> 0 / 1\n'    > "Transducer Library/WB035NEG.txt"
+printf '{0, 1}\n\n0\n0 -> 0 / 5\n1 -> 0 / 1\n'     > "Transducer Library/WB035POS.txt"
+printf '{1, 2}\n\n0\n1 -> 0 / 7\n2 -> 0 / 8\n'     > "Transducer Library/WB035SHIFT.txt"
+printf '{0, 1, 2}\n\n0\n0 -> 0 / 4\n1 -> 0 / 0\n2 -> 0 / 8\n' > "Transducer Library/WB035COL.txt"
+printf '{1, 2, 3}\n\n0\n1 -> 0 / 7\n2 -> 0 / 8\n3 -> 0 / 9\n' > "Transducer Library/WB035S123.txt"
+
+cat > "Command Files/wb035_capture.txt" <<'EOF'
+transduce wb035neg WB035NEG WB035P;
+transduce wb035pos WB035POS WB035P;
+transduce wb035tot WB035NEG WB035T;
+transduce wb035shift WB035SHIFT WB035P12;
+transduce wb035col WB035COL WB035P12;
+transduce wb035s123 WB035S123 WB035P23;
+transduce wb035rs RUNSUM2 WB035P;
+eval wb035alive "?msd_2 Ex x = 1";
+EOF
+java -cp target/Walnut-all.jar Main.Prover wb035_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+# transduce results land in Session/<timestamp>/Word Automata Library/
+
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb035     --force
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb035-pre --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain
+(`/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1/Contents/Home` — the
+shell's default `java` resolves to a JDK 11 too old for this project's class file version,
+and `JAVA_HOME` must point at the `Contents/Home` subdirectory or `mvnw` refuses to start).
+`</dev/null` matters: without it the process runs the command file and then blocks in the
+interactive REPL. Note the first `-Pfat-jar`-less build produces only
+`target/walnut-8.0-SNAPSHOT.jar`; the `Main.Prover` invocation above needs
+`target/Walnut-all.jar`, which is the `fat-jar` profile's output.
+
+## The captured before/after
+
+Both jars printed the same eight echoed command lines plus `Converted from brics:2 states`
+/ `TRUE` for the final liveness `eval`. The difference is in what they wrote:
+
+| command | pre-fix (`601a9d2`) | post-fix (`7f54eff`) |
+|---|---|---|
+| `wb035neg`   | `0 -1 / 0->1` · `1 1 / 0->1` — **`1 -> 0` deleted** | `0 -1 / 0->1` · `1 1 / 0->1, 1->0` |
+| `wb035col`   | `0 0 / 0->1` · `1 8 / 0->1` — **`1 -> 0` deleted** | `0 0 / 0->1` · `1 8 / 0->1, 1->0` |
+| `wb035shift` | *no file written* | `0 7 / 0->1` · `1 8 / 0->1, 1->0` |
+| `wb035s123`  | `0 1 / 0->1, 1->2` · `1 9 / 0->1` · `2 7 / 0->2, 1->2` — **three states, real and dead swapped** | `0 8 / 0->1` · `1 9 / 0->1, 1->0` |
+| `wb035pos`   | `0 5 / 0->1` · `1 1 / 0->1, 1->0` | identical (control) |
+| `wb035tot`   | `0 -1 / 0->1, 1->1` · `1 1 / 0->1, 1->0` | identical (total input) |
+| `wb035rs`    | 8 states, `[0,1,1,0,1,1,0,0]` | identical (shipped `RUNSUM2`) |
+
+The fixed jar's `stderr.txt` was **empty**. The pre-fix jar's carried exactly one entry,
+for `wb035shift`:
+
+```text
+java.lang.NullPointerException: Cannot invoke "it.unimi.dsi.fastutil.ints.IntList.getInt(int)" because the return value of "Automata.FA.Transitions.getNfaStateDests(int, int)" is null
+	at Automata.Transducer.createMap(Transducer.java:400)
+```
+
+The seven post-fix files are copied byte-for-byte into
+`tests/differential/fixtures/wb035/`, and are what `java_bugfix_wb035.rs` compares against
+(by `wr_core::equiv` semantic equivalence plus a per-word DFAO output comparison — this is
+not a writer-fidelity unit, so no byte comparison is made).
+
+## Corpus reachability, measured separately
+
+WB-035's entry used to claim the shipped corpus never reaches the dead-state branch at all.
+That was checked rather than trusted, in this port rather than in Java: a throwaway sweep
+ran `RUNSUM2`/`RUNSUM3`/`RUNSUM4` against every file in `~/dev/walnut-java/Word Automata
+Library` that passes `transduce`'s single-track and output-alphabet-compatibility guards —
+**95 combinations, of which 32 add a distinguished dead state**, covering 12 distinct word
+automata (`F`, `FASQ`, `FASQ1`, `FTM`, `KP`, `LUCAS`, `NA`, `R`, `RF`, `TR`, `V`, `X4`).
+All 95 results were byte-identical between this port's pre-fix and post-fix code, since
+every one of them is in the safe-coincidence case (`{0, 1, …}` alphabet, non-negative
+outputs, `min(M.O) == 0`). The upstream commit reports the same finding from a smaller
+sweep (8 of 24). The throwaway probe was deleted; `docs/WALNUT-BUGS.md` WB-035 carries the
+corrected fact.
+
+The command files, the nine hand-authored library files and both worktrees were removed
+afterward, matching every recipe above.

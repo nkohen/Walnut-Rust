@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9fd26e31d8014be73704a63a2e600dc376c117d44643b8c11f15aa9e7b3550f2 # shrinks to (m, t) = (Automaton { fa: Fa { q0: 0, q: 1, alphabet_size: 2, o: [1], d: [{1: [0]}], true_false: None }, alphabet: [[0, 1]], label: ["x"], msd: [Some(true)], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }, Transducer { automaton: Automaton { fa: Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{0: [0], 1: [0]}], true_false: None }, alphabet: [[0, 1]], label: ["0"], msd: [None], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }, sigma: [{0: 0, 1: 0}] }), k = 1, n_raw = 1
+cc c63c1ac730119b5297fe3ec199febbe3128f5d068a43ab049481a15c57d8ca42 # shrinks to (m, t) = (Automaton { fa: Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{0: [0]}], true_false: None }, alphabet: [[0, 1]], label: ["x"], msd: [Some(true)], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }, Transducer { automaton: Automaton { fa: Fa { q0: 0, q: 1, alphabet_size: 2, o: [0], d: [{0: [0], 1: [0]}], true_false: None }, alphabet: [[0, 1]], label: ["0"], msd: [None], all_reps: [None], ns_name: [None], encoder: [1], label_sorted: false, canonized: false, dfa_typed: false }, sigma: [{0: -1, 1: 0}] }), k = 1, n_raw = 2
