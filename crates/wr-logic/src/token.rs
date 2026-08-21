@@ -2194,157 +2194,137 @@ impl AlphabetLetter {
 // Word / Function — Phase 3a's U4
 // ---------------------------------------------------------------------------
 
-/// `wordAutomaton.getNS().get(i)` (`Word.java:62`), as honestly as this port can answer
-/// it today.
+/// `wordAutomaton.getNS().get(i)` (`Word.java:62`) — reduced to the ONE fact its caller
+/// ever reads off that `NumberSystem`, and computed **directly** from the track's own
+/// data.
 ///
-/// `wr-core`'s [`Automaton`] does not retain [`NumberSystem`] objects per track — only
-/// the three DERIVED facts `PORTING.md`'s "parallel vector" ruling settled on,
-/// [`Automaton::msd`] (direction), [`Automaton::all_reps`] (custom-base restriction) and
-/// [`Automaton::ns_name`] (the base's NAME) — so `getNS().get(i)` cannot be a field read
-/// here. What it CAN be:
+/// # What this computes, and why that is the whole problem
 ///
-/// * a `{...}`-declared track (`msd[i]` is `None`) has no numeration in Java either —
-///   correctly [`TrackNs::DeclaredAlphabet`], matching `getNS().get(i) == null` (see
-///   WB-013).
-/// * a track whose recorded name ([`Automaton::ns_name`]) is an ordinary programmatic
-///   base — `msd_k`/`lsd_k`, and also `msd_neg_k`/`lsd_neg_k`, which
-///   [`NumberSystem::new`] builds from no file at all — is rebuilt on the fly by
-///   [`NumberSystem::new`]. This is semantically identical to Java's cached instance
-///   (same name, same automata) — it just isn't the SAME object, so it does not share
-///   [`NumberSystem`]'s U5 memoization with anything else in the formula. That divergence
-///   is invisible to a caller: [`VariableExpression::act`] only ever reads `ns.equality`
-///   here, never mutates or re-looks-up through it.
-/// * a track with NO recorded name at all falls back to reconstructing one from its
-///   direction and alphabet size (`msd_<k>`/`lsd_<k>`), which is exact for every plain
-///   base — `wr-io`'s reader always records a name, so in practice this covers only
-///   automata built programmatically inside this workspace.
-/// * a CUSTOM-base track — one whose recorded name is NOT a base
-///   [`NumberSystem::new`] can build, e.g. `msd_fib` — **cannot** be built here. Not for
-///   lack of the name; because constructing that `NumberSystem` needs the
-///   `Custom Bases/*.txt` files ([`NumberSystem::with_custom_base_files`]), and only a
-///   `Session`-backed resolver in `wr-cli` can supply them; this function has an
-///   `&Automaton` and nothing else, and plain [`NumberSystem::new`] resolves no files at
-///   all. Java's `getNS().get(i)` IS non-`null` there (custom bases have real, cached
-///   `NumberSystem` instances) and the query succeeds — so this is a genuine, still-open
-///   **port limitation**, not a Walnut bug and not something `docs/WALNUT-BUGS.md` covers.
+/// [`VariableExpression::act`] — the sole consumer, in Java and here — touches exactly one
+/// field of `getNS().get(i)`: `ns.equality`, which it clones, `bind`s and `and`s in
+/// (`VariableExpression.java:41-44`). Nothing else in this crate reads a track's
+/// `NumberSystem` at all. So the question this function has to answer is not "which
+/// `NumberSystem` object did Java hold here" but the strictly smaller "what is that number
+/// system's `equality` automaton" — and *that* is fully determined by data the
+/// [`Automaton`] already carries per track, with no name parsing, no `Custom Bases/` file
+/// access and no `NumberSystem` reconstruction anywhere in it:
 ///
-/// # Why the custom-base test is the NAME and not `all_reps[i].is_some()`
+/// * [`Automaton::msd`] `[i]` is Java's `NS.get(i) == null` test. `None` is a
+///   `{...}`-declared track — no numeration in Java either, so
+///   [`TrackNs::DeclaredAlphabet`] and, on a repeated occurrence, WB-013's message.
+/// * otherwise, `NumberSystem`'s constructor built `equality` as
+///   `setEqualityAutomaton(getAlphabet())` (`NumberSystem.java:144`), where `getAlphabet()`
+///   is the adder's track-0 alphabet — which is *exactly* what `wr-io`'s reader stored in
+///   [`Automaton::alphabet`] `[i]` (`reader.rs`: `alphabet: ns.get_alphabet().to_vec()`).
+///   So [`wr_core::numsys::equality_automaton`] `(&automaton.alphabet[i], is_msd)`
+///   reproduces it verbatim.
+/// * the number system installs its own NAME on every track of `equality`
+///   (`NumberSystem.java:364-366`/`:392`/`initBasicAutomaton`, ported in
+///   [`NumberSystem::with_custom_base_files`]); [`Automaton::track_ns_names`] `[i]` is that
+///   same name — recorded by the reader, or reconstructed as `msd_<k>`/`lsd_<k>` for the
+///   programmatic bases where the two are identical by construction.
+/// * a custom base with a `Custom Bases/<name>.txt` all-representations file additionally
+///   restricts `equality` to the valid representations (`:151-155`). That restriction
+///   automaton is [`Automaton::all_reps`] `[i]` — the reader stores the very `Rc` the
+///   number system holds (`reader.rs`: `all_reps: ns.all_representations().cloned()`) — so
+///   replaying [`Automaton::set_all_reps`] + [`Automaton::apply_all_representations`] here
+///   is the same sequence, on the same operand, as the constructor ran.
 ///
-/// It was `all_reps[i].is_some()` when this three-way split was first introduced, and
-/// that was itself a live defect — the same wrong-answer camouflage this function's
-/// three-way return exists to prevent, one layer down. An all-representations file is
-/// **optional**: [`NumberSystem::with_custom_base_files`] leaves `all_representations`
-/// `None` when `Custom Bases/<name>.txt` is absent (Java's
-/// `flagUseAllRepresentations = false`, `NumberSystem.java:147-149`), while still
-/// recording the name. So a custom base shipping only `<name>_addition.txt` has
-/// `all_reps[i] == None` and `ns_name[i] == Some("msd_bar")` — it fell straight through
-/// to the direction+alphabet-size arm and FABRICATED a `NumberSystem` for a base that is
-/// not the track's own.
+/// The replay is deliberately given a throwaway [`wr_core::logging::Logging`]: Java logs
+/// nothing at this point (it clones an automaton built once, at `NumberSystem`
+/// construction time, whose own log lines both engines already emitted back then), so a
+/// silent replay is the faithful choice, not a narrowing.
 ///
-/// Reproduced against `walnut-java` `c75e630` (2026-08-21) with a `Custom Bases/
-/// msd_bar_addition.txt` over the alphabet `{0, 1, 5}` (legal — the constructor requires
-/// only that `0` and `1` be present) and no `msd_bar.txt`: real Walnut answers
-/// `eval barout "BAR2[i][i] = @1";` with a correct 1-state `msd_bar` automaton, and this
-/// port fabricated `msd_3` from the alphabet's cardinality, then died in the cross product
-/// with Java's own verbatim `"in computing cross product of two automaton, variables with
-/// the same label must have the same alphabet"` — printed on **stdout** as a `handled`
-/// `WalnutException` with an empty stderr, i.e. a wrong answer wearing legitimate Walnut
-/// output's clothes, never reaching this function's own
-/// [`TrackNs::NumberSystemUnrecoverable`] safety net. Where the fabricated base's alphabet
-/// happened to be contiguous `0..k-1` the failure was quieter still: a silent, coincidental
-/// "success" on the wrong numeration.
+/// # Why this is a rewrite and not another patch
 ///
-/// [`Automaton::ns_name`] is the authoritative answer to "which `NumberSystem` did Java
-/// hold on this track" — it is populated from the resolved `NumberSystem` itself by
-/// `wr-io`'s reader and by `wr-cli`'s `alphabet`/`reg` — so it, not a derived proxy, is
-/// what this function keys on.
+/// This function used to *reconstruct* a `NumberSystem` from the track's recorded name
+/// and read `.equality` off that, which forced it to decide "is this a base I can rebuild
+/// from no files at all?" — and three successive review rounds each found the same class
+/// of defect in a different spelling of that decision:
 ///
-/// # Why this returns a three-way [`TrackNs`] rather than an `Option`
+/// 1. `Option<NumberSystem>` collapsed "Java had no number system" and "this port could
+///    not rebuild one" into a single `None`, so an `msd_fib` track reported WB-013's
+///    Java-verbatim "your alphabet was declared explicitly, e.g. `{0,1}`" — false for
+///    `msd_fib` — on the *handled*/stdout channel.
+/// 2. splitting them on `all_reps[i].is_some()` missed every custom base with no
+///    all-representations file (that file is optional, `NumberSystem.java:147-149`), so
+///    `msd_bar` over `{0, 1, 5}` fell through and FABRICATED `msd_3` from the alphabet's
+///    cardinality.
+/// 3. splitting them on `NumberSystem::new(name).is_ok()` instead missed a
+///    programmatically-parseable name that a `Custom Bases/` file SHADOWS with a different
+///    alphabet (`msd_neg_3`), fabricating the programmatic base for it — and, in the other
+///    direction, refused perfectly computable custom bases whose alphabet is contiguous.
 ///
-/// It used to return `Option<NumberSystem>`, collapsing the last two bullets into one
-/// `None`. That was a live defect, found by adversarial review and reproduced against
-/// `walnut-java` `c75e630` (2026-08-21): a repeated variable indexing a custom-base track
-/// (`eval fibout2 "FIB2[i][i] = @1";` over an `msd_fib msd_fib` word automaton, which real
-/// Walnut answers with a 2-state `msd_fib` automaton) came out of the `None` arm and
-/// therefore reported [`ExprError::RepeatedIdentifierMissingNumberSystem`] — WB-013's
-/// Java-verbatim message, which asserts the track's "alphabet was declared explicitly,
-/// e.g. `{0,1}`". For an `msd_fib` track that sentence is simply FALSE, and (once WB-013's
-/// upstream fix made that variant a `handled` `WalnutException`) it printed on **stdout**,
-/// indistinguishable from legitimate Walnut behavior. The gap is unchanged — it is still
-/// open — but it now surfaces distinctly, as
-/// [`ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] on stderr, instead of being
-/// silently absorbed into a fixed-and-matching Java path. Flagged for whichever later unit
-/// threads a custom-base resolver (the one `PredicateEnv` already owns) down to here.
+/// Every one of those is the same root cause: a heuristic standing in for a value that
+/// never needed to be guessed. Computing `equality` directly retires the heuristic
+/// entirely — there is no "custom base?" question left to get wrong, because the answer is
+/// not used. All three shapes above now produce the same automaton real Walnut does; see
+/// this module's tests and `tests/differential/tests/java_bugfix_wb013.rs`.
 ///
-/// [`TrackNs::NumberSystemUnrecoverable`] also covers the residual case where a track
-/// carries a real msd/lsd direction and no recorded name, but its RECONSTRUCTED
-/// `msd_k`/`lsd_k` name is not a number system this crate can build (a track index past
-/// the alphabet, or an alphabet of fewer than two letters — `NumberSystem::new` rejects
-/// `msd_1`). Java holds a real `NumberSystem` object in every such case too, so it belongs
-/// with the custom-base gap rather than with Java's own `null`. That residual case has no
-/// known reachable input; it is classified deliberately rather than left to fall through
-/// to the wrong arm.
-fn track_number_system(automaton: &Automaton, i: usize) -> OwnedTrackNs {
-    if automaton.all_reps.get(i).and_then(|r| r.as_ref()).is_some() {
-        // A restriction automaton is only ever installed by a custom base, so this is
-        // already conclusive -- kept ahead of the name lookup as a belt-and-braces guard
-        // for any construction path that installs `all_reps` without a name (`ns_name`'s
-        // own parallel-vector invariant says there is none, but it is a `pub` field and
-        // nothing in the type system pins that).
-        return OwnedTrackNs::NumberSystemUnrecoverable;
-    }
+/// # The one remaining non-`Present` answer besides Java's own `null`
+///
+/// [`TrackNs::NumberSystemUnrecoverable`] survives as a defensive arm for a state that is
+/// representable but violates [`Automaton`]'s parallel-track invariant: `msd[i]` says the
+/// track HAS a number system while `alphabet` has no track `i` at all. No caller can reach
+/// it — [`Word::act`] iterates `0..arity` and `Word::new` requires `arity ==
+/// word_automaton.arity()`, i.e. `alphabet.len()` — but `msd` and `alphabet` are `pub`
+/// fields with only a `debug_assert` between them, so the case is constructible and is
+/// classified deliberately rather than left to borrow WB-013's (then false) message. Kept
+/// for the same reason `wr_core::logicalops::ConvertNsError::BaseOverflowsInt` is.
+fn track_equality_automaton(automaton: &Automaton, i: usize) -> OwnedTrackNs {
     let Some(is_msd) = automaton.msd.get(i).copied().flatten() else {
         // Java's own `null`: a `{...}`-declared track (WB-013).
         return OwnedTrackNs::DeclaredAlphabet;
     };
-    // The RECORDED name is authoritative -- see this function's docs on why deriving it
-    // from the alphabet's cardinality instead silently fabricates the wrong base.
-    let name = match automaton.ns_name.get(i).and_then(|n| n.as_ref()) {
-        Some(recorded) => recorded.clone(),
-        None => {
-            let Some(base) = automaton.alphabet.get(i).map(|a| a.len()) else {
-                return OwnedTrackNs::NumberSystemUnrecoverable;
-            };
-            if is_msd {
-                format!("msd_{base}")
-            } else {
-                format!("lsd_{base}")
-            }
-        }
+    let Some(alphabet) = automaton.alphabet.get(i) else {
+        // Unreachable from any caller -- see this function's last section.
+        return OwnedTrackNs::NumberSystemUnrecoverable;
     };
-    match NumberSystem::new(&name) {
-        Ok(ns) => OwnedTrackNs::Present(Box::new(ns)),
-        // Either a genuine custom base (`msd_fib`, `msd_bar`: no programmatic
-        // construction, and no resolver reachable from here) or the residual
-        // unbuildable-reconstruction case above. Both are Java-has-a-real-`NumberSystem`
-        // territory, never Java's `null`.
-        Err(_) => OwnedTrackNs::NumberSystemUnrecoverable,
+    // `setEqualityAutomaton(getAlphabet())` (`NumberSystem.java:144`).
+    let mut equality = wr_core::numsys::equality_automaton(alphabet, is_msd);
+    // The name half of `equality.getNS().set(i, this)` (see `with_custom_base_files`).
+    // `track_ns_names()[i]` is `Some` because both guards above passed: it maps over
+    // `msd.zip(alphabet)` and yields `Some` for every track whose `msd` is `Some`.
+    let name = automaton
+        .track_ns_names()
+        .get(i)
+        .cloned()
+        .flatten()
+        .expect("msd[i] and alphabet[i] are both present, so track_ns_names()[i] is Some");
+    equality.set_ns_names(vec![Some(name); equality.alphabet.len()]);
+    // `allRepresentations != null` -> `equality.applyAllRepresentations()` (`:151-155`).
+    if let Some(restriction) = automaton.all_reps.get(i).and_then(|r| r.as_ref()) {
+        equality.set_all_reps(vec![Some(Rc::clone(restriction)); equality.alphabet.len()]);
+        // Throwaway `Logging` on purpose -- Java logs nothing here; see the docs above.
+        equality.apply_all_representations(&mut wr_core::logging::Logging::new());
     }
+    OwnedTrackNs::Present(Box::new(equality))
 }
 
-/// The owned counterpart of [`TrackNs`], because [`track_number_system`] *builds* the
-/// `NumberSystem` it reports rather than borrowing one out of the automaton (see that
-/// function's first bullet), while [`VariableExpression::act`]'s other caller
-/// ([`Function::act`]) genuinely does hand over a borrow. [`Self::as_track_ns`] is the
-/// bridge, exactly as [`Option::as_ref`] was before this pair of types replaced the
-/// `Option<NumberSystem>` that could not distinguish the two "no number system" causes.
+/// The owned counterpart of [`TrackNs`], because [`track_equality_automaton`] *builds* the
+/// equality automaton it reports rather than borrowing one out of the word automaton,
+/// while [`VariableExpression::act`]'s other caller ([`Function::act`]) genuinely does hand
+/// over a borrow (of its own `NumberSystem`'s `equality` field). [`Self::as_track_ns`] is
+/// the bridge.
 enum OwnedTrackNs {
-    /// Boxed only to keep the enum small: a `NumberSystem` is ~1KB, so an unboxed variant
-    /// makes every `OwnedTrackNs` that large (`clippy::large_enum_variant`). The old
-    /// `Option<NumberSystem>` return type paid the same cost silently; this is strictly
-    /// cheaper to move.
-    Present(Box<NumberSystem>),
+    /// Boxed only to keep the enum small (`clippy::large_enum_variant`): the payload is a
+    /// whole [`Automaton`], the other two variants are unit.
+    Present(Box<Automaton>),
     DeclaredAlphabet,
     NumberSystemUnrecoverable,
 }
 
 impl OwnedTrackNs {
-    /// A short variant name for test failure messages — the payload is a `NumberSystem`,
-    /// which is deliberately not `Debug` (it holds three automata plus three memo caches).
+    /// A short variant description for test failure messages — `Automaton`'s own `Debug`
+    /// is a full transition table, far too noisy for an assertion message.
     #[cfg(test)]
     fn describe(&self) -> String {
         match self {
-            OwnedTrackNs::Present(ns) => format!("Present({})", ns.name()),
+            OwnedTrackNs::Present(eq) => format!(
+                "Present(ns_name={:?}, alphabet={:?})",
+                eq.ns_name.first(),
+                eq.alphabet.first()
+            ),
             OwnedTrackNs::DeclaredAlphabet => "DeclaredAlphabet".to_string(),
             OwnedTrackNs::NumberSystemUnrecoverable => "NumberSystemUnrecoverable".to_string(),
         }
@@ -2352,7 +2332,7 @@ impl OwnedTrackNs {
 
     fn as_track_ns(&self) -> TrackNs<'_> {
         match self {
-            OwnedTrackNs::Present(ns) => TrackNs::Present(ns),
+            OwnedTrackNs::Present(eq) => TrackNs::Present(eq),
             OwnedTrackNs::DeclaredAlphabet => TrackNs::DeclaredAlphabet,
             OwnedTrackNs::NumberSystemUnrecoverable => TrackNs::NumberSystemUnrecoverable,
         }
@@ -2476,7 +2456,7 @@ impl Word {
             string_value.push(']');
             match &expression {
                 Expression::Variable(ve) => {
-                    let ns = track_number_system(&word_automaton, i);
+                    let ns = track_equality_automaton(&word_automaton, i);
                     m = ve.act(
                         fresh,
                         ns.as_track_ns(),
@@ -2662,8 +2642,9 @@ impl Function {
                         fresh,
                         // `Function`'s number system is a real, always-present field
                         // (`Function.java:41`'s constructor parameter) — never Java's
-                        // `null` case, and never this port's custom-base gap either.
-                        TrackNs::Present(&self.ns),
+                        // `null` case — so its `equality` automaton is a plain borrow,
+                        // the case `TrackNs::Present` was shaped for.
+                        TrackNs::Present(&self.ns.equality),
                         &mut identifiers,
                         m,
                         &mut quantify,
@@ -3740,15 +3721,127 @@ mod tests {
         }
     }
 
-    /// [`track_number_system`]'s three-way classification, pinned directly: the ONE
-    /// distinction whose absence was a live defect (see that function's docs).
+    // ------------------------------------------------- `track_equality_automaton`
+    //
+    // The round-4 rewrite: `track_equality_automaton` computes the track's `ns.equality`
+    // automaton DIRECTLY from the track's own alphabet/direction/restriction instead of
+    // rebuilding a `NumberSystem` from its name and reading `.equality` off that. Three
+    // earlier rounds each shipped a different heuristic for "is this a base I can
+    // rebuild?", and each was found wrong; these tests pin the property that replaced all
+    // of them — see that function's docs.
+
+    /// A one-track [`Automaton`] shaped exactly like what `wr-io`'s reader produces for a
+    /// declared numeration system: the number system's own alphabet, its direction, and
+    /// its name recorded in [`Automaton::ns_name`].
+    fn track(alphabet: Vec<i32>, is_msd: bool, ns_name: Option<&str>) -> Automaton {
+        let mut a = Automaton::new(
+            wr_core::fa::Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: alphabet.len(),
+                o: vec![1],
+                d: vec![std::collections::BTreeMap::new()],
+            },
+            vec![alphabet],
+            Vec::new(),
+            vec![Some(is_msd)],
+        );
+        a.set_ns_names(vec![ns_name.map(str::to_string)]);
+        a
+    }
+
+    fn expect_equality(owned: &OwnedTrackNs) -> &Automaton {
+        match owned {
+            OwnedTrackNs::Present(eq) => eq,
+            other => panic!("expected an equality automaton, got {}", other.describe()),
+        }
+    }
+
+    /// Feeds a two-track word (one digit pair per position, in the automaton's own track
+    /// order) into `a` via [`Automaton::encode`], so the test never hand-computes symbol
+    /// ids.
+    fn accepts_pair(a: &Automaton, digit_pairs: &[(i32, i32)]) -> bool {
+        let word: Vec<i32> = digit_pairs
+            .iter()
+            .map(|&(x, y)| a.encode(&[x, y]))
+            .collect();
+        a.fa.accepts_word(&word)
+    }
+
+    /// A real one-track restriction automaton over `{0, 1}`: state 0 (accepting) reads
+    /// `0 -> 0`, `1 -> 1`; state 1 (accepting) reads `0 -> 0` and has no `1` transition at
+    /// all. So it accepts exactly the words with no `11` substring — Zeckendorf's
+    /// condition, i.e. `msd_fib`'s own `Custom Bases/msd_fib.txt`.
+    fn no_eleven_restriction() -> Automaton {
+        let mut a = Automaton::new(
+            wr_core::fa::Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 2,
+                o: vec![1, 1],
+                d: vec![
+                    [(0, vec![0]), (1, vec![1])].into_iter().collect(),
+                    [(0, vec![0])].into_iter().collect(),
+                ],
+            },
+            vec![vec![0, 1]],
+            Vec::new(),
+            vec![Some(true)],
+        );
+        a.set_ns_names(vec![Some("msd_fib".to_string())]);
+        a
+    }
+
+    /// The load-bearing correctness claim of the rewrite, checked against the only
+    /// independent reference available in-crate: for every base [`NumberSystem::new`] CAN
+    /// build, direct computation must produce that number system's *own* `equality`
+    /// automaton — same alphabet, same direction, same recorded name, same language.
     ///
-    /// Track 0 is a plain `msd_2` track (rebuildable), track 1 is `{...}`-declared
-    /// (Java's own `null`, WB-013), track 2 is a custom base (Java has a real
-    /// `NumberSystem`; this port cannot build one). The last two used to be one
-    /// indistinguishable `None`.
+    /// This is what makes the reconstruction step redundant rather than merely
+    /// inconvenient. (For the bases `NumberSystem::new` cannot build, the reference is
+    /// real `walnut-java` output — see `tests/differential/tests/java_bugfix_wb013.rs`.)
     #[test]
-    fn track_number_system_separates_javas_null_track_from_this_ports_custom_base_gap() {
+    fn track_equality_automaton_reproduces_the_real_number_systems_equality() {
+        for name in [
+            "msd_2",
+            "lsd_2",
+            "msd_3",
+            "msd_neg_3",
+            "lsd_neg_2",
+            "msd_10",
+        ] {
+            let ns = NumberSystem::new(name).unwrap();
+            let a = track(ns.get_alphabet().to_vec(), ns.is_msd(), Some(name));
+            let computed = track_equality_automaton(&a, 0);
+            let computed = expect_equality(&computed);
+            assert_eq!(
+                computed.alphabet, ns.equality.alphabet,
+                "{name}: alphabet must match the real number system's equality automaton"
+            );
+            assert_eq!(computed.msd, ns.equality.msd, "{name}: direction");
+            assert_eq!(
+                computed.ns_name, ns.equality.ns_name,
+                "{name}: the number system's NAME is installed on every track of `equality` \
+                 (`NumberSystem.java:364-366`/`:392`) and survives into the result"
+            );
+            assert!(
+                same_language(computed, &ns.equality),
+                "{name}: computed equality automaton has a different language"
+            );
+        }
+    }
+
+    /// Java's `getNS().get(i) == null` — the ONE case that is genuinely "no number
+    /// system", and the only one that may report WB-013's message.
+    ///
+    /// Track 0 is a plain `msd_2` track, track 1 is `{...}`-declared (no direction, which
+    /// is exactly how `ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)` branch
+    /// surfaces here), track 2 is a custom base carrying both a name and an
+    /// all-representations restriction. Only track 1 is Java's `null`.
+    #[test]
+    fn track_equality_automaton_reports_javas_null_only_for_a_declared_alphabet_track() {
         let fa = wr_core::fa::Fa {
             true_false: None,
             q0: 0,
@@ -3764,11 +3857,7 @@ mod tests {
             // `{...}`-declared tracks are exactly the ones with no direction.
             vec![Some(true), None, Some(true)],
         );
-        // A custom base carries its NAME (`set_ns_names`), and -- when it ships a
-        // `Custom Bases/<name>.txt` -- a restriction automaton too. This one has both;
-        // `a_custom_base_without_an_all_representations_file_is_still_unrecoverable`
-        // covers the (equally legal) case that has only the name.
-        let restriction = std::rc::Rc::new(Automaton::true_false(true));
+        let restriction = std::rc::Rc::new(no_eleven_restriction());
         a.set_all_reps(vec![None, None, Some(restriction)]);
         a.set_ns_names(vec![
             Some("msd_2".to_string()),
@@ -3777,112 +3866,223 @@ mod tests {
         ]);
 
         assert!(
-            matches!(track_number_system(&a, 0), OwnedTrackNs::Present(_)),
-            "a plain msd_2 track is rebuildable from direction + alphabet size"
-        );
-        assert!(
-            matches!(track_number_system(&a, 1), OwnedTrackNs::DeclaredAlphabet),
-            "a {{...}}-declared track is Java's own null NS (WB-013)"
+            matches!(track_equality_automaton(&a, 0), OwnedTrackNs::Present(_)),
+            "a plain msd_2 track has a number system"
         );
         assert!(
             matches!(
-                track_number_system(&a, 2),
-                OwnedTrackNs::NumberSystemUnrecoverable
+                track_equality_automaton(&a, 1),
+                OwnedTrackNs::DeclaredAlphabet
             ),
-            "a custom-base track is NOT Java's null case -- Java has a real NumberSystem \
-             there and succeeds; this port must say so rather than borrow WB-013's message"
+            "a {{...}}-declared track is Java's own null NS (WB-013)"
+        );
+        let custom = track_equality_automaton(&a, 2);
+        let custom = expect_equality(&custom);
+        assert_eq!(
+            custom.ns_name,
+            vec![Some("msd_fib".to_string()); 2],
+            "a custom-base track computes its own equality automaton, under its own name -- \
+             it is NOT Java's null case and must never report WB-013's message"
         );
     }
 
-    /// The gap the FIRST draft of [`track_number_system`]'s three-way split still had: it
-    /// keyed "is this a custom base?" on `all_reps[i].is_some()`, but a custom base's
-    /// `Custom Bases/<name>.txt` all-representations file is **optional**
-    /// (`NumberSystem.java:147-149`'s `flagUseAllRepresentations = false` branch), so a base
-    /// shipping only `<name>_addition.txt` has `all_reps[i] == None` and was silently
-    /// fabricated into an `msd_<alphabet size>` that is not the track's base at all.
+    /// Round 2's finding, now as a positive capability rather than a refusal: a custom
+    /// base's `Custom Bases/<name>.txt` all-representations file is **optional**
+    /// (`NumberSystem.java:147-149`'s `flagUseAllRepresentations = false` branch), so
+    /// `msd_bar` over `{0, 1, 5}` shipping only `msd_bar_addition.txt` has
+    /// `all_reps[0] == None` and `ns_name[0] == Some("msd_bar")`.
     ///
-    /// Track 0 is exactly that shape — `msd_bar` over `{0, 1, 5}`, which the old
-    /// discriminator turned into a fabricated `msd_3`. Track 1 pins the other half of the
-    /// same change: a NEGATIVE base is `NumberSystem::new`-buildable from no file at all, so
-    /// keying on the recorded name must not over-reject it. (The old code built a positive
-    /// `msd_3` there — a genuinely different `NumberSystem` object, though **not** an
-    /// observable divergence for this call site: [`VariableExpression::act`] reads only
-    /// `ns.equality`, and digit-wise equality over `{0, 1, 2}` is the same automaton either
-    /// way. Confirmed live on `walnut-java` `c75e630` and on both sides of this fix — an
-    /// `msd_neg_3 msd_neg_3` word automaton under `[i][i]` produced byte-identical output
-    /// before and after. That is precisely the "coincidentally right, for the wrong reason"
-    /// second consequence, kept honest here rather than sold as a fixed divergence.)
-    /// Track 2 is the no-recorded-name fallback arm.
+    /// The `all_reps`-keyed discriminator could not see it and FABRICATED `msd_3` from the
+    /// alphabet's cardinality (a different alphabet, `{0,1,2}` — which then died in the
+    /// cross product with Java's own "variables with the same label must have the same
+    /// alphabet" text, on stdout). Direct computation asks no such question: it uses the
+    /// track's own alphabet, whatever it is.
+    ///
+    /// Verified live against `walnut-java` `c75e630` (2026-08-21): with that custom base
+    /// and a `Word Automata Library/BAR2.txt` declared `msd_bar msd_bar`,
+    /// `eval barout "BAR2[i][i] = @1";` writes a 1-state `msd_bar` automaton, which this
+    /// port now reproduces.
     #[test]
-    fn a_custom_base_without_an_all_representations_file_is_still_unrecoverable() {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 27,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
-        let mut a = Automaton::new(
-            fa,
-            vec![vec![0, 1, 5], vec![0, 1, 2], vec![0, 1, 2]],
-            Vec::new(),
-            vec![Some(true), Some(true), Some(true)],
-        );
-        // No `set_all_reps` call at all: every track's `all_reps` stays `None`, which is
-        // precisely the case the old discriminator could not see.
-        a.set_ns_names(vec![
-            Some("msd_bar".to_string()),
-            Some("msd_neg_3".to_string()),
-            None,
-        ]);
+    fn a_custom_base_without_an_all_representations_file_computes_its_own_equality() {
+        let a = track(vec![0, 1, 5], true, Some("msd_bar"));
         assert!(
             a.all_reps.iter().all(Option::is_none),
             "the whole point of this test is that `all_reps` says nothing here"
         );
-
-        assert!(
-            matches!(
-                track_number_system(&a, 0),
-                OwnedTrackNs::NumberSystemUnrecoverable
-            ),
-            "a custom base with no all-representations file is still a custom base -- \
-             reporting `Present(msd_3)` here fabricates a numeration the track never had"
+        let computed = track_equality_automaton(&a, 0);
+        let computed = expect_equality(&computed);
+        assert_eq!(
+            computed.alphabet,
+            vec![vec![0, 1, 5]; 2],
+            "the track's OWN alphabet, not a `msd_3` fabricated from its cardinality"
         );
-        match track_number_system(&a, 1) {
-            OwnedTrackNs::Present(ns) => assert_eq!(
-                ns.name(),
-                "msd_neg_3",
-                "a negative base is built programmatically, so the recorded name must be \
-                 honoured rather than rejected -- and must not be re-derived as `msd_3`"
-            ),
-            other => panic!("expected the real msd_neg_3, got {}", other.describe()),
-        }
-        match track_number_system(&a, 2) {
-            OwnedTrackNs::Present(ns) => assert_eq!(
-                ns.name(),
-                "msd_3",
-                "with no recorded name, direction + alphabet size is the fallback"
-            ),
-            other => panic!("expected the reconstructed msd_3, got {}", other.describe()),
-        }
+        assert_eq!(computed.ns_name, vec![Some("msd_bar".to_string()); 2]);
+        // The diagonal over `{0, 1, 5}`, including the letter a fabricated `msd_3` would
+        // not have had at all.
+        assert!(accepts_pair(computed, &[(5, 5), (0, 0), (1, 1)]));
+        assert!(!accepts_pair(computed, &[(5, 1)]));
+        assert!(!accepts_pair(computed, &[(0, 0), (1, 5)]));
     }
 
-    /// The end-to-end half of
-    /// [`a_custom_base_without_an_all_representations_file_is_still_unrecoverable`], through
-    /// the real [`Word::act`] dispatch — and the repro that found it.
+    /// Round 3's review finding, now as a positive capability: a name that IS
+    /// programmatically parseable (`msd_neg_3`) but which a `Custom Bases/` file SHADOWS
+    /// with a different base — so the track's real alphabet is the FILE's, not the one
+    /// `NumberSystem::new("msd_neg_3")` would build.
+    ///
+    /// The `NumberSystem::new(name).is_ok()`-keyed discriminator answered "programmatic,
+    /// rebuild it" and fabricated the unshadowed base, silently substituting a different
+    /// alphabet. Direct computation cannot make that mistake: it never consults the name
+    /// for anything but the label it records.
+    #[test]
+    fn a_custom_base_shadowing_a_programmatic_name_uses_the_tracks_own_alphabet() {
+        // A `Custom Bases/msd_neg_3_addition.txt` over `{0, 1, 2, 3}` shadows the
+        // programmatic `msd_neg_3`, whose own alphabet is `{0, 1, 2}`.
+        let programmatic = NumberSystem::new("msd_neg_3").unwrap();
+        assert_eq!(
+            programmatic.get_alphabet(),
+            &[0, 1, 2],
+            "precondition: the UNSHADOWED base has a different alphabet, which is what \
+             makes the substitution observable"
+        );
+        let a = track(vec![0, 1, 2, 3], true, Some("msd_neg_3"));
+        let computed = track_equality_automaton(&a, 0);
+        let computed = expect_equality(&computed);
+        assert_eq!(
+            computed.alphabet,
+            vec![vec![0, 1, 2, 3]; 2],
+            "the shadowing base's alphabet, not the programmatic one's"
+        );
+        assert_eq!(computed.ns_name, vec![Some("msd_neg_3".to_string()); 2]);
+        assert!(accepts_pair(computed, &[(3, 3)]));
+        assert!(!accepts_pair(computed, &[(3, 2)]));
+        assert_eq!(
+            wr_core::equiv::automaton_language_equivalent(computed, &programmatic.equality),
+            Err(wr_core::equiv::EquivError::MismatchedTrackStructure),
+            "and it must NOT be the unshadowed base's equality automaton -- the two are not \
+             even comparable, which is precisely the cross-product failure the fabricated \
+             `NumberSystem` used to cause downstream"
+        );
+    }
+
+    /// Round 3's *capability regression*, now closed: a custom base whose alphabet happens
+    /// to be a contiguous `0..k-1` (`msd_baz` over `{0, 1, 2}`) and which ships no
+    /// all-representations file. The `NumberSystem::new(name).is_ok()` discriminator
+    /// refused it outright — real Walnut computes an answer there — even though its
+    /// equality automaton is perfectly computable, and identical to `msd_3`'s but for the
+    /// recorded name.
+    #[test]
+    fn a_contiguous_alphabet_custom_base_is_computed_rather_than_refused() {
+        let a = track(vec![0, 1, 2], true, Some("msd_baz"));
+        let computed = track_equality_automaton(&a, 0);
+        let computed = expect_equality(&computed);
+        assert_eq!(computed.alphabet, vec![vec![0, 1, 2]; 2]);
+        assert_eq!(
+            computed.ns_name,
+            vec![Some("msd_baz".to_string()); 2],
+            "the recorded name survives; it is not re-derived as `msd_3`"
+        );
+        let msd_3 = NumberSystem::new("msd_3").unwrap();
+        assert!(
+            same_language(computed, &msd_3.equality),
+            "digit-wise equality over `{{0,1,2}}` is the same relation either way -- only \
+             the recorded name differs"
+        );
+    }
+
+    /// With no recorded name at all (an automaton built programmatically inside this
+    /// workspace rather than read by `wr-io`), [`Automaton::track_ns_names`]'s
+    /// `msd_<k>`/`lsd_<k>` reconstruction supplies the label — the one place a name is
+    /// still derived, and it is only ever a label.
+    #[test]
+    fn a_track_with_no_recorded_name_falls_back_to_direction_plus_alphabet_size() {
+        let computed = track_equality_automaton(&track(vec![0, 1, 2], true, None), 0);
+        assert_eq!(
+            expect_equality(&computed).ns_name,
+            vec![Some("msd_3".to_string()); 2]
+        );
+        let computed = track_equality_automaton(&track(vec![0, 1], false, None), 0);
+        assert_eq!(
+            expect_equality(&computed).ns_name,
+            vec![Some("lsd_2".to_string()); 2]
+        );
+    }
+
+    /// The all-representations restriction really is folded in, on BOTH tracks — the step
+    /// `NumberSystem`'s constructor runs at `:151-155` and which a caller that only
+    /// rebuilt the base's *name* would have silently skipped.
+    ///
+    /// The restriction here is Zeckendorf's ("no `11` substring", i.e. `msd_fib`'s own
+    /// `Custom Bases/msd_fib.txt`), so the expected language is "the diagonal, restricted
+    /// to words with no `11`" — checked by simulation, not by re-running the same fold.
+    #[test]
+    fn an_all_representations_restriction_is_applied_to_the_computed_equality() {
+        let no_eleven = no_eleven_restriction();
+        assert!(no_eleven.fa.accepts_word(&[1, 0, 1]));
+        assert!(!no_eleven.fa.accepts_word(&[1, 1]));
+
+        let mut a = track(vec![0, 1], true, Some("msd_fib"));
+        a.set_all_reps(vec![Some(std::rc::Rc::new(no_eleven))]);
+        let computed = track_equality_automaton(&a, 0);
+        let computed = expect_equality(&computed);
+
+        assert!(
+            accepts_pair(computed, &[(1, 1), (0, 0), (1, 1)]),
+            "`101` = `101` is a valid Zeckendorf representation on both tracks"
+        );
+        assert!(
+            !accepts_pair(computed, &[(1, 1), (1, 1)]),
+            "`11` = `11` is diagonal but not a valid representation -- the restriction \
+             must have been folded into the equality automaton"
+        );
+        assert!(!accepts_pair(computed, &[(1, 0)]), "still the diagonal");
+        // Contrast: without the restriction, `11 = 11` is accepted. This is what makes
+        // the assertion above a real check on the fold rather than on the diagonal.
+        let unrestricted = track_equality_automaton(&track(vec![0, 1], true, Some("msd_fib")), 0);
+        assert!(accepts_pair(
+            expect_equality(&unrestricted),
+            &[(1, 1), (1, 1)]
+        ));
+    }
+
+    /// The one non-`Present`, non-Java answer left: an [`Automaton`] whose parallel track
+    /// vectors disagree — `msd[1]` declares a number system while `alphabet` has no track
+    /// 1 at all.
+    ///
+    /// Unreachable from any caller ([`Word::act`] iterates `0..arity` and [`Word::new`]
+    /// requires `arity == word_automaton.arity()`), but constructible, since `msd` is a
+    /// `pub` field. Classified deliberately rather than allowed to borrow WB-013's message,
+    /// which would be factually false about it.
+    #[test]
+    fn a_track_that_declares_a_number_system_but_has_no_alphabet_is_classified_not_guessed() {
+        let mut a = track(vec![0, 1], true, Some("msd_2"));
+        a.msd.push(Some(true)); // a second track's DIRECTION, with no second alphabet
+        assert!(a.alphabet.get(1).is_none());
+        assert!(
+            matches!(
+                track_equality_automaton(&a, 1),
+                OwnedTrackNs::NumberSystemUnrecoverable
+            ),
+            "must not be reported as Java's null (WB-013), which would claim the alphabet \
+             was declared explicitly"
+        );
+    }
+
+    // --------------------------------------------------- `Word::act`, end to end
+
+    /// [`a_custom_base_without_an_all_representations_file_computes_its_own_equality`]'s
+    /// end-to-end half, through the real [`Word::act`] dispatch — and the repro that found
+    /// round 2's defect, now asserting the *fixed* behavior.
     ///
     /// Run live against `walnut-java` `c75e630` (2026-08-21) with a
-    /// `Custom Bases/msd_bar_addition.txt` over `{0, 1, 5}`, no `msd_bar.txt`, and a
+    /// `Custom Bases/msd_bar_addition.txt` over `{0, 1, 5}` (legal — the constructor
+    /// requires only that `0` and `1` be present), no `msd_bar.txt`, and a
     /// `Word Automata Library/BAR2.txt` declared `msd_bar msd_bar`: real Walnut answers
-    /// `eval barout "BAR2[i][i] = @1";` with a 1-state `msd_bar` automaton. This port, with
-    /// the `all_reps`-keyed discriminator, fabricated `msd_3` and died in the cross product
-    /// with Java's own verbatim `"...variables with the same label must have the same
-    /// alphabet"` text, printed TWICE on **stdout** as a `handled` `WalnutException` with an
-    /// empty stderr — the exact wrong-answer-as-legitimate-output shape the three-way split
-    /// exists to prevent, reintroduced one layer down.
+    /// `eval barout "BAR2[i][i] = @1";` with a 1-state `msd_bar` automaton. Before round 4
+    /// this port fabricated `msd_3` and died in the cross product with Java's own verbatim
+    /// "variables with the same label must have the same alphabet" text on **stdout**; it
+    /// now computes an answer.
     #[test]
-    fn word_act_on_a_repeated_index_into_a_file_less_custom_base_reports_the_port_gap() {
+    fn word_act_on_a_repeated_index_into_a_file_less_custom_base_succeeds() {
         let fa = wr_core::fa::Fa {
             true_false: None,
             q0: 0,
@@ -3905,50 +4105,43 @@ mod tests {
             Expression::Variable(VariableExpression::new("i")),
             Expression::Variable(VariableExpression::new("i")),
         ];
-        let err = Token::Word(word)
+        Token::Word(word)
             .act(
                 &mut fresh,
                 &mut stack,
                 &mut wr_core::logging::Logging::new(),
             )
-            .unwrap_err();
-        match &err {
-            ActError::Expr(ExprError::RepeatedIdentifierNumberSystemUnrecoverable {
-                identifier,
-                token_name,
-            }) => {
-                assert_eq!(identifier, "i");
-                assert_eq!(token_name, "BAR2");
+            .expect("a repeated index into a custom-base track is computable");
+        match stack.as_slice() {
+            [Expression::Word(w)] => {
+                assert_eq!(
+                    w.word_automaton.alphabet[0],
+                    vec![0, 1, 5],
+                    "the custom base's own alphabet survives -- a fabricated `msd_3` would \
+                     have made this `{{0, 1, 2}}` and failed the cross product outright"
+                );
+                assert_eq!(
+                    w.m.track_ns_names()[0],
+                    Some("msd_bar".to_string()),
+                    "and its NAME survives, so the written header says `msd_bar`"
+                );
             }
-            other => panic!("expected the port-gap variant, got {other:?}"),
+            other => panic!("expected a single Word expression, got {other:?}"),
         }
-        assert!(
-            !err.to_string().contains("declared explicitly"),
-            "must not reuse WB-013's message, false for a custom base: {err}"
-        );
-        assert!(
-            !wr_core::logging::LoggableError::is_handled(&err),
-            "a port gap must stay on the unhandled/stderr channel, NOT be dressed up as a \
-             handled WalnutException on stdout"
-        );
-        assert_eq!(
-            wr_core::logging::LoggableError::kind(&err),
-            "walnut-rs.PortLimitation"
-        );
     }
 
-    /// The end-to-end shape of the same defect, through the real [`Word::act`] dispatch:
-    /// `FIB2[i][i]`, a repeated variable indexing a **custom-base** track.
+    /// The same, for the original round-1 repro: `FIB2[i][i]`, a repeated variable
+    /// indexing a **custom-base** track that DOES ship an all-representations file.
     ///
-    /// Mirrors the repro that found this, run live against `walnut-java` `c75e630`
-    /// (2026-08-21): with `Word Automata Library/FIB2.txt` declared `msd_fib msd_fib`,
+    /// Run live against `walnut-java` `c75e630` (2026-08-21): with
+    /// `Word Automata Library/FIB2.txt` declared `msd_fib msd_fib`,
     /// `eval fibout2 "FIB2[i][i] = @1";` makes real Walnut write a 2-state `msd_fib`
-    /// automaton. This port cannot (see [`track_number_system`]), and what it must NOT do
-    /// is report that failure in WB-013's Java-verbatim wording — which asserts the
-    /// track's alphabet "was declared explicitly, e.g. `{0,1}`", false for `msd_fib`, on
-    /// the `handled`/stdout channel reserved for genuine Walnut output.
+    /// automaton. This port used to report WB-013's Java-verbatim message here — which
+    /// asserts the track's alphabet "was declared explicitly, e.g. `{0,1}`", false for
+    /// `msd_fib` — and then, after round 2, an honest-but-still-wrong port-gap error. It
+    /// now computes the answer.
     #[test]
-    fn word_act_on_a_repeated_custom_base_index_reports_the_port_gap_not_wb013() {
+    fn word_act_on_a_repeated_custom_base_index_succeeds() {
         let fa = wr_core::fa::Fa {
             true_false: None,
             q0: 0,
@@ -3963,15 +4156,62 @@ mod tests {
             Vec::new(),
             vec![Some(true), Some(true)],
         );
-        let restriction = std::rc::Rc::new(Automaton::true_false(true));
+        // `msd_fib` ships a `Custom Bases/msd_fib.txt`, so the reader leaves both the name
+        // and the restriction automaton on every track.
+        let restriction = std::rc::Rc::new(no_eleven_restriction());
         word_automaton.set_all_reps(vec![Some(restriction.clone()), Some(restriction)]);
-        // `msd_fib` DOES ship a `Custom Bases/msd_fib.txt`, so this automaton carries both
-        // facts, exactly as `wr-io`'s reader would leave it -- the positive-path
-        // regression check that keying on the NAME did not break the original case.
         word_automaton.set_ns_names(vec![Some("msd_fib".to_string()); 2]);
 
         let word = Word::new(0, "FIB2", word_automaton, 2).unwrap();
         let mut fresh = FreshIdentifiers::new();
+        let mut stack = vec![
+            Expression::Variable(VariableExpression::new("i")),
+            Expression::Variable(VariableExpression::new("i")),
+        ];
+        Token::Word(word)
+            .act(
+                &mut fresh,
+                &mut stack,
+                &mut wr_core::logging::Logging::new(),
+            )
+            .expect("a repeated index into an msd_fib track is computable");
+        match stack.as_slice() {
+            [Expression::Word(w)] => assert_eq!(
+                w.m.track_ns_names()[0],
+                Some("msd_fib".to_string()),
+                "the equality automaton carries the custom base's name into the result"
+            ),
+            other => panic!("expected a single Word expression, got {other:?}"),
+        }
+    }
+
+    /// WB-013's own case, unchanged by the round-4 rewrite and still refused: track 1 of
+    /// `wb013T` is `{...}`-declared, so Java's `getNS().get(1)` really is `null` there and
+    /// real Walnut fails too — with the fixed `WalnutException` message this port
+    /// reproduces verbatim (`walnut-java` `c75e630`; see
+    /// `tests/differential/tests/java_bugfix_wb013.rs` for the captured output).
+    #[test]
+    fn word_act_on_a_repeated_declared_alphabet_index_is_still_wb013() {
+        let fa = wr_core::fa::Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: 4,
+            o: vec![1],
+            d: vec![std::collections::BTreeMap::new()],
+        };
+        let mut word_automaton = Automaton::new(
+            fa,
+            vec![vec![0, 1], vec![0, 1]],
+            Vec::new(),
+            // Track 1 was declared `{0,1}`: no direction, i.e. Java's `bases.add(null)`.
+            vec![Some(true), None],
+        );
+        word_automaton.set_ns_names(vec![Some("msd_2".to_string()), None]);
+
+        let word = Word::new(0, "wb013T", word_automaton, 2).unwrap();
+        let mut fresh = FreshIdentifiers::new();
+        // `wb013T[i][i]`: the repeated `i` lands on track 1, the declared-alphabet one.
         let mut stack = vec![
             Expression::Variable(VariableExpression::new("i")),
             Expression::Variable(VariableExpression::new("i")),
@@ -3983,32 +4223,29 @@ mod tests {
                 &mut wr_core::logging::Logging::new(),
             )
             .unwrap_err();
-        // `ActError` is not `PartialEq` (it wraps non-comparable payloads), so match the
-        // shape rather than compare.
         match &err {
-            ActError::Expr(ExprError::RepeatedIdentifierNumberSystemUnrecoverable {
+            ActError::Expr(ExprError::RepeatedIdentifierMissingNumberSystem {
                 identifier,
                 token_name,
             }) => {
                 assert_eq!(identifier, "i");
-                assert_eq!(token_name, "FIB2");
+                assert_eq!(token_name, "wb013T");
             }
-            other => panic!("expected the port-gap variant, got {other:?}"),
+            other => panic!("expected WB-013's fixed variant, got {other:?}"),
         }
-        assert!(
-            !err.to_string().contains("declared explicitly"),
-            "must not reuse WB-013's message, which is factually false for a custom base: \
-             {err}"
+        assert_eq!(
+            err.to_string(),
+            "the track indexed by the repeated variable i in wb013T has no attached number \
+             system (its alphabet was declared explicitly, e.g. {0,1}, rather than as \
+             msd_k/lsd_k)"
         );
-        // The classification half of the same defect: WB-013's variant is a `handled`
-        // `WalnutException` (stdout), this one must NOT be.
-        assert!(
-            !wr_core::logging::LoggableError::is_handled(&err),
-            "a port gap must stay on the unhandled/stderr channel"
-        );
+        // WB-013 is a real, deliberately-thrown `WalnutException` upstream as of
+        // `c75e630`, so it belongs on the HANDLED (stdout, message-only) channel -- unlike
+        // the port's own defensive variant.
+        assert!(wr_core::logging::LoggableError::is_handled(&err));
         assert_eq!(
             wr_core::logging::LoggableError::kind(&err),
-            "walnut-rs.PortLimitation"
+            "Main.WalnutException"
         );
     }
 

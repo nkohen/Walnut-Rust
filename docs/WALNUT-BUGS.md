@@ -676,9 +676,11 @@ bug costs a silent wrong answer somewhere downstream.
   port, contrary to this entry's original framing.
 - **Resolved (2026-08-21):** upstream fixed as described above (commit `c75e630`; verified live).
   **Rust port: fixed for the case WB-013 is actually about — a `{...}`-declared track — and matching
-  walnut-java there as of commit `c75e630`.** Deliberately NOT claimed for every input that reaches
-  this code path: see the "still-open port gap" bullet immediately below, which is a separate,
-  pre-existing defect this fix had to be scoped away from. For the `{...}`-declared-track case
+  walnut-java there as of commit `c75e630`.** When this was first written it deliberately claimed
+  nothing about every OTHER input reaching this code path: a separate, pre-existing port defect on
+  custom-base tracks lived there, which this fix had to be scoped away from. That defect is now
+  closed too — see the bullet immediately below for its full three-rounds-then-a-rewrite history.
+  For the `{...}`-declared-track case
   itself there is no functional change: this port already computed/reported a clean, recoverable
   `Result::Err`, never the raw Java crash. The only change is the message TEXT (Java's fixed
   `WalnutException.noNumberSystem(subject)` wording, verbatim) plus a new `token_name` field on
@@ -697,39 +699,66 @@ bug costs a silent wrong answer somewhere downstream.
   the fixed stdout text (including `EvalDef.compute`'s own double-print/`": char at N"` wrapping,
   generic to any `act()` failure) and an empty stderr — the same shape `java_bugfix_wb037.rs`
   established for catching a stale `is_handled()` classification, not just a stale message string.
-- **A still-open PORT gap on the same code path (not a Walnut bug, not fixed here):** a repeated
+- **A separate PORT gap on the same code path, found by adversarial review of the fix's own diff
+  — now CLOSED (2026-08-21), by a structural rewrite rather than by another patch:** a repeated
   variable indexing a **custom-base** track (`msd_fib`, …) also reaches
   `VariableExpression::act`'s repeated-identifier branch in this port, and real Walnut *succeeds*
   on exactly those inputs — a custom base has a real, cached `NumberSystem`, so Java's
   `getNS().get(i)` is non-`null` and the query computes an answer. Verified live against
   `walnut-java` `c75e630` (2026-08-21): a two-track `msd_fib msd_fib` word automaton `FIB2`,
   queried as `eval fibout2 "FIB2[i][i] = @1";`, makes Java write a 2-state `msd_fib` automaton,
-  while this port fails. The cause is `wr_logic::token::track_number_system`, which has only an
-  `&Automaton` and so cannot build a custom base's `NumberSystem` (that needs the `Custom Bases/`
-  files, reachable only through a `Session`-backed resolver in `wr-cli`) — the base's NAME is
-  retained (`Automaton::ns_name`), the construction capability is what is missing.
-  - **This gap PREDATES the fix above and is unchanged by it; what changed is that it no longer
-    hides inside it.** Found by adversarial review of the fix's own diff: before the fix, both
-    causes produced one error whose message named a `NullPointerException` and which was
-    classified `is_handled() == false` (stderr) — so the custom-base case at least *looked* like an
-    internal port problem. The fix (correctly, for WB-013's real case) replaced that with Java's
-    clean fixed wording and `is_handled() == true`, and — because `track_number_system` returned a
-    single undifferentiated `None` for both causes — the custom-base case inherited both. That made
-    a known port gap print, on stdout, a believable "this is expected Walnut behavior" message
-    asserting the track's "alphabet was declared explicitly, e.g. `{0,1}`", which is factually
-    false for an `msd_fib` track.
-  - **Handled by separating the two causes, not by fixing the gap** (fixing it is a real unit of
-    work: thread `PredicateEnv`'s custom-base resolver down to `track_number_system`).
-    `track_number_system` now returns a three-way `OwnedTrackNs`/`TrackNs`
-    (`Present`/`DeclaredAlphabet`/`NumberSystemUnrecoverable`) instead of an `Option`, and the
-    custom-base arm reports its own `ExprError::RepeatedIdentifierNumberSystemUnrecoverable`:
-    self-identifying text ("walnut-rs port limitation (real Walnut computes this successfully): …"),
-    `is_handled() == false`, and a deliberately non-Java `kind()` of `walnut-rs.PortLimitation`.
-    Pinned by `token.rs`'s `track_number_system_separates_javas_null_track_from_this_ports_custom_base_gap`
-    and `word_act_on_a_repeated_custom_base_index_reports_the_port_gap_not_wb013` (which also
-    asserts the classification, not just the string) plus `expr.rs`'s
-    `variable_expression_act_repeated_occurrence_with_an_unrecoverable_ns_is_a_port_gap`; all three
-    mutation-verified.
+  while this port failed.
+  - **The gap PREDATED the WB-013 fix above and was never caused by it; what the fix changed is
+    that it stopped hiding inside it.** Before the fix, both causes produced one error naming a
+    `NullPointerException`, classified `is_handled() == false` (stderr) — so the custom-base case
+    at least *looked* like an internal port problem. The fix (correctly, for WB-013's real case)
+    replaced that with Java's clean fixed wording and `is_handled() == true`, and — because the
+    number-system lookup returned a single undifferentiated `None` for both causes — the
+    custom-base case inherited both, printing on stdout a believable "this is expected Walnut
+    behavior" message asserting the track's "alphabet was declared explicitly, e.g. `{0,1}`",
+    which is factually false for an `msd_fib` track.
+  - **Three rounds of patch, then a rewrite.** Round 1 split the two causes apart into a three-way
+    `OwnedTrackNs`/`TrackNs` (`Present`/`DeclaredAlphabet`/`NumberSystemUnrecoverable`), so the
+    gap was at least labelled honestly instead of borrowing WB-013's message — but it kept the
+    underlying design, which *reconstructed* a whole `NumberSystem` from the track's recorded name
+    and therefore had to decide "is this a base I can rebuild from no files at all?". Every
+    subsequent round found that decision wrong in a new way: keying it on `all_reps[i].is_some()`
+    (round 2) missed every custom base with no all-representations file, since that file is
+    optional (`NumberSystem.java:147-149`) — `msd_bar` over `{0, 1, 5}` fabricated `msd_3` from the
+    alphabet's cardinality; keying it on `NumberSystem::new(name).is_ok()` (round 3) missed a
+    programmatically-parseable name that a `Custom Bases/` file SHADOWS with a different alphabet
+    (`msd_neg_3`), and in the other direction refused computable custom bases whose alphabet is a
+    contiguous `0..k-1` (`msd_baz`).
+  - **Round 4 closed the class, not the instance.** `VariableExpression::act` — the sole consumer,
+    in Java and here — reads exactly one field off `getNS().get(i)`: `ns.equality`. And that
+    automaton is fully determined by data the `Automaton` already carries per track, so it needs no
+    name parsing, no `Custom Bases/` access and no `NumberSystem` at all:
+    `wr_core::numsys::equality_automaton(&automaton.alphabet[i], is_msd)` (Java's
+    `setEqualityAutomaton(getAlphabet())`, `NumberSystem.java:144`, where `getAlphabet()` is
+    exactly what `wr-io`'s reader stored in `Automaton::alphabet[i]`), with the track's own
+    `Automaton::ns_name` installed on it and — when `Automaton::all_reps[i]` is present — the same
+    `set_all_reps` + `apply_all_representations` fold the constructor runs at `:151-155`.
+    `wr_logic::token`'s `track_number_system` is now `track_equality_automaton` and carries an
+    `Automaton`, not a `NumberSystem`; `TrackNs::Present` carries `&Automaton` likewise. There is
+    no "is this a custom base?" question left to answer wrongly, because the answer is not used.
+  - **Result:** `msd_fib`, `msd_bar`-without-an-all-representations-file, `Custom Bases/`-shadowed
+    `msd_neg_3` and contiguous-alphabet `msd_baz` all now produce exactly the automaton real
+    `walnut-java` does — verified live and pinned byte-for-byte against captured Java output in
+    `tests/differential/tests/custom_base_repeated_index.rs` (three cases, fixtures and capture
+    recipe in `tests/differential/fixtures/custom_base_repeated_index/` and
+    `tests/differential/CAPTURE.md`), plus `token.rs`'s
+    `track_equality_automaton_reproduces_the_real_number_systems_equality` (direct computation
+    equals `NumberSystem::new(name).equality` for every base this crate CAN build — the property
+    that makes reconstruction redundant) and six sibling unit tests. All mutation-verified.
+  - **`ExprError::RepeatedIdentifierNumberSystemUnrecoverable` survives, but only as a DEFENSIVE,
+    unreachable arm** for an `Automaton` whose parallel track vectors disagree (`msd[i]` declares a
+    number system while `alphabet` has no track `i`) — no caller can reach it, since `Word::act`
+    iterates `0..arity` and `Word::new` requires `arity == word_automaton.arity()`, but both fields
+    are `pub` with only a `debug_assert` between them. Its message and its `kind()`
+    (`walnut-rs.InternalError`, formerly `walnut-rs.PortLimitation`) were rewritten to describe
+    that, not a port limitation that no longer exists. Kept for the same reason
+    `ConvertNsError::BaseOverflowsInt` is.
+
 
 ---
 

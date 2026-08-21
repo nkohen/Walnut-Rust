@@ -1012,3 +1012,81 @@ convention for.
 
 The three hand-authored library files and command files were deleted from the checkout
 afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `custom_base_repeated_index.rs`
+
+Captured 2026-08-21, against the same fixed branch as the WB-013 entry above
+(`walnut-java` `bugfix/wb-013-033-034`, commit `c75e630`), while closing the custom-base
+PORT gap that WB-013's own entry in `docs/WALNUT-BUGS.md` tracks (three rounds of patch,
+then a rewrite — see that entry).
+
+Unlike every earlier recipe, this one is **fully reproducible from this repo alone**: every
+input file is checked in under `fixtures/custom_base_repeated_index/`, so nothing has to be
+re-authored by hand. The capture was run in a throwaway COPY of the `walnut-java` working
+tree, not in the checkout itself.
+
+```bash
+SCRATCH=$(mktemp -d)
+cd ~/dev/walnut-java     # bugfix/wb-013-033-034, target/Walnut-all.jar already built
+for d in "Automata Library" "Command Files" "Custom Bases" "Help Documentation" \
+         "Macro Library" "Morphism Library" "Session" "Test Results" \
+         "Transducer Library" "Word Automata Library"; do
+  mkdir -p "$SCRATCH/$d"; cp -R "$d/." "$SCRATCH/$d/"
+done
+cp target/Walnut-all.jar "$SCRATCH/"
+
+F=~/dev/walnut-rs/tests/differential/fixtures/custom_base_repeated_index
+cp "$F"/msd_bar_addition.txt "$F"/msd_baz_addition.txt \
+   "$F"/msd_neg_3_addition.txt "$F"/msd_neg_3_less_than.txt "$SCRATCH/Custom Bases/"
+cp "$F"/BAR2.txt "$F"/BAZ2.txt "$F"/NEG3.txt "$SCRATCH/Word Automata Library/"
+
+cat > "$SCRATCH/Command Files/r4_capture.txt" <<'EOF'
+eval barout "BAR2[i][i] = @1";
+eval neg3out "NEG3[i][i] = @1";
+eval bazout "BAZ2[i][i] = @1";
+EOF
+
+cd "$SCRATCH" && java -jar Walnut-all.jar r4_capture.txt < /dev/null
+# stdout echoes the three commands and nothing else; stderr is empty.
+S="Session/<timestamp>/Automata Library"
+cp "$S/barout.txt"  "$F/expected_barout.txt"
+cp "$S/neg3out.txt" "$F/expected_neg3out.txt"
+cp "$S/bazout.txt"  "$F/expected_bazout.txt"
+```
+
+The three bases are deliberately shaped to hit the three previously-broken cases:
+
+* **`msd_bar`** — alphabet `{0, 1, 5}` (legal: `NumberSystem`'s constructor requires only
+  that `0` and `1` be present), `msd_bar_addition.txt` **only**, no all-representations
+  `msd_bar.txt`. A non-contiguous alphabet, so a base fabricated from its cardinality is
+  observably different.
+* **`msd_neg_3`** — a `Custom Bases/` pair SHADOWING the programmatic negative base of the
+  same name, over `{0, 1, 2, 3}` where the programmatic one is `{0, 1, 2}`. **Both**
+  `_addition.txt` and `_less_than.txt` are needed: with only the adder, real Walnut
+  refuses the base outright —
+  `Inputs of _less_than.txt must have the same alphabet as the alphabet of inputs of _addition.txt : base msd_neg_3`
+  — because `setLessThanAutomaton` falls back to the programmatic negative comparator over
+  the *other* alphabet. Confirmed live, both ways.
+* **`msd_baz`** — alphabet `{0, 1, 2}` (contiguous), `msd_baz_addition.txt` only. The case a
+  name-keyed discriminator refused even though Walnut computes it.
+
+Captured results (all three 1-state, all three now reproduced exactly by the port):
+
+```text
+barout.txt   ->  header `msd_bar`,   transitions 0/1/5 -> 0
+neg3out.txt  ->  header `msd_neg_3`, transitions 0/1/2/3 -> 0
+bazout.txt   ->  header `msd_baz`,   transitions 0/1/2 -> 0
+```
+
+For the record, the same three commands run against this port at commit `c27838c` (round
+3's fix, the state this change replaces) produced:
+
+```text
+barout   walnut-rs port limitation (real Walnut computes this successfully): ...          [stderr + stdout]
+neg3out  in computing cross product of two automaton, variables with the same label must have the same alphabet   [stdout only, i.e. a HANDLED WalnutException -- the wrong-answer-as-legitimate-output shape]
+bazout   walnut-rs port limitation (real Walnut computes this successfully): ...          [stderr + stdout]
+```
+
+and wrote no result files at all.

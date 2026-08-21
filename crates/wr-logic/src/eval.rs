@@ -236,21 +236,25 @@
 //! every [`ActError`] variant corresponds to a real, deliberately-thrown
 //! `WalnutException` and is `handled` (message-only console/log line, no stack frames).
 //!
-//! Exactly ONE live `is_handled() == false` entry remains, and it is not a Java exception
-//! at all:
+//! Exactly ONE `is_handled() == false` entry remains, and it is neither a Java exception
+//! nor reachable from any caller:
 //!
-//! * [`crate::expr::ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] — **this
-//!   port's own, still-open limitation**, with no Walnut counterpart: a repeated variable
-//!   indexing a CUSTOM-base track (`msd_fib`, …), where Java holds a real cached
-//!   `NumberSystem` and computes an answer but this port cannot build one: the base's NAME
-//!   is retained ([`wr_core::automaton::Automaton::ns_name`], and it is exactly what
-//!   `track_number_system` keys on), but constructing the `NumberSystem` it names needs the
-//!   `Custom Bases/*.txt` files, which no `&Automaton`-only call site can reach.
-//!   Classified `false` deliberately, with
-//!   a deliberately non-Java `kind()` (`"walnut-rs.PortLimitation"`), so the gap prints on
-//!   stderr and cannot be mistaken for legitimate Walnut output — see
-//!   `crate::token`'s `track_number_system` for the full account of the defect that
-//!   motivated splitting it out of WB-013's variant.
+//! * [`crate::expr::ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] — a
+//!   **defensive** classification with no Walnut counterpart, for an
+//!   [`wr_core::automaton::Automaton`] whose parallel track vectors disagree (`msd[i]`
+//!   declares a number system while `alphabet` has no track `i`). Classified `false`
+//!   deliberately, with a deliberately non-Java `kind()` (`"walnut-rs.InternalError"`), so
+//!   it prints on stderr and cannot be mistaken for legitimate Walnut output.
+//!
+//!   It used to be a genuine, live PORT LIMITATION covering every custom-base track
+//!   (`msd_fib`, …), because `crate::token`'s number-system stand-in rebuilt a whole
+//!   `NumberSystem` from the track's recorded name and no `&Automaton`-only call site can
+//!   read the `Custom Bases/*.txt` files that needs. That limitation is closed: the
+//!   function now computes the one thing its caller reads — `ns.equality` — directly from
+//!   the track's own alphabet, direction and all-representations restriction, so every
+//!   custom base computes correctly. See `crate::token`'s `track_equality_automaton` for
+//!   the full account, including the three review rounds' worth of heuristics that
+//!   direct computation replaced.
 //!
 //! The two variants that used to be the documented exceptions here are Walnut (Java) bugs,
 //! both since fixed upstream, so both moved from `is_handled() == false` (the closest
@@ -392,9 +396,9 @@ fn expr_error_is_handled(e: &ExprError) -> bool {
         // of the old raw, UNCAUGHT `NullPointerException` — see this module's own docs for
         // the full history. Used to be `false`.
         ExprError::RepeatedIdentifierMissingNumberSystem { .. } => true,
-        // NOT a Java exception of any kind — real Walnut succeeds on every input that
-        // reaches this variant (verified live against `walnut-java` `c75e630`). It is
-        // this port's own, still-open gap, so it renders on the UNHANDLED channel
+        // NOT a Java exception of any kind, and not reachable from any caller — a
+        // defensive classification for one corrupt-operand shape (a track that declares a
+        // number system but carries no alphabet). It renders on the UNHANDLED channel
         // (stderr, with the deliberately non-Java `kind()` below) rather than joining the
         // `handled` bucket and passing itself off as legitimate Walnut output. See
         // `ExprError::RepeatedIdentifierNumberSystemUnrecoverable`'s own docs.
@@ -508,7 +512,7 @@ impl LoggableError for ActError {
             // this variant exists to avoid. A reader diffing this against `walnut-java`
             // sees at a glance that the PORT is speaking, not Walnut.
             ActError::Expr(ExprError::RepeatedIdentifierNumberSystemUnrecoverable { .. }) => {
-                "walnut-rs.PortLimitation".to_string()
+                "walnut-rs.InternalError".to_string()
             }
             // The three `NumSysError`s `num_sys_error_is_handled` classifies as unhandled
             // each name a *different* uncaught JVM exception — see that function's own

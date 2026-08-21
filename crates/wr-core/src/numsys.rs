@@ -1199,7 +1199,13 @@ fn lexicographic_less_than(alphabet: &[i32], is_msd: bool) -> Automaton {
 /// does NOT sort the alphabet — it doesn't need to, the diagonal is index-order
 /// independent — and unlike `addition`/`lessThan` it is never reversed for lsd
 /// (`:144` sits outside the `if (!isMsd)` blocks).
-fn equality_automaton(alphabet: &[i32], is_msd: bool) -> Automaton {
+///
+/// `pub` because it is the whole of what a `NumberSystem` contributes to
+/// `VariableExpression.act`'s repeated-identifier branch (`ns.equality`), and
+/// `wr_logic::token`'s `track_equality_automaton` computes exactly that directly from an
+/// `&Automaton`'s own track data rather than rebuilding a `NumberSystem` around it — see
+/// that function's docs.
+pub fn equality_automaton(alphabet: &[i32], is_msd: bool) -> Automaton {
     let size = alphabet.len();
     let mut equality = init_basic_automaton(vec![1], 2, alphabet, is_msd);
     for i in 0..size {
