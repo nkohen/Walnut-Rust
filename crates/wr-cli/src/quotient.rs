@@ -44,13 +44,29 @@ pub enum QuotientError {
     /// WB-038's bogus out-of-alphabet `-1` encoding key if either operand carries one —
     /// so that trigger is closed on this path too, not just WB-010's.
     ///
-    /// **`right_quotient_command` still has a live, reproducible trigger**, found by
-    /// adversarial review of the WB-010 fix: WB-038 (`docs/WALNUT-BUGS.md`) lets
-    /// `AutomatonReader` encode an out-of-alphabet transition digit to a bogus `-1` key;
-    /// calling `rightquo` directly (not through `leftQuotient`'s delegation, which
-    /// determinizes first) reaches `right_quotient`'s own re-encode with that `-1` key
-    /// still present, producing exactly this variant. Pinned by
-    /// `right_quotient_reports_wb_038s_bogus_encoding_key_as_runtime` below.
+    /// **`right_quotient_command`'s WB-038 instance is now closed as well**, one PR later
+    /// (`walnut-java` commit `601a9d2` on `bugfix/wb-038`, matched here in
+    /// `wr_io::reader::validate_transition`). That trigger — found by adversarial review
+    /// of the WB-010 fix — worked because `AutomatonReader` encoded an out-of-alphabet
+    /// transition digit to a bogus `-1` key, and `rightquo` called directly (not through
+    /// `leftQuotient`'s delegation, which determinizes first) carried it all the way into
+    /// `right_quotient`'s own re-encode. The reader now refuses such a file outright, so
+    /// the operand never loads: the same command reports a read error instead, on both
+    /// engines. `right_quotient_rejects_wb_038s_file_before_it_can_reach_the_re_encode`
+    /// below is that trigger's test, flipped to the fixed behavior.
+    ///
+    /// **This variant therefore has no known live trigger today**, and is deliberately
+    /// kept anyway rather than removed: it is the port of Java's *unclassified*
+    /// `RuntimeException` arm (`Prover.readBuffer`'s `catch`, and this crate's own
+    /// [`crate::walnut_exception::catch_walnut_panic`] wrapper), whose job is to give
+    /// whatever the NEXT such panic turns out to be the right rendering — a stack-trace
+    /// header rather than the message-only treatment a `WalnutException` gets. Removing
+    /// it would mean an unexpected panic in the quotient primitive either escaping to
+    /// kill the process or being mis-rendered as a Walnut-level message. Flipping the one
+    /// end-to-end test that used to reach it would have left
+    /// `QuotientError::from_panic`'s classification with no coverage at all, so that
+    /// function gained a direct unit test in the same change
+    /// (`from_panic_classifies_only_the_two_walnut_messages_as_walnut`).
     Runtime(String),
 }
 
@@ -384,16 +400,23 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// The live trigger [`QuotientError::Runtime`]'s doc comment names: WB-038
-    /// (`docs/WALNUT-BUGS.md`) lets `AutomatonReader` accept a transition on a digit
-    /// outside the declared alphabet, encoding it to a bogus `-1` key. `pb` here declares
-    /// `msd_2` (alphabet `{0,1}`) but has a transition on digit `2` — the subset guard
-    /// passes (both operands declare the same `{0,1}` alphabet), so `rightquo` reaches
-    /// `right_quotient`'s own re-encode with the bogus `-1` key still present. Found by
-    /// adversarial review of the WB-010 fix, which left this variant with no test at all
-    /// after flipping the one test that used to reach it.
+    /// The trigger [`QuotientError::Runtime`]'s doc comment used to name, **flipped to
+    /// WB-038's fixed behavior** (`walnut-java` commit `601a9d2`, ported in
+    /// `wr_io::reader`). `pb` declares `msd_2` (alphabet `{0,1}`) but has a transition on
+    /// digit `2`. Pre-fix, `AutomatonReader` encoded that digit to the bogus key `-1`,
+    /// the subset guard passed (both operands declare the same `{0,1}` alphabet), and
+    /// `rightquo` — called directly, not through `leftQuotient`'s determinizing
+    /// delegation — carried the key into `right_quotient`'s own re-encode, where it blew
+    /// up as an unclassified `RuntimeException`.
+    ///
+    /// The reader now refuses `pb.txt` before any of that, so this command fails one
+    /// layer earlier and for a much better reason. The test is kept (rather than deleted
+    /// with the trigger) because it is the only coverage that this specific operand
+    /// shape — a digit that is out of alphabet but whose destination state IS declared,
+    /// i.e. the sub-case nothing downstream would have complained about — is refused at
+    /// all, on the one command that used to get furthest with it.
     #[test]
-    fn right_quotient_reports_wb_038s_bogus_encoding_key_as_runtime() {
+    fn right_quotient_rejects_wb_038s_file_before_it_can_reach_the_re_encode() {
         let (session, dir) = temp_session("right-wb038");
         fs::write(
             dir.join("Automata Library/pa.txt"),
@@ -416,16 +439,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, QuotientError::Runtime(_)),
-            "WB-038's bogus -1 key must still reach the re-encode on this path; got {err:?}"
+            matches!(err, QuotientError::Read(_)),
+            "the operand must be refused at READ time, not carried into the re-encode; \
+             got {err:?}"
         );
         assert!(
-            !err.is_walnut_exception(),
-            "Java throws an unchecked (non-WalnutException) exception here, so it \
-             renders with a stack-trace header, not message-only"
+            err.to_string().contains(
+                "digit 2 in position 1 is not in the alphabet [0, 1] of that input: line 5"
+            ),
+            "and for WB-038's reason, verbatim from the fixed jar; got {err}"
         );
         assert!(!dir.join("Automata Library").join("pc.txt").exists());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`QuotientError::from_panic`]'s classification, direct — it lost its only coverage
+    /// when the test above was flipped, since WB-038's fix removed the one live path that
+    /// produced a [`QuotientError::Runtime`]. The distinction is not cosmetic: Java
+    /// renders a `WalnutException` message-only and anything else with a stack-trace
+    /// header, and `crate::prover` triages on exactly this.
+    #[test]
+    fn from_panic_classifies_only_the_two_walnut_messages_as_walnut() {
+        for message in [RIGHT_QUOTIENT_SUBSET_MESSAGE, LEFT_QUOTIENT_SUBSET_MESSAGE] {
+            let e = QuotientError::from_panic(message.to_string());
+            assert!(
+                matches!(e, QuotientError::Walnut(ref m) if m == message),
+                "{e:?}"
+            );
+            assert!(e.is_walnut_exception());
+        }
+        // Anything else -- e.g. the JDK text `Automaton::decode`'s guard raises -- is an
+        // unclassified RuntimeException, rendered with a stack-trace header.
+        let e = QuotientError::from_panic("Index -1 out of bounds for length 2".to_string());
+        assert!(matches!(e, QuotientError::Runtime(_)), "{e:?}");
+        assert!(!e.is_walnut_exception());
+        // A near-miss on the Walnut text must NOT be classified as one.
+        let almost = format!("{RIGHT_QUOTIENT_SUBSET_MESSAGE} ");
+        assert!(!QuotientError::from_panic(almost).is_walnut_exception());
     }
 
     /// Both quotients are ASYMMETRIC in their two automaton arguments, so a swapped-operand

@@ -2086,7 +2086,9 @@ bug costs a silent wrong answer somewhere downstream.
   `AutomatonWriter.writeToGV` (`:142`) → `RichAlphabet.decode` (`:130`) → `ArrayList.get(-1)` →
   uncaught `IndexOutOfBoundsException`.
 - **Trigger:** any `.txt` library file with a body digit outside its header's alphabet (incl. a
-  negative digit under `msd_k`). **Confirmed live** against `Walnut-all.jar` (2026-08-16):
+  negative digit under `msd_k`). **Confirmed live** against the PRE-FIX `Walnut-all.jar`
+  (2026-08-16; every observation in this bullet is pre-fix behavior — see **Upstream** below for
+  what the same files do now):
   `Automata Library/fw.txt` = `msd_2 / 0 0 / 0 -> 0 / 1 -> 1 / 1 1 / 0 -> 0 / 5 -> 1` →
   `def f2e "?msd_2 $fw(x)";` succeeds silently and writes the input **minus** the `5 -> 1` line.
   `Automata Library/fy.txt` = ` lsd_2 / 0 1 / 20 -> 0` → `eval f2b "?lsd_2 $fy(x)";` prints
@@ -2096,40 +2098,72 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** Phase 4, U30 (fuzz-testing `wr-io`'s `.txt` reader), finding F2, 2026-08-16.
   Root-caused by compiling a driver against the jar's own classes to get the untruncated stack
   trace, after the truncated REPL trace pointed at the wrong frame.
-- **Rust port:** `ported verbatim (quirk)`. `Automaton::encode_index_of` reproduces the `-1` key,
-  used by both the automaton and transducer readers; `Automaton::encode`'s panic is retained for
-  callers whose digits come from an alphabet this crate itself built (not raw file input). The
-  aliasing sub-case — where the `-1` terms cancel against the other tracks' and land on a *valid*
-  key, so the file silently means a different tuple than it spells (`5 1 -> 0` under `msd_2 msd_2`
-  is read as `1 0 -> 0`; confirmed live) — is reproduced digit-for-digit and pinned by
-  `wr_io::reader`'s `an_out_of_alphabet_digit_can_alias_onto_a_valid_key_exactly_as_java_does`.
-  **Outcome (c) is now ported too, closing what an earlier version of this entry recorded as an
-  open, separately-scoped divergence:** `Automaton::decode` used `rem_euclid`/`div_euclid` where
-  Java uses truncating `%`/`/`, so `decode(-1)` returned *some* digit where Java throws, and this
-  port silently wrote out a fabricated automaton where Java errors and writes nothing — silent
-  wrong math, i.e. worse than the Java bug it was standing in for. As of Phase 4 U30's second
-  review round it is Java's arithmetic exactly: `Automaton::try_decode` returns
-  `DecodeError::IndexOutOfBounds` carrying the JDK's own `Index -1 out of bounds for length 2`
-  text (verified against the real CLI, which prints precisely that for `combine wrcb wrbad=1;`),
-  and the panicking `Automaton::decode` wrapper is recovered at `wr_cli::prover`'s new
-  dispatch-level boundary (`Prover::caught`) — the port of `Prover.readBuffer`'s
-  `catch (RuntimeException)` — so the command fails and the session lives, as in Java. The one
-  quirk *kept*: Java bounds-checks only the per-track index, never the symbol as a whole, so a
-  symbol `>= alphabetSize` still wraps silently on both engines.
-  **A third review round corrected WHERE the cross-product half of the guard fires.**
-  `ProductStrategies.crossProductInternal(DFA)` hoists `inputA * B.getAlphabetSize()` into its
-  outer loop, but that is plain `int` multiplication — it wraps, it cannot throw. The only
-  expression that can throw is the array access `allInputsOfAxB[…]` in the **inner** loop, so
-  when the inner transition set is empty (the ordinary case for the `and` family, which does not
-  totalize) Java completes the command normally. This port had the check hoisted, and so
-  *rejected* files real Walnut processes: `intersect i bad ok;` on the `fw.txt` shape above
-  succeeds and writes `i.txt` on the real jar (verified live 2026-08-16). The check now sits at
-  the access itself and renders the JDK's `Index -2 out of bounds for length 4` — again the
-  verbatim string the real CLI prints, for `union u bad ok;`. All 20 commands of the corrupt-file
-  matrix in `wr_cli::prover`'s `a_corrupt_library_file_costs_one_command_not_the_process` now
-  agree with the jar on error-vs-success and on whether an output file appears.
-- **Upstream:** not filed. A per-digit alphabet-membership check in `validateTransition`, alongside
-  its existing arity check, would fix it in Java.
+- **Rust port:** `fixed AT THE READER, matches walnut-java as of commit 601a9d2` (PR-8 of
+  `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`, branch `bugfix/wb-038`) — **but this is a scoped fix, and
+  the scope matters**: the root cause is closed, while the downstream defensive machinery this
+  port built around the bug in Phase 4's U30 is deliberately RETAINED. Read both halves below
+  before touching any of it.
+
+  **What is fixed.** `wr_io::reader` gained a shared `validate_transition`, the port of Java's
+  now-three-throw `AutomatonReader.validateTransition`: arity as before, plus a per-digit
+  alphabet-membership check, skipping `None` (`*` wildcard) entries exactly as Java skips its
+  `null`s. Both readers call it — the automaton reader and the transducer reader — mirroring
+  Java's single shared method (before this, each Rust reader inlined its own arity check, which
+  is precisely where a second copy of the digit check would have drifted). The new
+  `ReadError::DigitNotInAlphabet` renders Java's message verbatim (`digit {d} in position {i} is
+  not in the alphabet {[…]} of that input: line {n} of file {addr}`, 1-based position, alphabet in
+  `List<Integer>`'s `[a, b, c]` shape). All three of this entry's outcomes are gone at the source:
+  **(a)** the coincidental `UndeclaredDestState` report is superseded — the digit check runs
+  inside the parse loop, the state check after it, so on a file with both defects the digit wins
+  (verified live, both engines); **(b)** the silent-language-corruption case now refuses the
+  file; **(c)** so does the crash-on-write case.
+
+  **What is deliberately NOT changed, and why.** `Automaton::encode_index_of` keeps Java's
+  `List.indexOf` semantics, because `RichAlphabet.encode` keeps them too — the upstream fix is in
+  the validator, not the encoder, exactly as WB-024's was (`Reg.java:63-68`). And the whole
+  U30-era downstream chain is kept verbatim: `Automaton::try_decode`'s truncating `%`/`/` +
+  `DecodeError::IndexOutOfBounds`, the panicking `Automaton::decode` wrapper,
+  `wr_cli::prover`'s `Prover::caught` dispatch boundary, and `wr_core::product`'s bounds check at
+  the exact inner-loop array access (NOT hoisted — a third U30 review round established that
+  hoisting it makes this port reject files Java processes). None of that was WB-038-specific
+  defensive code that the fix makes wrong; each piece is a faithful port of Java code that still
+  exists and still behaves that way, and the `decode` half in particular replaced a REAL port bug
+  (`rem_euclid`/`div_euclid` silently fabricated a digit tuple where Java throws). `Prover::caught`
+  additionally still has a live, file-free trigger — `ost bigone [1291] [1];`'s `int`-width
+  alphabet-size overflow — which is what `a_recovered_panic_records_where_it_was_raised` now
+  drives, since the corrupt-`.txt` delivery mechanism it used to use is gone.
+  The one *quirk* kept for the same reason it always was: Java bounds-checks only the per-track
+  index, never the symbol as a whole, so a symbol `>= alphabetSize` still wraps silently on both
+  engines — WB-038's fix did not touch that.
+
+  **Tests flipped, none deleted.** `wr_io::reader`'s four F2 sub-case tests now assert the clean
+  rejection (`…_is_rejected_before_the_undeclared_state_check`,
+  `…_with_a_declared_dest_is_now_rejected`, `…_refuses_the_whole_file_not_just_its_own_line`,
+  `the_aliasing_case_is_rejected_though_the_encoder_still_aliases`), two of them keeping their
+  `encode_index_of` arithmetic assertions on hand-built automata so a future "tidy-up" that moves
+  the check into the encoder is a deliberate divergence rather than a silent one; three new tests
+  cover the wildcard non-rejection, the exact message text (a non-first track position and a
+  `{...}`-set alphabet), and the transducer reader. `wr_cli::prover`'s 20-command corrupt-file
+  matrix is flipped wholesale — every row is now a clean load-time refusal writing nothing, which
+  is what the fixed jar does, re-measured live rather than inferred — and additionally asserts
+  each row fails for WB-038's reason, so the table cannot go green with the fix removed.
+  `wr_cli::quotient`'s `right_quotient_reports_wb_038s_bogus_encoding_key_as_runtime` becomes
+  `right_quotient_rejects_wb_038s_file_before_it_can_reach_the_re_encode`; since that was
+  `QuotientError::Runtime`'s only live trigger, `QuotientError::from_panic` gained the direct
+  classification test it never had. `fuzz`'s `wr_io_reader` target keeps its
+  `has_invalid_transition_key` triage as an explicit tripwire (documented as expected-dead).
+  End-to-end coverage against the fixed jar is `tests/differential/tests/java_bugfix_wb038.rs`.
+- **Upstream:** fixed, `walnut-java` commit `601a9d2` (branch `bugfix/wb-038`, stacked on
+  `bugfix/wb-021`). `AutomatonReader.validateTransition` gained a per-digit alphabet-membership
+  loop alongside its existing arity check, skipping `null` (wildcard `*`) entries, and throwing an
+  inline `WalnutException` naming the digit, its 1-based position, the track's alphabet, and the
+  line/file — the same inline-construction convention that method's two existing throws already
+  use, rather than `WalnutException.digitNotInAlphabet` (WB-024's factory, whose "…of a
+  regular-expression vector…" wording does not fit a `.txt` transition line). `readTransducer`
+  shares the method, so it is fixed by the same change. No corpus fixture needed flipping — unlike
+  WB-024's regex case, Walnut's own corpus contains no library file with an out-of-alphabet
+  transition digit — and `AutomatonReaderTest` gained four tests (ordinary automaton, transducer,
+  wildcard-not-rejected, well-formed-file-unaffected).
 - **Severity:** medium — this is silent wrong output on a plausible input (a hand-edited or
   corrupted library file), not just a crash; outcome (b) is the more concerning half since it
   produces no diagnostic at all.

@@ -223,10 +223,13 @@ fn write_alphabet<W: Write>(automaton: &Automaton, out: &mut W) -> io::Result<()
 ///
 /// # A transition key this cannot render
 ///
-/// `automaton.fa.d`'s keys are not guaranteed to be valid symbols: a `.txt` file with an
-/// out-of-alphabet body digit stores one under `-1` (WB-038, faithfully ported — see
-/// [`Automaton::encode_index_of`]). [`Automaton::decode`] **panics** on such a key rather
-/// than inventing digits for it, and that is deliberate on both counts:
+/// `automaton.fa.d`'s keys are not guaranteed by TYPE to be valid symbols. A `.txt` file
+/// with an out-of-alphabet body digit used to store one under `-1` (WB-038; as of
+/// `walnut-java` commit `601a9d2` the reader refuses such a file instead — see
+/// [`crate::reader`]'s `validate_transition` — so that particular source is gone on both
+/// engines, and no other live one is known). [`Automaton::decode`] **panics** on such a
+/// key rather than inventing digits for it, and that stays deliberate on both counts,
+/// independently of where the key might come from:
 ///
 /// * Java does the same thing here — `RichAlphabet.decode`'s `ArrayList.get(-1)` throws
 ///   `IndexOutOfBoundsException`, `writeToTxtFormat`'s try/catch covers only `IOException`,

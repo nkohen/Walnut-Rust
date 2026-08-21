@@ -182,8 +182,18 @@ pub const ALPHABET_CHANGED_WARNING: &str =
 pub enum DecodeError {
     /// `ArrayList.get(idx)` with a negative `idx` — `IndexOutOfBoundsException: Index
     /// {index} out of bounds for length {length}` (the JDK's own wording, as printed by
-    /// the real CLI on the WB-038 reproducer). Reached whenever the encoded symbol is
-    /// negative, which the `.txt` reader really can produce (WB-038).
+    /// the real CLI on the pre-fix WB-038 reproducer). Reached whenever the encoded symbol
+    /// is negative.
+    ///
+    /// The `.txt` reader used to be a live source of exactly that: an out-of-alphabet
+    /// body digit encoded to `-1` (WB-038). `walnut-java` commit `601a9d2` closed that at
+    /// the reader (`AutomatonReader.validateTransition` now checks each digit against its
+    /// track's alphabet), and `wr_io::reader` matches it — so **there is no longer a known
+    /// live path that reaches this variant on either engine.** It is kept, verbatim,
+    /// because it is what `RichAlphabet.decode`'s own arithmetic still does in Java: the
+    /// alternative (the `rem_euclid` this port originally had) silently fabricates a digit
+    /// tuple where Java throws, which is strictly worse than a reported error and was
+    /// itself a real port bug once already.
     IndexOutOfBounds { index: i32, length: usize },
     /// `n % 0` — `ArithmeticException: / by zero`. A track with an empty alphabet; no
     /// alphabet this crate builds is empty, so this is a defensive value, not a live
@@ -761,28 +771,34 @@ impl Automaton {
     /// negative and is not a valid symbol at all.
     ///
     /// This is the same verbatim-`indexOf` shape as `crate::regex`'s private
-    /// `encode_with_index_of` (WB-024's own primitive, `docs/WALNUT-BUGS.md` — since
-    /// fixed at ITS one call site, `determine_encoded_regex`, by validating the digit
-    /// before encoding rather than by changing the encoder itself), at the one call site
-    /// here that genuinely needs the `-1` semantics preserved (WB-038, a separate,
-    /// still-open Walnut bug — not this one): `AutomatonReader.readAutomaton`/
-    /// `readTransducer` encode every
-    /// transition line's digit tuple straight out of an untrusted `.txt` file
-    /// (`AutomatonReader.java:71-72`, `:245-247`), and Java's reader has **no**
-    /// out-of-alphabet check anywhere — verified by running `walnut-java` on a file whose
-    /// body digit is outside the header's alphabet (` lsd_2\n0 1\n20 -> 0`): it loads
-    /// with no error at all, keeping a transition under the bogus key `-1`. Whether that
-    /// then goes on to fail depends entirely on what the automaton is *used* for
-    /// afterwards, and porting that faithfully means reproducing the key, not rejecting
-    /// the file:
+    /// `encode_with_index_of` (WB-024's own primitive, `docs/WALNUT-BUGS.md`), and the two
+    /// are now fixed the same way: **not by changing the encoder**, but by validating the
+    /// digit at the one call site that feeds it untrusted input. `Reg.java:63-68` does
+    /// that for regex vectors (WB-024, `walnut-java` `59eda64`);
+    /// `AutomatonReader.validateTransition` does it for `.txt` transition lines (WB-038,
+    /// `walnut-java` `601a9d2`), ported in `wr_io::reader::validate_transition`.
+    ///
+    /// So this function keeps Java's `indexOf` semantics — `RichAlphabet.encode` still has
+    /// them, and `AutomatonReader.readAutomaton`/`readTransducer`
+    /// (`AutomatonReader.java:71-72`, `:245-247`) still call it — while the `-1` it can
+    /// return is, as of that fix, **unreachable from either reader**: every digit is
+    /// checked against its track's alphabet first, and a `*` wildcard is expanded from
+    /// that alphabet. Sole remaining reason to prefer it over [`Automaton::encode`] here
+    /// is mechanical-port correspondence with Java's own call.
+    ///
+    /// For the record of what the `-1` key used to do once a file carried one (all three
+    /// outcomes confirmed live, pre-fix, and now history rather than behavior):
     ///
     /// * with a state id that was never declared, `validateDeclaredStates` (which runs
-    ///   AFTER the whole parse loop) reports the clean `State N is used but never
-    ///   declared anywhere in file: …` this port already ports as
-    ///   `wr_io::reader::ReadError::UndeclaredDestState`;
-    /// * otherwise the file loads, and the `-1`-keyed transition is silently dropped by
-    ///   any later pass that iterates `0..alphabet_size` — real `walnut-java` writes
-    ///   exactly that reduced automaton back out (confirmed on two such files).
+    ///   AFTER the whole parse loop) reported the clean `State N is used but never
+    ///   declared anywhere in file: …` this port ports as
+    ///   `wr_io::reader::ReadError::UndeclaredDestState` — a coincidence, not a check for
+    ///   this;
+    /// * otherwise the file loaded, and the `-1`-keyed transition was silently dropped by
+    ///   any later pass that iterates `0..alphabet_size` — real `walnut-java` wrote
+    ///   exactly that reduced automaton back out (confirmed on two such files);
+    /// * or, on more than one track, the `-1` terms cancelled onto a *valid* key, so the
+    ///   file silently meant a different tuple than it spelled.
     ///
     /// [`Automaton::encode`] — which panics instead — remains correct for every caller
     /// whose digits come from an alphabet this crate itself built, and is what those
@@ -820,31 +836,34 @@ impl Automaton {
     /// `%`/`/` being **truncating** (C-style), so a negative `n` produces a negative
     /// index and `ArrayList.get(-1)` throws `IndexOutOfBoundsException` — an unchecked
     /// exception `Prover.readBuffer`'s `catch (RuntimeException)` recovers from, leaving
-    /// the session alive (verified live: `Automata Library/fy.txt` = ` lsd_2 / 0 1 /
-    /// 20 -> 0`, then `eval f2b "?lsd_2 $fy(x)";` prints `java.lang.IndexOutOfBounds
-    /// Exception: Index -1 out of bounds for length 2` and the next command still runs).
+    /// the session alive (verified live against the PRE-FIX jar: `Automata Library/fy.txt`
+    /// = ` lsd_2 / 0 1 / 20 -> 0`, then `eval f2b "?lsd_2 $fy(x)";` printed
+    /// `java.lang.IndexOutOfBoundsException: Index -1 out of bounds for length 2` and the
+    /// next command still ran).
     ///
-    /// A negative symbol is **reachable from an ordinary `.txt` file**, not a
-    /// hypothetical: [`Automaton::encode_index_of`] faithfully reproduces Java's
-    /// `List.indexOf(-1)` for an out-of-alphabet body digit (WB-038), so the reader
-    /// really does store transitions under key `-1`, and every pass that iterates
-    /// `fa.d`'s KEYS (rather than `0..alphabet_size`) hands one straight to this
-    /// function — `wr_io::writer`'s `write_state`/`write_gv`,
-    /// [`Automaton::rebuild_transitions_for_new_alphabet`],
-    /// `logicalops::right_quotient`, `infinite`'s path decoding,
-    /// `wr_cli::test_command`'s accepted-word formatting.
+    /// A negative symbol used to be **reachable from an ordinary `.txt` file**:
+    /// [`Automaton::encode_index_of`] faithfully reproduces Java's `List.indexOf(-1)` for
+    /// an out-of-alphabet body digit (WB-038), so the reader really did store transitions
+    /// under key `-1`, and every pass that iterates `fa.d`'s KEYS (rather than
+    /// `0..alphabet_size`) handed one straight to this function — `wr_io::writer`'s
+    /// `write_state`/`write_gv`, [`Automaton::rebuild_transitions_for_new_alphabet`],
+    /// `logicalops::right_quotient`, `infinite`'s path decoding, `wr_cli::test_command`'s
+    /// accepted-word formatting. `walnut-java` commit `601a9d2` closed that at the reader
+    /// on both engines, so no known live path produces a negative symbol today.
     ///
-    /// This port used `rem_euclid`/`div_euclid` instead, which **always** produces some
-    /// in-range index — so where Java threw and wrote nothing, walnut-rs silently
-    /// fabricated a digit tuple and wrote out an automaton whose language matches
-    /// neither the file nor Java's answer. Silent wrong math is strictly worse than a
-    /// reported error, so the check is ported: truncating `%`/`/`, and an out-of-range
-    /// index is [`DecodeError::IndexOutOfBounds`], carrying the JDK's own message text.
+    /// **The arithmetic below is unchanged by that, deliberately.** This port once used
+    /// `rem_euclid`/`div_euclid`, which **always** produces some in-range index — so where
+    /// Java threw and wrote nothing, walnut-rs silently fabricated a digit tuple and wrote
+    /// out an automaton whose language matched neither the file nor Java's answer. Silent
+    /// wrong math is strictly worse than a reported error, and `RichAlphabet.decode` still
+    /// has Java's truncating `%`/`/` — so the check stays: an out-of-range index is
+    /// [`DecodeError::IndexOutOfBounds`], carrying the JDK's own message text.
     ///
     /// Note that Java bounds-checks only the PER-TRACK index, never the symbol as a
     /// whole: `decode(alphabet_size + k)` silently wraps to `decode(k)`-ish garbage in
-    /// Java, and does here too. That quirk is ported (it is `n / size`'s natural
-    /// behavior once the loop runs out of tracks), not "fixed" — same rule as WB-038.
+    /// Java, and does here too. That quirk is still ported as a quirk (it is `n / size`'s
+    /// natural behavior once the loop runs out of tracks), not "fixed" — WB-038's fix was
+    /// in `validateTransition`, and did not touch it.
     pub fn try_decode(&self, sym: i32) -> Result<Vec<i32>, DecodeError> {
         let mut n = sym;
         let mut out = Vec::with_capacity(self.alphabet.len());
@@ -2015,12 +2034,18 @@ mod tests {
         assert_eq!(a.decode(8), vec![2, 2]);
     }
 
-    /// The `-1` key WB-038's faithfully-ported `encode_index_of` really does put into a
-    /// `.txt`-loaded automaton must never decode to *something*: Java's truncating
-    /// `n % size` yields `-1`, and `ArrayList.get(-1)` throws. This port used
-    /// `rem_euclid`, which always lands in range — so `decode(-1)` returned digit `[1]`
-    /// (for a 2-symbol track) and every caller downstream silently wrote out an
-    /// automaton whose language matched neither the file nor Java's answer.
+    /// A negative symbol must never decode to *something*: Java's truncating `n % size`
+    /// yields `-1`, and `ArrayList.get(-1)` throws. This port used `rem_euclid`, which
+    /// always lands in range — so `decode(-1)` returned digit `[1]` (for a 2-symbol
+    /// track) and every caller downstream silently wrote out an automaton whose language
+    /// matched neither the file nor Java's answer.
+    ///
+    /// The `.txt` reader no longer produces such a symbol (WB-038's fix, `walnut-java`
+    /// `601a9d2`, ported in `wr_io::reader`), so this is now a unit-level pin on
+    /// `RichAlphabet.decode`'s arithmetic rather than a reproduction of a live file
+    /// shape. It is kept and still built by hand: the arithmetic is Java's, unchanged by
+    /// that fix, and the failure mode it guards against (silently fabricating a tuple)
+    /// was a real port bug once already.
     #[test]
     fn decoding_an_out_of_range_symbol_is_an_error_not_a_fabricated_tuple() {
         let a = Automaton::new(
@@ -2077,8 +2102,10 @@ mod tests {
 
     /// Java bounds-checks only the per-track index, never the symbol as a whole, so a
     /// symbol at or above `alphabet_size` silently wraps instead of erroring. Ported as
-    /// the quirk it is (same rule as WB-038) — pinned here so a later "obvious"
-    /// tightening is a deliberate, reviewed divergence rather than a silent one.
+    /// the quirk it is — and note WB-038's fix did NOT touch it (that fix is in
+    /// `AutomatonReader.validateTransition`, not in `RichAlphabet.decode`) — pinned here
+    /// so a later "obvious" tightening is a deliberate, reviewed divergence rather than a
+    /// silent one.
     #[test]
     fn decoding_a_symbol_past_the_alphabet_wraps_exactly_as_java_does() {
         let a = Automaton::new(

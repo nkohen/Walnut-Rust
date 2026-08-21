@@ -1045,10 +1045,10 @@ impl Prover {
     /// covers all of them, present and future.
     ///
     /// Verified live against `walnut-java/target/Walnut-all.jar` (2026-08-16) on exactly
-    /// the corrupt file this port's regression test uses
+    /// the corrupt file this port's regression test used at the time
     /// (`a_corrupt_library_file_costs_one_command_not_the_process`) — a command file of
     /// `reg wrok …; union wrbad wrok; inf wrbad; combine wrcb wrbad=1; reg wralive …;`
-    /// prints
+    /// printed
     ///
     /// ```text
     /// java.lang.ArrayIndexOutOfBoundsException: Index -2 out of bounds for length 4
@@ -1058,10 +1058,30 @@ impl Prover {
     ///     at java.base/jdk.internal.util.Preconditions.outOfBounds(Preconditions.java:64)
     /// ```
     ///
-    /// and then **runs the final `reg` normally**. Three failed commands, one live
+    /// and then **ran the final `reg` normally**. Three failed commands, one live
     /// session — which is the behavior this boundary reproduces. (Note the third one:
-    /// that is `RichAlphabet.decode`'s bounds check, i.e. the Java counterpart of
+    /// that was `RichAlphabet.decode`'s bounds check, i.e. the Java counterpart of
     /// [`wr_core::automaton::DecodeError::IndexOutOfBounds`], reached through `combine`.)
+    ///
+    /// # WB-038's fix removed that DELIVERY MECHANISM, not this boundary
+    ///
+    /// `walnut-java` commit `601a9d2` (branch `bugfix/wb-038`) makes
+    /// `AutomatonReader.validateTransition` check every transition digit against its
+    /// track's alphabet, so a corrupt `.txt` library file can no longer reach any of the
+    /// five index sites above on EITHER engine — the transcript above is history, and
+    /// `a_corrupt_library_file_costs_one_command_not_the_process`'s twenty rows are now
+    /// twenty identical clean load-time refusals.
+    ///
+    /// That does not make this boundary dead code, and it was deliberately kept rather
+    /// than unwound with the bug that motivated it. Java's own
+    /// `catch (RuntimeException)` is unconditional and still there; this port still
+    /// models a number of `wr-core` guards as `panic!` (see [`wr_core::walnut_panic`]);
+    /// and at least one is still reachable from a plain user-typed command with no file
+    /// involved at all — `ost bigone [1291] [1];`, whose `int`-width alphabet-size
+    /// overflow is `Math.multiplyExact`'s `ArithmeticException` on the real jar. That is
+    /// what [`Self::a_recovered_panic_records_where_it_was_raised`] now drives, so the
+    /// boundary keeps live end-to-end coverage rather than only the synthetic-panic unit
+    /// test.
     ///
     /// # Known, deliberate limitation of the recovered message
     ///
@@ -3808,48 +3828,50 @@ mod tests {
 
     // ------------------------------------------------- the panic-recovery boundary
 
-    /// WB-038's blast radius, pinned at the layer that fixes it.
+    /// WB-038's blast radius — **now measured against the FIXED `walnut-java`**
+    /// (`bugfix/wb-038`, commit `601a9d2`), which is a wholesale flip of this table.
     ///
-    /// `bad.txt` is Java's own accepted-but-corrupt shape: a body digit outside the
-    /// header's alphabet, which `Automaton::encode_index_of` faithfully stores under the
-    /// key `-1` (real Walnut does exactly this — see that method's docs). That key then
-    /// reaches raw `[sym as usize]` indexing in `wr_core::product`, `wr_core::automaton`,
-    /// `wr_core::quantify` and `wr_core::word_automaton`, and `decode(-1)` in
-    /// `wr_io::writer`/`Automaton::rebuild_transitions_for_new_alphabet`. Every one of
-    /// those was a process-killing panic before [`Prover::caught`]; in real Walnut every
-    /// one is a `RuntimeException` that `Prover.readBuffer` catches, printing it and
-    /// running the NEXT command in the same session (verified live on `Walnut-all.jar`:
-    /// `eval f2b "?lsd_2 $fy(x)";` prints `java.lang.IndexOutOfBoundsException: Index -1
-    /// out of bounds for length 2`, then the following `eval` still evaluates).
+    /// `bad.txt` used to be Java's own accepted-but-corrupt shape: a body digit outside
+    /// the header's alphabet, which `RichAlphabet.encode`'s `List.indexOf` stored under
+    /// the bogus key `-1` rather than rejecting. Twenty commands then disagreed with each
+    /// other about it — some silently succeeded on a corrupted language, some crashed
+    /// deep in a product/decode with an opaque JDK exception — and the whole point of
+    /// this table was pinning *which*, per command, against the real jar.
     ///
-    /// So one half of the assertion is *no panic escapes, and the session is still usable
-    /// afterwards*.
+    /// `AutomatonReader.validateTransition` now checks every transition digit against its
+    /// track's alphabet, so the corruption never gets past the read. **Every one of the
+    /// twenty commands now fails identically, at load, with one clean message**, and
+    /// none of them writes anything. Re-measured live (not inferred from the Java diff)
+    /// by running this exact command sequence through the freshly built fixed jar: all
+    /// twenty print
     ///
-    /// # The other half: each command's OUTCOME, captured from the real jar
+    /// ```text
+    /// digit 5 in position 1 is not in the alphabet [0, 1] of that input: line 7 of file Automata Library/bad.txt
+    /// ```
     ///
-    /// The first version of this test asserted only "a LATER command still works", which
-    /// is not enough: it cannot tell a command that correctly errors from one that
-    /// wrongly errors, nor a correct success from a silent wrong success. Two real
-    /// regressions hid behind exactly that gap (a cross-product bounds check hoisted into
-    /// the wrong loop, which made `intersect` reject a file real Walnut processes; and a
-    /// missing `normalizeNumberSystemToken` branch). So every row below carries the
-    /// outcome the real `Walnut-all.jar` produces on the same corrupt inputs — measured,
-    /// not guessed, both per-command in a fresh session and in one sequential session
-    /// whose surviving `Automata Library`/`Word Automata Library` contents were listed:
-    /// `cc, dv, ev, fl, i, lq, ok, rv, st` and `rvw`, and nothing else.
+    /// (`Word Automata Library/badw.txt` for the two DFAO rows), and the surviving
+    /// `Automata Library` afterwards holds `ok` and `alive` and nothing else — where
+    /// pre-fix it held `cc, dv, ev, fl, i, lq, ok, rv, st` and `rvw` too.
     ///
-    /// The `Ok` rows are the load-bearing ones: `intersect`/`concat`/`star`/`leftquo` all
-    /// go through the `and`-family product, which does NOT totalize its operands, so the
-    /// inner transition set is empty and the corrupt key is never used as an index. See
-    /// `wr_core::product::cross_product_internal`'s docs.
+    /// # What this test is still FOR, now that every row is `false`
+    ///
+    /// Two things, neither of which the flip makes vacuous:
+    ///
+    /// 1. **The rejection is uniform across every command that loads a library file.**
+    ///    A per-command reader wrapper that forgot the check — or a command that reaches
+    ///    an automaton through some other path — would show up here as a lone `Ok` row,
+    ///    or as a `NotWritten` violation from a command that got far enough to write.
+    /// 2. **The session survives all twenty.** That is [`Prover::caught`]'s own
+    ///    invariant, and it is genuinely independent of WB-038: `Prover.readBuffer`'s
+    ///    `catch (RuntimeException)` is what Java does for *any* unchecked exception, and
+    ///    this port still models several `wr-core` guards as panics. The reader fix
+    ///    removes the corrupt-`.txt` *delivery mechanism* for those guards, not the
+    ///    guards; see [`Self::a_recovered_panic_records_where_it_was_raised`], which now
+    ///    drives a still-live one (`ost`'s `int`-width alphabet-size overflow).
     #[test]
     fn a_corrupt_library_file_costs_one_command_not_the_process() {
-        /// Where a command's output lands, when it produces one.
+        /// Where a command's output would land, if it produced one.
         enum Out {
-            /// `Automata Library/<name>.txt` must exist afterwards.
-            Automata(&'static str),
-            /// `Word Automata Library/<name>.txt` must exist afterwards.
-            Word(&'static str),
             /// The command names an output that must NOT have been written.
             NotWritten(&'static str),
             /// A read-only command (`inf`/`test`/`describe`) — nothing to check.
@@ -3861,7 +3883,7 @@ mod tests {
         let lib = dir.join("Automata Library");
         let word_lib = dir.join("Word Automata Library");
         // Out-of-alphabet digit `5` under `msd_2`, with a DECLARED destination -- the
-        // sub-case real Walnut loads without complaint.
+        // sub-case real Walnut used to load without complaint, and now rejects.
         fs::write(
             lib.join("bad.txt"),
             "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n",
@@ -3876,37 +3898,53 @@ mod tests {
         )
         .unwrap();
 
-        // (command, does real Walnut succeed?, where its output goes)
+        // Java's own message, verbatim -- the `(detail)` half of what every row below
+        // must report. The port additionally wraps some of these in its own
+        // already-documented `"File does not parse: <address> (...)"` /
+        // `"<address>: ..."` shells (`wr_logic::predicate_env::PredicateEnvError`'s own
+        // doc comment records that pre-existing, WB-038-independent divergence), so the
+        // assertion below is `contains`, not `==`.
+        const JAVA_MESSAGE: &str =
+            "digit 5 in position 1 is not in the alphabet [0, 1] of that input: line 7 of file ";
+
+        // (command, does real Walnut succeed?, where its output would go)
         let expected: &[(&str, bool, Out)] = &[
             ("union u bad ok;", false, NotWritten("u")),
-            ("intersect i bad ok;", true, Automata("i")),
+            ("intersect i bad ok;", false, NotWritten("i")),
             ("join j bad[x] ok[x];", false, NotWritten("j")),
-            ("concat cc bad ok;", true, Automata("cc")),
-            ("star st bad;", true, Automata("st")),
+            ("concat cc bad ok;", false, NotWritten("cc")),
+            ("star st bad;", false, NotWritten("st")),
             ("rightquo rq bad ok;", false, NotWritten("rq")),
-            ("leftquo lq bad ok;", true, Automata("lq")),
-            ("reverse rv $bad;", true, Automata("rv")),
-            ("reverse rvw badw;", true, Word("rvw")),
+            ("leftquo lq bad ok;", false, NotWritten("lq")),
+            ("reverse rv $bad;", false, NotWritten("rv")),
+            ("reverse rvw badw;", false, NotWritten("rvw")),
             ("minimize mw badw;", false, NotWritten("mw")),
-            ("fixleadzero fl bad;", true, Automata("fl")),
+            ("fixleadzero fl bad;", false, NotWritten("fl")),
             ("fixtrailzero ft bad;", false, NotWritten("ft")),
             ("combine cb bad=1;", false, NotWritten("cb")),
             ("alphabet al msd_3 $bad;", false, NotWritten("al")),
             ("inf bad;", false, None),
             ("test bad 3;", false, None),
-            ("describe $bad;", true, None),
-            ("eval ev \"?msd_2 Ex $bad(x)\";", true, Automata("ev")),
-            ("def dv x \"?msd_2 $bad(x)\";", true, Automata("dv")),
+            ("describe $bad;", false, None),
+            ("eval ev \"?msd_2 Ex $bad(x)\";", false, NotWritten("ev")),
+            ("def dv x \"?msd_2 $bad(x)\";", false, NotWritten("dv")),
             ("[export * gv] union u2 bad ok::", false, NotWritten("u2")),
         ];
 
         for (command, java_succeeds, out) in expected {
-            // The point of the whole panic fix: whatever this command does, it RETURNS.
+            // Whatever this command does, it RETURNS -- no panic escapes dispatch.
             let outcome = p.dispatch(command);
             if let Err(e) = &outcome {
                 // Never an I/O-class error -- `readBuffer` must keep reading (see
                 // `is_io_class_error`'s `Thrown` arm).
                 assert!(!is_io_class_error(e), "{command}: {e}");
+                // ...and it fails for the RIGHT reason: the reader's new per-digit
+                // alphabet check, not some unrelated refusal that would leave this table
+                // green while the fix was gone.
+                assert!(
+                    e.to_string().contains(JAVA_MESSAGE),
+                    "`{command}` must report WB-038's fixed message; got {e}"
+                );
             }
             // ...and it agrees with the real jar about WHETHER it worked.
             assert_eq!(
@@ -3922,14 +3960,6 @@ mod tests {
                 outcome.as_ref().err().map(ToString::to_string),
             );
             match out {
-                Automata(name) => assert!(
-                    lib.join(format!("{name}.txt")).is_file(),
-                    "`{command}` must write Automata Library/{name}.txt"
-                ),
-                Word(name) => assert!(
-                    word_lib.join(format!("{name}.txt")).is_file(),
-                    "`{command}` must write Word Automata Library/{name}.txt"
-                ),
                 NotWritten(name) => {
                     let f = format!("{name}.txt");
                     assert!(
@@ -3954,6 +3984,17 @@ mod tests {
     /// loop `Prover.readBuffer` is, with its `catch (RuntimeException)`. Java's demoed
     /// behavior is "the command file keeps running"; this pins that the LAST line of the
     /// file still executes after an earlier line blew up.
+    ///
+    /// Two failing middle lines, deliberately, since WB-038's fix split what used to be
+    /// one case into two distinct ones:
+    ///
+    /// * `union u bad ok;` — `bad.txt` is WB-038's out-of-alphabet-digit file, which
+    ///   used to load and then die inside `wr_core::product` with a recovered panic, and
+    ///   is now refused cleanly by the reader on both engines. Still a failing command
+    ///   the loop must survive, just a `ReadError` instead of a `Thrown`.
+    /// * `ost bigone [1291] [1];` — a still-live recovered PANIC (`int`-width
+    ///   alphabet-size overflow, `wr_core::ostrowski`), so the `catch (RuntimeException)`
+    ///   half of this loop keeps genuine coverage rather than becoming vacuous.
     #[test]
     fn read_buffer_survives_a_command_that_panics_and_runs_the_next_one() {
         let (mut p, dir, out) = prover("panic-readbuffer");
@@ -3962,7 +4003,8 @@ mod tests {
             " lsd_2\n0 1\n20 -> 0\n",
         )
         .unwrap();
-        let script = "reg ok lsd_2 \"0*1\";\nunion u bad ok;\nreg after lsd_2 \"1*\";\n";
+        let script = "reg ok lsd_2 \"0*1\";\nunion u bad ok;\nost bigone [1291] [1];\n\
+                      reg after lsd_2 \"1*\";\n";
         let mut input = io::Cursor::new(script.as_bytes().to_vec());
 
         assert!(
@@ -3970,8 +4012,13 @@ mod tests {
             "the loop must run to end-of-input, not abort"
         );
         assert!(
+            !dir.join("Automata Library").join("u.txt").exists(),
+            "the refused union must have written nothing: {}",
+            out.text()
+        );
+        assert!(
             dir.join("Automata Library").join("after.txt").is_file(),
-            "the command AFTER the failing one must still have run: {}",
+            "the command AFTER the failing ones must still have run: {}",
             out.text()
         );
         fs::remove_dir_all(&dir).ok();
@@ -4010,23 +4057,31 @@ mod tests {
 
     /// The point of carrying the location at all: a real guard panic recovered through
     /// the dispatch boundary names the site it came from.
+    ///
+    /// This used to be driven by `union u bad ok;` on a WB-038 corrupt library file,
+    /// whose bogus `-1` transition key blew up inside `wr_core::product`'s ported bounds
+    /// check. `walnut-java`'s WB-038 fix (commit `601a9d2`, ported here) rejects that file
+    /// at read time, so that delivery mechanism is gone — **not the boundary, and not the
+    /// guards behind it.** The trigger is now `ost`'s `int`-width alphabet-size check,
+    /// which is a genuinely live, user-typed, dispatch-level panic on both engines: real
+    /// Walnut writes `msd_bigone.txt`, then throws `java.lang.ArithmeticException:
+    /// integer overflow` from `Math.multiplyExact` and returns to the prompt (verified
+    /// live when `ost` was ported — see `crates/wr-core/src/ostrowski.rs`'s
+    /// `assert_alphabet_size_fits_in_an_int`). `1291³ > i32::MAX` is the smallest cube
+    /// that overflows.
     #[test]
     fn a_recovered_panic_records_where_it_was_raised() {
         let (mut p, dir, _) = prover("thrown-location");
-        fs::write(
-            dir.join("Automata Library").join("bad.txt"),
-            "msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n",
-        )
-        .unwrap();
-        assert!(p.dispatch("reg ok msd_2 \"0*1\";").unwrap());
-        match p.dispatch("union u bad ok;") {
+        match p.dispatch("ost bigone [1291] [1];") {
             Err(ProverError::Thrown { message, location }) => {
-                assert_eq!(message, "Index -2 out of bounds for length 4");
+                assert_eq!(message, "integer overflow");
                 let location = location.expect("the site must be recorded");
-                assert!(location.contains("product.rs"), "{location}");
+                assert!(location.contains("ostrowski.rs"), "{location}");
             }
             other => panic!("expected a recovered guard panic, got {other:?}"),
         }
+        // The session survives it, which is the boundary's whole purpose.
+        assert!(p.dispatch("reg alive msd_2 \"1*\";").unwrap());
         fs::remove_dir_all(&dir).ok();
     }
 }

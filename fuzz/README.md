@@ -350,11 +350,19 @@ because they define what this target may and may not call —
   time — the squared-alphabet cost that `MAX_ALPHABET_SIZE_FOR_PRODUCT` now bounds.
 
 It also re-found the WB-038 `-1`-key panic class in `wr_core::product` on
-`{ 1}\n0 1\n0 -> 0` — the exact class the dispatch boundary was added for. That one is *not*
-a harness defect and *not* a new finding: it is the ported behavior of a Java
+`{ 1}\n0 1\n0 -> 0` — the exact class the dispatch boundary was added for. That one was *not*
+a harness defect and *not* a new finding: it was the ported behavior of a Java
 `RuntimeException`, and it is what motivates the guarded/raw split in `exercise_downstream`
 (see its call site). The `wr-cli` regression test
 `a_corrupt_library_file_costs_one_command_not_the_process` pins the user-visible half.
+
+**As of `walnut-java` commit `601a9d2` (WB-038's real upstream fix, ported in
+`wr_io::reader::validate_transition`), that input no longer produces the `-1` key at all** —
+`{ 1}\n0 1\n0 -> 0` declares the one-symbol alphabet `{1}` and its body digit `0` is not in
+it, so the read now fails cleanly and nothing downstream runs. The guarded/raw split and the
+`has_invalid_transition_key` triage are deliberately kept as a tripwire (see that function's
+own doc); the `wr-cli` regression test is flipped to the twenty-identical-clean-refusals
+shape the fixed jar produces.
 
 ## Environment notes
 

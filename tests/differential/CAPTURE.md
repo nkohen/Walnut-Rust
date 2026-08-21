@@ -699,3 +699,112 @@ constant).
 
 The command file was deleted from the isolated worktree afterward, matching every
 recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb038.rs`
+
+Captured 2026-08-20 for `tests/differential/tests/java_bugfix_wb038.rs`, verifying
+`wr_io::reader`'s port of WB-038's real upstream fix (`walnut-java` commit `601a9d2`,
+branch `bugfix/wb-038`, stacked on `bugfix/wb-021`) — **not mainline**, per this
+project's now-standard practice for these follow-up units.
+
+`bugfix/wb-038` was already checked out at the main `~/dev/walnut-java` working tree when
+this was captured (the same situation `java_bugfix_wb021.rs`/`java_bugfix_wb032.rs` hit),
+so the worktree below is added by commit hash (detached), not by branch name:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb038 601a9d2
+cd /tmp/walnut-java-wb038
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+printf 'msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n'  > "Automata Library/wb038fw.txt"
+printf ' lsd_2\n0 1\n20 -> 0\n'                             > "Automata Library/wb038fy.txt"
+printf 'msd_2 msd_2\n0 1\n5 1 -> 0\n'                       > "Automata Library/wb038alias.txt"
+printf 'msd_2\n0 1\n* -> 0\n'                               > "Automata Library/wb038wild.txt"
+printf '{0, 1}\n\n0\n0 -> 0 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 1\n5 -> 0 / 0\n' \
+                                                      > "Transducer Library/wb038td.txt"
+
+cat > "Command Files/wb038_capture.txt" <<'EOF'
+def wb038e "?msd_2 $wb038fw(x)";
+eval wb038b "?lsd_2 $wb038fy(x)";
+eval wb038al "?msd_2 $wb038alias(x,y)";
+eval wb038w "?msd_2 $wb038wild(x)";
+transduce wb038tr wb038td T;
+eval wb038alive "?msd_2 Ex x = 1";
+EOF
+java -cp target/Walnut-all.jar Main.Prover wb038_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb038 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain
+(`/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1/Contents/Home`) — the
+shell's default `java` resolves to a JDK 11 too old for this project's class file version,
+and `JAVA_HOME` must point at the `Contents/Home` subdirectory or `mvnw` refuses to start.
+`</dev/null` matters too: without it the process runs the command file and then blocks in
+the interactive REPL.
+
+`stderr.txt` was empty. `stdout.txt`, up to the REPL banner that follows the command file:
+
+```text
+def wb038e "?msd_2 $wb038fw(x)";
+digit 5 in position 1 is not in the alphabet [0, 1] of that input: line 7 of file Automata Library/wb038fw.txt
+eval wb038b "?lsd_2 $wb038fy(x)";
+digit 20 in position 1 is not in the alphabet [0, 1] of that input: line 3 of file Automata Library/wb038fy.txt
+eval wb038al "?msd_2 $wb038alias(x,y)";
+digit 5 in position 1 is not in the alphabet [0, 1] of that input: line 3 of file Automata Library/wb038alias.txt
+eval wb038w "?msd_2 $wb038wild(x)";
+transduce wb038tr wb038td T;
+digit 5 in position 1 is not in the alphabet [0, 1] of that input: line 9 of file Transducer Library/wb038td.txt
+eval wb038alive "?msd_2 Ex x = 1";
+Converted from brics:2 states - 5ms
+____
+TRUE
+```
+
+The surviving `Session/<timestamp>/Automata Library/` held `wb038w.txt` and
+`wb038alive.txt` and **nothing else** — the wildcard file's `eval` and the final liveness
+`eval` are the only two commands that produced any automaton. (`Result/` additionally held
+a `*_log.txt` per command, failed ones included, because Walnut opens the log before
+dispatching; that is why the tests assert on `Automata Library` contents rather than on
+`Result/`.)
+
+## Three further shapes from the same session
+
+Asserted at the `wr-io`/`wr-cli` layer rather than in the differential file, because they
+need no CLI to be meaningful:
+
+```text
+# Automata Library/fpos2.txt = "msd_2 msd_3\n0 1\n1 7 -> 0\n"   (bad digit, NON-first track)
+digit 7 in position 2 is not in the alphabet [0, 1, 2] of that input: line 3 of file Automata Library/fpos2.txt
+
+# Automata Library/fset.txt = "{0, 1, 3}\n0 1\n2 -> 0\n"        (explicit-set alphabet)
+digit 2 in position 1 is not in the alphabet [0, 1, 3] of that input: line 3 of file Automata Library/fset.txt
+
+# Automata Library/fund.txt = " lsd_2\n0 1\n20-> 11\n"          (bad digit AND undeclared dest)
+digit 20 in position 1 is not in the alphabet [0, 1] of that input: line 3 of file Automata Library/fund.txt
+# ...i.e. the DIGIT check wins: it runs inside the parse loop, validateDeclaredStates after it.
+# (A negative digit reports the same way: "digit -1 in position 1 ...".)
+```
+
+The first two are pinned by `the_out_of_alphabet_message_matches_real_walnut_text` in
+`crates/wr-io/src/reader.rs`, the third by
+`an_out_of_alphabet_digit_is_rejected_before_the_undeclared_state_check` in the same file.
+
+## The 20-command corrupt-file matrix
+
+`crates/wr-cli/src/prover.rs`'s `a_corrupt_library_file_costs_one_command_not_the_process`
+was re-measured against the same jar in the same session — its exact command sequence, run
+over an `Automata Library/bad.txt` of
+`"msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n"` and a `Word Automata
+Library/badw.txt` of the same shape with output `2` on state 1. **All twenty commands
+printed the same single line** (`digit 5 in position 1 … line 7 of file Automata
+Library/bad.txt`, or `… Word Automata Library/badw.txt` for the two DFAO rows), the
+following `reg alive …;` still ran, and the session's `Automata Library` afterwards held
+only `ok.txt` and `alive.txt` — where against the PRE-fix jar it also held
+`cc, dv, ev, fl, i, lq, rv, st` and `rvw`.
+
+The command files and the six hand-authored library files were deleted from the isolated
+worktree afterward, matching every recipe above.

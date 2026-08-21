@@ -228,14 +228,35 @@ pub enum ReadError {
         got: usize,
         address: String,
     },
+    /// A transition digit isn't a member of its track's declared alphabet —
+    /// `AutomatonReader.validateTransition`'s THIRD throw, added by `walnut-java`'s
+    /// **WB-038 fix** (commit `601a9d2`, branch `bugfix/wb-038`).
+    ///
+    /// `position` is **1-based**, exactly as Java prints it (`(i + 1)`); `alphabet` is
+    /// the offending track's declared alphabet, rendered with Java's `List.toString()`
+    /// shape (`[0, 1]`). A wildcard (`*`) entry is not a literal digit and is never
+    /// checked here — it is expanded from the track's own alphabet later, so it cannot
+    /// be out of it.
+    ///
+    /// Raised from inside the parse loop, so it takes precedence over
+    /// [`ReadError::UndeclaredDestState`] (which Java validates only after the whole
+    /// loop) on a file that has both defects — confirmed live against the fixed jar.
+    DigitNotInAlphabet {
+        line: usize,
+        digit: i32,
+        position: usize,
+        alphabet: Vec<i32>,
+        address: String,
+    },
     /// A transition named a destination state with no `<id> <output>` block —
     /// `AutomatonReader.validateDeclaredStates` (`:189-193`). `state` is `i32`, matching
     /// the `int` Java parses it as (see [`parse_methods::parse_transition`]).
     ///
-    /// **Newly reachable** as of U30's F2 fix on a file real Walnut accepts: an
-    /// out-of-alphabet body digit is encoded to the bogus key `-1` rather than rejected
-    /// (WB-038), so a file whose only offense is that digit now runs the same
-    /// declared-state validation Java runs, and reports through here.
+    /// Note this is NOT how an out-of-alphabet body digit reports: since `walnut-java`'s
+    /// WB-038 fix, such a file is rejected inside the parse loop with
+    /// [`ReadError::DigitNotInAlphabet`], before the declared-state validation runs at
+    /// all. (Between Phase 4's U30 and this fix, the port deliberately reproduced Java's
+    /// then-buggy behavior of letting such a file through to here.)
     UndeclaredDestState {
         state: i32,
         address: String,
@@ -337,6 +358,21 @@ impl fmt::Display for ReadError {
             } => write!(
                 f,
                 "This automaton requires a {expected}-tuple as input: line {line} of file {address}"
+            ),
+            // Verbatim `AutomatonReader.java:129-133` (the WB-038 fix's own throw).
+            // `alphabet` is rendered Java-`List.toString()`-style (`[0, 1]`) because that
+            // is literally what Java's message interpolates.
+            ReadError::DigitNotInAlphabet {
+                line,
+                digit,
+                position,
+                alphabet,
+                address,
+            } => write!(
+                f,
+                "digit {digit} in position {position} is not in the alphabet {} \
+                 of that input: line {line} of file {address}",
+                format_java_int_list(alphabet)
             ),
             // Verbatim `AutomatonReader.java:191`.
             ReadError::UndeclaredDestState { state, address } => write!(
@@ -758,28 +794,19 @@ fn read_automaton_str_impl(
                 line: lineno,
                 address: address.to_string(),
             })?;
-            if input_tokens.len() != num_tracks {
-                return Err(ReadError::ArityMismatch {
-                    line: lineno,
-                    expected: num_tracks,
-                    got: input_tokens.len(),
-                    address: address.to_string(),
-                });
-            }
+            // `AutomatonReader.validateTransition` (`:122-135`) — arity, then the
+            // per-digit alphabet-membership check `walnut-java`'s WB-038 fix added.
+            validate_transition(&input_tokens, &alphabet, lineno, address)?;
             dest_states_used.extend(dests.iter().copied());
             for digits in expand_wildcards(&input_tokens, &alphabet) {
-                // `Automaton::encode_index_of`, NOT `encode`: these digits come straight
-                // out of an untrusted file, and Java's `AutomatonReader` has no
-                // out-of-alphabet check at all — `RichAlphabet.encode`'s `List.indexOf`
-                // just returns `-1` and the transition is stored under that bogus key
-                // (`AutomatonReader.java:71-72`). Reproducing the key rather than
-                // rejecting the file is what keeps this port's observable behavior equal
-                // to Java's on both shapes: an undeclared destination still reports the
-                // clean `UndeclaredDestState` below (Java's `validateDeclaredStates`,
-                // which runs after this loop), and a declared one still loads. Using
-                // `encode` here was a process-fatal panic on a plausible file, found by
-                // Tier-5 fuzzing (Phase 4, U30, finding F2); see `encode_index_of`'s doc
-                // for the real-`walnut-java` evidence.
+                // `Automaton::encode_index_of`, NOT `encode`, exactly as Java still calls
+                // the `List.indexOf`-based `RichAlphabet.encode` here
+                // (`AutomatonReader.java:71-72`) — WB-038's fix is in
+                // `validateTransition` above, not in the encoder. With that check in
+                // place every digit reaching this line is in its track's alphabet, so
+                // `indexOf` can no longer answer `-1` and the two encoders agree; keeping
+                // `encode_index_of` preserves the mechanical-port correspondence with
+                // Java's own call rather than swapping in this crate's panicking variant.
                 let sym = automaton.encode_index_of(&digits);
                 transitions
                     .get_mut(&cur)
@@ -1406,6 +1433,83 @@ fn probe_custom_base_candidate(
     Ok(CustomBaseCandidates { main, complement })
 }
 
+/// Java's `AbstractCollection.toString()` shape (`[a, b, c]`), used to render a track's
+/// alphabet inside [`ReadError::DigitNotInAlphabet`]'s message exactly as Java's own
+/// `"… is not in the alphabet " + a.get(i) + " of that input: …"` string concatenation
+/// does for a `List<Integer>`. Third private copy of this three-line formatter in the
+/// workspace (`wr_core::regex`'s `format_java_int_list` and `wr_core::ostrowski`'s
+/// `format_int_list` are the other two, both private to their crate and both documented
+/// as deliberately un-shared); kept local for the same reason rather than widening
+/// `wr_core::util`'s public surface for a `join(", ")` with brackets.
+fn format_java_int_list(list: &[i32]) -> String {
+    let mut s = String::from("[");
+    for (i, v) in list.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&v.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// `AutomatonReader.validateTransition`'s arity check (`:122-125`) plus the per-digit
+/// alphabet-membership check `walnut-java`'s **WB-038 fix** added beside it
+/// (`:127-135`, commit `601a9d2`).
+///
+/// Shared by the automaton reader and the transducer reader, exactly as Java's single
+/// `validateTransition` is shared by `readAutomaton` and `readTransducer` — before this
+/// existed each Rust reader inlined its own copy of the arity check, and a second copy of
+/// the digit check would have been the obvious place for the two to drift apart.
+///
+/// `validateTransition`'s FIRST throw (a transition line before any state declaration) is
+/// not here: both call sites need `current_state` as a value, so they raise
+/// [`ReadError::TransitionBeforeState`] from the `Option` themselves, ahead of this call
+/// — which preserves Java's own ordering (no-state → arity → digits).
+///
+/// # Why the digit check must run BEFORE encoding
+///
+/// `RichAlphabet.encode` computes each track's term as `encoder[i] * A.get(i).indexOf(d)`,
+/// and `List.indexOf` answers `-1` for an absent digit rather than raising — so without
+/// this check an out-of-alphabet digit becomes a bogus encoded key instead of an error
+/// (`docs/WALNUT-BUGS.md` WB-038, and see [`Automaton::encode_index_of`], which still
+/// reproduces that `indexOf` behavior because Java's encoder still has it: the fix is in
+/// the validator, not in the encoder).
+///
+/// `input` carries `None` for a `*` wildcard, which is deliberately NOT checked: it is
+/// expanded from the track's own alphabet by [`expand_wildcards`] afterwards
+/// (`RichAlphabet.expandWildcard` in Java), so it cannot be out of that alphabet, and
+/// Java's fix skips its `null` entries for exactly this reason.
+fn validate_transition(
+    input: &[Option<i32>],
+    alphabet: &[Vec<i32>],
+    line: usize,
+    address: &str,
+) -> Result<(), ReadError> {
+    if input.len() != alphabet.len() {
+        return Err(ReadError::ArityMismatch {
+            line,
+            expected: alphabet.len(),
+            got: input.len(),
+            address: address.to_string(),
+        });
+    }
+    for (i, digit) in input.iter().enumerate() {
+        let Some(digit) = *digit else { continue };
+        if !alphabet[i].contains(&digit) {
+            return Err(ReadError::DigitNotInAlphabet {
+                line,
+                digit,
+                // Java prints `(i + 1)`, i.e. 1-based.
+                position: i + 1,
+                alphabet: alphabet[i].clone(),
+                address: address.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `RichAlphabet.expandWildcard`: cross-product-expands every `None` (`*`) position
 /// against its own track's alphabet, one wildcard position at a time.
 fn expand_wildcards(input: &[Option<i32>], alphabet: &[Vec<i32>]) -> Vec<Vec<i32>> {
@@ -1558,14 +1662,11 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
                 line: lineno,
                 address: address.to_string(),
             })?;
-            if t.input.len() != num_tracks {
-                return Err(ReadError::ArityMismatch {
-                    line: lineno,
-                    expected: num_tracks,
-                    got: t.input.len(),
-                    address: address.to_string(),
-                });
-            }
+            // The very same `validateTransition` `readAutomaton` calls
+            // (`AutomatonReader.java:216`) — including, since `walnut-java`'s WB-038 fix,
+            // the per-digit alphabet-membership check. Confirmed live against the fixed
+            // jar on a transducer file with an out-of-alphabet digit.
+            validate_transition(&t.input, &alphabet, lineno, address)?;
             // `parseTransducerTransition`'s output group always yields exactly one
             // element by construction (see `parse_methods::TransducerTransition`'s own
             // doc) -- Java's `if (output.size() != 1) throw` guard is dead code, not
@@ -1575,9 +1676,10 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
             let dest: Vec<usize> = t.dest.iter().map(|&x| x as usize).collect();
             dest_states_used.extend(t.dest.iter().copied());
             for digits in expand_wildcards(&t.input, &alphabet) {
-                // Same untrusted-input reasoning as the automaton reader above;
-                // `readTransducer` (`AutomatonReader.java:245-247`) encodes with the very
-                // same `richAlphabet.encode`.
+                // Same reasoning as the automaton reader above; `readTransducer`
+                // (`AutomatonReader.java:245-247`) encodes with the very same
+                // `richAlphabet.encode`, and the WB-038 fix guards it with the very same
+                // `validateTransition`.
                 let sym = scratch.encode_index_of(&digits);
                 // `AutomatonReader.readTransducer` (`:249-250`):
                 // `currentStateTransitions.put(encode(i), dest)` — Java `Map.put`
@@ -1780,103 +1882,222 @@ mod tests {
     // Phase 4 U30 Tier-5 fuzz regressions (findings F1/F2/F3)
     // =======================================================================
 
+    // -----------------------------------------------------------------------
+    // WB-038: the four F2 sub-cases, FLIPPED to the fixed behavior
+    //
+    // Every one of these files used to LOAD (that was Walnut's bug, ported verbatim per
+    // `CLAUDE.md`'s mechanical-port rule). `walnut-java` commit `601a9d2` adds the
+    // per-digit alphabet-membership check to `validateTransition`, so all four are now
+    // rejected at read time with the same message — pinned below against text captured
+    // live from the fixed jar, per `tests/differential/CAPTURE.md`. The historical
+    // diagnosis each test used to carry lives on in `docs/WALNUT-BUGS.md`'s WB-038 entry.
+    // -----------------------------------------------------------------------
+
+    /// [`read_automaton_from_str`] with a real file address, so the tests below can
+    /// assert the `… of file <address>` half of Java's message instead of `<string>`.
+    fn read_at_address(content: &str, address: &str) -> Result<Automaton, ReadError> {
+        read_automaton_str_impl(content, address, None, &mut BTreeSet::new(), None)
+    }
+
+    /// `Some((digit, 1-based position, that track's alphabet, line))` for a read that was
+    /// rejected by the new per-digit alphabet check. **Panics** on any other outcome —
+    /// including a successful read — so a test using it cannot pass by the file quietly
+    /// loading or by failing for an unrelated reason. Keeps the flipped tests below from
+    /// re-typing the same destructuring five times over.
+    fn digit_rejection(src: &str) -> Option<(i32, usize, Vec<i32>, usize)> {
+        match read_automaton_from_str(src) {
+            Err(ReadError::DigitNotInAlphabet {
+                digit,
+                position,
+                alphabet,
+                line,
+                ..
+            }) => Some((digit, position, alphabet, line)),
+            other => panic!("expected a DigitNotInAlphabet rejection, got {other:?}"),
+        }
+    }
+
     /// F2, sub-case A. ` lsd_2\n0 1\n20-> 11` — the body digit `20` is outside the
-    /// header's `{0,1}` alphabet AND state `11` is never declared. Real `walnut-java`
-    /// on this exact file reports `State 11 is used but never declared anywhere in
-    /// file: …` (verified on `target/Walnut-all.jar`), because `RichAlphabet.encode`'s
-    /// `List.indexOf` silently yields `-1` and the undeclared-state validation only
-    /// runs after the whole parse loop. This port used to panic inside `encode` before
-    /// ever reaching that check.
+    /// header's `{0,1}` alphabet AND state `11` is never declared. It used to report the
+    /// undeclared state (`RichAlphabet.encode`'s `List.indexOf` silently yielded `-1`,
+    /// and only `validateDeclaredStates`, which runs after the whole parse loop, had
+    /// anything to say). Post-fix the DIGIT is reported instead, because
+    /// `validateTransition` runs inside the loop — so this test also pins the precedence
+    /// between the two checks, which is a real observable and not obvious from the source.
+    ///
+    /// Both messages captured live from the fixed jar (`tests/differential/CAPTURE.md`):
+    /// `digit 20 in position 1 is not in the alphabet [0, 1] of that input: line 3 of
+    /// file Automata Library/fund.txt`, and for the negative-digit shape `digit -1 in
+    /// position 1 …`.
     #[test]
-    fn an_out_of_alphabet_digit_with_an_undeclared_dest_reports_the_undeclared_state() {
-        let e = read_automaton_from_str(" lsd_2\n0 1\n20-> 11").expect_err("undeclared state");
-        assert!(
-            matches!(e, ReadError::UndeclaredDestState { state: 11, .. }),
-            "{e:?}"
+    fn an_out_of_alphabet_digit_is_rejected_before_the_undeclared_state_check() {
+        assert_eq!(
+            digit_rejection(" lsd_2\n0 1\n20-> 11"),
+            Some((20, 1, vec![0, 1], 3)),
+            "the digit check runs inside the parse loop, the state check after it"
         );
-        // A negative digit reaches the same place (`-1 1 -> 0` under `msd_2`).
-        let e = read_automaton_from_str("msd_2\n0 1\n-1 -> 9").expect_err("undeclared state");
-        assert!(
-            matches!(e, ReadError::UndeclaredDestState { state: 9, .. }),
-            "{e:?}"
+        // A NEGATIVE digit is out of alphabet too, and reports identically.
+        assert_eq!(
+            digit_rejection("msd_2\n0 1\n-1 -> 9"),
+            Some((-1, 1, vec![0, 1], 3))
         );
     }
 
-    /// F2, sub-case B. Same shape but with a DECLARED destination. Real `walnut-java`
-    /// **loads this file with no error at all** — `new Automaton(path)` returns a
-    /// 1-state automaton, keeping the transition under the bogus encoded key `-1`
-    /// (verified directly against `Walnut-all.jar`'s classes; the
-    /// `IndexOutOfBoundsException: Index -1 out of bounds for length 2` the fuzz report
-    /// saw comes later, from `AutomatonWriter.writeToGV`'s `decode(-1)`, and
-    /// `Prover.readBuffer`'s `catch (RuntimeException)` recovers from that too).
+    /// F2, sub-case B. The same shape with a DECLARED destination — the sub-case that
+    /// used to load with no error at all, keeping the transition under the bogus key
+    /// `-1`. Now rejected.
     ///
-    /// So the faithful port is to REPRODUCE the key, not to reject the file: rejecting
-    /// it would diverge on every file Java accepts (see the test below). Any later pass
-    /// that iterates `0..alphabet_size` drops the `-1` entry, which is exactly what
-    /// real Walnut's own written-back output shows.
+    /// The second half of this test is the part that matters for the SHAPE of the fix:
+    /// [`Automaton::encode_index_of`] still answers `-1`, because `walnut-java`'s fix is
+    /// in `validateTransition`, NOT in `RichAlphabet.encode` — that encoder keeps its
+    /// `List.indexOf` semantics on both engines. Pinning it here means a future "tidy-up"
+    /// that moves the check into the encoder is a deliberate divergence rather than a
+    /// silent one.
     #[test]
-    fn an_out_of_alphabet_digit_with_a_declared_dest_loads_with_javas_minus_one_key() {
-        let a = read_automaton_from_str(" lsd_2\n0 1\n20 -> 0\n").expect("Java loads this too");
-        assert_eq!(a.fa.q, 1);
-        assert_eq!(a.fa.d[0].get(&-1), Some(&vec![0usize]));
-        assert!(
-            a.fa.d[0].keys().all(|&k| k < 0),
-            "no valid symbol is stored"
+    fn an_out_of_alphabet_digit_with_a_declared_dest_is_now_rejected() {
+        assert_eq!(
+            digit_rejection(" lsd_2\n0 1\n20 -> 0\n"),
+            Some((20, 1, vec![0, 1], 3))
         );
-        // `encode_index_of` is what produces that key; `encode` would have panicked.
+        // The encoder itself is UNCHANGED by the fix -- built here directly, since the
+        // reader no longer produces such an automaton to ask.
+        let a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 0,
+                alphabet_size: 2,
+                o: vec![],
+                d: vec![],
+            },
+            vec![vec![0, 1]],
+            vec!["0".to_string()],
+            vec![Some(false)],
+        );
         assert_eq!(a.encode_index_of(&[20]), -1);
     }
 
-    /// F2, sub-case B, the case that decides the fix: real `walnut-java` accepts this
-    /// file and writes it back out as exactly itself minus the out-of-alphabet line
-    /// (`5 -> 1`), confirmed by running `eval`/`def` over it on `Walnut-all.jar`. A
-    /// port that rejected out-of-alphabet digits outright would diverge here.
+    /// F2, sub-case B again, on the multi-line `fw.txt` shape whose in-alphabet
+    /// transitions used to survive while the `5 -> 1` line was silently dropped (WB-038's
+    /// outcome (b): a different language than the file describes, with no diagnostic).
+    /// The whole file is now refused, so no partially-correct automaton is built at all.
+    ///
+    /// Captured live from the fixed jar: `digit 5 in position 1 is not in the alphabet
+    /// [0, 1] of that input: line 7 of file Automata Library/fw.txt`.
     #[test]
-    fn an_out_of_alphabet_digit_leaves_every_in_alphabet_transition_intact() {
-        let a = read_automaton_from_str("msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n")
-            .expect("Java accepts this file");
-        assert_eq!(a.fa.q, 2);
-        assert_eq!(a.fa.o, vec![0, 1]);
-        // State 0's two real transitions, unaffected.
-        assert_eq!(a.fa.d[0].get(&0), Some(&vec![0usize]));
-        assert_eq!(a.fa.d[0].get(&1), Some(&vec![1usize]));
-        // State 1 keeps its real `0 -> 0` and parks `5 -> 1` under the bogus key.
-        assert_eq!(a.fa.d[1].get(&0), Some(&vec![0usize]));
-        assert_eq!(a.fa.d[1].get(&1), None);
-        assert_eq!(a.fa.d[1].get(&-1), Some(&vec![1usize]));
+    fn an_out_of_alphabet_digit_refuses_the_whole_file_not_just_its_own_line() {
+        assert_eq!(
+            digit_rejection("msd_2\n0 0\n0 -> 0\n1 -> 1\n1 1\n0 -> 0\n5 -> 1\n"),
+            Some((5, 1, vec![0, 1], 7)),
+            "the file is rejected, not silently reduced to its in-alphabet transitions"
+        );
     }
 
-    /// F2, sub-case C — the **aliasing** case, and the reason `encode_index_of` is a
-    /// faithfulness point rather than merely a crash-avoidance one.
+    /// F2, sub-case C — the **aliasing** case, WB-038's nastiest half and the reason the
+    /// fix had to land in the reader rather than being left to a downstream crash.
     ///
     /// With more than one track, `RichAlphabet.encode`'s `-1` terms can cancel against
     /// the other tracks' real terms and land on a **valid** key: under `msd_2 msd_2`
     /// (`encoder = [1, 2]`), the line `5 1 -> 0` encodes to `1*(-1) + 2*1 == 1`, i.e.
-    /// exactly the key the legitimate input `1 0` would have. Real Walnut therefore reads
-    /// this file as an automaton that accepts `(1, 0)` — silently, with no diagnostic and
-    /// no crash to give it away (WB-038's outcome (b)). This port must agree digit for
-    /// digit, so the test asserts the ALIASED language, not the file's apparent one.
+    /// exactly the key the legitimate input `1 0` would have. Pre-fix, both engines read
+    /// this file as an automaton over `(1, 0)` — silently, with no diagnostic and no
+    /// crash anywhere downstream to give it away, so no defensive guard further down the
+    /// pipeline could ever have caught it. Post-fix it is refused at read time on both
+    /// engines (captured live: `digit 5 in position 1 is not in the alphabet [0, 1] of
+    /// that input: line 3 of file Automata Library/falias.txt`).
     ///
-    /// It is pinned precisely because it is intentional and easy to "fix" by accident: an
-    /// out-of-alphabet check anywhere in this path would reject a file Java accepts, and
-    /// clamping the index would change which valid key it aliases onto.
-    ///
-    /// **Confirmed live** against `walnut-java/target/Walnut-all.jar` (2026-08-16): this
-    /// exact file, evaluated as `eval wralias1 "?msd_2 $wralias(x,y)";`, loads with no
-    /// diagnostic and writes a result whose only non-zero-input transition is `1 0 -> 0`
-    /// — the aliased tuple, never the `5 1` the file spells.
+    /// The aliasing ARITHMETIC is still pinned below, on a hand-built `Automaton`: it is
+    /// unchanged by the fix (again, the fix is the validator, not the encoder), and it is
+    /// what makes "reject in the reader" the only place this bug could have been closed.
     #[test]
-    fn an_out_of_alphabet_digit_can_alias_onto_a_valid_key_exactly_as_java_does() {
-        let a = read_automaton_from_str("msd_2 msd_2\n0 1\n5 1 -> 0\n").expect("Java loads this");
-        assert_eq!(a.fa.q, 1);
-        // The bogus digit tuple is stored under the VALID key 1, not under a negative
-        // one -- so unlike the single-track case it survives every later pass.
-        assert_eq!(a.fa.d[0].get(&1), Some(&vec![0usize]));
+    fn the_aliasing_case_is_rejected_though_the_encoder_still_aliases() {
+        assert_eq!(
+            digit_rejection("msd_2 msd_2\n0 1\n5 1 -> 0\n"),
+            Some((5, 1, vec![0, 1], 3))
+        );
+
+        let a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 0,
+                alphabet_size: 4,
+                o: vec![],
+                d: vec![],
+            },
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["0".to_string(), "1".to_string()],
+            vec![Some(true), Some(true)],
+        );
+        // `1*(-1) + 2*1 == 1`: indistinguishable from the legitimate tuple `(1, 0)`.
         assert_eq!(a.encode_index_of(&[5, 1]), 1);
         assert_eq!(a.encode(&[1, 0]), 1);
-        // Which means the automaton's language is over `(1, 0)`, NOT over the `(5, 1)`
-        // the file appears to declare.
         assert_eq!(a.decode(1), vec![1, 0]);
+    }
+
+    /// A `*` wildcard is NOT a literal digit and must still be accepted — the new
+    /// per-digit check has to skip `None` entries, exactly as Java's fix skips its `null`
+    /// ones. Verified live on the fixed jar (`Automata Library/fwild.txt` =
+    /// `msd_2\n0 1\n* -> 0\n` evaluates with no error), and the strongest single
+    /// regression against over-tightening the check.
+    #[test]
+    fn a_wildcard_transition_is_not_treated_as_an_out_of_alphabet_digit() {
+        let a = read_automaton_from_str("msd_2\n0 1\n* -> 0\n").expect("Java accepts this");
+        assert_eq!(a.fa.q, 1);
+        // Expanded from the track's own alphabet, so both real symbols are present.
+        assert_eq!(a.fa.d[0].get(&0), Some(&vec![0usize]));
+        assert_eq!(a.fa.d[0].get(&1), Some(&vec![0usize]));
+    }
+
+    /// The message text itself, verbatim against the fixed jar's own output, for the two
+    /// shapes the four tests above do not render: a bad digit in a NON-first track
+    /// position (so the 1-based `position` is genuinely exercised, not just a 1 that a
+    /// hardcoded constant would also satisfy), and a `{...}`-set alphabet (so the
+    /// `[0, 1, 3]` rendering is not merely `0..k`).
+    ///
+    /// Captured live (`tests/differential/CAPTURE.md`):
+    /// ```text
+    /// digit 7 in position 2 is not in the alphabet [0, 1, 2] of that input: line 3 of file Automata Library/fpos2.txt
+    /// digit 2 in position 1 is not in the alphabet [0, 1, 3] of that input: line 3 of file Automata Library/fset.txt
+    /// ```
+    #[test]
+    fn the_out_of_alphabet_message_matches_real_walnut_text() {
+        let e = read_at_address("msd_2 msd_3\n0 1\n1 7 -> 0\n", "fpos2.txt")
+            .expect_err("digit 7 is not in msd_3's alphabet");
+        assert_eq!(
+            e.to_string(),
+            "digit 7 in position 2 is not in the alphabet [0, 1, 2] \
+             of that input: line 3 of file fpos2.txt"
+        );
+
+        let e = read_at_address("{0, 1, 3}\n0 1\n2 -> 0\n", "fset.txt")
+            .expect_err("digit 2 is not in {0, 1, 3}");
+        assert_eq!(
+            e.to_string(),
+            "digit 2 in position 1 is not in the alphabet [0, 1, 3] \
+             of that input: line 3 of file fset.txt"
+        );
+    }
+
+    /// The transducer reader shares Java's `validateTransition`, so it gets the same
+    /// check from the same change — and this port shares `validate_transition` for the
+    /// same reason. Confirmed live on the fixed jar with a `Transducer Library/badtd.txt`
+    /// of exactly this content: `transduce trbad badtd T;` reports `digit 5 in position 1
+    /// is not in the alphabet [0, 1] of that input: line 9 of file Transducer
+    /// Library/badtd.txt`, while `transduce trok RUNSUM2 T;` on a well-formed transducer
+    /// still succeeds.
+    #[test]
+    fn a_transducer_with_an_out_of_alphabet_digit_is_rejected_too() {
+        let e = read_transducer_str_impl(
+            "{0, 1}\n\n0\n0 -> 0 / 0\n1 -> 1 / 1\n\n1\n0 -> 1 / 1\n5 -> 0 / 0\n",
+            "badtd.txt",
+        )
+        .expect_err("digit 5 is not in {0, 1}");
+        assert_eq!(
+            e.to_string(),
+            "digit 5 in position 1 is not in the alphabet [0, 1] \
+             of that input: line 9 of file badtd.txt"
+        );
     }
 
     /// F3. Java's `NumberSystem` constructor rejects a base `<= 1` outright

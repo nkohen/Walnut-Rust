@@ -345,8 +345,10 @@ mod tests {
     }
 
     /// The shape test the fuzz targets triage on. It must accept the real messages both
-    /// ported guards render — including a NEGATIVE index, which is the whole WB-038 case
-    /// — and reject anything else, however similar.
+    /// ported guards render — including a NEGATIVE index, which is the shape WB-038 used
+    /// to deliver from a `.txt` file (that source is closed as of `walnut-java` commit
+    /// `601a9d2`; the guards, and this triage, are unchanged) — and reject anything else,
+    /// however similar.
     #[test]
     fn only_the_jdk_index_error_shape_counts_as_a_ported_guard() {
         let at_a_guard = Some("crates/wr-core/src/automaton.rs:702:23");

@@ -245,24 +245,36 @@ impl BooleanOp {
 ///
 /// # Where the alphabet bounds check goes, and why it matters
 ///
-/// A `.txt` library file whose body carries a digit outside its header's alphabet loads
-/// with a transition stored under the key `-1` (`List.indexOf` → `-1`, WB-038 — real
-/// Walnut does this too), so `a_sym` here can genuinely be negative. Java's two loops
+/// A `.txt` library file whose body carried a digit outside its header's alphabet used to
+/// load with a transition stored under the key `-1` (`List.indexOf` → `-1`, WB-038 — real
+/// Walnut did this too), so `a_sym` here could genuinely be negative. Java's two loops
 /// hoist `entryA.getIntKey() * B.getAlphabetSize()` into the OUTER one, but that is
 /// ordinary `int` multiplication: it wraps, it does not throw. The only expression that
 /// can throw is the array access `allInputsOfAxB[AxBalphabet + entryB.getIntKey()]`,
 /// **inside** the inner loop — so when the inner set is empty, Java completes the state
 /// normally and the whole command succeeds.
 ///
-/// That is not hypothetical. `and`-family products deliberately do not totalize their
+/// That was not hypothetical. `and`-family products deliberately do not totalize their
 /// operands ([`crate::logicalops::and`]), so an inner `b.d[q]` really is empty for
-/// ordinary inputs: `intersect i bad ok;` on such a file **succeeds and writes `i.txt`**
-/// on the real `Walnut-all.jar` (verified live). An earlier version of this port hoisted
-/// a `checked_mul(...).expect(...)` into the outer loop, so it rejected that file with an
-/// error — a file real Walnut processes. The check therefore sits exactly where Java's
-/// access is, and reports the JDK's own `ArrayIndexOutOfBoundsException` text (`Index -2
-/// out of bounds for length 4` — again, the verbatim string the real CLI prints for
-/// `union u bad ok;`), recovered at `wr_cli::prover`'s `Prover::caught` boundary.
+/// ordinary inputs: `intersect i bad ok;` on such a file **succeeded and wrote `i.txt`**
+/// on the pre-fix `Walnut-all.jar` (verified live). An earlier version of this port
+/// hoisted a `checked_mul(...).expect(...)` into the outer loop, so it rejected that file
+/// with an error — a file real Walnut processed. The check therefore sits exactly where
+/// Java's access is, and reports the JDK's own `ArrayIndexOutOfBoundsException` text
+/// (`Index -2 out of bounds for length 4` — again, the verbatim string the real CLI
+/// printed for `union u bad ok;`), recovered at `wr_cli::prover`'s `Prover::caught`
+/// boundary.
+///
+/// **Where WB-038's fix leaves this.** `walnut-java` commit `601a9d2` makes
+/// `AutomatonReader.validateTransition` reject an out-of-alphabet digit at read time, so
+/// the `.txt` reader is no longer a source of a negative key on either engine (this port
+/// matches it in `wr_io::reader::validate_transition`), and no other live path to one is
+/// known. The placement above is nonetheless kept EXACTLY as it is: it is where Java's
+/// own array access is, the whole point of the third review round that put it there was
+/// that hoisting it changes which files the engine accepts, and this position is the one
+/// that cannot introduce a divergence — it throws precisely when Java's access throws
+/// and is inert otherwise. The two tests below build their corrupt keys by hand for the
+/// same reason.
 ///
 /// # Progress logging not ported
 ///
@@ -923,7 +935,14 @@ mod tests {
         assert_eq!(axb_match.o[0], 1);
     }
 
-    // --- the WB-038 `-1` key: where the bounds check may and may not fire ---
+    // --- an out-of-range `-1` key: where the bounds check may and may not fire ---
+    //
+    // These two tests hand-build the corrupt key. That is not a shortcut: as of
+    // `walnut-java`'s WB-038 fix (`601a9d2`, ported in `wr_io::reader`), the `.txt`
+    // reader no longer produces one, so this is the only way to exercise the placement
+    // of `cross_product_internal`'s bounds check — and that placement is still worth
+    // pinning, since it is what makes this port's accept/reject set equal to Java's
+    // wherever a negative key does turn up. See this function's own docs.
 
     /// Two one-state FAs, `a` with the given transition keys and `b` with `b_keys`, both
     /// self-looping. `alphabet_size` is 2 on each, so the product table has 4 entries.
@@ -947,10 +966,12 @@ mod tests {
     /// loop can. So a corrupt `-1` key on `a` is completely harmless when `b`'s state has
     /// no outgoing transitions, and real Walnut finishes the command.
     ///
-    /// Confirmed live on `Walnut-all.jar`: `intersect i bad ok;` (with `bad.txt` carrying
-    /// an out-of-alphabet body digit) SUCCEEDS and writes `i.txt`; the `and` family does
-    /// not totalize its operands, so the empty inner set is the ordinary case, not a
-    /// contrived one. A guard hoisted into the outer loop rejected that file.
+    /// Confirmed live on the pre-WB-038-fix `Walnut-all.jar`: `intersect i bad ok;` (with
+    /// `bad.txt` carrying an out-of-alphabet body digit) SUCCEEDED and wrote `i.txt`; the
+    /// `and` family does not totalize its operands, so the empty inner set is the ordinary
+    /// case, not a contrived one. A guard hoisted into the outer loop rejected that file.
+    /// (The fixed jar refuses `bad.txt` at read time instead, so that end-to-end
+    /// reproduction is history — the loop-placement property this test pins is not.)
     #[test]
     fn a_corrupt_key_is_harmless_when_the_other_operands_state_has_no_transitions() {
         let a = fa_with_keys(&[-1]);
@@ -970,8 +991,8 @@ mod tests {
 
     /// ...and when the inner loop DOES run, the access happens and throws — with the
     /// JDK's own `ArrayIndexOutOfBoundsException` text. `-1 * 2 + 0 = -2`, and
-    /// `union u bad ok;` on the real CLI prints exactly `Index -2 out of bounds for
-    /// length 4`.
+    /// `union u bad ok;` on the pre-WB-038-fix CLI printed exactly `Index -2 out of
+    /// bounds for length 4`.
     #[test]
     fn a_corrupt_key_raises_the_jdks_own_message_when_the_access_really_happens() {
         let a = fa_with_keys(&[-1]);

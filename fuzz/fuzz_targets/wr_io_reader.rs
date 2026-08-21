@@ -18,13 +18,20 @@
 //! # Why the target does not stop at the read (review round 2)
 //!
 //! It used to. That is why 6M+ clean executions missed both of the defects the adversarial
-//! review of the first fix round found: a successfully-read automaton can carry a
+//! review of the first fix round found: a successfully-read automaton could carry a
 //! transition under the bogus key `-1` (Java's `List.indexOf` semantics, WB-038,
 //! faithfully reproduced by `Automaton::encode_index_of`), and **nothing the reader itself
 //! does ever touches that key again** — the panics live one step downstream, in whatever
-//! consumes the automaton. So each successful read is now followed by a small, bounded
-//! set of downstream steps that a real command would perform on a freshly loaded library
-//! automaton:
+//! consumes the automaton.
+//!
+//! That specific key is no longer producible: `walnut-java` commit `601a9d2` makes
+//! `AutomatonReader.validateTransition` check every digit against its track's alphabet,
+//! and `wr_io::reader` matches it. The downstream steps stay, for two independent
+//! reasons — the reasoning above ("the reader's own output is not where the panics are")
+//! is about this target's SHAPE, not about one bug; and the corrupt-key triage below is
+//! now, in effect, a tripwire that should never fire. So each successful read is followed
+//! by a small, bounded set of downstream steps that a real command would perform on a
+//! freshly loaded library automaton:
 //!
 //! * `write_txt`/`write_gv` into a `Vec<u8>` — `AutomatonWriter`'s two `decode` call
 //!   sites, the ones that used to fabricate a digit tuple for the `-1` key and write out
@@ -136,14 +143,22 @@ fuzz_target!(|data: &[u8]| {
     let _ = wr_io::reader::read_transducer_from_str(content);
 
     if let Ok(automaton) = read {
-        // A file with an out-of-alphabet body digit loads with a transition stored under
-        // an INVALID key (Java's `List.indexOf` -> `-1`, WB-038, faithfully ported). Every
-        // `wr-core` primitive then raises the same unchecked exception real Walnut raises
-        // on it — by design, and reported at `wr_cli::prover`'s `Prover::caught` boundary
-        // exactly as `Prover.readBuffer`'s `catch (RuntimeException)` reports Java's. That
-        // is a *ported behavior*, not a crash-freedom violation, so those inputs run the
-        // downstream steps behind the same boundary the shipped binary has (and would
-        // otherwise re-report the known class within seconds, discovering nothing else).
+        // A file with an out-of-alphabet body digit USED TO load with a transition stored
+        // under an INVALID key (Java's `List.indexOf` -> `-1`, WB-038, faithfully ported).
+        // Every `wr-core` primitive then raised the same unchecked exception real Walnut
+        // raises on it — by design, and reported at `wr_cli::prover`'s `Prover::caught`
+        // boundary exactly as `Prover.readBuffer`'s `catch (RuntimeException)` reports
+        // Java's. That is a *ported behavior*, not a crash-freedom violation, so those
+        // inputs ran the downstream steps behind the same boundary the shipped binary has
+        // (and would otherwise re-report the known class within seconds, discovering
+        // nothing else).
+        //
+        // `walnut-java` commit `601a9d2` (WB-038's fix, ported in
+        // `wr_io::reader::validate_transition`) rejects such a file at read time, so this
+        // branch is now expected to be DEAD. It is kept rather than deleted: it costs one
+        // cheap key scan per successful read, and if the reader ever regresses -- or some
+        // other route to an out-of-range key appears -- it is the difference between a
+        // triaged known class and an unbounded re-raise of Rust's own panic.
         //
         // But ONLY that one class. A blanket catch here would absorb any panic reached
         // through a corrupt-key input, so a genuinely different bug hiding behind one
@@ -174,8 +189,9 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-/// Whether any transition key is outside `0..alphabet_size` — i.e. whether this automaton
-/// carries WB-038's bogus key. See the call site for why that changes how it is exercised.
+/// Whether any transition key is outside `0..alphabet_size` — the shape WB-038's bogus
+/// key had. Expected to be unreachable since WB-038's fix; see the call site for why the
+/// branch it guards is kept anyway.
 fn has_invalid_transition_key(automaton: &wr_core::automaton::Automaton) -> bool {
     let size = automaton.fa.alphabet_size;
     automaton
