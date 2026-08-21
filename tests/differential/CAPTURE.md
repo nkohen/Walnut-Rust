@@ -620,12 +620,16 @@ git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb032 --force
 Case 1's output (`Session/<timestamp>/Automata Library/wb032b10msd1000.txt`, header
 `msd_1000`, ~3,000 lines for the full `0..1000` alphabet) was copied over
 `tests/differential/fixtures/convert_ns/b10msd1000.txt` as a straight overwrite —
-that fixture's own re-capture, since it is the SAME command (`convert $b10msd1000
-msd_1000 $base10;`) `tests/differential/tests/convert_ns.rs`'s own capture recipe already
-used, now run against the fixed jar instead of mainline's, per that file's own updated
-module docs. `tests/differential/tests/java_bugfix_wb032.rs`'s own Case 1 test reuses that
-same fixture as its comparison target rather than duplicating a ~3,000-line automaton
-inline.
+that fixture's own re-capture, since it is the SAME operation (`convert … msd_1000 …`
+against the same `base10.txt` source content) `tests/differential/tests/convert_ns.rs`'s
+own capture recipe already used, now run against the fixed jar instead of mainline's, per
+that file's own updated module docs. The command STRING differs cosmetically — this
+worktree's actual capture, per the recipe above, was `convert $wb032b10msd1000 msd_1000
+$wb032base10;`, using this file's own `wb032`-prefixed automaton names rather than
+`convert_ns.rs`'s original `$b10msd1000`/`$base10` — not a byte-identical rerun of that
+file's exact command text. `tests/differential/tests/java_bugfix_wb032.rs`'s own Case 1
+test reuses that same fixture as its comparison target rather than duplicating a
+~3,000-line automaton inline.
 
 Case 2's output (`Session/<timestamp>/Automata Library/wb032eps1000to10.txt`, ~20 lines)
 is inlined directly in `java_bugfix_wb032.rs` — see that file's own module docs for the

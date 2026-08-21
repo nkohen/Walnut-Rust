@@ -1766,6 +1766,18 @@ fn int_pow(base: i32, exponent: i32) -> i32 {
 /// `bugfix/wb-032`. Computes the exponent `j` such that `root^j == base` by exact integer
 /// repeated multiplication, never floating-point logarithms.
 ///
+/// # File placement: deliberately here, not in `wr_core::util`
+///
+/// Java's `exactIntegerExponent` lives in the general-purpose `Main/UtilityMethods.java`,
+/// which this crate already ports as [`crate::util`] — the same file that hosts this
+/// function's sibling [`util::common_root`], and `wr_core::util`'s module doc says as
+/// much. This port keeps `exact_integer_exponent` in `logicalops.rs` instead, next to its
+/// only caller ([`convert_ns`]), rather than relocating it to match Java's file layout
+/// exactly: it is a same-crate, no-behavior-change move, and WB-032's fix is scoped to
+/// fixing the computation, not to a structural refactor. Not required reading to trust the
+/// fix, but noted explicitly per this project's convention of stating deliberate
+/// deviations from a strict per-file Java->Rust mapping rather than leaving them implicit.
+///
 /// # What this replaces
 ///
 /// `convert_ns`'s two call sites used to compute the same `j` as
@@ -5633,8 +5645,29 @@ mod tests {
     /// `(int)(Math.log(base)/Math.log(root))` used to return `exponent - 1`
     /// (`docs/WALNUT-BUGS.md` WB-032's own "root <= 100" list, itself independently swept
     /// from a real JVM). The fixed [`exact_integer_exponent`] must recover the CORRECT
-    /// exponent on every one of these — this is the direct regression guard against ever
-    /// silently reintroducing WB-032's float-log computation.
+    /// exponent on every one of these.
+    ///
+    /// # Why this table is a real regression guard, not incidental data
+    ///
+    /// Every pair here is already covered by the full round-trip sweep three tests below
+    /// (`root <= 46340`), so on its own this table would add zero net coverage beyond it —
+    /// a prior version of this comment claimed it was "the direct regression guard against
+    /// ever silently reintroducing WB-032's float-log computation," which was an overclaim
+    /// for exactly that reason. What makes it a genuine, *self-validating* guard is the
+    /// first assertion in the loop below: before checking the FIXED function, it confirms
+    /// the pair actually reproduces the OLD bug — `(f64::from(base).ln() /
+    /// f64::from(root).ln()) as i32 == exponent - 1` — using Rust's own `f64::ln`, not a
+    /// resurrected bit-for-bit `java_log`/FDLIBM port (both deleted along with
+    /// `truncated_log_ratio` now that nothing calls them; see [`exact_integer_exponent`]'s
+    /// doc comment). That substitution is checked here, not assumed to be safe everywhere:
+    /// `f64::ln` does **not** agree with Java's `Math.log` in general (it disagrees on 29
+    /// of the pairs once `root` is widened to `<= 1000` — missing `(3,5)`, `(3,10)`, …,
+    /// and inventing `(185,2)`, `(196,2)`, … — see this file's git history at the WB-032
+    /// fix commit for that capture), but it was independently re-verified (by direct
+    /// computation, before writing this comment) to agree with Java's buggy direction on
+    /// all 27 pairs in THIS specific `root <= 100` table. If this table is ever widened
+    /// past `root <= 100`, that agreement must be re-checked before trusting the
+    /// self-validation, not assumed to keep holding.
     #[rustfmt::skip]
     const FORMERLY_WB032_AFFECTED_ROOT_LE_100: &[(i32, i32)] = &[
         (9, 5), (10, 3), (10, 6), (10, 9), (11, 7), (12, 7), (17, 3), (17, 6), (22, 5),
@@ -5646,6 +5679,21 @@ mod tests {
     fn exact_integer_exponent_on_formerly_wb032_affected_pairs() {
         for &(root, exponent) in FORMERLY_WB032_AFFECTED_ROOT_LE_100 {
             let base = i64::from(root).pow(exponent as u32);
+            // Self-validation: confirm this pair genuinely triggers WB-032's bug in the
+            // OLD (now-deleted) computation, so the table is asserting the FIX actually
+            // changed the answer on exactly the cases it needed to, not just restating
+            // data the sweep below already covers.
+            let old_buggy_computation = (f64::from(base as i32).ln() / f64::from(root).ln()) as i32;
+            assert_eq!(
+                old_buggy_computation,
+                exponent - 1,
+                "root={root} exponent={exponent} base={base}: this pair is expected to \
+                 reproduce WB-032's float-log bug under Rust's own f64::ln (independently \
+                 verified to agree with Java's Math.log on the buggy direction for every \
+                 root <= 100 pair, see this table's own doc comment) -- if this assertion \
+                 ever fails, the pair no longer demonstrates the regression and does not \
+                 belong in this table"
+            );
             assert_eq!(
                 exact_integer_exponent(base as i32, root),
                 Ok(exponent),
@@ -5712,6 +5760,37 @@ mod tests {
                 Err(ConvertNsError::InvalidRoot { root })
             );
         }
+    }
+
+    /// Forces [`exact_integer_exponent`]'s `power: i64` accumulator to actually matter.
+    ///
+    /// Every OTHER test in this module stays at or below `base == i32::MAX`, and in every
+    /// one of those cases `power` never needs to leave `i32` range before the loop's
+    /// `power < i64::from(base)` check notices it has gone far enough and stops — so
+    /// `power: i64 -> power: i32` is a mutation the rest of this suite cannot see. This
+    /// case is the one the function's own doc comment ("`# The algorithm`") already
+    /// reasons about: `base = i32::MAX = 2_147_483_647`, `root = 2`. The doubling
+    /// sequence is `1, 2, 4, …, 2^30 = 1_073_741_824` (still an `i32`), then the next
+    /// multiply produces `2^31 = 2_147_483_648` — one past `i32::MAX`, so `power` MUST be
+    /// wider than `i32` to hold the value the loop needs to compare against `base` on
+    /// that very iteration. With `power: i32` that multiply overflows: a debug build
+    /// panics (`attempt to multiply with overflow`); a release build wraps to
+    /// `i32::MIN`, and because a wrapped negative `i32` widened to `i64` still satisfies
+    /// `power < i64::from(base)`, the loop never terminates at all — exactly the kind of
+    /// hang `CLAUDE.md`'s test-performance guardrails ("every end-to-end test has a
+    /// wall-time … cap") exist to keep out of the actual decision procedure
+    /// (`convert_ns` calls this function directly, unguarded by any such cap of its
+    /// own). Mutation-verified: temporarily changing `power`'s declared type to `i32`
+    /// makes this test fail with a debug-build overflow panic; restored afterward.
+    #[test]
+    fn exact_integer_exponent_forces_the_i64_accumulator_past_i32_max() {
+        assert_eq!(
+            exact_integer_exponent(i32::MAX, 2),
+            Err(ConvertNsError::NotAnExactPower {
+                base: i32::MAX,
+                root: 2,
+            })
+        );
     }
 
     /// `AutomatonLogicalOpsTest.testConvertNSWb032ToBaseDirectionRegroupsToExactExponentNotOneLess`

@@ -115,13 +115,17 @@
 //!
 //! **`fixtures/convert_ns/b10msd1000.txt` was RE-captured 2026-08-20**, against the FIXED
 //! `walnut-java` branch `bugfix/wb-032` (commit `18b7c4b`, built in an isolated worktree),
-//! by the exact same command this recipe already used —
-//! `convert $b10msd1000 msd_1000 $base10;` against the SAME `base10.txt` source — now
-//! producing the mathematically correct `msd_1000` automaton instead of the pre-fix
-//! `msd_100` one WB-032 used to silently produce. A straight overwrite, per this recipe's
-//! own step-4 discipline. See `tests/differential/tests/java_bugfix_wb032.rs` for the
-//! dedicated WB-032 fix coverage (both `convertNS` directions, driven through the real
-//! `convert` CLI command).
+//! by the same command this recipe already used, over the SAME `base10.txt` source —
+//! `convert $b10msd1000 msd_1000 $base10;` above, `convert $wb032b10msd1000 msd_1000
+//! $wb032base10;` in the actual recapture (`../CAPTURE.md`'s WB-032 entry), since that
+//! recapture ran in `java_bugfix_wb032.rs`'s own isolated worktree/session and used its
+//! own `wb032`-prefixed automaton names throughout rather than reusing these names —
+//! semantically the identical operation (same source content, same target base), not a
+//! literal byte-identical command string. Now producing the mathematically correct
+//! `msd_1000` automaton instead of the pre-fix `msd_100` one WB-032 used to silently
+//! produce. A straight overwrite, per this recipe's own step-4 discipline. See
+//! `tests/differential/tests/java_bugfix_wb032.rs` for the dedicated WB-032 fix coverage
+//! (both `convertNS` directions, driven through the real `convert` CLI command).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -420,8 +424,12 @@ fn mod3_dfao_msd4_to_lsd8_matches_real_walnut() {
 /// (`wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines`, expecting base
 /// `100`) — it is flipped here, and `fixtures/convert_ns/b10msd1000.txt` was re-captured
 /// from the FIXED `walnut-java` branch (a straight overwrite of the same fixture, per this
-/// file's own capture-recipe discipline: `convert $b10msd1000 msd_1000 $base10;` against the
-/// same `base10.txt` source, now run against `bugfix/wb-032`'s jar instead of mainline's).
+/// file's own capture-recipe discipline: the same operation, `convert … msd_1000 …` against
+/// the same `base10.txt` source content, now run against `bugfix/wb-032`'s jar instead of
+/// mainline's — the actual recapture command used `wb032`-prefixed automaton names
+/// (`convert $wb032b10msd1000 msd_1000 $wb032base10;`, not this module's own
+/// `$b10msd1000`/`$base10`), see this file's module docs and `../CAPTURE.md`'s WB-032
+/// entry for the exact command run).
 #[test]
 fn wb032_msd10_to_msd1000_now_correctly_produces_msd1000_in_both_engines() {
     check_conversion("base10.txt", true, 1000, "b10msd1000.txt", 1000);
