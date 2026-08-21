@@ -92,11 +92,17 @@ fn alphabet_declaration_string(alphabets: &[Vec<i32>]) -> String {
 // `reg`, through the string alphabet declaration
 // ---------------------------------------------------------------------------
 
-/// A representative subset of `tests/reg_brics_regex.rs`'s own 60-case corpus (same
-/// fixture names, same `(alphabets, regex)` pairs -- see this file's module docs for why
+/// A representative subset of `tests/reg_brics_regex.rs`'s own corpus (same fixture
+/// names, same `(alphabets, regex)` pairs -- see this file's module docs for why
 /// re-driving them through the STRING layer needs no new capture), covering: single- and
-/// multi-track declarations, intersection/negated-class/interval syntax, and both
-/// WB-024 trigger shapes (`r19`, `r50`, `r58`).
+/// multi-track declarations, intersection/negated-class/interval syntax.
+///
+/// `r19`/`r50`/`r58` (WB-024's own trigger shapes -- an out-of-alphabet digit, bare and
+/// bracketed) removed 2026-08-20 once `wr_core::regex::determine_encoded_regex` ported
+/// WB-024's fix, for the same reason `tests/reg_brics_regex.rs` removed them from ITS
+/// corpus: all three now reject instead of building an automaton, so comparing against
+/// the mainline-captured fixture files is no longer meaningful. See that file's own
+/// module docs for the replacement coverage.
 #[allow(clippy::type_complexity)]
 fn reg_corpus_subset() -> Vec<(&'static str, Vec<Vec<i32>>, &'static str)> {
     fn b2() -> Vec<Vec<i32>> {
@@ -114,15 +120,12 @@ fn reg_corpus_subset() -> Vec<(&'static str, Vec<Vec<i32>>, &'static str)> {
         ("r09", b2(), "0*1"),
         ("r10", b2(), "0?1+"),
         ("r15", vec![vec![0, 1, 2]], "[0-1]*2"),
-        ("r19", b2(), "2*"),
         ("r23", vec![vec![0, 1], vec![0, 1]], "[0,1][1,0]*"),
         ("r24", vec![vec![0, 1], vec![0, 1]], "([0,0]|[1,1])*"),
         ("r31", vec![vec![0, 1, 2]], "[0-2]"),
         ("r42", b2(), "[01][01]"),
-        ("r50", vec![vec![0, 1, 2, 3], vec![0, 1]], "[9,9][0,0]"),
         ("r51", vec![vec![2, 4, 1]], "4*"),
         ("r52", vec![vec![1, 0]], "10*"),
-        ("r58", b2(), "[10]"),
     ]
 }
 

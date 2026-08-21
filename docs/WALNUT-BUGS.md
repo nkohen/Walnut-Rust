@@ -1264,26 +1264,42 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** Phase 3a, U8 (`wr-core`'s regex engine), 2026-08-12. Pre-identified during the Phase-3 planning
   research and re-confirmed live here against the real `walnut-java` CLI (`target/Walnut-all.jar`): both
   commands above were run and produced exactly the quoted outputs.
-- **Rust port:** `ported verbatim (quirk)`. `wr_core::regex::encode_with_index_of` reproduces
-  `List.indexOf`'s `-1` deliberately (it exists *because* `Automaton::encode` panics on an out-of-alphabet
-  digit and therefore cannot be reused here), and `convert_encoding_for_brics` reproduces Java's truncating
-  `(char)` cast rather than range-checking. Pinned by `wb_024_*` in `crates/wr-core/src/regex/tests.rs`
-  (four tests: the encoding itself, the order-dependence end to end, the "every negative encoding lands in
-  the reserved range" invariant plus the whitespace-deletion face, and the `[10]` face) and by
-  `wb_024_alphabet_offset_collision_is_order_dependent` in
-  `tests/differential/tests/reg_brics_regex.rs`, which asserts the same two commands against the same
-  behavior the real jar produced.
-- **Upstream:** not filed. The minimal fix is a guard in `Reg.determineEncodedRegex` (or in
-  `RichAlphabet.encode`): reject a digit whose `indexOf` is `-1` with a real message naming the digit and
-  the track, instead of letting a negative encoding reach `convertEncodingForBrics`. Widening the offset
-  would not be sufficient on its own — the wrong-answer case (`[9,9][0,0]` quietly yielding the empty
-  language) is a missing *validation*, not a character-range problem.
-- **Severity:** moderate-to-high — this is a **silently wrong answer** on plausible user input in the most
-  common branch (a mistyped digit produces the empty language, and an empty-language `reg` result then
-  propagates into every `eval` that uses it), with the crash branch as a bonus. It is bounded only by
-  needing an out-of-alphabet digit in the first place; the `[10]`-as-a-vector face makes that easier to hit
-  than it looks, since nothing in the syntax warns that bracketed digit runs are vectors rather than
-  character classes.
+- **Rust port:** `fixed, matches walnut-java as of commit 59eda64` (branch `bugfix/wb-024-025`).
+  `wr_core::regex::determine_encoded_regex` now ports `Reg.java:63-68`'s real fix: every digit of a
+  parsed vector (bracketed or bare — both go through the same loop) is checked against its own
+  track's declared alphabet BEFORE [`encode_with_index_of`] can ever see it, raising
+  `RegexError::Walnut` naming the offending digit, its position, and the track's alphabet (Java's
+  `WalnutException.digitNotInAlphabet`, message text ported verbatim: `"digit {d} in position {i} of
+  a regular-expression vector is not in that input's alphabet: {alphabet}"`, using a private
+  `format_java_int_list` helper to reproduce `List<Integer>`'s `[a, b, c]` `toString()` shape).
+  `encode_with_index_of`/`convert_encoding_for_brics` themselves are UNCHANGED (Java's fix didn't
+  touch `RichAlphabet.encode`/`convertEncodingForBrics` either — every other call site already
+  passes an in-range index), so the underlying `-1`/wraparound mechanism this entry describes is
+  still reachable by calling those lower-level functions directly, just no longer through `reg`.
+  Pinned by `wb_024_*` in `crates/wr-core/src/regex/tests.rs` (six tests: the two order-flipped
+  vectors now rejecting identically, the `[10]` face now rejecting, an in-alphabet vector unaffected
+  by the new guard, plus the two direct-call tests confirming the lower-level primitives are
+  unchanged) and by three differential tests in `tests/differential/tests/java_bugfix_wb024_wb025.rs`
+  (`wb024_r19_bare_digit_now_rejects`, `wb024_r50_bracketed_vectors_reject_regardless_of_order`,
+  `wb024_r58_bracketed_integer_outside_alphabet_now_rejects`), each driving the real `wr-cli`
+  dispatch path and asserting byte-identical console/stderr output against the real fixed jar. The
+  three fixtures this bug used to need (`tests/differential/fixtures/reg/r19.txt`/`r50.txt`/
+  `r58.txt`, each an out-of-alphabet-digit shape) were removed 2026-08-20, since none of the three
+  builds an automaton any more — see `tests/differential/tests/java_bugfix_wb024_wb025.rs`'s own
+  module docs for the full reasoning (mirroring this same upstream commit's own
+  `automaton<i>.txt`→`error<i>.txt` fixture-flip precedent on the `Main.IntegrationTest` side,
+  adapted to this harness's own inline-message convention for an error outcome).
+- **Upstream:** fixed, `walnut-java` commit `59eda64` on branch `bugfix/wb-024-025` (stacked on
+  `bugfix/wb-010`). `Reg.determineEncodedRegex` now validates every digit against its track's
+  alphabet before encoding, raising `WalnutException.digitNotInAlphabet`; `RichAlphabet.encode`/
+  `BricsConverter.convertEncodingForBrics` are unchanged, per this entry's own suggested fix above.
+  Also flipped `Main.IntegrationTest`'s `test149`-`test155` (seven `reg` fixtures that happened to
+  embed an out-of-alphabet digit, none deliberately) from a stale `automaton<i>.txt` to a captured
+  `error<i>.txt`.
+- **Severity:** moderate-to-high (as filed) — this was a **silently wrong answer** on plausible user
+  input in the most common branch (a mistyped digit produced the empty language, and an
+  empty-language `reg` result then propagated into every `eval` that used it), with the crash branch
+  as a bonus. Now closed: every one of those cases is a clean, diagnosable rejection on both engines.
 
 ---
 
@@ -1317,20 +1333,35 @@ bug costs a silent wrong answer somewhere downstream.
   `(1<<16)-1` bound and same truncating cast confirmed live against the real `BricsConverter.java`
   source (`:151-165`); not a hypothetical reading, the arithmetic is unconditional once
   `alphabetSize` is in the affected range.
-- **Rust port:** `ported verbatim (quirk)`. `wr_core::regex::convert_encoding_for_brics` reproduces
-  Java's `(char)` narrowing cast exactly via `vector_encoding.wrapping_add(128) as u16`, and
-  `validate_brics_alphabet_size` reproduces `MAX_BRICS_CHARACTER == (1<<16)-1` verbatim, so the same
-  wraparound reproduces at the same boundary. Pinned by
-  `wb_025_a_legitimate_large_alphabet_symbol_wraps_into_the_reserved_range` in
-  `crates/wr-core/src/regex/tests.rs`, right next to the WB-024 tests.
-- **Upstream:** not filed. The minimal fix is tightening `MAX_BRICS_CHARACTER` (or
-  `validateBricsAlphabetSize`'s bound) to `65535 - 128 = 65407`, so every validator-accepted symbol
-  index's `+128` offset stays inside `char`'s range — narrower than WB-024's fix (which is a missing
-  *validation* of the encoding's sign), this is a missing validation of the encoding's *magnitude*.
-- **Severity:** low-to-moderate — same silently-wrong-answer/spurious-parse-error shape as WB-024,
-  but gated behind an alphabet size (`> 65408`) far outside any plausible hand-written Walnut query;
-  realistic exposure is through generated/fuzzed or programmatically-constructed large alphabets, not
-  everyday use.
+- **Rust port:** `fixed, matches walnut-java as of commit 59eda64` (branch `bugfix/wb-024-025`, same
+  commit as WB-024). `wr_core::regex::validate_brics_alphabet_size` is renamed
+  `validate_offset_encodable_alphabet_size` (mirroring Java's own
+  `validateOffsetEncodableAlphabetSize`) and its bound tightened to
+  `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == (1 << 16) - 1 - 128 == 65407`, exactly Java's fix. Java's
+  OTHER guard at the wider `65535` bound (plain `validateBricsAlphabetSize`, used by
+  `toDkBricsAutomaton`, which does not add the `+128` offset) has no Rust counterpart, because
+  `toDkBricsAutomaton` itself is dead code in Java (confirmed by inspection: no callers anywhere in
+  `walnut-java`) and so was never ported — this port only ever needed the one, now-tightened, guard.
+  `convert_encoding_for_brics` itself is UNCHANGED (same reasoning as WB-024: Java's fix didn't touch
+  `convertEncodingForBrics` either, only its guard), so the truncating-cast wraparound this entry
+  describes is still reachable by calling that function directly with a symbol index the tightened
+  guard would now reject — just no longer through `set_from_brics_automaton`/`reg`. Pinned by
+  `wb_025_*` in `crates/wr-core/src/regex/tests.rs` (the tightened boundary at `65407`/`65408`
+  through both the private guard directly and through the public `set_from_brics_automaton` entry
+  point, plus a direct-call test confirming `convert_encoding_for_brics` itself still wraps the same
+  way). Not independently re-verified through `tests/differential/tests/java_bugfix_wb024_wb025.rs`
+  (driving a `65408`-track alphabet through `reg`'s own textual grammar is impractically slow/
+  parser-hostile at that scale — see that file's own module docs); instead independently confirmed
+  against the real fixed jar's own committed regression tests, added in the same fix commit
+  (`Automata/FA/BricsConverterTest.java`, `Main/Commands/RegTest.java`), re-run live in this
+  investigation (`./mvnw -q -Dtest=BricsConverterTest,RegTest test`, JDK 17) and passing.
+- **Upstream:** fixed, `walnut-java` commit `59eda64` on branch `bugfix/wb-024-025`, same commit as
+  WB-024. Tightened `validateOffsetEncodableAlphabetSize`'s bound to `65535 - 128 = 65407`, exactly
+  this entry's own suggested fix, while leaving `toDkBricsAutomaton`'s own (dead) call to the wider
+  `validateBricsAlphabetSize` at the full `65535` bound.
+- **Severity:** low-to-moderate (as filed) — same silently-wrong-answer/spurious-parse-error shape as
+  WB-024, but gated behind an alphabet size (`> 65408`) far outside any plausible hand-written Walnut
+  query. Now closed on both engines.
 
 ---
 

@@ -760,9 +760,13 @@ impl Automaton {
     /// contributes `encoder[i] * -1` rather than raising anything, so the result can be
     /// negative and is not a valid symbol at all.
     ///
-    /// This is the same verbatim-`indexOf` port `crate::regex`'s private
-    /// `encode_with_index_of` already carries for WB-024, at the second call site that
-    /// genuinely needs it: `AutomatonReader.readAutomaton`/`readTransducer` encode every
+    /// This is the same verbatim-`indexOf` shape as `crate::regex`'s private
+    /// `encode_with_index_of` (WB-024's own primitive, `docs/WALNUT-BUGS.md` — since
+    /// fixed at ITS one call site, `determine_encoded_regex`, by validating the digit
+    /// before encoding rather than by changing the encoder itself), at the one call site
+    /// here that genuinely needs the `-1` semantics preserved (WB-038, a separate,
+    /// still-open Walnut bug — not this one): `AutomatonReader.readAutomaton`/
+    /// `readTransducer` encode every
     /// transition line's digit tuple straight out of an untrusted `.txt` file
     /// (`AutomatonReader.java:71-72`, `:245-247`), and Java's reader has **no**
     /// out-of-alphabet check anywhere — verified by running `walnut-java` on a file whose

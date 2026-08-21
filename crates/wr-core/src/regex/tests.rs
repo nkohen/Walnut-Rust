@@ -296,16 +296,22 @@ fn a_numerical_interval_is_a_documented_scope_exclusion_not_a_silent_wrong_answe
 #[test]
 fn intervals_and_brace_counts_are_unreachable_through_the_reg_command() {
     // Both die in dk.brics' own parser, because `determineEncodedRegex` has already
-    // replaced every digit with a private-use character. Verified against the real
-    // `walnut-java` CLI (`reg r {0,1} "<1-5>"` / `reg r {0,1} "0{2,3}"`).
+    // replaced every digit with a private-use character. Originally verified against
+    // real (pre-WB-024-fix) `walnut-java` over `{0,1}`; widened to `{0,1,2,3,4,5}` here
+    // so every digit these two regexes mention (`1`/`5`, `0`/`2`/`3`) is genuinely in the
+    // declared alphabet -- otherwise WB-024's fix would reject them before dk.brics' own
+    // parser ever runs, which is a real (and separately pinned, see `wb_024_*` above)
+    // behavior but not what THIS test is about. Each digit still becomes exactly one
+    // replacement character regardless of alphabet size, so the expected message
+    // positions are unchanged from the original `{0,1}` capture.
     assert_eq!(
-        reg(vec![vec![0, 1]], "<1-5>")
+        reg(vec![vec![0, 1, 2, 3, 4, 5]], "<1-5>")
             .expect_err("must fail")
             .message(),
         "interval syntax error at position 5"
     );
     assert_eq!(
-        reg(vec![vec![0, 1]], "0{2,3}")
+        reg(vec![vec![0, 1, 2, 3, 4, 5]], "0{2,3}")
             .expect_err("must fail")
             .message(),
         "integer expected at position 3"
@@ -377,11 +383,22 @@ fn determine_encoded_regex_reports_an_i32_overflowing_vector_element_instead_of_
     // A bare (unbracketed) digit run is NOT this call site: `RE_FOR_AN_ALPHABET_VECTOR`
     // matches one bare digit at a time, so `8888888800` is ten separate one-element
     // vectors and nothing overflows -- only the bracketed form can carry a multi-digit
-    // element. Pinned so the two are not conflated.
-    assert!(determine_encoded_regex("8888888800", &[vec![0, 1]]).is_ok());
-    // Still no panic when the value merely does not exist in the alphabet -- that is
-    // WB-024's negative-encoding path, which is a different (ported-verbatim) quirk.
-    assert!(determine_encoded_regex("9", &[vec![0, 1]]).is_ok());
+    // element. Every one of those ten digits (8s and 0s) is in `{0,1}`'s... wait, `8` is
+    // NOT in `{0,1}` -- this now correctly rejects post-WB-024-fix rather than silently
+    // succeeding, pinning the two failure modes (`NumberFormat` vs `Walnut`) stay
+    // distinguishable rather than conflated.
+    let err2 = determine_encoded_regex("8888888800", &[vec![0, 1]])
+        .expect_err("8 is not in {0,1}, caught by the WB-024 guard, not the overflow path");
+    assert!(matches!(err2, RegexError::Walnut(_)));
+    // No panic when the value merely does not exist in the alphabet -- that is WB-024's
+    // fix (`docs/WALNUT-BUGS.md`): a clean, digit-naming error rather than the pre-fix
+    // silent negative-encoding path.
+    let err3 = determine_encoded_regex("9", &[vec![0, 1]]).expect_err("9 is not in {0,1}");
+    assert_eq!(
+        err3.message(),
+        "digit 9 in position 0 of a regular-expression vector is not in that input's \
+         alphabet: [0, 1]"
+    );
 }
 
 #[test]
@@ -422,56 +439,85 @@ fn determine_encoded_regex_leaves_non_digit_syntax_untouched() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wb_024_out_of_alphabet_digits_encode_to_negative_values_inside_the_reserved_range() {
-    // `docs/WALNUT-BUGS.md` WB-024, at the encoding layer: `9` is in neither track, so
-    // `RichAlphabet.encode`'s `List.indexOf` yields -1 for both.
-    // encoder = [1, 4]; 1*(-1) + 4*(-1) = -5; -5 + 128 = 123 = '{'.
+fn wb_024_out_of_alphabet_digits_are_now_cleanly_rejected() {
+    // `docs/WALNUT-BUGS.md` WB-024, fixed in `walnut-java` commit `59eda64`: `9` is in
+    // neither track, so this used to reach `RichAlphabet.encode`'s `List.indexOf` `-1`
+    // path (encoder = [1, 4]; 1*(-1) + 4*(-1) = -5; -5 + 128 = 123 = '{') and silently
+    // build a one-character-class regex instead of erroring. Now the digit is checked
+    // against its track's alphabet BEFORE encoding. Message verified live against the
+    // fixed real jar (see `tests/differential/tests/java_bugfix_wb024_wb025.rs`).
     let alphabet = vec![vec![0, 1, 2, 3], vec![0, 1]];
+    let err = determine_encoded_regex("[9,9]", &alphabet).expect_err("9 is in neither track");
     assert_eq!(
-        determine_encoded_regex("[9,9]", &alphabet).expect("encodes"),
-        vec!['{' as u16]
+        err.message(),
+        "digit 9 in position 0 of a regular-expression vector is not in that input's \
+         alphabet: [0, 1, 2, 3]"
     );
 }
 
 #[test]
-fn wb_024_the_same_two_vectors_in_the_other_order_are_a_parse_error() {
-    // The whole point of the bug: order-dependence, with no diagnostic connecting the
-    // failure to the out-of-alphabet digit that caused it. Both halves confirmed live
-    // against the real `walnut-java` CLI.
+fn wb_024_the_same_two_vectors_in_either_order_now_reject_identically() {
+    // WB-024's headline symptom was ORDER-dependence -- the same two vectors behaved
+    // completely differently depending on which one came first, with no diagnostic
+    // connecting the failure to the actual out-of-alphabet digit. The fix removes the
+    // order-dependence entirely: both orders now reject with the SAME message, naming the
+    // first out-of-alphabet digit encountered (position 0 in both vectors here). Both
+    // halves confirmed live against the real, fixed `walnut-java` CLI.
     let alphabet = vec![vec![0, 1, 2, 3], vec![0, 1]];
+    let expected = "digit 9 in position 0 of a regular-expression vector is not in that \
+                     input's alphabet: [0, 1, 2, 3]";
 
-    let ok = reg(alphabet.clone(), "[9,9][0,0]").expect("'{' first: parses");
-    assert_eq!(ok.automaton().fa.q, 1);
-    assert!(ok.automaton().fa.is_language_empty());
+    let err_first = reg(alphabet.clone(), "[9,9][0,0]").expect_err("9 not in track 0");
+    assert_eq!(err_first.message(), expected);
 
-    let err = reg(alphabet, "[0,0][9,9]").expect_err("'{' after an expression: throws");
-    assert_eq!(err.message(), "integer expected at position 3");
+    let err_second = reg(alphabet, "[0,0][9,9]").expect_err("9 not in track 0, second vector");
+    assert_eq!(err_second.message(), expected);
 }
 
 #[test]
-fn wb_024_every_negative_encoding_lands_inside_the_range_the_offset_exists_to_escape() {
-    // The `+128` offset is only sound for non-negative encodings; `List.indexOf`'s `-1`
-    // breaks that precondition, and the reserved range starts right below 128.
+fn wb_024_encode_with_index_of_still_produces_negative_encodings_directly() {
+    // WB-024's fix is at `determine_encoded_regex`'s caller boundary (guard added before
+    // `encode_with_index_of` runs), NOT inside `encode_with_index_of`/
+    // `convert_encoding_for_brics` themselves -- exactly like Java's fix, which changed
+    // `Reg.determineEncodedRegex` and left `RichAlphabet.encode` untouched (every other
+    // Java call site already passes an in-range index). So calling these lower-level
+    // functions directly, bypassing the new guard, still reproduces the underlying
+    // mechanism -- this is a property of the (unchanged) primitives, not an observable
+    // `reg` command outcome any more.
     for enc in [-1i32, -5, -119, -128] {
         assert!(
             convert_encoding_for_brics(enc) <= 127,
             "encoding {enc} must land inside dk.brics' reserved range"
         );
     }
-    // Second face of the same root cause: `determineEncodedRegex` strips `\s` AFTER
-    // substituting, so an encoding whose replacement character IS whitespace vanishes
-    // silently rather than producing any diagnostic at all.
     assert!(is_java_regex_space(convert_encoding_for_brics(-119)));
 }
 
 #[test]
-fn wb_024_a_bracketed_integer_outside_the_alphabet_silently_becomes_the_empty_language() {
-    // `[10]` reads as the one-element vector holding 10, which is in no track, so the
-    // whole regex collapses to a character outside the alphabet. Real Walnut agrees:
-    // `reg r {0,1} "[10]"` reports `Set from brics:1 states`.
-    let m = reg(vec![vec![0, 1]], "[10]").expect("builds");
-    assert_eq!(m.automaton().fa.q, 1);
-    assert!(m.automaton().fa.is_language_empty());
+fn wb_024_a_bracketed_integer_outside_the_alphabet_is_now_rejected() {
+    // `[10]` reads as the one-element vector holding 10, which is in no track -- before
+    // the fix this silently built a one-state, empty-language automaton (real
+    // pre-fix Walnut: `reg r {0,1} "[10]"` reported `Set from brics:1 states`); now it is
+    // rejected the same way any other out-of-alphabet digit is.
+    let err = reg(vec![vec![0, 1]], "[10]").expect_err("10 is not in {0,1}");
+    assert_eq!(
+        err.message(),
+        "digit 10 in position 0 of a regular-expression vector is not in that input's \
+         alphabet: [0, 1]"
+    );
+}
+
+#[test]
+fn wb_024_an_in_alphabet_vector_is_unaffected_by_the_new_guard() {
+    // Sanity check mirroring `walnut-java`'s own `RegTest.testInAlphabetVectorsStillEncodeNormally`
+    // (added by the same fix commit): a regex that never mentions an out-of-alphabet
+    // digit must still encode exactly as before.
+    // encoder = [1, 4]; [0,0] -> 1*0 + 4*0 = 0 -> 128; [1,1] -> 1*1 + 4*1 = 5 -> 133.
+    let alphabet = vec![vec![0, 1, 2, 3], vec![0, 1]];
+    assert_eq!(
+        determine_encoded_regex("[0,0][1,1]*", &alphabet).expect("all digits in range"),
+        vec![128, 133, '*' as u16]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -479,38 +525,60 @@ fn wb_024_a_bracketed_integer_outside_the_alphabet_silently_becomes_the_empty_la
 // ---------------------------------------------------------------------------
 
 #[test]
-fn wb_025_a_legitimate_large_alphabet_symbol_wraps_into_the_reserved_range() {
-    // `docs/WALNUT-BUGS.md` WB-025: unlike WB-024 (an out-of-alphabet digit producing a
-    // *negative* encoding), this is a validator-legal symbol index whose `+128` offset
-    // itself overflows `u16` (Java `char`) and wraps back into dk.brics' reserved
-    // `0..127` range. `alphabet_size == 65535` is the largest alphabet
-    // `validate_brics_alphabet_size` accepts (`MAX_BRICS_CHARACTER == (1 << 16) - 1`), so
-    // every symbol index up to 65534 is validator-legal.
-    assert!(validate_brics_alphabet_size(65535).is_ok());
+fn wb_025_the_tightened_guard_rejects_exactly_what_the_offset_cannot_encode() {
+    // `docs/WALNUT-BUGS.md` WB-025, fixed in `walnut-java` commit `59eda64`: unlike
+    // WB-024 (an out-of-alphabet digit producing a negative encoding), this is a
+    // validator-legal symbol index whose `+128` offset itself overflows `u16` (Java
+    // `char`). Before the fix, `validate_brics_alphabet_size`'s `65535` bound
+    // (`MAX_BRICS_CHARACTER == (1 << 16) - 1`, the full `char`/`u16` range) let every
+    // symbol index up to 65534 through, of which [65408, 65534] all wrapped into
+    // dk.brics' reserved range. The fix tightens the guard to
+    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == 65535 - 128 == 65407`, exactly the largest
+    // alphabet size whose every symbol index's `+128` offset still fits in `u16`.
+    //
+    // Boundary verified live against the fixed real jar (direct
+    // `BricsConverter.setFromBricsAutomaton` invocation, since driving this size through
+    // the full `reg` CLI's textual alphabet syntax is impractically slow/parser-hostile
+    // at this scale -- see `tests/differential/tests/java_bugfix_wb024_wb025.rs`'s module
+    // docs): `65408` throws `"size of input alphabet exceeds the limit of 65407"`.
+    assert!(validate_offset_encodable_alphabet_size(65407).is_ok());
+    let err = validate_offset_encodable_alphabet_size(65408).expect_err("one past the boundary");
+    assert_eq!(
+        err.message(),
+        "size of input alphabet exceeds the limit of 65407"
+    );
 
+    // The OLD bound (65535) is now correctly rejected too -- every symbol index in
+    // [65408, 65534] that used to wrap into the reserved range is unreachable through
+    // `set_from_brics_automaton` any more.
+    assert!(validate_offset_encodable_alphabet_size(65535).is_err());
+}
+
+#[test]
+fn wb_025_convert_encoding_for_brics_still_wraps_the_same_way_when_called_directly() {
+    // Exactly like WB-024's `encode_with_index_of` test above: the fix is in the GUARD
+    // (`validate_offset_encodable_alphabet_size`), not in `convert_encoding_for_brics`
+    // itself -- Java's fix didn't touch `convertEncodingForBrics` either. So the
+    // truncating-cast wraparound mechanism is unchanged; it's just no longer reachable
+    // through `set_from_brics_automaton` for a symbol index a validator-accepted
+    // alphabet size would ever assign.
     // 65408 + 128 == 65536, which truncates (`as u16`) to 0 -- collides with dk.brics'
     // reserved NUL.
     assert_eq!(convert_encoding_for_brics(65408), 0);
     // 65534 + 128 == 65662, which truncates to 126 -- collides with '~' (dk.brics'
-    // complement operator), and 65534 is the largest symbol index a 65535-sized alphabet
-    // ever assigns (indices run 0..alphabet_size).
+    // complement operator).
     assert_eq!(convert_encoding_for_brics(65534), '~' as u16);
-
-    // Every validator-legal symbol index in [65408, 65534] wraps into the reserved range
-    // -- this is the CURRENT (buggy-but-faithful) behavior, ported verbatim from
-    // `BricsConverter.convertEncodingForBrics`'s truncating `(char)` cast. A future
-    // deliberate fix (narrowing `MAX_BRICS_CHARACTER`, see WB-025's entry) should change
-    // this assertion visibly rather than silently.
     for x in 65408i32..=65534 {
         assert!(
             convert_encoding_for_brics(x) <= 127,
-            "symbol index {x} (alphabet_size 65535 is validator-legal) must wrap into \
-             dk.brics' reserved range"
+            "symbol index {x} must still wrap into dk.brics' reserved range when this \
+             function is called directly, bypassing the guard"
         );
     }
-
     // Symbols just below the wraparound boundary do NOT collide -- pins the boundary
-    // itself, not just "somewhere in this range".
+    // itself, not just "somewhere in this range". This is exactly
+    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE - 1`, i.e. the largest symbol index a
+    // `validate_offset_encodable_alphabet_size`-accepted alphabet ever assigns.
     assert!(convert_encoding_for_brics(65407) > 127);
 }
 
@@ -801,12 +869,33 @@ fn from_regex_over_alphabet_rejects_an_empty_or_out_of_range_alphabet() {
 
 #[test]
 fn set_from_brics_automaton_rejects_an_alphabet_wider_than_a_java_char() {
+    // Post-WB-025-fix: the limit named in the message is the tightened
+    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE` (65407), not the plain `char`/`u16` range
+    // (65535) -- this alphabet size exceeds both, so it was already rejected before the
+    // fix, but now with the tighter number in the message.
     assert_eq!(
         set_from_brics_automaton(65_536, &u16s("x"))
             .expect_err("must fail")
             .message(),
-        "size of input alphabet exceeds the limit of 65535"
+        "size of input alphabet exceeds the limit of 65407"
     );
+}
+
+/// WB-025's exact boundary (`docs/WALNUT-BUGS.md`), through the real public entry point
+/// `set_from_brics_automaton` rather than the private guard directly -- confirms the
+/// guard is actually wired up at the one call site that matters, not just present.
+/// `65408` verified live against the fixed real jar (direct `BricsConverter.
+/// setFromBricsAutomaton` invocation -- see
+/// `tests/differential/tests/java_bugfix_wb024_wb025.rs`); `65535` (the OLD, too-wide
+/// bound) is a size that used to be validator-legal and must now also be rejected.
+#[test]
+fn set_from_brics_automaton_rejects_an_alphabet_in_wb025s_former_danger_zone() {
+    let err = set_from_brics_automaton(65_408, &u16s("x")).expect_err("one past the boundary");
+    assert_eq!(
+        err.message(),
+        "size of input alphabet exceeds the limit of 65407"
+    );
+    assert!(set_from_brics_automaton(65_535, &u16s("x")).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -847,9 +936,9 @@ fn arb_alphabet_size() -> impl Strategy<Value = usize> {
 }
 
 /// As [`arb_regex_text`], but the digit leaves range over `0..alphabet_size` instead of
-/// being hardcoded to `{0,1}`. Digits outside the declared alphabet hit `reg`'s
-/// `RichAlphabet::encode` `-1`/WB-024 path instead of the property being tested here, so
-/// this generator only ever emits digits that are actually in the track's alphabet.
+/// being hardcoded to `{0,1}`. Digits outside the declared alphabet now hit WB-024's fix
+/// (a clean rejection, `RegexError::Walnut`) instead of the property being tested here,
+/// so this generator only ever emits digits that are actually in the track's alphabet.
 fn arb_regex_text_over_alphabet(depth: u32, alphabet_size: usize) -> impl Strategy<Value = String> {
     let digit = (0..alphabet_size as i32).prop_map(|d| d.to_string());
     let leaf = prop_oneof![

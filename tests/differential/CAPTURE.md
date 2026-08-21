@@ -60,8 +60,11 @@ the real oracle rather than a second hand-derivation.
 # Ground-truth capture: the `reg` corpus (`fixtures/reg/*.txt`)
 
 Phase 3a U8 (`wr_core::regex`, the hand-rolled Brics-dialect engine) is checked against
-60 real `reg` outputs by `tests/reg_brics_regex.rs`. Same one-time-capture discipline as
-above — no live JVM shellout from the test.
+57 real `reg` outputs by `tests/reg_brics_regex.rs` (60 captured originally; `r19`/`r50`/
+`r58` removed 2026-08-20 once WB-024's fix landed, since none of the three still builds an
+automaton — see that file's own module docs, and the `java_bugfix_wb024_wb025.rs` entry
+below for where their coverage moved to, not just disappeared). Same one-time-capture
+discipline as above — no live JVM shellout from the test.
 
 ## How they were captured (reproducible)
 
@@ -498,3 +501,67 @@ opposite-direction-complement-plus-reverse fallback, which is exactly what
 
 The command file and session directory were deleted from the `walnut-java` checkout
 afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb024_wb025.rs` (no `fixtures/` files — all inline)
+
+Captured 2026-08-20 for `tests/java_bugfix_wb024_wb025.rs`, verifying `wr_core::regex`'s
+port of WB-024's and WB-025's real upstream fix (`walnut-java` commit `59eda64`, branch
+`bugfix/wb-024-025`) — **not mainline**, per this project's now-standard practice for
+these follow-up units (see the `java_bugfix_wb002.rs`/`java_bugfix_wb010.rs` entries in
+this project's own git history for the same discipline). This is also where the coverage
+that used to live in `fixtures/reg/r19.txt`/`r50.txt`/`r58.txt` moved to, once WB-024's
+fix meant none of those three `(alphabets, regex)` pairs builds an automaton any more (see
+the `reg` corpus entry above, and `tests/java_bugfix_wb024_wb025.rs`'s own module docs for
+the full reasoning on why removal-plus-inline-replacement, not an updated fixture file,
+was the right move here).
+
+Built in an isolated worktree, per this project's standing shared-checkout-safety rule:
+
+```bash
+git -C ~/dev/walnut-java worktree add /tmp/walnut-java-wb024025-resume bugfix/wb-024-025
+cd /tmp/walnut-java-wb024025-resume
+# (jar already built: target/Walnut-all.jar)
+cat > "Command Files/resume_capture.txt" <<'CMD'
+reg r19new {0,1} "2*";
+reg r50new {0,1,2,3} {0,1} "[9,9][0,0]";
+reg r50rev {0,1,2,3} {0,1} "[0,0][9,9]";
+reg r58new {0,1} "[10]";
+CMD
+/opt/homebrew/opt/openjdk@17/bin/java -cp target/Walnut-all.jar Main.Prover \
+    resume_capture.txt >stdout.txt 2>stderr.txt
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb024025-resume --force
+```
+
+`stderr.txt` was empty. `stdout.txt` (up to the REPL banner that follows the command
+file):
+
+```
+reg r19new {0,1} "2*";
+digit 2 in position 0 of a regular-expression vector is not in that input's alphabet: [0, 1]
+reg r50new {0,1,2,3} {0,1} "[9,9][0,0]";
+digit 9 in position 0 of a regular-expression vector is not in that input's alphabet: [0, 1, 2, 3]
+reg r50rev {0,1,2,3} {0,1} "[0,0][9,9]";
+digit 9 in position 0 of a regular-expression vector is not in that input's alphabet: [0, 1, 2, 3]
+reg r58new {0,1} "[10]";
+digit 10 in position 0 of a regular-expression vector is not in that input's alphabet: [0, 1]
+```
+
+None of `r19new.txt`/`r50new.txt`/`r50rev.txt`/`r58new.txt` were written to
+`Automata Library/` — each command errors out before writing anything, so there is
+nothing to copy into `fixtures/`. The test asserts this captured text verbatim through
+`wr_cli::prover::Prover::read_buffer`, the same dispatch path the `reg` CLI command
+actually uses (per `java_bugfix_wb010.rs`'s own established practice), not just through
+`wr_core::regex::determine_encoded_regex` directly.
+
+WB-025's boundary (`validateOffsetEncodableAlphabetSize`'s tightened `65407` limit) was
+**not** re-captured through this recipe — driving a 65408-track (or -symbol) alphabet
+declaration through `reg`'s own textual grammar is impractically slow/parser-hostile at
+that scale. It is instead independently verified by the fixed jar's own committed
+regression tests, added in the same fix commit: `./mvnw -q -Dtest=BricsConverterTest,RegTest
+test` (run live in this investigation, JDK 17, from the same isolated worktree) passed
+cleanly, pinning the exact `65407`/`65408` boundary and message text this port's own
+`wb_025_*` tests in `crates/wr-core/src/regex/tests.rs` assert.
+
+The command file and worktree were removed afterward, matching every recipe above.

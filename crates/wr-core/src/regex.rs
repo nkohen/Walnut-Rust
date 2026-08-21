@@ -99,13 +99,19 @@
 //! case produced byte-identical output — so it is a reproducibility hazard on paper
 //! only, not a live nondeterminism bug worth a `docs/WALNUT-BUGS.md` entry.)
 //!
-//! # `docs/WALNUT-BUGS.md` WB-024
+//! # `docs/WALNUT-BUGS.md` WB-024 and WB-025 — both fixed (`bugfix/wb-024-025`)
 //!
-//! [`determine_encoded_regex`] ports `Main/Commands/Reg.determineEncodedRegex`
-//! verbatim, **including** its collision between `RichAlphabet.encode`'s
-//! `List.indexOf` returning `-1` for a digit outside the declared alphabet and
-//! `BricsConverter.convertEncodingForBrics`'s `+128` offset. See that function's own
-//! docs and WB-024 for the full reproduction.
+//! Both bugs are the same underlying mechanism: a symbol index that should be
+//! non-negative and below `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE` reaching
+//! [`convert_encoding_for_brics`]'s `+128`-then-truncate-to-`u16` cast anyway, landing
+//! back inside dk.brics' reserved `0..127` character range instead of above it.
+//! [`determine_encoded_regex`] now validates every digit against its track's declared
+//! alphabet before it can ever produce a negative encoding (WB-024's fix — see that
+//! function's own docs), and [`set_from_brics_automaton`] now rejects an alphabet size
+//! that the `+128` offset itself cannot safely encode, `65535 - 128 = 65407`, tighter
+//! than the plain `u16`-range check any non-offset caller could use (WB-025's fix — see
+//! that function's own docs). Both mirror `walnut-java` commit `59eda64` exactly,
+//! including message text.
 //!
 //! # Character width
 //!
@@ -1161,12 +1167,30 @@ pub fn convert_encoding_for_brics(vector_encoding: i32) -> u16 {
     vector_encoding.wrapping_add(128) as u16
 }
 
-/// `BricsConverter.validateBricsAlphabetSize` (`:151-156`).
-fn validate_brics_alphabet_size(alphabet_size: usize) -> Result<(), RegexError> {
-    const MAX_BRICS_CHARACTER: usize = (1 << 16) - 1;
-    if alphabet_size > MAX_BRICS_CHARACTER {
+/// `BricsConverter.validateOffsetEncodableAlphabetSize` (`:169-174`) — the WB-025 fix
+/// (`walnut-java` commit `59eda64`, `docs/WALNUT-BUGS.md`).
+///
+/// Before the fix, this guard was `validateBricsAlphabetSize`'s plain `alphabetSize >
+/// MAX_BRICS_CHARACTER` check (`MAX_BRICS_CHARACTER == (1 << 16) - 1 == 65535`, the full
+/// `char`/`u16` range) — sound for a caller that puts a symbol index straight into a
+/// `char` with no further arithmetic, but [`set_from_brics_automaton`]'s only caller does
+/// something different: it feeds every symbol index through
+/// [`convert_encoding_for_brics`]'s `+128` offset first. For `x >= 65408`, `128 + x >=
+/// 65536` overflows `u16`/`char` and the truncating cast wraps back into dk.brics' own
+/// reserved `0..127` range — the very range `+128` exists to escape — even though `x` is
+/// a perfectly legitimate, validator-accepted symbol index, not a user mistake (contrast
+/// WB-024, where the digit itself is out of alphabet). Java has a second, narrower guard
+/// (`validateBricsAlphabetSize` alone, at the original `65535` bound) for
+/// `toDkBricsAutomaton`, which does NOT add the offset and so is safe up to the full
+/// range -- but `toDkBricsAutomaton` itself has no callers anywhere in `walnut-java`
+/// (confirmed by inspection: dead code even in Java), so this port never had a matching
+/// function to give the wider bound to in the first place, and needs only the one,
+/// tightened, guard below.
+fn validate_offset_encodable_alphabet_size(alphabet_size: usize) -> Result<(), RegexError> {
+    const MAX_OFFSET_ENCODABLE_ALPHABET_SIZE: usize = (1 << 16) - 1 - 128;
+    if alphabet_size > MAX_OFFSET_ENCODABLE_ALPHABET_SIZE {
         return Err(RegexError::Walnut(format!(
-            "size of input alphabet exceeds the limit of {MAX_BRICS_CHARACTER}"
+            "size of input alphabet exceeds the limit of {MAX_OFFSET_ENCODABLE_ALPHABET_SIZE}"
         )));
     }
     Ok(())
@@ -1246,11 +1270,15 @@ pub fn convert_from_brics(alphabet: &[i32], regular_expression: &str) -> Result<
 /// deterministic — and equally unreachable here, where [`regex_to_fa`] ends in
 /// [`crate::minimize::minimize`]. Kept as a debug assertion rather than a live throw so
 /// the (dead) branch is not silently dropped.
+///
+/// The size guard is [`validate_offset_encodable_alphabet_size`] (WB-025's fix, that
+/// function's own docs), not the wider `65535` bound — this is the offset-encoding path
+/// the tighter guard exists for.
 pub fn set_from_brics_automaton(
     alphabet_size: usize,
     regular_expression: &[u16],
 ) -> Result<Fa, RegexError> {
-    validate_brics_alphabet_size(alphabet_size)?;
+    validate_offset_encodable_alphabet_size(alphabet_size)?;
 
     let mut internal: Vec<u16> = Vec::with_capacity(alphabet_size);
     let mut symbol_of: BTreeMap<u16, i32> = BTreeMap::new();
@@ -1294,17 +1322,22 @@ fn determine_encoder(alphabet: &[Vec<i32>]) -> Vec<i32> {
 /// i.e. a digit that is not in its track's alphabet contributes `encoder[i] * -1`
 /// instead of raising anything.
 ///
-/// # `docs/WALNUT-BUGS.md` WB-024 — ported verbatim, deliberately not fixed
+/// # `docs/WALNUT-BUGS.md` WB-024 — fixed at the caller, not here
 ///
-/// This is the first half of WB-024. `Reg.determineEncodedRegex` feeds the result
-/// straight into [`convert_encoding_for_brics`], whose `+128` offset exists precisely to
-/// lift every encoding above dk.brics' reserved ASCII range — an invariant that only
-/// holds for **non-negative** encodings. An out-of-alphabet digit produces a negative
-/// encoding, which lands back *inside* the reserved range and is then parsed as regex
-/// syntax. `reg foo {0,1,2,3} {0,1} "[9,9][0,0]"` and `reg foo {0,1,2,3} {0,1}
-/// "[0,0][9,9]"` therefore behave completely differently — the first silently yields the
-/// empty language, the second throws `integer expected at position 3`, purely from the
-/// order the two vectors appear in.
+/// This is the mechanism WB-024 described: fed a negative index, this function still
+/// produces a negative encoding, which [`convert_encoding_for_brics`]'s `+128` offset
+/// (sound only for **non-negative** encodings) then lands back *inside* dk.brics'
+/// reserved ASCII range, to be parsed as regex syntax instead of raising anything.
+///
+/// `walnut-java` commit `59eda64` (`docs/WALNUT-BUGS.md` WB-024) fixed this not by
+/// changing `RichAlphabet.encode` itself (every other call site passes an already
+/// in-range index, e.g. `Automaton::encode`'s own separate, panicking encoder — see this
+/// function's own doc comment on why it exists at all), but by validating each digit
+/// against its track's alphabet in the ONE caller that can feed it unchecked user input,
+/// `Reg.determineEncodedRegex` — [`determine_encoded_regex`]'s own doc comment carries
+/// that guard. So this function's `-1` branch is now provably unreachable through its
+/// only Rust call site (the guard runs first), but is kept exactly as Java kept
+/// `RichAlphabet.encode` itself: unchanged, because it is not where the bug lived.
 fn encode_with_index_of(digits: &[i32], alphabet: &[Vec<i32>], encoder: &[i32]) -> i32 {
     let mut encoding: i32 = 0;
     for (i, &d) in digits.iter().enumerate() {
@@ -1322,6 +1355,24 @@ fn encode_with_index_of(digits: &[i32], alphabet: &[Vec<i32>], encoder: &[i32]) 
     encoding
 }
 
+/// Java's `AbstractCollection.toString()` shape (`[a, b, c]`), used to render a track's
+/// alphabet inside the WB-024 digit-not-in-alphabet message exactly as
+/// `WalnutException.digitNotInAlphabet`'s `"…" + alphabet` string concatenation does for
+/// a `List<Integer>`. Same convention as `crate::ostrowski`'s private `format_int_list`
+/// (no shared helper exists in `crate::util` for this exact format — see that module for
+/// the closest near-misses).
+fn format_java_int_list(list: &[i32]) -> String {
+    let mut s = String::from("[");
+    for (i, v) in list.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&v.to_string());
+    }
+    s.push(']');
+    s
+}
+
 /// `Reg.determineEncodedRegex` (`Reg.java:42-76`): rewrite every alphabet vector
 /// (`[a,b,…]`) and every bare digit in the user's regex into the single private-use
 /// character that stands for its encoded input vector, then strip all whitespace.
@@ -1331,16 +1382,33 @@ fn encode_with_index_of(digits: &[i32], alphabet: &[Vec<i32>], encoder: &[i32]) 
 /// `<n-m>`/`{n,m}` are unreachable through the `reg` command (their digits get rewritten
 /// before the parser ever runs; see the module docs).
 ///
-/// Ported verbatim including WB-024 (see [`encode_with_index_of`]) and including the
-/// ordering quirk in the last step: whitespace is stripped **after** substitution, so a
-/// replacement character that happens to be a whitespace code unit (reachable only via
-/// WB-024's negative encodings — e.g. an encoding of `-119` yields a literal TAB) is
-/// deleted along with the user's own spaces.
+/// Includes the WB-024 fix (`walnut-java` commit `59eda64`, `docs/WALNUT-BUGS.md`):
+/// every digit of a parsed vector is checked against its own track's declared alphabet
+/// BEFORE [`encode_with_index_of`] can ever see it, raising [`RegexError::Walnut`] naming
+/// the offending digit, its position, and the alphabet — matching `Reg.java:63-68`
+/// exactly, including its message text (`WalnutException.digitNotInAlphabet`). Before
+/// this fix, an out-of-alphabet digit reached [`encode_with_index_of`]'s `-1` path,
+/// producing a negative encoding that landed back inside dk.brics' reserved character
+/// range and was parsed as regex syntax instead: `reg foo {0,1,2,3} {0,1} "[9,9][0,0]"`
+/// used to silently yield the empty language, and the same two vectors in the other
+/// order, `reg foo {0,1,2,3} {0,1} "[0,0][9,9]"`, used to throw an opaque `integer
+/// expected at position 3` from deep inside the Brics parser — both now cleanly reject
+/// with the same digit-naming message (verified live against the fixed real jar,
+/// `tests/differential/tests/java_bugfix_wb024_wb025.rs`).
+///
+/// The ordering quirk in the last step is otherwise unchanged: whitespace is stripped
+/// **after** substitution, so a replacement character that happens to be a whitespace
+/// code unit is deleted along with the user's own spaces. That quirk's own WB-024
+/// negative-encoding trigger (e.g. an encoding of `-119` yielding a literal TAB) is now
+/// unreachable through this function (the new guard rejects the digit first), so it
+/// survives only as dead-but-documented behavior of [`is_java_regex_space`]/
+/// [`convert_encoding_for_brics`] themselves, not as an observable `reg` outcome.
 ///
 /// # Errors
 ///
 /// [`RegexError::Walnut`] if a bracketed vector's arity does not match the number of
-/// declared tracks (`Reg.java:60-62`); [`RegexError::NumberFormat`] if one of that
+/// declared tracks (`Reg.java:60-62`), or if a digit is not in its track's alphabet
+/// (WB-024's fix, `Reg.java:63-68`, above); [`RegexError::NumberFormat`] if one of that
 /// vector's elements overflows `i32` (see [`parse_set_elements`]).
 pub fn determine_encoded_regex(
     baseexp: &str,
@@ -1369,6 +1437,19 @@ pub fn determine_encoded_regex(
                 "Mismatch between vector length in regex and specified number of inputs to automaton"
                     .to_string(),
             ));
+        }
+        // `Reg.java:63-68` (WB-024 fix, `walnut-java` commit `59eda64`): every digit must
+        // actually be in its track's alphabet, checked BEFORE `encode_with_index_of` can
+        // ever see it -- see that function's own docs for why a digit that fails this
+        // check used to reach `convert_encoding_for_brics` as a negative encoding instead.
+        for (track_index, &digit) in l.iter().enumerate() {
+            if !alphabet[track_index].contains(&digit) {
+                return Err(RegexError::Walnut(format!(
+                    "digit {digit} in position {track_index} of a regular-expression vector \
+                     is not in that input's alphabet: {}",
+                    format_java_int_list(&alphabet[track_index])
+                )));
+            }
         }
         out.push(convert_encoding_for_brics(encode_with_index_of(
             &l, alphabet, &encoder,
