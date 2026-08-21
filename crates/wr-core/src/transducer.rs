@@ -178,8 +178,9 @@
 //! author got from a 400-case randomized differential (46 of which hit the discriminating
 //! condition, `min(M.O) - 1` already being a letter of the transducer's alphabet).
 //!
-//! The upstream commit attributes that to luck. It is not: the two agree *by construction*
-//! in this call shape. `encode_input(v)` is `A[0].indexOf(v)`, so the entry the minimal
+//! The upstream commit message doesn't attribute this to luck or to anything else — it just
+//! reports the 400-case agreement and moves on. This port went further: the two agree *by
+//! construction* in this call shape. `encode_input(v)` is `A[0].indexOf(v)`, so the entry the minimal
 //! variant overwrites is the entry of the letter `min(M.O) - 1` **itself** — and the only
 //! keys anything ever reads back out of `t_new` are `encode_input(o)` for outputs `o` of
 //! `M_new`, i.e. `M`'s own outputs (all strictly greater) plus the dead state's. So the
@@ -190,9 +191,12 @@
 //! The freshness is still ported, and still worth having: it is what upstream does (the
 //! mechanical-port rule), and it converts "no real letter is clobbered" from a two-step
 //! argument about `add_distinguished_dead_state`'s choice of output into a local
-//! invariant of this one method. It is pinned directly, by
-//! `wb035_the_dead_letter_is_outside_the_transducers_input_alphabet`, rather than left as
-//! untested defence — which is the right shape for a guarantee that no end-to-end answer
+//! invariant of this one method. It is pinned directly AT THE HELPER LEVEL, by
+//! `wb035_the_dead_letter_is_outside_the_transducers_input_alphabet` (which asserts the
+//! helper's return value, not that the construction routes through it — swapping in the
+//! minimal encode-only variant leaves that test, and every other test in this module,
+//! green), rather than left as untested defence — which is the right shape for a guarantee
+//! that no end-to-end answer
 //! can currently distinguish.
 //!
 //! # WB-034: a track with no number system NPEs before the transduction even starts
@@ -1994,11 +1998,13 @@ mod tests {
     /// A **partial transducer**: `{0, 1}` declared, but state `1` has no transition on
     /// letter `1`. Nothing about the file is malformed — `read_transducer_txt` accepts
     /// it, and `transduce_non_deterministic`'s only compatibility guard checks the
-    /// transducer's state `0` (WB-035), which is total here. So `create_map` reaches the
-    /// hole in state `1` and Java NPEs at `Transducer.java:400`; this port returns the
-    /// same [`TransduceError::NoTransducerTransition`] rather than panicking. This is the
-    /// shape U26's `transduce` command makes reachable from an ordinary user-supplied
-    /// `.txt` — see `wr_cli::transduce`'s end-to-end twin of this test.
+    /// transducer's state `0` — a ported-verbatim quirk, unrelated to WB-035's fix —
+    /// which is total here. So `create_map` reaches the hole in state `1` and Java NPEs
+    /// at `Transducer.java:480` (`:400` pre-fix); this port returns the same
+    /// [`TransduceError::NoTransducerTransition`] rather than panicking. This is the ONE
+    /// input shape that still reaches this error now that WB-035's shifted-alphabet
+    /// dead-state trigger is fixed — see `wr_cli::transduce`'s end-to-end twin of this
+    /// test.
     #[test]
     fn a_partial_transducer_is_a_clean_error_not_a_panic() {
         let mut logging = Logging::new();

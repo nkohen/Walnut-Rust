@@ -1741,12 +1741,23 @@ bug costs a silent wrong answer somewhere downstream.
   invalidating any index-keyed dead set — a distinct OUTPUT value is what survives minimization.
   The mechanism was sound; only its choice of value was wrong.
 
+  **A shared edge, faithfully ported, not a divergence:** both new `min - 1` computations (the
+  dead letter and the marker) wrap at `i32::MIN` on a hand-authored file whose alphabet or `sigma`
+  already contains `-2147483648` — if `i32::MAX` also happens to be present, the freshness
+  guarantee this fix exists to provide breaks. Java's `int` arithmetic wraps identically, so the
+  Rust port's **release** build matches; a **debug** build panics (`attempt to subtract with
+  overflow`) where Java silently continues, the same pre-existing class of divergence
+  `add_distinguished_dead_state`'s own `min - 1` already has. Not fixed here (out of scope for a
+  faithful port of upstream's own fix), just recorded.
+
   **One thing measured rather than inherited: the freshness half is not observable here.**
   Replacing the relabel-and-append with the minimal "just encode `min(M.O) - 1`" variant leaves
   every test in `wr-core` green, including the Tier-4 property at 20,000 cases — the same negative
-  result upstream got from its own 400-case randomized differential. Upstream attributes that to
-  the sweep not hitting the discriminating condition; on this port's call shape the two agree *by
-  construction*, and `crates/wr-core/src/transducer.rs`'s module docs carry the argument (the entry
+  result upstream got from its own 400-case randomized differential (46 of the 400 cases hit the
+  discriminating condition, `min(M.O) - 1` already being a letter of the transducer's alphabet;
+  upstream's commit message reports the byte-for-byte agreement without attributing it to anything).
+  On this port's call shape the two agree *by construction*, and
+  `crates/wr-core/src/transducer.rs`'s module docs carry the argument (the entry
   the minimal variant overwrites is the entry of the letter `min(M.O) - 1` itself, which is exactly
   the entry the dead state was going to consult, and nothing else ever reads a key that is not
   `encode_input` of an output of `M`). The freshness is ported anyway — it is what upstream does,
