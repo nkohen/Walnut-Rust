@@ -675,12 +675,16 @@ bug costs a silent wrong answer somewhere downstream.
   walnut-rs's own CLI (see the "not yet wired" correction above) — this WAS live user impact in this
   port, contrary to this entry's original framing.
 - **Resolved (2026-08-21):** upstream fixed as described above (commit `c75e630`; verified live).
-  **Rust port: fixed, matches walnut-java as of commit `c75e630`.** No functional change: this port
-  already computed/reported a clean, recoverable `Result::Err`, never the raw Java crash. The only
-  change is the message TEXT (Java's fixed `WalnutException.noNumberSystem(subject)` wording,
-  verbatim) plus a new `token_name` field on `ExprError::RepeatedIdentifierMissingNumberSystem` to
-  carry the `subject` string's `Word`/`Function`-name half (threaded from `Word::act`/`Function::act`
-  through `VariableExpression::act`'s new `token_name: &str` parameter) — and moving this variant's
+  **Rust port: fixed for the case WB-013 is actually about — a `{...}`-declared track — and matching
+  walnut-java there as of commit `c75e630`.** Deliberately NOT claimed for every input that reaches
+  this code path: see the "still-open port gap" bullet immediately below, which is a separate,
+  pre-existing defect this fix had to be scoped away from. For the `{...}`-declared-track case
+  itself there is no functional change: this port already computed/reported a clean, recoverable
+  `Result::Err`, never the raw Java crash. The only change is the message TEXT (Java's fixed
+  `WalnutException.noNumberSystem(subject)` wording, verbatim) plus a new `token_name` field on
+  `ExprError::RepeatedIdentifierMissingNumberSystem` to carry the `subject` string's
+  `Word`/`Function`-name half (threaded from `Word::act`/`Function::act` through
+  `VariableExpression::act`'s new `token_name: &str` parameter) — and moving this variant's
   `ActError::is_handled()` classification (in `wr_logic::eval`) from its own `false` arm ("a real,
   UNCAUGHT `NullPointerException`") to `true` (a genuine `WalnutException`), the same shape WB-037's
   own fix took for `JoinError::NoAutomataSpecified`. The renamed test
@@ -693,6 +697,39 @@ bug costs a silent wrong answer somewhere downstream.
   the fixed stdout text (including `EvalDef.compute`'s own double-print/`": char at N"` wrapping,
   generic to any `act()` failure) and an empty stderr — the same shape `java_bugfix_wb037.rs`
   established for catching a stale `is_handled()` classification, not just a stale message string.
+- **A still-open PORT gap on the same code path (not a Walnut bug, not fixed here):** a repeated
+  variable indexing a **custom-base** track (`msd_fib`, …) also reaches
+  `VariableExpression::act`'s repeated-identifier branch in this port, and real Walnut *succeeds*
+  on exactly those inputs — a custom base has a real, cached `NumberSystem`, so Java's
+  `getNS().get(i)` is non-`null` and the query computes an answer. Verified live against
+  `walnut-java` `c75e630` (2026-08-21): a two-track `msd_fib msd_fib` word automaton `FIB2`,
+  queried as `eval fibout2 "FIB2[i][i] = @1";`, makes Java write a 2-state `msd_fib` automaton,
+  while this port fails. The cause is `wr_logic::token::track_number_system`, which has only an
+  `&Automaton` and so cannot build a custom base's `NumberSystem` (that needs the `Custom Bases/`
+  files, reachable only through a `Session`-backed resolver in `wr-cli`) — the base's NAME is
+  retained (`Automaton::ns_name`), the construction capability is what is missing.
+  - **This gap PREDATES the fix above and is unchanged by it; what changed is that it no longer
+    hides inside it.** Found by adversarial review of the fix's own diff: before the fix, both
+    causes produced one error whose message named a `NullPointerException` and which was
+    classified `is_handled() == false` (stderr) — so the custom-base case at least *looked* like an
+    internal port problem. The fix (correctly, for WB-013's real case) replaced that with Java's
+    clean fixed wording and `is_handled() == true`, and — because `track_number_system` returned a
+    single undifferentiated `None` for both causes — the custom-base case inherited both. That made
+    a known port gap print, on stdout, a believable "this is expected Walnut behavior" message
+    asserting the track's "alphabet was declared explicitly, e.g. `{0,1}`", which is factually
+    false for an `msd_fib` track.
+  - **Handled by separating the two causes, not by fixing the gap** (fixing it is a real unit of
+    work: thread `PredicateEnv`'s custom-base resolver down to `track_number_system`).
+    `track_number_system` now returns a three-way `OwnedTrackNs`/`TrackNs`
+    (`Present`/`DeclaredAlphabet`/`NumberSystemUnrecoverable`) instead of an `Option`, and the
+    custom-base arm reports its own `ExprError::RepeatedIdentifierNumberSystemUnrecoverable`:
+    self-identifying text ("walnut-rs port limitation (real Walnut computes this successfully): …"),
+    `is_handled() == false`, and a deliberately non-Java `kind()` of `walnut-rs.PortLimitation`.
+    Pinned by `token.rs`'s `track_number_system_separates_javas_null_track_from_this_ports_custom_base_gap`
+    and `word_act_on_a_repeated_custom_base_index_reports_the_port_gap_not_wb013` (which also
+    asserts the classification, not just the string) plus `expr.rs`'s
+    `variable_expression_act_repeated_occurrence_with_an_unrecoverable_ns_is_a_port_gap`; all three
+    mutation-verified.
 
 ---
 
@@ -1965,17 +2002,39 @@ bug costs a silent wrong answer somewhere downstream.
   already computed/reported a clean, recoverable `Result::Err`, never the raw Java crash. The only
   change is the message TEXT (Java's fixed `WalnutException.noNumberSystem(subject)` wording,
   verbatim) — `wb034_a_track_with_no_number_system_is_rejected` now pins the fixed text instead of
-  the old NPE text. `ProverError::Transduce(_) => true` (`wr_cli::prover`) already unconditionally
-  classified every `TransduceError` (including this one) as a handled `WalnutException`, a
-  pre-existing coarse bucket that does not distinguish this variant from WB-035's own two
-  still-genuinely-NPE-mimicking variants (`NoTransducerTransition`/`NoTransducerOutput`, upstream
-  not yet fixed) — so unlike WB-013's/WB-033's sibling fixes, no `is_handled()` code change was
-  needed here specifically; this fix is message-text-only. Differential coverage against a live
+  the old NPE text. `ProverError::Transduce(_) => true` (`wr_cli::prover`) already classified this
+  variant as a handled `WalnutException`, and that stayed correct once Java's own exception became
+  real — so unlike WB-013's/WB-033's sibling fixes, no `is_handled()` change was needed **for this
+  variant**; the WB-034 fix itself is message-text-only. Differential coverage against a live
   capture from the fixed branch: `tests/differential/tests/java_bugfix_wb034.rs`'s
   `wb034_transduce_on_a_track_with_no_number_system_matches_fixed_java`, which drives the real
   `transduce` command end-to-end through `wr_cli::prover::Prover::read_buffer` and asserts both the
-  fixed stdout text and an empty stderr (confirming the pre-existing coarse classification is still
-  correct for this variant, not just that the message string changed).
+  fixed stdout text and an empty stderr (confirming the classification is right for this variant,
+  not just that the message string changed).
+- **A neighbouring misclassification the same bucket was hiding, found and FIXED (2026-08-21):** the
+  `ProverError::Transduce(_) => true` arm above was a single *unconditional* bucket over every
+  `TransduceError`, and two of the others do NOT belong in it — `NoTransducerTransition` and
+  `NoTransducerOutput`, which port `Transducer.createMap`'s `getNfaStateDests(...).getInt(0)` NPE
+  and the `sigma.get(s).get(encoded)` `Integer`-unboxing NPE one line earlier. Those are genuine,
+  **still-unfixed** raw `NullPointerException`s in Java. They are **not part of WB-035**, and an
+  earlier draft of this bullet wrongly called them "WB-035's own … upstream not yet fixed": WB-035
+  *is* fixed upstream (`walnut-java` commit `7f54eff`), and its fix neither touched nor was about
+  these two — WB-035 removed one of `NoTransducerTransition`'s two former triggers (the
+  shifted-alphabet dead-state path) and left the `createMap`/`sigma` hole itself untouched, as
+  `wr_core::transducer::TransduceError::NoTransducerTransition`'s own doc already recorded.
+  Reproduced live (2026-08-21) with a partial `Transducer Library/*.txt` — state `0` total, so it
+  clears `transduceNonDeterministic`'s state-0-only compatibility guard, state `1` missing a letter
+  — against a Thue-Morse-shaped `msd_2` word automaton: real Java prints
+  `java.lang.NullPointerException: Cannot invoke "it.unimi.dsi.fastutil.ints.IntList.getInt(int)"
+  … / at Automata.Transducer.createMap(Transducer.java:481)` on **stderr** with nothing on stdout,
+  while this port printed the bare message on **stdout** with an empty stderr. Fixed by narrowing
+  the bucket (`!matches!(…)` on those two variants) and adding the matching
+  `kind() == "java.lang.NullPointerException"` arm; the port's stderr line now matches Java's
+  except for the JVM `at …` frame, which this port has no analogue for by design
+  (`wr_core::logging`'s documented fidelity limit). Pinned by `prover.rs`'s
+  `u24_command_errors_classify_by_walnutexception_vs_jdk_exception`, which also asserts the four
+  *other* `TransduceError` variants (including WB-034's own `NoNumberSystem`) stay `handled` —
+  a narrowed bucket, not an inverted one. Mutation-verified.
 
 ---
 

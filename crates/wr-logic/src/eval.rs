@@ -236,13 +236,24 @@
 //! every [`ActError`] variant corresponds to a real, deliberately-thrown
 //! `WalnutException` and is `handled` (message-only console/log line, no stack frames).
 //!
-//! As of this writing every [`ActError`] variant this crate can currently construct is
-//! `handled` — there is no live entry in this list. Both of the two variants that used to
-//! be documented exceptions here are Walnut (Java) bugs, both since fixed upstream, so
-//! both moved from `is_handled() == false` (the closest honest `kind()` text, an empty
-//! `stack_trace_lines()` — this port has no JVM frames to report; see `wr_core::logging`'s
-//! own module docs on why frame text has no Rust analogue and is a documented, not
-//! silent, fidelity limit) to `true`:
+//! Exactly ONE live `is_handled() == false` entry remains, and it is not a Java exception
+//! at all:
+//!
+//! * [`crate::expr::ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] — **this
+//!   port's own, still-open limitation**, with no Walnut counterpart: a repeated variable
+//!   indexing a CUSTOM-base track (`msd_fib`, …), where Java holds a real cached
+//!   `NumberSystem` and computes an answer but `wr-core`'s `Automaton` does not retain the
+//!   base's name for this port to rebuild one from. Classified `false` deliberately, with
+//!   a deliberately non-Java `kind()` (`"walnut-rs.PortLimitation"`), so the gap prints on
+//!   stderr and cannot be mistaken for legitimate Walnut output — see
+//!   `crate::token`'s `track_number_system` for the full account of the defect that
+//!   motivated splitting it out of WB-013's variant.
+//!
+//! The two variants that used to be the documented exceptions here are Walnut (Java) bugs,
+//! both since fixed upstream, so both moved from `is_handled() == false` (the closest
+//! honest `kind()` text, an empty `stack_trace_lines()` — this port has no JVM frames to
+//! report; see `wr_core::logging`'s own module docs on why frame text has no Rust analogue
+//! and is a documented, not silent, fidelity limit) to `true`:
 //!
 //! * [`crate::expr::ExprError::RepeatedIdentifierMissingNumberSystem`] — WB-013. Fixed
 //!   upstream, `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`):
@@ -259,10 +270,10 @@
 //!   `aa4a241`: `infinite()` no longer errors on any input, so this port's `ActError` has
 //!   no `Infinite` variant to classify anymore.
 //!
-//! This is an emptied-out list, not a deleted mechanism: the trait and its triage stay in
-//! place for whatever future `ActError` variant — a new Walnut (Java) bug this port
-//! chooses to reproduce as a `Result::Err`, per `CLAUDE.md`'s "log it, don't silently fix
-//! or replicate it" rule — needs it next.
+//! So the mechanism is very much still load-bearing: it now carries a port-gap entry as
+//! well as whatever future `ActError` variant — a new Walnut (Java) bug this port chooses
+//! to reproduce as a `Result::Err`, per `CLAUDE.md`'s "log it, don't silently fix or
+//! replicate it" rule — needs it next.
 
 use std::fmt;
 use std::time::Instant;
@@ -378,6 +389,13 @@ fn expr_error_is_handled(e: &ExprError) -> bool {
         // of the old raw, UNCAUGHT `NullPointerException` — see this module's own docs for
         // the full history. Used to be `false`.
         ExprError::RepeatedIdentifierMissingNumberSystem { .. } => true,
+        // NOT a Java exception of any kind — real Walnut succeeds on every input that
+        // reaches this variant (verified live against `walnut-java` `c75e630`). It is
+        // this port's own, still-open gap, so it renders on the UNHANDLED channel
+        // (stderr, with the deliberately non-Java `kind()` below) rather than joining the
+        // `handled` bucket and passing itself off as legitimate Walnut output. See
+        // `ExprError::RepeatedIdentifierNumberSystemUnrecoverable`'s own docs.
+        ExprError::RepeatedIdentifierNumberSystemUnrecoverable { .. } => false,
         ExprError::NumberSystem(e) => num_sys_error_is_handled(e),
     }
 }
@@ -481,6 +499,14 @@ impl LoggableError for ActError {
 
     fn kind(&self) -> String {
         match self {
+            // Deliberately NOT a Java class name: there is no Java exception here to
+            // name (real Walnut computes an answer instead of throwing), so borrowing
+            // one would be exactly the "looks like legitimate Walnut output" camouflage
+            // this variant exists to avoid. A reader diffing this against `walnut-java`
+            // sees at a glance that the PORT is speaking, not Walnut.
+            ActError::Expr(ExprError::RepeatedIdentifierNumberSystemUnrecoverable { .. }) => {
+                "walnut-rs.PortLimitation".to_string()
+            }
             // The three `NumSysError`s `num_sys_error_is_handled` classifies as unhandled
             // each name a *different* uncaught JVM exception — see that function's own
             // per-variant comments for the throw site each one stands in for.

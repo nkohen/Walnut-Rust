@@ -144,6 +144,61 @@ pub enum ExprError {
         /// name (e.g. `T` in `T[i][i]`), not the repeated variable's name.
         token_name: String,
     },
+    /// **NOT a Walnut (Java) error at all — this port's own, still-open limitation.**
+    ///
+    /// Real Walnut *succeeds* on every input that reaches this variant. It exists so the
+    /// gap is loud and honestly labelled instead of being silently absorbed into
+    /// [`ExprError::RepeatedIdentifierMissingNumberSystem`] above, whose (Java-verbatim)
+    /// message would be factually FALSE here — it tells the user their alphabet "was
+    /// declared explicitly, e.g. `{0,1}`", when in fact it was declared as a perfectly
+    /// ordinary custom base such as `msd_fib`.
+    ///
+    /// # The gap
+    ///
+    /// [`crate::token`]'s `track_number_system` (this crate's stand-in for Java's
+    /// `wordAutomaton.getNS().get(i)`, `Word.java:62`) can reconstruct a plain
+    /// `msd_k`/`lsd_k` track's [`NumberSystem`] from the two derived facts `wr-core`'s
+    /// `Automaton` retains (direction + alphabet size), and correctly reports "no number
+    /// system" for a `{...}`-declared track. It can do NEITHER for a **custom-base**
+    /// track (`Automaton::all_reps[i]` is `Some`, e.g. `msd_fib`). The base's *name* is
+    /// not the missing piece — `Automaton::ns_name[i]` does record it — but *building*
+    /// the `NumberSystem` it names needs the `Custom Bases/*.txt` files
+    /// (`NumberSystem::with_custom_base_files`), and only a `Session`-backed resolver in
+    /// `wr-cli` can supply those. This function gets an `&Automaton` and nothing else, so
+    /// `NumberSystem::new("msd_fib")` — which resolves no files at all — simply fails.
+    /// In real Java `getNS().get(i)` is a genuine, non-`null`, cached `NumberSystem`
+    /// there, and `VariableExpression.act`'s repeated-identifier branch reads
+    /// `ns.equality` off it and computes a real answer.
+    ///
+    /// Verified live against `walnut-java` `c75e630` (2026-08-21): a two-track
+    /// `msd_fib msd_fib` word automaton `FIB2`, queried as
+    /// `eval fibout2 "FIB2[i][i] = @1";`, writes a 2-state `msd_fib` automaton in Java
+    /// and reaches this variant here.
+    ///
+    /// # Why `is_handled() == false`
+    ///
+    /// Java throws nothing here, so there is no `WalnutException` to mimic and no
+    /// "handled" classification to inherit. Rendering this on **stderr** with a
+    /// deliberately non-Java `kind()` (`wr_logic::eval`'s `LoggableError for ActError`)
+    /// keeps it visibly distinct from legitimate Walnut output: a user (or a differential
+    /// harness) must not be able to mistake a known port gap for expected behavior.
+    /// Closing the gap means threading a custom-base resolver (the one `PredicateEnv`
+    /// already owns) down to `track_number_system`; until then this is the honest report.
+    ///
+    /// One thing `is_handled() == false` does NOT suppress, stated rather than left to be
+    /// rediscovered: `EvalDef.compute`'s own catch-log-then-rethrow shape
+    /// (`EvalDef.java:123-128`, ported in [`crate::eval`]) logs the original error and then
+    /// raises a SECOND, position-annotated error (`message + "\n\t: char at N"`) that
+    /// `Prover.dispatch` prints message-only on stdout. That wrapper is generic to every
+    /// `act()` failure and is not variant-aware, so this text reaches stdout too — which is
+    /// why the message itself has to be self-identifying ("walnut-rs port limitation…")
+    /// rather than relying on the channel alone to distinguish it.
+    RepeatedIdentifierNumberSystemUnrecoverable {
+        identifier: String,
+        /// Same as [`ExprError::RepeatedIdentifierMissingNumberSystem`]'s field — the
+        /// `Word`/`Function` occurrence's own name (e.g. `FIB2` in `FIB2[i][i]`).
+        token_name: String,
+    },
     /// Propagated out of `this.base.getConstant(this.value)` in
     /// [`NumberLiteralExpression::act`] (`NumberLiteralExpression.java:62`). Java lets the
     /// `WalnutException` from `NumberSystem` escape unchanged; this wraps it so the caller
@@ -186,6 +241,21 @@ impl fmt::Display for ExprError {
                 "the track indexed by the repeated variable {identifier} in {token_name} has \
                  no attached number system (its alphabet was declared explicitly, e.g. \
                  {{0,1}}, rather than as msd_k/lsd_k)"
+            ),
+            // NOT Java text — there is no Java error here to reproduce (real Walnut
+            // succeeds). Worded so nobody can mistake it for Walnut's own output: it
+            // names walnut-rs, says what the port cannot do, and says what Java does
+            // instead. See this variant's own docs.
+            ExprError::RepeatedIdentifierNumberSystemUnrecoverable {
+                identifier,
+                token_name,
+            } => write!(
+                f,
+                "walnut-rs port limitation (real Walnut computes this successfully): the \
+                 track indexed by the repeated variable {identifier} in {token_name} uses a \
+                 custom numeration base, whose number system this port cannot build here \
+                 (that needs the Custom Bases files, which are not reachable from this call \
+                 site)"
             ),
             ExprError::NumberSystem(e) => write!(f, "{e}"),
         }
@@ -426,6 +496,37 @@ impl ArithmeticExpression {
 // VariableExpression
 // ---------------------------------------------------------------------------
 
+/// What Java's `wordAutomaton.getNS().get(i)` (`Word.java:62`) resolved to for one track,
+/// as [`VariableExpression::act`] can actually answer it here — and, when it resolved to
+/// nothing, **why**, because the two "nothing" cases are not the same thing on this side
+/// of the port and must not report the same error.
+///
+/// Java has no analogue of this type: there, `getNS().get(i)` is simply a
+/// `NumberSystem` reference that may be `null`, and exactly one condition produces the
+/// `null` (a `{...}`-declared track). This port has a second, Java-independent way to
+/// come up empty — a custom base whose identity `wr-core`'s `Automaton` does not retain
+/// — so the caller must say which it hit. Collapsing the two back into one
+/// `Option<&NumberSystem>` is precisely the defect this enum exists to prevent: it made
+/// a known port gap render Java's own "your alphabet was declared explicitly, e.g.
+/// `{0,1}`" text, which is factually false for an `msd_fib` track, on the *handled*
+/// (stdout) channel — i.e. a wrong answer wearing legitimate Walnut output's clothes.
+#[derive(Debug, Clone, Copy)]
+pub enum TrackNs<'a> {
+    /// Java's non-`null` case: a real `NumberSystem` for this track.
+    Present(&'a NumberSystem),
+    /// Java's `null` case, faithfully: the track's alphabet was declared explicitly
+    /// (`{0,1}`, …) rather than as `msd_k`/`lsd_k`, so `ParseMethods.
+    /// parseAlphabetDeclaration` put a literal `null` in `NS`. A repeated occurrence
+    /// here is WB-013 — real Walnut fails too, with the message
+    /// [`ExprError::RepeatedIdentifierMissingNumberSystem`] reproduces verbatim.
+    DeclaredAlphabet,
+    /// **No Java analogue**: a custom-base track, where Java's `getNS().get(i)` is a
+    /// genuine non-`null` `NumberSystem` and the query *succeeds*, but this port cannot
+    /// reconstruct it. A repeated occurrence here reports
+    /// [`ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] — see that variant's docs.
+    NumberSystemUnrecoverable,
+}
+
 /// `Expressions/VariableExpression.java` (49 LOC).
 #[derive(Debug, Clone)]
 pub struct VariableExpression {
@@ -448,16 +549,19 @@ impl VariableExpression {
     /// `ns.equality` is consulted, never mutated), so `&NumberSystem` — not `&mut` —
     /// suffices even before U5's interior-mutability upgrade lands.
     ///
-    /// `ns` is `Option<&NumberSystem>`, not `&NumberSystem`: Java's caller,
-    /// `Word.java:62`, passes `wordAutomaton.getNS().get(i)`, which is a real `null`
-    /// whenever track `i` was declared with an explicit alphabet (`{0,1}`, …) rather
-    /// than `msd_k`/`lsd_k` (`ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)`
-    /// branch). `ns` is only ever dereferenced in the repeated-identifier branch below
+    /// `ns` is [`TrackNs`], not `&NumberSystem`: Java's caller, `Word.java:62`, passes
+    /// `wordAutomaton.getNS().get(i)`, which is a real `null` whenever track `i` was
+    /// declared with an explicit alphabet (`{0,1}`, …) rather than `msd_k`/`lsd_k`
+    /// (`ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)` branch) — and which
+    /// this port additionally cannot reconstruct for a custom base, a gap with no Java
+    /// counterpart. `ns` is only ever consulted in the repeated-identifier branch below
     /// (the first-occurrence branch never touches it, in Java or here), so a first
-    /// occurrence is safe with `ns = None`; a *repeated* occurrence with `ns = None` now
-    /// reports [`ExprError::RepeatedIdentifierMissingNumberSystem`], the fixed
-    /// (`c75e630`) Java behavior — see that variant's docs and WB-013 for the full call
-    /// chain and trigger.
+    /// occurrence is safe under any [`TrackNs`]; a *repeated* occurrence reports
+    /// [`ExprError::RepeatedIdentifierMissingNumberSystem`] (the fixed, `c75e630`, Java
+    /// behavior — see that variant's docs and WB-013) for
+    /// [`TrackNs::DeclaredAlphabet`], and the honestly-labelled
+    /// [`ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] for
+    /// [`TrackNs::NumberSystemUnrecoverable`], where real Walnut succeeds and this port cannot.
     ///
     /// `token_name` is `t.toString()` at Java's call site — needed only to build the
     /// fixed error message's `subject` string (`"... in {t}"`); not consulted at all on
@@ -466,7 +570,7 @@ impl VariableExpression {
     pub fn act(
         &self,
         fresh: &mut FreshIdentifiers,
-        ns: Option<&NumberSystem>,
+        ns: TrackNs<'_>,
         identifiers: &mut Vec<String>,
         acc: Automaton,
         quantify: &mut Vec<String>,
@@ -477,10 +581,26 @@ impl VariableExpression {
             identifiers.push(self.identifier.clone());
             Ok(acc)
         } else {
-            let ns = ns.ok_or_else(|| ExprError::RepeatedIdentifierMissingNumberSystem {
-                identifier: self.identifier.clone(),
-                token_name: token_name.to_string(),
-            })?;
+            let ns = match ns {
+                TrackNs::Present(ns) => ns,
+                // Java's own `null` case: WB-013's fixed `WalnutException`, verbatim.
+                TrackNs::DeclaredAlphabet => {
+                    return Err(ExprError::RepeatedIdentifierMissingNumberSystem {
+                        identifier: self.identifier.clone(),
+                        token_name: token_name.to_string(),
+                    });
+                }
+                // NOT Java's case at all — real Walnut has a live `NumberSystem` here and
+                // computes an answer. Reported as this port's own gap so it cannot be
+                // mistaken for the (factually different, and here factually false)
+                // WB-013 message above.
+                TrackNs::NumberSystemUnrecoverable => {
+                    return Err(ExprError::RepeatedIdentifierNumberSystemUnrecoverable {
+                        identifier: self.identifier.clone(),
+                        token_name: token_name.to_string(),
+                    });
+                }
+            };
             let new_identifier = format!("{}{}", self.identifier, fresh.next_identifier());
             let mut eq = ns.equality.clone();
             eq.bind(vec![self.identifier.clone(), new_identifier.clone()]);
@@ -1064,7 +1184,7 @@ mod tests {
         let m = ve
             .act(
                 &mut fresh,
-                Some(&n),
+                TrackNs::Present(&n),
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
@@ -1083,8 +1203,8 @@ mod tests {
     }
 
     /// A first occurrence never dereferences `ns` (matching Java: the repeated-identifier
-    /// branch is the only place `ns` is touched), so `ns = None` must be safe here even
-    /// though it would fail a repeated occurrence -- see
+    /// branch is the only place `ns` is touched), so a [`TrackNs`] carrying no number
+    /// system must be safe here even though it would fail a repeated occurrence -- see
     /// [`variable_expression_act_repeated_occurrence_with_no_ns_matches_fixed_java`].
     #[test]
     fn variable_expression_act_first_occurrence_tolerates_missing_number_system() {
@@ -1095,7 +1215,7 @@ mod tests {
         let m = ve
             .act(
                 &mut fresh,
-                None,
+                TrackNs::DeclaredAlphabet,
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
@@ -1117,7 +1237,7 @@ mod tests {
         let m = ve
             .act(
                 &mut fresh,
-                Some(&n),
+                TrackNs::Present(&n),
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
@@ -1152,7 +1272,7 @@ mod tests {
         let err = ve
             .act(
                 &mut fresh,
-                None,
+                TrackNs::DeclaredAlphabet,
                 &mut identifiers,
                 Automaton::true_false(true),
                 &mut quantify,
@@ -1173,7 +1293,72 @@ mod tests {
              system (its alphabet was declared explicitly, e.g. {0,1}, rather than as \
              msd_k/lsd_k)"
         );
-        assert_eq!(fresh.issued(), 0, "must fail before minting a fresh name");
+        // NOT a fidelity claim -- pinning a known, deliberate ordering DIVERGENCE from
+        // Java. Java's fixed `VariableExpression.act` mints first and checks second:
+        // `String new_identifier = this.identifier + t.getUniqueString();` (`:38`) runs
+        // BEFORE `NumberSystem.requireNumberSystem(...)` (`:39-40`) throws, and
+        // `Token.getUniqueString` (`Token.java:37-40`) increments `uniqueCounter` as a
+        // side effect -- so real Walnut burns a counter value on this failure and this
+        // port does not. Currently unobservable in any output either engine produces: a
+        // fresh name exists only to be quantified away immediately, and no log line names
+        // one. Recorded here (rather than asserted as agreement) so that whoever makes
+        // the counter observable has to decide about it deliberately.
+        assert_eq!(
+            fresh.issued(),
+            0,
+            "this port checks before minting; Java mints before throwing (see above)"
+        );
+    }
+
+    /// The sibling of the test above, for the *other* reason this port can arrive at a
+    /// repeated occurrence with no [`NumberSystem`] in hand — and the reason the two must
+    /// not share one error.
+    ///
+    /// [`TrackNs::NumberSystemUnrecoverable`] is **not** Java's `null`-`NS` case: real
+    /// Walnut has a live, cached `NumberSystem` for a custom-base track and computes an
+    /// answer (verified live against `walnut-java` `c75e630` — see
+    /// [`ExprError::RepeatedIdentifierNumberSystemUnrecoverable`]'s docs for the exact
+    /// repro). Reporting WB-013's Java-verbatim message here would tell the user their
+    /// alphabet "was declared explicitly, e.g. `{0,1}`" about an `msd_fib` track, which is
+    /// false, on the channel reserved for genuine Walnut output. This pins the honest
+    /// alternative instead: different variant, different (self-identifying) text.
+    #[test]
+    fn variable_expression_act_repeated_occurrence_with_an_unrecoverable_ns_is_a_port_gap() {
+        let ve = VariableExpression::new("i");
+        let mut fresh = FreshIdentifiers::new();
+        let mut identifiers = vec!["i".to_string()]; // already seen once, e.g. FIB2[i][i]
+        let mut quantify = vec![];
+        let err = ve
+            .act(
+                &mut fresh,
+                TrackNs::NumberSystemUnrecoverable,
+                &mut identifiers,
+                Automaton::true_false(true),
+                &mut quantify,
+                &mut wr_core::logging::Logging::new(),
+                "FIB2",
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ExprError::RepeatedIdentifierNumberSystemUnrecoverable {
+                identifier: "i".to_string(),
+                token_name: "FIB2".to_string(),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "walnut-rs port limitation (real Walnut computes this successfully): the track \
+             indexed by the repeated variable i in FIB2 uses a custom numeration base, \
+             whose number system this port cannot build here (that needs the Custom Bases \
+             files, which are not reachable from this call site)"
+        );
+        // The whole point of the split: this must NOT be WB-013's Java-verbatim message,
+        // which would be factually false about a custom-base track.
+        assert!(
+            !err.to_string().contains("declared explicitly"),
+            "must not claim the alphabet was declared explicitly -- it wasn't"
+        );
     }
 
     // ---------------------------------------------------------- NumberLiteralExpression

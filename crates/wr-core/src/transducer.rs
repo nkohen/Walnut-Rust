@@ -209,6 +209,15 @@
 //! diagnosable `WalnutException` instead. This port's [`TransduceError::NoNumberSystem`]
 //! needed no behavioral change — only its `Display` text, to match the fixed message.
 //!
+//! Note the scope: that upstream fix covers ONLY this variant.
+//! [`TransduceError::NoTransducerTransition`] and [`TransduceError::NoTransducerOutput`]
+//! model a *different*, still-unfixed pair of raw `NullPointerException`s
+//! (`Transducer.createMap`'s `getNfaStateDests(...).getInt(0)`, and the
+//! `sigma.get(s).get(encoded)` `Integer` unboxing one line earlier) — unrelated to
+//! WB-035's fix as well, which landed (`7f54eff`) without touching them. `wr_cli::prover`
+//! classifies those two `is_handled() == false` with a `java.lang.NullPointerException`
+//! `kind()`, unlike this one; the `transduce` bucket there is deliberately not uniform.
+//!
 //! # Logging
 //!
 //! This is [`crate::logging::Logging`]'s first real consumer in the port. Java calls

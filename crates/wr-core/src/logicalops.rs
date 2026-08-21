@@ -1570,13 +1570,26 @@ pub fn combine(
 // Number-system conversion: `convertNS` and its five private helpers (U18).
 // ---------------------------------------------------------------------------
 
-/// Every failure [`convert_ns`] can report. Every variant, including
-/// [`ConvertNsError::NoNumberSystem`], is now a real `WalnutException` Java throws from
+/// Every failure [`convert_ns`] can report. Most variants — including
+/// [`ConvertNsError::NoNumberSystem`], which used to stand in for a genuine Java
+/// `NullPointerException` before it was fixed upstream (see its own docs and
+/// `docs/WALNUT-BUGS.md` WB-033) — are real `WalnutException`s Java throws from
 /// `convertNS`/`convertMsdBaseToExponent`/`convertLsdBaseToRoot`, with their messages
 /// preserved verbatim in the [`fmt::Display`] impl (each one checked against the real
-/// `walnut-java` CLI, not transcribed from source); `NoNumberSystem` used to stand in for a
-/// genuine Java `NullPointerException` before it was fixed upstream — see its own docs
-/// and `docs/WALNUT-BUGS.md` WB-033.
+/// `walnut-java` CLI, not transcribed from source).
+///
+/// **Exactly three are NOT `WalnutException`s**, and each says so in its own doc:
+/// [`ConvertNsError::BaseOverflowsInt`] (an uncaught `java.lang.NumberFormatException`
+/// out of `Integer.parseInt`), and [`ConvertNsError::InvalidRoot`] /
+/// [`ConvertNsError::NotAnExactPower`] (`java.lang.IllegalArgumentException`, from
+/// WB-032's fix to `UtilityMethods.exactIntegerExponent`). All three are classified
+/// `is_handled() == false` in `wr_cli::prover`, with a matching `kind()` arm, so they
+/// render Java's kind-prefixed stderr line rather than a plain stdout message — and all
+/// three are unreachable through `convert_ns`'s real call sites today (each variant's doc
+/// says why), classified for fidelity regardless, per this crate's standing practice for
+/// defensive-only ported guards. Blanket-claiming "every variant is a `WalnutException`"
+/// here was wrong, and directly contradicted `prover.rs`'s own arms; corrected after
+/// adversarial review.
 ///
 /// `Result` rather than `panic!`, per `PORTING.md`'s exception-mapping rule and for the
 /// same reason WB-013's entry spells out: every one of these is reachable from raw

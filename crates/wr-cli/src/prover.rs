@@ -150,6 +150,7 @@ use crate::test_case::TestCase;
 use crate::test_command::{test_command_to, TestError};
 use crate::transduce::TransduceCommandError;
 use crate::walnut_exception as msg;
+use wr_core::transducer::TransduceError;
 
 // ---------------------------------------------------------------------------
 // Command names and small constants (`Prover.java:36-244`)
@@ -742,7 +743,6 @@ impl LoggableError for ProverError {
             | ProverError::Alphabet(_)
             | ProverError::Helper(_)
             | ProverError::Test(_)
-            | ProverError::Transduce(_)
             | ProverError::Io(_)
             | ProverError::Reverse(_)
             | ProverError::Describe(_)
@@ -752,6 +752,28 @@ impl LoggableError for ProverError {
             // throwables faithfully surfaced by U23's review fixes.
             ProverError::AutomatonOps(e) => !matches!(e, AutomatonOpsError::NumberFormat(_)),
             ProverError::Quotient(e) => e.is_walnut_exception(),
+            // `transduce` used to be an unconditional `true` in the paragraph above. That
+            // was correct for `NoNumberSystem` (WB-034, now a real `WalnutException`
+            // upstream) and for every alphabet/arity guard, but NOT for the two variants
+            // that model `Transducer.createMap`'s and the `sigma` unboxing's raw,
+            // still-unfixed `NullPointerException`s -- a separate open Java defect, NOT
+            // part of WB-035's fix, whose own commit (`7f54eff`) landed and did not touch
+            // them. Confirmed live (2026-08-21) with a partial `Transducer Library/*.txt`
+            // (state 0 total so it clears the state-0-only compatibility guard, state 1
+            // missing a letter): real Java prints
+            // `java.lang.NullPointerException: Cannot invoke
+            // "it.unimi.dsi.fastutil.ints.IntList.getInt(int)" … / at
+            // Automata.Transducer.createMap(Transducer.java:481)` on **stderr** with an
+            // empty stdout, while this port printed the bare message on **stdout** with an
+            // empty stderr. Same shape of stale/missing classification as
+            // `ConvertNsError::BaseOverflowsInt` above; see each variant's own doc in
+            // `wr_core::transducer` for the throw site.
+            ProverError::Transduce(e) => !matches!(
+                e,
+                TransduceCommandError::Transduce(
+                    TransduceError::NoTransducerTransition | TransduceError::NoTransducerOutput
+                )
+            ),
 
             // --- the three wrapped enums that are NOT uniformly `WalnutException` -----
             //
@@ -809,8 +831,29 @@ impl LoggableError for ProverError {
             // `wr_core::logicalops::exact_integer_exponent`'s doc comment) but classified
             // for fidelity anyway, matching this file's own precedent for defensive-only
             // ported guards.
+            //
+            // `BaseOverflowsInt` joins them (added after adversarial review found it in
+            // neither the `false` arm nor `kind()`, so it fell through
+            // `ProverError::Convert(_) => true` below and rendered a plain stdout line
+            // despite its own doc correctly calling it an uncaught, NOT-a-`WalnutException`
+            // `java.lang.NumberFormatException`): `NumberSystem.parseBase`'s
+            // `Integer.parseInt(baseStr)` runs only when `isNumber(baseStr)` already
+            // passed, so an all-digit base too big for an `int` throws instead of the
+            // `WalnutException` next to it. Also unreachable through `convert`, and for a
+            // reason worth recording rather than re-deriving: BOTH engines reject such a
+            // file at READ time, before `convertNS` is ever entered. Verified live
+            // (2026-08-21) with an `Automata Library/` file headed `msd_99999999999999`
+            // and `convert $out msd_4 $in;` -- real Java prints
+            // `java.lang.NumberFormatException: For input string: "99999999999999"`
+            // straight out of the reader, and this port reports its own reader-level
+            // `Base of automaton's number system must fit in an int, found: …`. (That
+            // reader-level pair is a separate, pre-existing text divergence on a different
+            // code path -- `NumSysError::BaseNotAnI32`, not this variant -- noted here only
+            // to make clear which failure this arm is and is not about.)
             ProverError::Convert(ConvertError::Convert(
-                ConvertNsError::InvalidRoot { .. } | ConvertNsError::NotAnExactPower { .. },
+                ConvertNsError::InvalidRoot { .. }
+                | ConvertNsError::NotAnExactPower { .. }
+                | ConvertNsError::BaseOverflowsInt { .. },
             )) => false,
             // The remaining `convertNS` failures (including, as of the fix above,
             // `NoNumberSystem`), and `convertDFAOIntoFunction`, are deliberately-thrown
@@ -866,6 +909,10 @@ impl LoggableError for ProverError {
             )) => "java.lang.IllegalArgumentException".to_string(),
             ProverError::NumberFormat(_)
             | ProverError::AutomatonOps(AutomatonOpsError::NumberFormat(_))
+            // `NumberSystem.parseBase`'s `Integer.parseInt(baseStr)` on an all-digit base
+            // too big for an `int` -- see this type's `is_handled` arm for why it is not a
+            // `WalnutException` and why it is unreachable through `convert` today.
+            | ProverError::Convert(ConvertError::Convert(ConvertNsError::BaseOverflowsInt { .. }))
             // `ost o [99999999999] [1];` — `ParseMethods.parseList`'s
             // `UtilityMethods.parseInt` overflowing `int`, same bucket as the two arms
             // above (see `OstError::Parse`'s doc and this function's `is_handled` arm
@@ -885,6 +932,15 @@ impl LoggableError for ProverError {
             ProverError::Quotient(QuotientError::Runtime(_)) => {
                 "java.lang.ArrayIndexOutOfBoundsException".to_string()
             }
+            // The two `transduce` variants `is_handled` classifies as unhandled: both port
+            // a genuine, still-unfixed `NullPointerException` (`Transducer.createMap`'s
+            // `getNfaStateDests(...).getInt(0)` and the `sigma.get(s).get(encoded)`
+            // `Integer`-unboxing one line earlier). `stack_trace_lines()` stays empty --
+            // this port has no JVM frames, a documented fidelity limit -- so the rendered
+            // stderr line is the kind + message without Java's `at …` frame.
+            ProverError::Transduce(TransduceCommandError::Transduce(
+                TransduceError::NoTransducerTransition | TransduceError::NoTransducerOutput,
+            )) => "java.lang.NullPointerException".to_string(),
             ProverError::Meta(e) => e.kind(),
             _ => "Main.WalnutException".to_string(),
         }
@@ -2708,8 +2764,56 @@ mod tests {
                 ProverError::Convert(ConvertError::InvalidBase("x".to_string())),
                 "Integer.parseInt throws NumberFormatException",
             ),
+            (
+                ProverError::Convert(ConvertError::Convert(ConvertNsError::BaseOverflowsInt {
+                    found: "99999999999999".to_string(),
+                })),
+                "NumberSystem.parseBase's Integer.parseInt throws an uncaught \
+                 NumberFormatException, NOT a WalnutException (its own doc says so; this \
+                 arm used to be missing, so it fell into the Convert(_) => true bucket)",
+            ),
         ] {
             assert!(!e.is_handled(), "{why}");
+        }
+        // ...and with the exception KIND Java would print, not the generic
+        // `Main.WalnutException` fallback (the same gap `Ost(Parse(NumberFormat))` had).
+        assert_eq!(
+            ProverError::Convert(ConvertError::Convert(ConvertNsError::BaseOverflowsInt {
+                found: "99999999999999".to_string(),
+            }))
+            .kind(),
+            "java.lang.NumberFormatException"
+        );
+
+        // `transduce`'s own two raw-NPE variants -- see this type's `is_handled` arm for
+        // the live 2026-08-21 reproduction (real Java: stderr + `java.lang.
+        // NullPointerException` + an `at Automata.Transducer.createMap(...)` frame; this
+        // port, before the fix: the bare message on stdout, empty stderr). NOT part of
+        // WB-035, which IS fixed upstream (`7f54eff`) and never touched these.
+        for variant in [
+            TransduceError::NoTransducerTransition,
+            TransduceError::NoTransducerOutput,
+        ] {
+            let e = ProverError::Transduce(TransduceCommandError::Transduce(variant));
+            assert!(
+                !e.is_handled(),
+                "{variant:?} ports a raw NullPointerException, not a WalnutException"
+            );
+            assert_eq!(e.kind(), "java.lang.NullPointerException");
+        }
+        // ...while every OTHER `TransduceError` stays in the handled bucket, including
+        // WB-034's now-fixed `NoNumberSystem` -- the point is a narrowed bucket, not an
+        // inverted one.
+        for variant in [
+            TransduceError::NoNumberSystem,
+            TransduceError::NotSingleInput,
+            TransduceError::IncompatibleAlphabet,
+            TransduceError::MultipleTransitionsPerInput,
+        ] {
+            assert!(
+                ProverError::Transduce(TransduceCommandError::Transduce(variant)).is_handled(),
+                "{variant:?} is a real WalnutException"
+            );
         }
 
         // Genuine WalnutExceptions -> message only.

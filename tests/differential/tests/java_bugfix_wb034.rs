@@ -32,16 +32,24 @@
 //! a clean, recoverable `TransduceError::NoNumberSystem` before this unit (never the raw
 //! Java crash, per WB-013's established convention) — this fix is message-text-only.
 //!
-//! `ProverError::Transduce(_) => true` unconditionally classifies every `Transduce`
-//! error as a handled `WalnutException` (a pre-existing, coarse bucket that does not
-//! distinguish `TransduceError`'s own sub-variants — see `wr_cli::prover`'s
-//! `LoggableError for ProverError` for the full bucket). That was already the classification
-//! before this fix, so unlike `wb033`'s sibling fix, no `is_handled()` code change was
-//! needed here for WB-034 specifically — but this test still drives the real
-//! `read_buffer` -> `print_truncated_stack_trace` rendering path (not just
-//! `err.to_string()`) and asserts the fixed jar's exact stdout/stderr split, both because
-//! that is the only way to actually confirm the classification is (still) correct, and
-//! for consistency with its `wb033`/`wb037` siblings.
+//! `wr_cli::prover`'s `LoggableError for ProverError` already classified this variant as a
+//! handled `WalnutException`, and that stayed correct once Java's own exception became
+//! real — so unlike `wb033`'s sibling fix, no `is_handled()` change was needed for WB-034
+//! specifically. This test still drives the real `read_buffer` ->
+//! `print_truncated_stack_trace` rendering path (not just `err.to_string()`) and asserts
+//! the fixed jar's exact stdout/stderr split, both because that is the only way to
+//! actually confirm the classification is (still) correct, and for consistency with its
+//! `wb033`/`wb037` siblings.
+//!
+//! What that arm used to be, and no longer is: a single UNCONDITIONAL
+//! `ProverError::Transduce(_) => true` covering every `TransduceError`. Adversarial review
+//! of this fix's own diff found that bucket also swept in `NoTransducerTransition` and
+//! `NoTransducerOutput`, which port `Transducer.createMap`'s and the `sigma` unboxing's
+//! genuinely still-unfixed raw `NullPointerException`s (a separate open Java defect, NOT
+//! part of WB-035 — WB-035 *is* fixed upstream, `7f54eff`, and did not touch them).
+//! Reproduced live and fixed in the same pass; see `docs/WALNUT-BUGS.md`'s WB-034 entry and
+//! `wr_cli::prover`'s own arm for the full account. Nothing about WB-034's own verdict
+//! changed as a result.
 //!
 //! `wb034out` is never written (the command errors out before writing anything), so
 //! there is no result `.txt` fixture to capture — only the printed line.
