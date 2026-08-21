@@ -3549,6 +3549,30 @@ mod tests {
         // means -1 = a - b, i.e. b = a + 1, NOT b = a - 1. Flipped from `MINUS` to `PLUS`
         // on the right-hand side to match `walnut-java` commit `f846cad`'s deliberate
         // flip of `NumberSystemTest.testNegArithmeticOrdering`.
+        //
+        // Adversarial review (two-reviewer round on `bugfix/wb-043`) found this
+        // comparison, as originally written, was a TAUTOLOGY rather than a fix pin: both
+        // `arithmetic_const_c("a","b",-1,Minus)` (post-fix) and
+        // `arithmetic_const_b("a",1,"b",Plus)` bind the identical fresh-variable name
+        // (`format!("{a}{b}")` == `format!("{a}{c}")` == `"ab"` here) and build the exact
+        // same call sequence internally, so `same_language` was comparing an automaton
+        // against itself -- it would have passed just as tautologically pre-fix, with
+        // zero power against a reintroduced bug in `arithmetic_const_c` itself. The
+        // `accepts_digits` ground-truth check below (independently re-derived, not
+        // cross-compared) is what actually pins the fix; base -3, "00" = 0, "01" = 1,
+        // "12" = -3*1 + 2 = -1.
+        let check = ns
+            .arithmetic_const_c("a", "b", &big(-1), ArithmeticOp::Minus, log)
+            .unwrap();
+        assert!(
+            accepts_digits(&check, &[("a", "00"), ("b", "01")]),
+            "b = a + 1: a=0, b=1 must be accepted"
+        );
+        assert!(
+            !accepts_digits(&check, &[("a", "00"), ("b", "12")]),
+            "b = a - 1 (the pre-WB-043-fix relation): a=0, b=-1 must now be rejected"
+        );
+
         let mut a = ns
             .arithmetic_const_c("a", "b", &big(-1), ArithmeticOp::Minus, log)
             .unwrap();
