@@ -156,13 +156,14 @@ pub enum ExprError {
     /// # The gap
     ///
     /// [`crate::token`]'s `track_number_system` (this crate's stand-in for Java's
-    /// `wordAutomaton.getNS().get(i)`, `Word.java:62`) can reconstruct a plain
-    /// `msd_k`/`lsd_k` track's [`NumberSystem`] from the two derived facts `wr-core`'s
-    /// `Automaton` retains (direction + alphabet size), and correctly reports "no number
-    /// system" for a `{...}`-declared track. It can do NEITHER for a **custom-base**
-    /// track (`Automaton::all_reps[i]` is `Some`, e.g. `msd_fib`). The base's *name* is
-    /// not the missing piece — `Automaton::ns_name[i]` does record it — but *building*
-    /// the `NumberSystem` it names needs the `Custom Bases/*.txt` files
+    /// `wordAutomaton.getNS().get(i)`, `Word.java:62`) can rebuild any track whose
+    /// recorded name (`Automaton::ns_name[i]`) is a base [`NumberSystem::new`] constructs
+    /// programmatically — `msd_k`/`lsd_k` and `msd_neg_k`/`lsd_neg_k` — and correctly
+    /// reports "no number system" for a `{...}`-declared track. It can do NEITHER for a
+    /// **custom-base** track, i.e. one whose recorded name is anything else (`msd_fib`,
+    /// `msd_pell`, a user's own `msd_bar`, …). The base's *name* is not the missing piece
+    /// — `Automaton::ns_name[i]` does record it — but *building* the `NumberSystem` it
+    /// names needs the `Custom Bases/*.txt` files
     /// (`NumberSystem::with_custom_base_files`), and only a `Session`-backed resolver in
     /// `wr-cli` can supply those. This function gets an `&Automaton` and nothing else, so
     /// `NumberSystem::new("msd_fib")` — which resolves no files at all — simply fails.
@@ -170,10 +171,19 @@ pub enum ExprError {
     /// there, and `VariableExpression.act`'s repeated-identifier branch reads
     /// `ns.equality` off it and computes a real answer.
     ///
-    /// Verified live against `walnut-java` `c75e630` (2026-08-21): a two-track
-    /// `msd_fib msd_fib` word automaton `FIB2`, queried as
-    /// `eval fibout2 "FIB2[i][i] = @1";`, writes a 2-state `msd_fib` automaton in Java
-    /// and reaches this variant here.
+    /// Verified live against `walnut-java` `c75e630` (2026-08-21), twice over — the
+    /// second repro is why `track_number_system` keys on the NAME rather than on
+    /// `all_reps[i].is_some()` (see its docs; the all-representations file is optional,
+    /// so the first discriminator missed half the custom bases and fabricated a wrong
+    /// `NumberSystem` for them instead of reaching this variant):
+    ///
+    /// * a two-track `msd_fib msd_fib` word automaton `FIB2`, queried as
+    ///   `eval fibout2 "FIB2[i][i] = @1";`, writes a 2-state `msd_fib` automaton in Java;
+    /// * a two-track `msd_bar msd_bar` one over a custom base shipping only
+    ///   `msd_bar_addition.txt` (alphabet `{0, 1, 5}`, no `msd_bar.txt`) writes a 1-state
+    ///   `msd_bar` automaton in Java.
+    ///
+    /// Both reach this variant here.
     ///
     /// # Why `is_handled() == false`
     ///

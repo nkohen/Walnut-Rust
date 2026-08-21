@@ -242,8 +242,11 @@
 //! * [`crate::expr::ExprError::RepeatedIdentifierNumberSystemUnrecoverable`] — **this
 //!   port's own, still-open limitation**, with no Walnut counterpart: a repeated variable
 //!   indexing a CUSTOM-base track (`msd_fib`, …), where Java holds a real cached
-//!   `NumberSystem` and computes an answer but `wr-core`'s `Automaton` does not retain the
-//!   base's name for this port to rebuild one from. Classified `false` deliberately, with
+//!   `NumberSystem` and computes an answer but this port cannot build one: the base's NAME
+//!   is retained ([`wr_core::automaton::Automaton::ns_name`], and it is exactly what
+//!   `track_number_system` keys on), but constructing the `NumberSystem` it names needs the
+//!   `Custom Bases/*.txt` files, which no `&Automaton`-only call site can reach.
+//!   Classified `false` deliberately, with
 //!   a deliberately non-Java `kind()` (`"walnut-rs.PortLimitation"`), so the gap prints on
 //!   stderr and cannot be mistaken for legitimate Walnut output — see
 //!   `crate::token`'s `track_number_system` for the full account of the defect that

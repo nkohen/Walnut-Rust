@@ -768,10 +768,34 @@ impl LoggableError for ProverError {
             // empty stderr. Same shape of stale/missing classification as
             // `ConvertNsError::BaseOverflowsInt` above; see each variant's own doc in
             // `wr_core::transducer` for the throw site.
+            //
+            // `TrivialAutomaton` joins them on the same reasoning, and for the same reason
+            // `ConvertNsError::BaseOverflowsInt` did: it is UNREACHABLE through the real
+            // dispatch, but it is still a port of an unchecked JDK throw and belongs in
+            // the bucket that says so. `transduce`'s only entry point is
+            // `Transducer::transduce_non_deterministic`, whose `msd.len() != 1` guard
+            // rejects a trivial (zero-track) automaton first -- verified live on BOTH
+            // engines (2026-08-21) with a `Word Automata Library/TRIV.txt` containing the
+            // literal word `true` and `transduce tout RUNSUM2 TRIV;`: each prints the same
+            // `NotSingleInput` text, `"Automata with only one input can be transduced."`.
+            // What `TrivialAutomaton` stands in for is one level below that, reachable only
+            // by calling `transduceMsdDeterministic` directly:
+            // `M.fa.getO().getInt(currState.state)` (`Transducer.java:188`) on the empty
+            // `O` of a zero-state automaton. Verified live too, with a throwaway JVM driver
+            // against `Walnut-all.jar` (this repo's `phase0-artifacts/CAPTURE.md`
+            // convention): `java.lang.IndexOutOfBoundsException: Index (0) is greater than
+            // or equal to list size (0)` -- an unchecked `RuntimeException`, hence `false`
+            // here and an `IndexOutOfBoundsException` `kind()` below, NOT the
+            // `WalnutException` treatment it silently had.
+            //
+            // `Exploded` deliberately stays `true`: it is this port's own resource verdict
+            // with no Java throw to classify at all (see `TransduceError::Exploded`).
             ProverError::Transduce(e) => !matches!(
                 e,
                 TransduceCommandError::Transduce(
-                    TransduceError::NoTransducerTransition | TransduceError::NoTransducerOutput
+                    TransduceError::NoTransducerTransition
+                        | TransduceError::NoTransducerOutput
+                        | TransduceError::TrivialAutomaton
                 )
             ),
 
@@ -921,7 +945,19 @@ impl LoggableError for ProverError {
             // `kind()` had no matching arm, so it fell through to the generic
             // `"Main.WalnutException"` instead of the real
             // `java.lang.NumberFormatException` Java reports.
-            | ProverError::Ost(OstError::Parse(ParseMethodsError::NumberFormat(_))) => {
+            | ProverError::Ost(OstError::Parse(ParseMethodsError::NumberFormat(_)))
+            // `convert conv_out2 msd_99999999999999 $ok2;` — `Convert.java`'s own
+            // `Integer.parseInt` on the DESTINATION base name, i.e. the same gap as
+            // `BaseOverflowsInt` and `OstError::Parse` above, but on a REACHABLE path
+            // (`BaseOverflowsInt` turned out not to be, which is why the first pass at this
+            // bucket stopped short of it). `is_handled()` has always routed this correctly
+            // (`ConvertError::InvalidBase(_) => false`, several arms up); `kind()` had no
+            // matching arm, so it fell through to `"Main.WalnutException"`. Verified live
+            // (2026-08-21) on both engines: real Java prints
+            // `java.lang.NumberFormatException: For input string: "99999999999999"`, this
+            // port printed `Main.WalnutException: For input string: "99999999999999"` —
+            // same message, wrong exception class.
+            | ProverError::Convert(ConvertError::InvalidBase(_)) => {
                 "java.lang.NumberFormatException".to_string()
             }
             // `RichAlphabet.encode`'s corrupt index -- WB-010's own trigger (`docs/
@@ -941,6 +977,13 @@ impl LoggableError for ProverError {
             ProverError::Transduce(TransduceCommandError::Transduce(
                 TransduceError::NoTransducerTransition | TransduceError::NoTransducerOutput,
             )) => "java.lang.NullPointerException".to_string(),
+            // `transduceMsdDeterministic`'s zero-state `M.fa.getO().getInt(0)`
+            // (`Transducer.java:188`) — see this type's `is_handled` arm for the live JVM
+            // capture and for why this variant is unreachable through the real dispatch
+            // yet classified anyway.
+            ProverError::Transduce(TransduceCommandError::Transduce(
+                TransduceError::TrivialAutomaton,
+            )) => "java.lang.IndexOutOfBoundsException".to_string(),
             ProverError::Meta(e) => e.kind(),
             _ => "Main.WalnutException".to_string(),
         }
@@ -2242,6 +2285,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
+    use wr_core::transducer::TransduceLimit;
 
     // ------------------------------------------------------------ scaffolding
 
@@ -2784,6 +2828,16 @@ mod tests {
             .kind(),
             "java.lang.NumberFormatException"
         );
+        // ...and the same for `InvalidBase`, which -- unlike `BaseOverflowsInt` -- is
+        // genuinely REACHABLE, so this one was a live divergence, not a fidelity nicety.
+        // Verified live (2026-08-21) with `convert conv_out2 msd_99999999999999 $ok2;`:
+        // real Java prints `java.lang.NumberFormatException: For input string:
+        // "99999999999999"`, this port printed `Main.WalnutException: …` — right message,
+        // wrong class, because `is_handled()` had the arm and `kind()` did not.
+        assert_eq!(
+            ProverError::Convert(ConvertError::InvalidBase("99999999999999".to_string())).kind(),
+            "java.lang.NumberFormatException"
+        );
 
         // `transduce`'s own two raw-NPE variants -- see this type's `is_handled` arm for
         // the live 2026-08-21 reproduction (real Java: stderr + `java.lang.
@@ -2801,18 +2855,80 @@ mod tests {
             );
             assert_eq!(e.kind(), "java.lang.NullPointerException");
         }
+        // `TrivialAutomaton` is the third unhandled one, added after adversarial review
+        // pointed out this test enumerated only the variants the diff happened to touch.
+        // It has no Java `WalnutException` behind it either: it stands in for
+        // `transduceMsdDeterministic`'s `M.fa.getO().getInt(0)` on a zero-state automaton,
+        // captured live from a throwaway JVM driver (2026-08-21) as
+        // `java.lang.IndexOutOfBoundsException: Index (0) is greater than or equal to list
+        // size (0)`. Unreachable through the real dispatch (`transduce`'s only entry point
+        // rejects a zero-track automaton with `NotSingleInput` first, confirmed live on
+        // both engines) -- classified for fidelity regardless, exactly as
+        // `ConvertNsError::BaseOverflowsInt` above is.
+        {
+            let e = ProverError::Transduce(TransduceCommandError::Transduce(
+                TransduceError::TrivialAutomaton,
+            ));
+            assert!(
+                !e.is_handled(),
+                "TrivialAutomaton ports an unchecked IndexOutOfBoundsException, not a \
+                 WalnutException"
+            );
+            assert_eq!(e.kind(), "java.lang.IndexOutOfBoundsException");
+        }
         // ...while every OTHER `TransduceError` stays in the handled bucket, including
         // WB-034's now-fixed `NoNumberSystem` -- the point is a narrowed bucket, not an
         // inverted one.
+        //
+        // This list plus the three unhandled ones above is EXHAUSTIVE over
+        // `TransduceError`'s eight variants, and the `match` below is what keeps it that
+        // way: adding a ninth variant fails to compile here, so it cannot silently land in
+        // whichever bucket the catch-all happens to put it in. (An earlier version of this
+        // test listed four of the eight and said nothing about the other four, which is
+        // precisely how `TrivialAutomaton` sat misclassified.)
         for variant in [
             TransduceError::NoNumberSystem,
             TransduceError::NotSingleInput,
             TransduceError::IncompatibleAlphabet,
             TransduceError::MultipleTransitionsPerInput,
+            // This port's own resource verdict, with no Java throw to classify at all --
+            // deliberately in the message-only bucket. See `TransduceError::Exploded`.
+            TransduceError::Exploded(TransduceLimit::MapSteps),
+            TransduceError::Exploded(TransduceLimit::BfsStates),
+            TransduceError::Exploded(TransduceLimit::WordLength),
         ] {
             assert!(
                 ProverError::Transduce(TransduceCommandError::Transduce(variant)).is_handled(),
-                "{variant:?} is a real WalnutException"
+                "{variant:?} is a real WalnutException (or this port's own resource verdict)"
+            );
+        }
+        // The exhaustiveness tripwire: every variant must appear in exactly one of the two
+        // buckets above, and this `match` is the compiler-checked proof that the
+        // enumeration is complete.
+        for variant in [
+            TransduceError::NotSingleInput,
+            TransduceError::IncompatibleAlphabet,
+            TransduceError::MultipleTransitionsPerInput,
+            TransduceError::NoNumberSystem,
+            TransduceError::TrivialAutomaton,
+            TransduceError::NoTransducerTransition,
+            TransduceError::NoTransducerOutput,
+            TransduceError::Exploded(TransduceLimit::MapSteps),
+        ] {
+            let expected_handled = match variant {
+                TransduceError::NotSingleInput
+                | TransduceError::IncompatibleAlphabet
+                | TransduceError::MultipleTransitionsPerInput
+                | TransduceError::NoNumberSystem
+                | TransduceError::Exploded(_) => true,
+                TransduceError::TrivialAutomaton
+                | TransduceError::NoTransducerTransition
+                | TransduceError::NoTransducerOutput => false,
+            };
+            assert_eq!(
+                ProverError::Transduce(TransduceCommandError::Transduce(variant)).is_handled(),
+                expected_handled,
+                "{variant:?} is in the wrong is_handled bucket"
             );
         }
 
