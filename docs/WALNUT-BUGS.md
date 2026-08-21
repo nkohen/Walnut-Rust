@@ -1845,43 +1845,58 @@ bug costs a silent wrong answer somewhere downstream.
   unrelated reason: `def`-ing anything over `msd_1000` first blows up in
   `ProductStrategies.computeAllInputsOfAxB` with `NegativeArraySizeException` on the `1000^2`
   cross-product alphabet — a separate, already-known scaling limit, not this bug.)
-- **Rust port:** `ported verbatim (quirk)`. `wr_core::logicalops::truncated_log_ratio` reproduces
-  the exact expression.
+- **Rust port:** `fixed, matches walnut-java as of commit 18b7c4b` — `wr_core::logicalops::
+  convert_ns`'s two exponent computations now call `exact_integer_exponent(base, root)`, a direct
+  port of Java's fix (`UtilityMethods.exactIntegerExponent`): exact integer repeated multiplication
+  (`power *= root` until `power >= base`, then check `power == base` exactly), never floating-point
+  logarithms. `wr_core::logicalops::java_log` and `truncated_log_ratio` — the bit-for-bit
+  `Math.log` transliteration and the truncated-quotient expression this port used to reproduce the
+  bug verbatim with — are deleted; nothing in this crate calls them any more.
 
-  **Reproducing it required porting `Math.log` itself** (`wr_core::logicalops::java_log`), and the
-  first draft of this port got that wrong. The draft used Rust's `f64::ln` and justified it with
-  "the value is libm-independent as long as `ln` is correctly rounded" — **a false premise, because
-  Java's `Math.log` is specifically NOT correctly rounded.** It is FDLIBM-derived and specified only
-  as "within 1 ulp", and it really does differ: on 1,940 of the 199,999 integers in `2..=200_000`,
-  `ln(3)` among them (Java `0x1.193ea7aad030ap0`, correctly rounded `0x1.193ea7aad030bp0`). Over the
-  sweep above, the two disagree on the computed exponent for **149** `(root, exponent)` pairs — in
-  both directions. The starkest: `convert t243 msd_243 t3;` on an `msd_3` automaton, where real
-  Walnut correctly produces `msd_243` and the `f64::ln` draft produced **`msd_81`** — a silently
-  wrong base on an ordinary input, i.e. a port bug rather than a faithful reproduction of this one.
-  `java_log` is a transliteration of FDLIBM 5.3's `__ieee754_log` (the source `StrictMath.log` is
-  derived from) and was verified **bit-for-bit against a real JVM on every integer in `2..=200_000`,
-  0 mismatches** (`openjdk 11.0.16.1`, `aarch64`, where `Math.log` and `StrictMath.log` were also
-  confirmed identical over that range). `int_pow`'s use of `powf` for `(int) Math.pow` was checked
-  the same way over the same sweep — exact on both sides, no divergence.
+  **Historical note, kept for the record.** Reproducing the ORIGINAL bug faithfully (before this
+  fix) had required porting `Math.log` itself, and the first draft of that port got it wrong: it
+  used Rust's `f64::ln` and justified it with "the value is libm-independent as long as `ln` is
+  correctly rounded" — a false premise, because Java's `Math.log` is specifically NOT correctly
+  rounded (it is FDLIBM-derived, "within 1 ulp", and really does differ from a correctly-rounded
+  `ln` on 1,940 of the 199,999 integers in `2..=200_000`). That `f64::ln` draft silently computed a
+  DIFFERENT wrong answer than real (buggy) Java on 149 `(root, exponent)` pairs — e.g. `convert
+  t243 msd_243 t3;` on an `msd_3` automaton, where real (pre-fix) Walnut correctly produced `msd_243`
+  and the `f64::ln` draft produced `msd_81`, a port bug rather than a faithful bug reproduction. The
+  corrected draft used a bit-for-bit FDLIBM transliteration (`java_log`), verified bit-for-bit
+  against a real JVM over `2..=200_000` with 0 mismatches — moot now that both `java_log` and the
+  float-log expression it served are gone, but recorded here since it is the reason this bug took
+  real engineering effort to *faithfully reproduce* before it was fixed for real.
 
-  Three tests pin the result: `java_log_matches_real_java_bit_for_bit` (raw
-  `doubleToRawLongBits` values captured from the JVM, including the three where `f64::ln` differs,
-  so a regression to `ln` fails loudly), `truncated_log_ratio_agrees_with_real_java` (the whole
-  `root <= 1000` slice of the sweep, expectations captured from the JVM — 2,406 pairs, 170 of them
-  WB-032 hits), and the end-to-end
-  `wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines` in
-  `tests/differential/tests/convert_ns.rs`, which compares the port's wrong answer against the real
-  engine's wrong answer.
-- **Upstream:** not filed. The fix in Java is to compute the exponent with integer arithmetic
-  (repeated division by `commonRoot` until the quotient is 1, verifying exactness on the way) rather
-  than `Math.log`; `UtilityMethods.commonRoot` already walks exactly that recursion and could return
-  the exponent alongside the root.
+  **Tests, updated for the fix.** The three tests that used to pin the OLD buggy computation
+  (`java_log_matches_real_java_bit_for_bit`, `truncated_log_ratio_agrees_with_real_java`,
+  `truncated_log_ratio_reproduces_wb032`) are deleted along with the functions they tested; replaced
+  with `exact_integer_exponent_on_ordinary_pairs`, `exact_integer_exponent_on_formerly_wb032_
+  affected_pairs` (the same `root <= 100` affected-pair list, now asserting the CORRECT exponent —
+  the direct regression guard against ever silently reintroducing the float-log computation),
+  `exact_integer_exponent_recovers_the_exponent_over_the_full_int_alphabet_sweep` (the same 48,036-pair
+  round-trip sweep, now checking the correct answer on every pair rather than the previously-wrong
+  343), and the two error-path tests for `exact_integer_exponent`'s own defensive guards — all in
+  `crates/wr-core/src/logicalops.rs`. The end-to-end differential pin (formerly
+  `wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines`, asserting the WRONG base) is now
+  `wb032_msd10_to_msd1000_now_correctly_produces_msd1000_in_both_engines`
+  (`tests/differential/tests/convert_ns.rs`), with its backing fixture
+  (`fixtures/convert_ns/b10msd1000.txt`) re-captured from the FIXED `walnut-java` branch as a
+  straight overwrite. A new file, `tests/differential/tests/java_bugfix_wb032.rs`, adds command-level
+  (not just `convert_ns`-primitive-level) coverage of both call sites through the real `convert` CLI
+  command, against a fresh capture from `bugfix/wb-032` (`../CAPTURE.md`'s entry for this file has
+  the full recipe).
+- **Upstream:** fixed, `walnut-java` commit `18b7c4b` on branch `bugfix/wb-032` (local, not yet
+  pushed/opened as of this writing) — adds `UtilityMethods.exactIntegerExponent(int base, int root)`
+  (exact integer repeated multiplication, throwing on an invalid `root` or a `base` that turns out
+  not to be an exact power of it) and switches both of `convertNS`'s exponent computations
+  (`AutomatonLogicalOps.java`, previously around `:504`/`:519`) to call it instead of the old
+  `(int) (Math.log(base) / Math.log(root))`.
 - **Severity:** moderate — a silently wrong answer (not a crash) from a supported command on valid
   input. **The original "confined to a small, unusual set of bases" framing understated it**: 343
   `(root, exponent)` pairs are affected, including `1000`, `10^6`, `17^3`, `31^3` and 125 perfect
   squares. It stays *moderate* rather than *high* only because every power of 2 is correct and
   bases 2/4/8/16 are what essentially all real usage converts between; a user working in base 10
-  hits it on the third power.
+  hits it on the third power. Now fixed on both engines.
 
 ---
 

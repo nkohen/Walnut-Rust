@@ -796,6 +796,16 @@ impl LoggableError for ProverError {
             ProverError::Convert(ConvertError::InvalidBase(_)) => false,
             // WB-033: `ns.parseBase()` on a `null` NS is a `NullPointerException`.
             ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)) => false,
+            // WB-032's fix (`UtilityMethods.exactIntegerExponent`, `walnut-java` commit
+            // `18b7c4b` on `bugfix/wb-032`): both of its own guards throw
+            // `IllegalArgumentException`, not a `WalnutException` -- same bucket as
+            // `NoNumberSystem` above. Unreachable through `convert_ns`'s real call sites
+            // (see `wr_core::logicalops::exact_integer_exponent`'s doc comment) but
+            // classified for fidelity anyway, matching this file's own precedent for
+            // defensive-only ported guards.
+            ProverError::Convert(ConvertError::Convert(
+                ConvertNsError::InvalidRoot { .. } | ConvertNsError::NotAnExactPower { .. },
+            )) => false,
             // The remaining `convertNS` failures, and `convertDFAOIntoFunction`, are
             // deliberately-thrown `WalnutException`s.
             ProverError::Convert(_) => true,
@@ -839,7 +849,14 @@ impl LoggableError for ProverError {
 
     fn kind(&self) -> String {
         match self {
-            ProverError::InvalidFile(_) => "java.lang.IllegalArgumentException".to_string(),
+            // WB-032's fix (`UtilityMethods.exactIntegerExponent`) throws the same
+            // `IllegalArgumentException` `InvalidFile` does -- see this type's
+            // `is_handled` arm for why these two `ConvertNsError` variants are unreachable
+            // through `convert_ns`'s real call sites, kept for fidelity regardless.
+            ProverError::InvalidFile(_)
+            | ProverError::Convert(ConvertError::Convert(
+                ConvertNsError::InvalidRoot { .. } | ConvertNsError::NotAnExactPower { .. },
+            )) => "java.lang.IllegalArgumentException".to_string(),
             ProverError::NumberFormat(_)
             | ProverError::AutomatonOps(AutomatonOpsError::NumberFormat(_))
             // `ost o [99999999999] [1];` — `ParseMethods.parseList`'s

@@ -39,7 +39,7 @@
 //! | **both** halves in one call (`fromBase != root != toBase`) | `lt5_msd4 -> msd_8/lsd_8`, `mod3msd4 -> msd_8/lsd_8` |
 //! | final reversal (`:525-527`) | every `-> lsd_*` case |
 //! | `exponent > 2` (three-digit grouping) | `even -> msd_8`, `mod3 -> msd_8` |
-//! | WB-032's truncated exponent | `lt15_msd10 -> msd_1000` |
+//! | `exactIntegerExponent`'s exponent computation (WB-032, fixed) | `lt15_msd10 -> msd_1000` |
 //!
 //! # Capture recipe (reproducible, same discipline as `../CAPTURE.md`)
 //!
@@ -112,6 +112,16 @@
 //! ```
 //!
 //! Captured 2026-08-13 against `walnut-java` at `Walnut v8.0-alpha`.
+//!
+//! **`fixtures/convert_ns/b10msd1000.txt` was RE-captured 2026-08-20**, against the FIXED
+//! `walnut-java` branch `bugfix/wb-032` (commit `18b7c4b`, built in an isolated worktree),
+//! by the exact same command this recipe already used —
+//! `convert $b10msd1000 msd_1000 $base10;` against the SAME `base10.txt` source — now
+//! producing the mathematically correct `msd_1000` automaton instead of the pre-fix
+//! `msd_100` one WB-032 used to silently produce. A straight overwrite, per this recipe's
+//! own step-4 discipline. See `tests/differential/tests/java_bugfix_wb032.rs` for the
+//! dedicated WB-032 fix coverage (both `convertNS` directions, driven through the real
+//! `convert` CLI command).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -172,7 +182,7 @@ fn all_words(base: i32, max_len: usize) -> Vec<Vec<i32>> {
 fn assert_same_outputs(ours: &Automaton, theirs: &Automaton, base: i32, what: &str) {
     // `base^max_len` words are materialized, so the bound has to shrink as the base grows —
     // `CLAUDE.md`'s "generate SMALL" guardrail. An earlier draft used a flat `3` for every
-    // base > 4, which meant 10^6 words for the base-100 WB-032 case: pure waste, since
+    // base > 4, which meant 10^9 words for the base-1000 WB-032 case: pure waste, since
     // every automaton here has at most 6 states and length-2 words already saturate their
     // reachable behaviour many times over.
     let max_len = if base <= 4 {
@@ -395,23 +405,26 @@ fn mod3_dfao_msd4_to_lsd8_matches_real_walnut() {
 }
 
 // ---------------------------------------------------------------------------
-// WB-032: the truncated floating-point exponent.
+// WB-032, FIXED: the exponent is now computed with exact integer arithmetic.
 // ---------------------------------------------------------------------------
 
-/// `x < 15` over `msd_10`, asked to become **`msd_1000`** — and silently becoming
-/// `msd_100` instead, in both engines.
+/// `x < 15` over `msd_10`, asked to become **`msd_1000`** — the smallest trigger for
+/// `docs/WALNUT-BUGS.md` WB-032's old float-log exponent bug, which used to make BOTH
+/// engines silently produce a wrong `msd_100`-shaped automaton instead
+/// (`(int)(Math.log(1000) / Math.log(10))` used to be `2`, not `3`).
 ///
-/// `(int)(Math.log(1000) / Math.log(10))` is `2`, not `3`
-/// (`docs/WALNUT-BUGS.md` WB-032), so `convertMsdBaseToExponent` groups two digits instead
-/// of three. This test asserts the port reproduces the wrong answer **bit for bit against
-/// the real engine's wrong answer** — it is the pin that would fail if someone "fixed" the
-/// exponent computation in this port without going through the WALNUT-BUGS process, and it
-/// would also fail on a platform whose `ln` is less accurate than the correctly-rounded one
-/// Java and every mainstream libm provide.
+/// As of `walnut-java` commit `18b7c4b` (branch `bugfix/wb-032`), `convertNS` computes the
+/// exponent by exact integer repeated multiplication (`UtilityMethods.exactIntegerExponent`,
+/// ported here as `wr_core::logicalops::exact_integer_exponent`) and correctly produces
+/// `msd_1000`. **This test used to assert the WRONG, bug-compatible answer**
+/// (`wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines`, expecting base
+/// `100`) — it is flipped here, and `fixtures/convert_ns/b10msd1000.txt` was re-captured
+/// from the FIXED `walnut-java` branch (a straight overwrite of the same fixture, per this
+/// file's own capture-recipe discipline: `convert $b10msd1000 msd_1000 $base10;` against the
+/// same `base10.txt` source, now run against `bugfix/wb-032`'s jar instead of mainline's).
 #[test]
-fn wb032_msd10_to_msd1000_silently_produces_msd100_in_both_engines() {
-    // Note the `100`, not `1000`, as the expected base: that IS the bug.
-    check_conversion("base10.txt", true, 1000, "b10msd1000.txt", 100);
+fn wb032_msd10_to_msd1000_now_correctly_produces_msd1000_in_both_engines() {
+    check_conversion("base10.txt", true, 1000, "b10msd1000.txt", 1000);
 }
 
 // ---------------------------------------------------------------------------

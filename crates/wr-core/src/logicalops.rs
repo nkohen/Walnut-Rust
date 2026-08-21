@@ -1669,6 +1669,26 @@ pub enum ConvertNsError {
         /// The automaton's declared base.
         found: i32,
     },
+    /// `UtilityMethods.exactIntegerExponent`'s `root <= 1` guard (WB-032's fix,
+    /// `Main/UtilityMethods.java`) — `IllegalArgumentException("root must be > 1, got " +
+    /// root)`. **Not a `WalnutException`.** See [`exact_integer_exponent`]'s doc comment for
+    /// why this is unreachable through [`convert_ns`]'s own two call sites; kept for the same
+    /// reason [`ConvertNsError::NotDeterministicAndTotal`] is.
+    InvalidRoot {
+        /// The offending `root`, always `<= 1`.
+        root: i32,
+    },
+    /// `UtilityMethods.exactIntegerExponent`'s final consistency check (WB-032's fix) —
+    /// `IllegalArgumentException(base + " is not an exact power of " + root)`. **Not a
+    /// `WalnutException`.** See [`exact_integer_exponent`]'s doc comment for why this is
+    /// unreachable through [`convert_ns`]'s own two call sites; kept for the same reason
+    /// [`ConvertNsError::NotDeterministicAndTotal`] is.
+    NotAnExactPower {
+        /// The value that turned out not to be an exact power of `root`.
+        base: i32,
+        /// The claimed root.
+        root: i32,
+    },
 }
 
 impl fmt::Display for ConvertNsError {
@@ -1703,6 +1723,12 @@ impl fmt::Display for ConvertNsError {
             ConvertNsError::BaseMismatch { expected, found } => {
                 write!(f, "Base mismatch: expected {expected}, found {found}")
             }
+            ConvertNsError::InvalidRoot { root } => {
+                write!(f, "root must be > 1, got {root}")
+            }
+            ConvertNsError::NotAnExactPower { base, root } => {
+                write!(f, "{base} is not an exact power of {root}")
+            }
         }
     }
 }
@@ -1735,183 +1761,63 @@ fn int_pow(base: i32, exponent: i32) -> i32 {
     f64::from(base).powf(f64::from(exponent)) as i32
 }
 
-/// **Java's `Math.log`, transliterated** — i.e. FDLIBM's `__ieee754_log`, which is what
-/// `StrictMath.log` is and what `Math.log` resolves to on the platforms this port is
-/// checked against.
+/// `UtilityMethods.exactIntegerExponent(int, int)` — **WB-032's fix**
+/// (`docs/WALNUT-BUGS.md`), landed in `walnut-java` commit `18b7c4b` on branch
+/// `bugfix/wb-032`. Computes the exponent `j` such that `root^j == base` by exact integer
+/// repeated multiplication, never floating-point logarithms.
 ///
-/// # Why this exists instead of `f64::ln`
+/// # What this replaces
 ///
-/// [`truncated_log_ratio`] below is bug-for-bug sensitive to the LAST BIT of the logarithm
-/// (it truncates a quotient of two of them), so "same to within an ulp" is not good enough:
-/// the port has to compute the *same double* Java does.
-///
-/// **`f64::ln` does not.** Rust's `ln` is the platform libm's, which on macOS/glibc is
-/// correctly rounded; Java's `Math.log` is FDLIBM-derived and is **not** — it is documented
-/// only as "within 1 ulp", and it really does differ. It differs on 1,940 of the 199,999
-/// integers in `2..=200_000` (`ln(3)`, `ln(185)` and `ln(196)` among them: for `3`, Java
-/// gives `0x1.193ea7aad030ap0` where the correctly-rounded value is `0x1.193ea7aad030bp0`).
-///
-/// Those last bits propagate: swept over every `(root, exponent)` with `root <= 46340` and
-/// `root^exponent <= 2^31`, `(int)(ln(x)/ln(root))` computed with Rust's `ln` disagrees with
-/// the same expression computed with Java's on **149** pairs. The starkest is
-/// `root = 3, exponent = 5`: real Walnut converts an `msd_3` automaton to `msd_243`, while a
-/// `f64::ln`-based port converted it to `msd_81` — a silently different, wrong base on a
-/// perfectly ordinary input. (This module's first draft did exactly that, on the false
-/// premise that "the value is libm-independent as long as `ln` is correctly rounded".)
+/// `convert_ns`'s two call sites used to compute the same `j` as
+/// `(int) (Math.log(base) / Math.log(root))` (ported here as `truncated_log_ratio`, backed
+/// by a bit-for-bit transliteration of Java's own non-correctly-rounded `Math.log`,
+/// `java_log`). That quotient of two logarithms is not exact — it can land a fraction of an
+/// ulp below the true integer answer, and the truncating cast then rounded it DOWN by a
+/// whole unit on 343 real `(root, exponent)` pairs (`root <= 46340`, `root^exponent <=
+/// 2^31`), the smallest being `(1000, 10)`: `Math.log(1000) / Math.log(10) ==
+/// 2.9999999999999996`, truncating to `2` instead of `3`. `docs/WALNUT-BUGS.md`'s WB-032
+/// entry carries the full historical diagnosis and characterization; both `java_log` and
+/// `truncated_log_ratio` are gone from this file now that nothing calls them.
 ///
 /// # The algorithm
 ///
-/// A direct transliteration of FDLIBM 5.3's `e_log.c` (`__ieee754_log`), the same source
-/// OpenJDK's `StrictMath.log` is derived from: argument-reduce `x = 2^k * (1+f)` with
-/// `sqrt(2)/2 < 1+f < sqrt(2)`, then evaluate `log(1+f)` from the odd polynomial in
-/// `s = f/(2+f)`. Constants are given as raw bit patterns (the same ones FDLIBM lists in
-/// its comments) so no decimal-literal rounding can creep in.
+/// A direct port of Java's fix: start `exponent = 0`, `power = 1`, and repeatedly multiply
+/// `power` by `root` (incrementing `exponent` each time) until `power >= base`, then check
+/// `power == base` exactly. `power` is `i64` (matching Java's `long power`) even though
+/// `base`/`root`/the returned exponent are all `i32` — the intermediate product can exceed
+/// `i32::MAX` on the very last multiply before the loop notices `power >= base` and stops
+/// (`base` itself is `<= i32::MAX`, but `power` can overshoot it by up to a factor of `root`
+/// first).
 ///
-/// # Verification (this is the whole point of the function, so it is checked, not asserted)
+/// # Reachability of the two error arms
 ///
-/// `java_log_matches_real_java_bit_for_bit` pins a spread of captured
-/// `Double.doubleToRawLongBits(Math.log(v))` values, and the port was checked exhaustively
-/// off-line against a dump from the real JVM: **0 mismatches over every integer in
-/// `2..=200_000`**, on `openjdk 11.0.16.1` / `aarch64`, where `Math.log` and
-/// `StrictMath.log` were also verified to agree bit-for-bit over the same range. (On x86-64
-/// HotSpot can substitute an Intel-LIBM intrinsic for `Math.log`; should that ever be shown
-/// to differ from FDLIBM on an input this file feeds it, this function is the single place
-/// to record the divergence.)
-///
-/// Only the ordinary finite-positive path is ever exercised here — every argument is a
-/// small positive integer base — but the subnormal/zero/negative/NaN branches are ported
-/// too rather than replaced with a panic, so the function is a faithful `Math.log` and not
-/// a partial one.
-#[allow(clippy::excessive_precision)]
-fn java_log(x: f64) -> f64 {
-    // FDLIBM's file-scope constants, given as the raw bit patterns its own comments list.
-    // `let`, not `const`, only because `f64::from_bits` is not const-callable below Rust
-    // 1.83 and this workspace's MSRV is 1.75; the values are compile-time constants in
-    // every other sense.
-    let ln2_hi = f64::from_bits(0x3FE6_2E42_FEE0_0000);
-    let ln2_lo = f64::from_bits(0x3DEA_39EF_3579_3C76);
-    let two54 = f64::from_bits(0x4350_0000_0000_0000);
-    let lg1 = f64::from_bits(0x3FE5_5555_5555_5593);
-    let lg2 = f64::from_bits(0x3FD9_9999_9997_FA04);
-    let lg3 = f64::from_bits(0x3FD2_4924_9422_9359);
-    let lg4 = f64::from_bits(0x3FCC_71C5_1D8E_78AF);
-    let lg5 = f64::from_bits(0x3FC7_4664_96CB_03DE);
-    let lg6 = f64::from_bits(0x3FC3_9A09_D078_C69F);
-    let lg7 = f64::from_bits(0x3FC2_F112_DF3E_5244);
-
-    /// FDLIBM's `__HI(x)`: the high 32 bits, read as a SIGNED int (its `hx` is an `int`,
-    /// and both the `hx < 0` sign test and the `hx >> 20` exponent extraction rely on that).
-    fn high_word(x: f64) -> i32 {
-        (x.to_bits() >> 32) as u32 as i32
+/// Both of `convert_ns`'s call sites pass a `root` that came out of [`util::common_root`]
+/// applied to `from_base`/`to_base`, which by the time either call site runs are already
+/// known to differ (the `from_base == to_base` case returns earlier in `convert_ns`) and are
+/// each already validated `> 1` by [`parse_base`]. `common_root`'s own contract (see its doc
+/// comment) guarantees any result other than [`util::NO_COMMON_ROOT`] is a genuine common
+/// divisor reached by exact integer division of the larger by the smaller — never `1` (its
+/// `a == 1 || b == 1` guard returns `NO_COMMON_ROOT` first) — so `root` is always `> 1`, and
+/// `base` (one of `from_base`/`to_base`) is always exactly `root^exponent` for some
+/// non-negative integer `exponent`. **Neither error arm below is therefore reachable through
+/// `convert_ns`'s real call sites**; both are kept anyway, matching Java's own defensive
+/// `IllegalArgumentException` guards and the "ported anyway, exactly as Java keeps the
+/// defensive guard" precedent [`ConvertNsError::NotDeterministicAndTotal`]'s doc comment
+/// already sets for a neighbouring guard in this same function.
+fn exact_integer_exponent(base: i32, root: i32) -> Result<i32, ConvertNsError> {
+    if root <= 1 {
+        return Err(ConvertNsError::InvalidRoot { root });
     }
-    /// FDLIBM's `__LO(x)`: the low 32 bits, unsigned (only ever tested for zero).
-    fn low_word(x: f64) -> u32 {
-        x.to_bits() as u32
+    let mut exponent: i32 = 0;
+    let mut power: i64 = 1;
+    while power < i64::from(base) {
+        power *= i64::from(root);
+        exponent += 1;
     }
-    /// FDLIBM's `__HI(x) = h` assignment: replace the high word, keep the low one.
-    fn with_high_word(x: f64, h: i32) -> f64 {
-        f64::from_bits((u64::from(h as u32) << 32) | u64::from(low_word(x)))
+    if power != i64::from(base) {
+        return Err(ConvertNsError::NotAnExactPower { base, root });
     }
-
-    let mut x = x;
-    let mut hx = high_word(x);
-    let lx = low_word(x);
-    let mut k: i32 = 0;
-
-    if hx < 0x0010_0000 {
-        // x < 2^-1022
-        if ((hx & 0x7fff_ffff) as u32 | lx) == 0 {
-            return -two54 / 0.0; // log(+-0) = -inf
-        }
-        if hx < 0 {
-            // FDLIBM's `(x-x)/zero` idiom for "log of a negative is NaN" — deliberately
-            // NOT simplified to `f64::NAN`, so the sign/payload it produces is whatever
-            // the hardware produces, exactly as in Java.
-            #[allow(clippy::eq_op)]
-            return (x - x) / 0.0;
-        }
-        k -= 54;
-        x *= two54; // subnormal: scale up
-        hx = high_word(x);
-    }
-    if hx >= 0x7ff0_0000 {
-        return x + x; // +inf / NaN
-    }
-    k += (hx >> 20) - 1023;
-    hx &= 0x000f_ffff;
-    let i = (hx + 0x9_5f64) & 0x10_0000;
-    x = with_high_word(x, hx | (i ^ 0x3ff0_0000)); // normalize x or x/2
-    k += i >> 20;
-    let f = x - 1.0;
-    let dk: f64;
-
-    if (0x000f_ffff & (2 + hx)) < 3 {
-        // |f| < 2^-20
-        if f == 0.0 {
-            if k == 0 {
-                return 0.0;
-            }
-            dk = f64::from(k);
-            return dk * ln2_hi + dk * ln2_lo;
-        }
-        let r = f * f * (0.5 - 0.33333333333333333 * f);
-        if k == 0 {
-            return f - r;
-        }
-        dk = f64::from(k);
-        return dk * ln2_hi - ((r - dk * ln2_lo) - f);
-    }
-
-    let s = f / (2.0 + f);
-    dk = f64::from(k);
-    let z = s * s;
-    let mut i = hx - 0x6_147a;
-    let w = z * z;
-    let j = 0x6_b851 - hx;
-    let t1 = w * (lg2 + w * (lg4 + w * lg6));
-    let t2 = z * (lg1 + w * (lg3 + w * (lg5 + w * lg7)));
-    i |= j;
-    let r = t2 + t1;
-    if i > 0 {
-        let hfsq = 0.5 * f * f;
-        if k == 0 {
-            f - (hfsq - s * (hfsq + r))
-        } else {
-            dk * ln2_hi - ((hfsq - (s * (hfsq + r) + dk * ln2_lo)) - f)
-        }
-    } else if k == 0 {
-        f - s * (f - r)
-    } else {
-        dk * ln2_hi - ((s * (f - r) - dk * ln2_lo) - f)
-    }
-}
-
-/// Java's `(int) (Math.log(x) / Math.log(root))` (`:504`, `:519`) — "the `j` such that
-/// `x == root^j`", computed in floating point and **truncated**.
-///
-/// Uses [`java_log`], not `f64::ln`; see that function for why the difference is
-/// load-bearing rather than cosmetic.
-///
-/// # This is `docs/WALNUT-BUGS.md` WB-032, ported verbatim
-///
-/// The truncation is not safe: `log(x)/log(root)` can land a fraction of an ulp *below* the
-/// integer it should be, and `as i32` then rounds it DOWN by a whole unit. The smallest
-/// affected pair is `(x, root) = (1000, 10)`, where the quotient is `2.9999999999999996`
-/// and this returns `2` instead of `3` — so `convert $y msd_1000 $x` on an `msd_10`
-/// automaton silently produces an `msd_100` one (confirmed live against `Walnut-all.jar`).
-///
-/// The affected set is larger than an eyeball estimate suggests: **343** `(root, exponent)`
-/// pairs with `root <= 46340` and `root^exponent <= 2^31`, of which 170 have `root <= 1000`
-/// and 241 have `root^exponent <= 10^9`. Every power of 2 is safe (`log(2^n)/log(2)` is
-/// exact in binary floating point), which is why it has gone unnoticed; the smallest
-/// affected base is `1000` itself. `docs/WALNUT-BUGS.md` WB-032 carries the full
-/// characterization.
-///
-/// Kept bug-for-bug rather than replaced with an exact integer logarithm, per `CLAUDE.md`'s
-/// mechanical-port rule. `truncated_log_ratio_agrees_with_real_java` below pins the whole
-/// `root <= 1000` slice of that sweep against expectations captured from the real JVM.
-fn truncated_log_ratio(x: i32, root: i32) -> i32 {
-    (java_log(f64::from(x)) / java_log(f64::from(root))) as i32
+    Ok(exponent)
 }
 
 /// `NumberSystem.parseBase()` (`NumberSystem.java:237-243`), including its
@@ -2361,11 +2267,16 @@ fn convert_lsd_base_to_root(
 /// explicitly through the two helpers, for the reason Java re-reads it: each is passed the
 /// base the automaton actually has *at that point*, which is not the one it started with.
 ///
-/// # `docs/WALNUT-BUGS.md` WB-032 lives on this path
+/// # `docs/WALNUT-BUGS.md` WB-032 lived on this path — now FIXED
 ///
-/// See [`truncated_log_ratio`]: for 343 `(root, exponent)` pairs (`msd_10 -> msd_1000`
-/// being the smallest) the exponent is computed one too low, and the automaton is silently
-/// converted to the wrong base. Ported verbatim.
+/// The two exponent computations below used to be `truncated_log_ratio(from_base,
+/// common_root)`/`truncated_log_ratio(to_base, common_root)`, a floating-point log ratio
+/// that silently computed one too few for 343 `(root, exponent)` pairs (`msd_10 ->
+/// msd_1000` being the smallest), converting the automaton to the wrong base with no error.
+/// As of `walnut-java` commit `18b7c4b` (branch `bugfix/wb-032`) both call sites use
+/// [`exact_integer_exponent`] instead — exact integer arithmetic, never floating point — and
+/// this port follows suit. `docs/WALNUT-BUGS.md`'s WB-032 entry carries the full historical
+/// diagnosis.
 ///
 /// # `docs/WALNUT-BUGS.md` WB-001 also lives on this path
 ///
@@ -2449,7 +2360,7 @@ pub fn convert_ns(
 
     // Convert from k^i -> k if needed.
     if from_base != common_root {
-        let exponent = truncated_log_ratio(from_base, common_root);
+        let exponent = exact_integer_exponent(from_base, common_root)?;
         word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
         currently_reversed = true;
 
@@ -2464,7 +2375,7 @@ pub fn convert_ns(
             word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
             currently_reversed = false;
         }
-        let exponent = truncated_log_ratio(to_base, common_root);
+        let exponent = exact_integer_exponent(to_base, common_root)?;
         convert_msd_base_to_exponent(a, common_root, exponent)?;
         word_automaton::minimize_self_with_output_with_ctx(a, None, logging);
     }
@@ -5705,161 +5616,61 @@ mod tests {
         }
     }
 
-    /// [`java_log`] must return the SAME `double` Java's `Math.log` does, bit for bit —
-    /// that is its entire reason for existing (see its doc comment).
-    ///
-    /// Every expectation below is a raw
-    /// `Double.doubleToRawLongBits(Math.log(v))` **captured from a real JVM**
-    /// (`openjdk 11.0.16.1`, `aarch64`), not recomputed from a formula. The captured values
-    /// were also checked against `StrictMath.log` on the same JVM (identical for every
-    /// integer in `2..=200_000`) and against this function exhaustively over that whole
-    /// range off-line, with zero mismatches.
-    ///
-    /// `3`, `185` and `196` are here specifically because `f64::ln` gets those WRONG
-    /// relative to Java (it returns the correctly-rounded neighbour, one ulp away), so this
-    /// test fails loudly if the implementation is ever "simplified" back to `f64::ln`.
+    /// `UtilityMethodsTest.testExactIntegerExponentOnOrdinaryPairs` (`walnut-java` commit
+    /// `18b7c4b`, `bugfix/wb-032`) — cases where the OLD float computation already happened
+    /// to be correct, so the fix must not disturb them.
     #[test]
-    fn java_log_matches_real_java_bit_for_bit() {
-        // (v, Double.doubleToRawLongBits(Math.log(v)) as captured from the JVM)
-        const CAPTURED: &[(i32, u64)] = &[
-            (2, 0x3fe6_2e42_fefa_39ef),
-            (3, 0x3ff1_93ea_7aad_030a), // f64::ln gives ...030b
-            (4, 0x3ff6_2e42_fefa_39ef),
-            (8, 0x4000_a2b2_3f3b_ab73),
-            (9, 0x4001_93ea_7aad_030b),
-            (10, 0x4002_6bb1_bbb5_5516),
-            (16, 0x4006_2e42_fefa_39ef),
-            (17, 0x4006_aa6b_c1fa_7f7a),
-            (100, 0x4012_6bb1_bbb5_5516),
-            (185, 0x4014_e1a4_f518_c72c), // f64::ln gives ...c72b
-            (196, 0x4015_1cca_16d7_bba8), // f64::ln gives ...bba7
-            (243, 0x4015_f8e5_1958_43cd),
-            (1000, 0x401b_a18a_998f_ffa0),
-            (4913, 0x4020_ffd0_d17b_df9b),
-            (34225, 0x4024_e1a4_f518_c72b),
-            (59049, 0x4025_f8e5_1958_43cd),
-            (100_000, 0x4027_069e_2aa2_aa5b),
-        ];
-        for &(v, bits) in CAPTURED {
+    fn exact_integer_exponent_on_ordinary_pairs() {
+        assert_eq!(exact_integer_exponent(2, 2), Ok(1));
+        assert_eq!(exact_integer_exponent(8, 2), Ok(3));
+        assert_eq!(exact_integer_exponent(1024, 2), Ok(10));
+        assert_eq!(exact_integer_exponent(16, 4), Ok(2));
+        assert_eq!(exact_integer_exponent(81, 9), Ok(2));
+    }
+
+    /// `UtilityMethodsTest.testExactIntegerExponentOnWb032AffectedPairs` — every
+    /// `(root, exponent)` pair with `root <= 100` on which real (pre-fix) Java's
+    /// `(int)(Math.log(base)/Math.log(root))` used to return `exponent - 1`
+    /// (`docs/WALNUT-BUGS.md` WB-032's own "root <= 100" list, itself independently swept
+    /// from a real JVM). The fixed [`exact_integer_exponent`] must recover the CORRECT
+    /// exponent on every one of these — this is the direct regression guard against ever
+    /// silently reintroducing WB-032's float-log computation.
+    #[rustfmt::skip]
+    const FORMERLY_WB032_AFFECTED_ROOT_LE_100: &[(i32, i32)] = &[
+        (9, 5), (10, 3), (10, 6), (10, 9), (11, 7), (12, 7), (17, 3), (17, 6), (22, 5),
+        (31, 3), (31, 6), (34, 3), (34, 6), (41, 3), (46, 5), (52, 3), (52, 5), (54, 5),
+        (55, 5), (56, 3), (56, 5), (69, 5), (83, 3), (88, 3), (93, 3), (98, 3), (100, 3),
+    ];
+
+    #[test]
+    fn exact_integer_exponent_on_formerly_wb032_affected_pairs() {
+        for &(root, exponent) in FORMERLY_WB032_AFFECTED_ROOT_LE_100 {
+            let base = i64::from(root).pow(exponent as u32);
             assert_eq!(
-                java_log(f64::from(v)).to_bits(),
-                bits,
-                "java_log({v}) must be bit-identical to real Java's Math.log({v})"
+                exact_integer_exponent(base as i32, root),
+                Ok(exponent),
+                "root={root} base={base}: must recover the exact exponent, not \
+                 WB-032's off-by-one-low float result"
             );
         }
     }
 
-    /// The `(root, exponent)` pairs on which `docs/WALNUT-BUGS.md` WB-032 fires — i.e. on
-    /// which real Java's `(int)(Math.log(root^e) / Math.log(root))` returns `e - 1` instead
-    /// of `e` — for every `root <= 1000` with `root^e <= 2^31`.
+    /// `UtilityMethodsTest.testExactIntegerExponentSweepAgreesWithBruteForceOverRootUpTo1000`,
+    /// widened to the full `int`-alphabet range: sweep every `(root, exponent)` with
+    /// `root <= 46340` (the largest `root` with `root^2 <= 2^31`, the last one an `int`
+    /// alphabet can hold) and `root^exponent <= 2^31`, constructing `base` from `exponent`
+    /// by plain repeated multiplication and confirming [`exact_integer_exponent`] recovers
+    /// `exponent` back out of `(base, root)` alone. Construction and recovery are the
+    /// opposite directions of the same arithmetic, so this is a genuine round-trip check,
+    /// not a tautology — the same shape Java's own new sweep test uses.
     ///
-    /// **Captured from a real JVM**, by running that exact Java expression over the same
-    /// sweep; deliberately NOT recomputed with Rust's `ln`, which would have re-introduced
-    /// the very divergence [`java_log`] exists to remove (it disagrees with Java on 29 of
-    /// the pairs in this range: it misses `(3,5)`, `(3,10)`, `(3,13)`, `(3,15)`, `(3,17)`,
-    /// `(48,3)`, … and invents `(185,2)`, `(196,2)`, `(220,2)`, `(343,3)`, …).
-    #[rustfmt::skip]
-    const WB032_AFFECTED_ROOT_LE_1000: &[(i32, i32)] = &[
-        (9, 5), (10, 3), (10, 6), (10, 9), (11, 7), (12, 7), (17, 3), (17, 6), (22, 5),
-        (31, 3), (31, 6), (34, 3), (34, 6), (41, 3), (46, 5), (52, 3), (52, 5), (54, 5),
-        (55, 5), (56, 3), (56, 5), (69, 5), (83, 3), (88, 3), (93, 3), (98, 3), (100, 3),
-        (154, 3), (166, 3), (170, 3), (171, 3), (175, 3), (183, 3), (185, 2), (185, 3),
-        (185, 4), (186, 3), (196, 2), (196, 3), (196, 4), (216, 3), (220, 2), (223, 3),
-        (226, 3), (236, 3), (237, 3), (238, 3), (239, 3), (242, 3), (245, 3), (253, 3),
-        (266, 3), (271, 3), (272, 3), (283, 3), (285, 3), (289, 3), (293, 3), (295, 3),
-        (297, 3), (304, 3), (305, 3), (318, 3), (328, 3), (340, 3), (343, 3), (348, 3),
-        (355, 3), (358, 3), (373, 3), (374, 3), (385, 3), (387, 3), (390, 3), (397, 3),
-        (402, 3), (404, 3), (410, 3), (418, 3), (426, 3), (453, 3), (454, 3), (458, 3),
-        (460, 3), (467, 3), (468, 3), (470, 3), (489, 3), (494, 3), (496, 3), (505, 3),
-        (508, 3), (523, 3), (527, 3), (539, 3), (540, 3), (548, 3), (551, 3), (557, 3),
-        (563, 3), (564, 3), (565, 3), (573, 3), (575, 3), (579, 3), (582, 3), (587, 3),
-        (605, 3), (612, 3), (620, 3), (630, 3), (644, 3), (661, 2), (661, 3), (662, 3),
-        (666, 3), (669, 3), (672, 3), (675, 3), (679, 3), (680, 2), (685, 3), (689, 3),
-        (691, 3), (720, 3), (721, 3), (736, 3), (745, 3), (754, 3), (756, 3), (761, 3),
-        (764, 3), (768, 3), (772, 3), (773, 3), (776, 3), (790, 3), (791, 3), (796, 3),
-        (798, 3), (802, 3), (807, 3), (820, 2), (824, 3), (831, 3), (833, 3), (835, 2),
-        (845, 3), (847, 3), (849, 3), (854, 3), (871, 3), (876, 3), (878, 3), (881, 3),
-        (886, 3), (892, 3), (894, 3), (926, 3), (931, 3), (939, 3), (950, 3), (954, 3),
-        (961, 3), (969, 3), (971, 3), (985, 3), (989, 3), (990, 3), (991, 3),
-    ];
-
-    /// The rest of the same capture: every affected pair with `1000 < root <= 46340` (the
-    /// largest `root` with `root^2 <= 2^31`, i.e. the last one an `int` alphabet can hold).
-    ///
-    /// **Added in Phase 4, U31**, extending the sweep below from `root <= 1000` to the
-    /// whole `int`-representable range — the half `docs/WALNUT-BUGS.md` WB-032 describes
-    /// ("125 perfect squares are affected too, the smallest being `34225 = 185^2`") but
-    /// that no test previously touched. That gap mattered for a concrete reason: for
-    /// `root > 1000` the argument handed to [`java_log`] is up to `2^31`, well outside the
-    /// `2..=200_000` range over which `java_log` was verified bit-for-bit against a real
-    /// JVM, so nothing in this crate pinned its agreement with Java up there at all.
-    ///
-    /// **Captured from a real JVM** by the same recipe as the table above — a throwaway
-    /// driver evaluating Java's own `(int) (Math.log(x) / Math.log(root))` over the sweep
-    /// (`openjdk 11.0.16.1`, `aarch64`, the JVM WB-032's original capture used):
-    ///
-    /// ```java
-    /// for (long root = 2; root <= 46340; root++) {
-    ///     long x = root;
-    ///     for (int exponent = 2; ; exponent++) {
-    ///         x *= root;
-    ///         if (x > (long) Integer.MAX_VALUE) break;
-    ///         int got = (int) (Math.log((double) x) / Math.log((double) root));
-    ///         if (got != exponent) System.out.println("(" + root + ", " + exponent + ")");
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// That run reproduced the `root <= 1000` table above **entry for entry**, which is
-    /// the cross-check that the recapture is comparable to the original one; it reported
-    /// 343 affected pairs in total, exactly the figure WB-032 records. Every affected pair
-    /// (in both tables) has Java returning `exponent - 1`, never any other wrong value —
-    /// asserted below rather than assumed.
-    #[rustfmt::skip]
-    const WB032_AFFECTED_ROOT_GT_1000: &[(i32, i32)] = &[
-        (1003, 3), (1012, 3), (1014, 3), (1022, 3), (1025, 3), (1037, 3), (1052, 3), (1058, 3), (1064, 3),
-        (1067, 3), (1073, 3), (1074, 3), (1084, 3), (1093, 3), (1095, 3), (1103, 3), (1109, 3), (1113, 3),
-        (1117, 3), (1132, 3), (1133, 3), (1136, 3), (1137, 3), (1140, 3), (1142, 3), (1154, 3), (1156, 3),
-        (1160, 3), (1168, 3), (1170, 3), (1182, 3), (1186, 3), (1188, 3), (1190, 3), (1202, 3), (1206, 3),
-        (1207, 3), (1216, 3), (1218, 3), (1220, 3), (1222, 3), (1231, 3), (1242, 3), (1243, 3), (1246, 3),
-        (1248, 3), (1253, 3), (1254, 3), (1257, 3), (1272, 3), (1279, 3), (1283, 3), (1284, 3), (1285, 3),
-        (1290, 3), (1377, 2), (1459, 2), (1512, 2), (2486, 2), (2519, 2), (2662, 2), (2740, 2), (2766, 2),
-        (2865, 2), (4498, 2), (4847, 2), (5395, 2), (5396, 2), (5561, 2), (5632, 2), (5646, 2), (5853, 2),
-        (5992, 2), (5998, 2), (6074, 2), (6165, 2), (6177, 2), (6371, 2), (6888, 2), (6926, 2), (11036, 2),
-        (11359, 2), (11428, 2), (11511, 2), (11569, 2), (11647, 2), (11729, 2), (11841, 2), (11866, 2), (11903, 2),
-        (11978, 2), (12300, 2), (12306, 2), (12448, 2), (12451, 2), (12525, 2), (12613, 2), (12746, 2), (12885, 2),
-        (13117, 2), (13186, 2), (19995, 2), (20128, 2), (20753, 2), (21041, 2), (21152, 2), (21189, 2), (21552, 2),
-        (21658, 2), (21885, 2), (22414, 2), (22431, 2), (22551, 2), (22680, 2), (22952, 2), (23151, 2), (23669, 2),
-        (23679, 2), (23751, 2), (23759, 2), (23926, 2), (24318, 2), (24341, 2), (24443, 2), (24618, 2), (24885, 2),
-        (25276, 2), (25279, 2), (28050, 2), (28573, 2), (38415, 2), (38785, 2), (41380, 2), (41672, 2), (41836, 2),
-        (41863, 2), (42189, 2), (42322, 2), (42564, 2), (42639, 2), (42726, 2), (42819, 2), (42981, 2), (43003, 2),
-        (43093, 2), (43346, 2), (43408, 2), (43461, 2), (43634, 2), (43661, 2), (43867, 2), (44069, 2), (44137, 2),
-        (44184, 2), (44199, 2), (44331, 2), (44367, 2), (44497, 2), (44566, 2), (44594, 2), (44749, 2), (44915, 2),
-        (45008, 2), (45482, 2), (45495, 2), (45835, 2), (45931, 2), (45964, 2), (46027, 2), (46094, 2), (46169, 2),
-        (46224, 2), (46326, 2),
-    ];
-
-    /// The real pin on [`truncated_log_ratio`]: a bounded sweep asserting the port computes
-    /// **exactly what real Java computes**, right answers and WB-032's wrong ones alike, for
-    /// every `(root, exponent)` with `root <= 46340` and `root^exponent <= 2^31` — i.e. for
-    /// every conversion an `int`-alphabet `convert` command can express.
-    ///
-    /// This is the test the module's first draft lacked. That draft checked only a handful
-    /// of hand-picked pairs and a `< 3.0` guard on the `ln(1000)/ln(10)` quotient — neither
-    /// of which can see a last-bit disagreement with Java on some *other* base, which is
-    /// precisely how the `f64::ln` bug survived (`msd_3 -> msd_243` converted to `msd_81`).
-    /// Phase 4's U31 widened it from `root <= 1000` to the full range; see
-    /// [`WB032_AFFECTED_ROOT_GT_1000`] for the capture recipe and for why the wider range
-    /// is not redundant with the narrower one.
+    /// This sweep is what the deleted `truncated_log_ratio_agrees_with_real_java` (a real-JVM
+    /// capture of the OLD buggy behaviour) used to cover, now at the same size (48,036 pairs,
+    /// asserted below) but checking the fixed, CORRECT answer on every pair, not just the
+    /// 343 that used to be wrong.
     #[test]
-    fn truncated_log_ratio_agrees_with_real_java() {
-        let affected: HashSet<(i32, i32)> = WB032_AFFECTED_ROOT_LE_1000
-            .iter()
-            .chain(WB032_AFFECTED_ROOT_GT_1000)
-            .copied()
-            .collect();
+    fn exact_integer_exponent_recovers_the_exponent_over_the_full_int_alphabet_sweep() {
         let mut swept = 0usize;
-        let mut wrong = 0usize;
         for root in 2i64..=46340 {
             let mut x = root;
             for exponent in 2i32.. {
@@ -5867,51 +5678,117 @@ mod tests {
                 if x > i64::from(i32::MAX) {
                     break;
                 }
-                let expected = if affected.contains(&(root as i32, exponent)) {
-                    wrong += 1;
-                    exponent - 1 // WB-032 fires: Java truncates a whole unit off
-                } else {
-                    exponent
-                };
                 assert_eq!(
-                    truncated_log_ratio(x as i32, root as i32),
-                    expected,
-                    "root {root}^{exponent} = {x}: disagrees with real walnut-java"
+                    exact_integer_exponent(x as i32, root as i32),
+                    Ok(exponent),
+                    "root {root}^{exponent} = {x}: exact_integer_exponent must recover \
+                     the exponent exactly"
                 );
                 swept += 1;
             }
         }
         // Guards against the sweep silently collapsing (a bad bound would make the
-        // assertions above vacuous) and against the captured tables going stale.
+        // assertions above vacuous).
         assert_eq!(swept, 48036, "the swept range changed");
-        assert_eq!(
-            wrong,
-            WB032_AFFECTED_ROOT_LE_1000.len() + WB032_AFFECTED_ROOT_GT_1000.len(),
-            "every captured WB-032 pair must be inside the swept range"
+    }
+
+    /// `UtilityMethodsTest.testExactIntegerExponentThrowsWhenBaseIsNotAnExactPowerOfRoot`.
+    /// Unreachable through [`convert_ns`]'s own call sites (see [`exact_integer_exponent`]'s
+    /// doc comment), but the guard itself — and its exact message — is still pinned
+    /// directly, matching Java's own defensive test.
+    #[test]
+    fn exact_integer_exponent_errors_when_base_is_not_an_exact_power() {
+        let err = exact_integer_exponent(10, 3).unwrap_err();
+        assert_eq!(err, ConvertNsError::NotAnExactPower { base: 10, root: 3 });
+        assert_eq!(err.to_string(), "10 is not an exact power of 3");
+    }
+
+    /// `UtilityMethodsTest.testExactIntegerExponentThrowsWhenRootIsNotGreaterThanOne`.
+    #[test]
+    fn exact_integer_exponent_errors_when_root_is_not_greater_than_one() {
+        for root in [1, 0, -2] {
+            assert_eq!(
+                exact_integer_exponent(8, root),
+                Err(ConvertNsError::InvalidRoot { root })
+            );
+        }
+    }
+
+    /// `AutomatonLogicalOpsTest.testConvertNSWb032ToBaseDirectionRegroupsToExactExponentNotOneLess`
+    /// (`walnut-java` commit `18b7c4b`, `bugfix/wb-032`) — WB-032's `k -> k^j` regrouping
+    /// direction (`toBase != commonRoot`, `convertMsdBaseToExponent`). Before the fix, the
+    /// truncated exponent (2 instead of 3) silently produced a well-formed but WRONG
+    /// `msd_100` automaton with no error. Replaces `truncated_log_ratio_reproduces_wb032`,
+    /// whose entire purpose was pinning that now-deleted buggy computation; this is the
+    /// positive coverage that the same trigger case now computes correctly end-to-end
+    /// through `convert_ns` itself, not just through `exact_integer_exponent` in isolation.
+    #[test]
+    fn convert_ns_wb032_to_base_direction_regroups_to_exact_exponent_not_one_less() {
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 10,
+                o: vec![1],
+                d: vec![BTreeMap::new()],
+            },
+            vec![util::int_range_list(10)],
+            vec!["x".to_string()],
+            vec![Some(true)],
         );
-        // `docs/WALNUT-BUGS.md` WB-032's own headline figure, so a table edit that
-        // silently changed the population would fail here rather than in prose.
+        assert!(
+            a.fa.accepts_word(&[]),
+            "language before conversion: {{epsilon}} only"
+        );
+
+        convert_ns(&mut a, true, 1000, &mut crate::logging::Logging::new())
+            .expect("msd_10 -> msd_1000 must succeed");
+
         assert_eq!(
-            wrong, 343,
-            "WB-032 records 343 affected (root, exponent) pairs"
+            a.track_ns_names(),
+            vec![Some("msd_1000".to_string())],
+            "WB-032: must regroup 3 base-10 digits per base-1000 digit, not 2"
+        );
+        assert_eq!(a.alphabet, vec![util::int_range_list(1000)]);
+        assert!(
+            a.fa.accepts_word(&[]),
+            "empty string still accepted after regrouping"
+        );
+        assert!(
+            !a.fa.accepts_word(&[0]),
+            "a single base-1000 digit (= 3 base-10 zero digits) must still be rejected"
         );
     }
 
-    /// `docs/WALNUT-BUGS.md` WB-032's headline case, kept as its own named test because it
-    /// is the one quoted throughout the docs (the differential suite pins it end-to-end).
+    /// `AutomatonLogicalOpsTest.testConvertNSWb032FromBaseDirectionUngroupsToExactExponentNotOneLess`
+    /// — WB-032's `k^i -> k` ungrouping direction (`fromBase != commonRoot`,
+    /// `convertLsdBaseToRoot`). Before the fix, the truncated exponent made
+    /// `convertLsdBaseToRoot`'s own base-mismatch guard fire ("Base mismatch: expected 100,
+    /// found 1000"), crashing a call that should succeed.
     #[test]
-    fn truncated_log_ratio_reproduces_wb032() {
-        assert_eq!(truncated_log_ratio(1000, 10), 2, "WB-032: should be 3");
+    fn convert_ns_wb032_from_base_direction_ungroups_to_exact_exponent_not_one_less() {
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 1,
+                alphabet_size: 1000,
+                o: vec![1],
+                d: vec![BTreeMap::new()],
+            },
+            vec![util::int_range_list(1000)],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
+        assert!(a.fa.accepts_word(&[]));
 
-        // The unaffected neighbours, so the test also proves the truncation is not
-        // uniformly wrong (an exponent that were always one low would break these).
-        assert_eq!(truncated_log_ratio(4, 2), 2);
-        assert_eq!(truncated_log_ratio(8, 2), 3);
-        assert_eq!(truncated_log_ratio(100, 10), 2);
-        assert_eq!(truncated_log_ratio(9, 3), 2);
-        // `3^5 = 243` is the case an `f64::ln`-based port got WRONG (it returned 4): Java
-        // computes this one correctly, and so must the port.
-        assert_eq!(truncated_log_ratio(243, 3), 5);
+        convert_ns(&mut a, true, 10, &mut crate::logging::Logging::new())
+            .expect("msd_1000 -> msd_10 must succeed, not hit a spurious base-mismatch error");
+
+        assert_eq!(a.track_ns_names(), vec![Some("msd_10".to_string())]);
+        assert_eq!(a.alphabet, vec![util::int_range_list(10)]);
+        assert!(a.fa.accepts_word(&[]));
     }
 
     /// `computeStringValue` (`:671-677`) reads its digit list **least**-significant-first,
@@ -6166,15 +6043,18 @@ mod tests {
 
     // -------------------------------------------- Tier-4 property over `convert_ns`
     //
-    // Phase 4, U31. Deliberately NOT a "`base_new == root^j`" property test: WB-032 is
-    // ported verbatim as a quirk, so on its 343 affected `(root, exponent)` pairs the port
-    // is *supposed* to disagree with the mathematics, and the only oracle that agrees with
-    // the port's intended behaviour there is the port itself (circular) or the JVM capture
-    // above (`truncated_log_ratio_agrees_with_real_java`, which is the right tool and
-    // already exists). What follows is the genuinely non-circular half: WB-032's own entry
-    // establishes that **every power of 2 is safe** (`log(2^n)/log(2)` is exact in binary
-    // floating point), so on a power-of-2 root the conversion has to be mathematically
-    // correct, and a from-scratch digit-regrouping oracle can say so.
+    // Phase 4, U31; scope note updated once WB-032 was fixed (`walnut-java` commit
+    // `18b7c4b`, `bugfix/wb-032`, ported here as `exact_integer_exponent`). This property
+    // is scoped to base-2 SOURCE automata purely because `arb_total_msd2_automaton` and
+    // `expand_digit` below are base-2-specific plumbing, not because any other base is
+    // untrustworthy: WB-032 being fixed means `convert_ns`'s exponent computation is
+    // provably correct for every `(root, exponent)` an `int` alphabet can express, not just
+    // powers of 2 — `exact_integer_exponent_recovers_the_exponent_over_the_full_int_alphabet
+    // _sweep` above already proves that directly, non-circularly, root by root. What follows
+    // is a genuinely independent SECOND check, at the level `convert_ns` itself operates on
+    // (a real automaton's digit-regrouping), not just the exponent arithmetic in isolation.
+    // Widening its generator to arbitrary source bases would be a reasonable follow-up but
+    // is not needed to close WB-032, so it is not done here.
 
     /// `d` written as exactly `j` base-`k` digits, most significant first — the digit-level
     /// meaning of "base `k^j`". Computed here by plain integer arithmetic; nothing in
@@ -6363,18 +6243,22 @@ mod tests {
         ///
         /// The oracle is `expand_digit` — "one base-`2^j` digit *is* `j` base-2 digits" —
         /// applied to the ORIGINAL automaton, and nothing else; it never calls
-        /// `convert_ns`, `convert_msd_base_to_exponent`, `truncated_log_ratio`, `java_log`
-        /// or `equiv`. Because `value_{2^j}(w) == value_2(expand(w))` (asserted below, so
+        /// `convert_ns`, `convert_msd_base_to_exponent`, `exact_integer_exponent` or
+        /// `equiv`. Because `value_{2^j}(w) == value_2(expand(w))` (asserted below, so
         /// the digit-level statement really is the integer-level one), this says exactly
         /// that the converted automaton accepts the same integers as the original —
         /// presented to each in its own base, at the corresponding representation length.
         ///
-        /// Restricted to base 2 on purpose (WB-032: every power of 2 is provably
-        /// unaffected by the truncated-log quirk, so here the port must be RIGHT, not
-        /// merely bug-compatible), and constrained away from WB-001's *actual* triggering
-        /// shape — see [`wb_001_can_fire_on_regrouping`], which is the precondition
-        /// derived from `minimize_with_output`'s per-output-value uncombine, not the
-        /// coarser "every state reachable" over-approximation an earlier draft used.
+        /// Restricted to base 2 for the oracle's own plumbing (`expand_digit`/
+        /// `arb_total_msd2_automaton` are base-2-specific), not because any other base
+        /// is untrustworthy — WB-032 is fixed, so the port is unconditionally correct here
+        /// now, not merely bug-compatible; see this file's Tier-4
+        /// `exact_integer_exponent_recovers_the_exponent_over_the_full_int_alphabet_sweep`
+        /// for the non-circular check that covers every other base. Constrained away from
+        /// WB-001's *actual* triggering shape — see [`wb_001_can_fire_on_regrouping`], which
+        /// is the precondition derived from `minimize_with_output`'s per-output-value
+        /// uncombine, not the coarser "every state reachable" over-approximation an earlier
+        /// draft used.
         ///
         /// The filter is a `prop_assume!`, not a bare `return Ok(())`: proptest counts a
         /// bare early return as an ordinary PASS, so a future change that made every

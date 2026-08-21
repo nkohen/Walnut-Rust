@@ -572,3 +572,65 @@ has zero `reg`-command-level coverage on either engine; see
 correction (an earlier draft of this file wrongly claimed `RegTest` covered it too).
 
 The command file and worktree were removed afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb032.rs` (plus a re-capture of `fixtures/convert_ns/b10msd1000.txt`)
+
+Captured 2026-08-20 for `tests/java_bugfix_wb032.rs`, verifying `wr_core::logicalops`'s
+port of WB-032's real upstream fix (`walnut-java` commit `18b7c4b`, branch
+`bugfix/wb-032`) — **not mainline**, per this project's now-standard practice for these
+follow-up units (see the `java_bugfix_wb002.rs`/`java_bugfix_wb010.rs` entries in this
+project's own git history for the same discipline).
+
+`bugfix/wb-032` was already checked out at the main `~/dev/walnut-java` working tree when
+this was captured, so the worktree below is added by commit hash (detached), not by
+branch name, to avoid git's "branch already checked out" refusal:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb032 18b7c4b
+cd /tmp/walnut-java-wb032
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+# -- Case 1: the regrouping direction (msd_10 -> msd_1000, was silently msd_100) --
+cp <repo>/tests/differential/fixtures/convert_ns/base10.txt "Automata Library/wb032base10.txt"
+cat > "Command Files/wb032_capture.txt" <<'EOF'
+convert $wb032b10msd1000 msd_1000 $wb032base10;
+EOF
+java -jar target/Walnut-all.jar wb032_capture.txt < /dev/null
+
+# -- Case 2: the ungrouping direction (msd_1000 -> msd_10, used to crash) --
+cat > "Automata Library/wb032eps1000.txt" <<'EOF'
+msd_1000
+
+0 1
+EOF
+cat > "Command Files/wb032_capture2.txt" <<'EOF'
+convert $wb032eps1000to10 msd_10 $wb032eps1000;
+EOF
+java -jar target/Walnut-all.jar wb032_capture2.txt < /dev/null
+
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb032 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain
+(`/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1`) — the shell's default
+`java` resolves to a JDK 11 too old for this project's class file version.
+
+Case 1's output (`Session/<timestamp>/Automata Library/wb032b10msd1000.txt`, header
+`msd_1000`, ~3,000 lines for the full `0..1000` alphabet) was copied over
+`tests/differential/fixtures/convert_ns/b10msd1000.txt` as a straight overwrite —
+that fixture's own re-capture, since it is the SAME command (`convert $b10msd1000
+msd_1000 $base10;`) `tests/differential/tests/convert_ns.rs`'s own capture recipe already
+used, now run against the fixed jar instead of mainline's, per that file's own updated
+module docs. `tests/differential/tests/java_bugfix_wb032.rs`'s own Case 1 test reuses that
+same fixture as its comparison target rather than duplicating a ~3,000-line automaton
+inline.
+
+Case 2's output (`Session/<timestamp>/Automata Library/wb032eps1000to10.txt`, ~20 lines)
+is inlined directly in `java_bugfix_wb032.rs` — see that file's own module docs for the
+full text and the reasoning (state `0` rejects every digit into a non-accepting sink,
+so the converted language stays `{ε}`, matching the untotalized `msd_1000` source).
+
+The command files and hand-authored automaton files were deleted from the isolated
+worktree afterward, matching every recipe above.

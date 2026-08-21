@@ -55,9 +55,11 @@ pub enum ConvertError {
     /// `new Automaton(inLibrary)` (`:737`) failing to read the input automaton.
     Read(PredicateEnvError),
     /// `AutomatonLogicalOps.convertNS` (`:739-741`) itself — see
-    /// [`wr_core::logicalops::ConvertNsError`] for its five failure modes (including
-    /// WB-032's silent-wrong-answer float-log case, which is NOT an `Err` here either,
-    /// matching Java: it doesn't throw, it just computes the wrong exponent).
+    /// [`wr_core::logicalops::ConvertNsError`] for its seven failure modes. WB-032 (the
+    /// float-log exponent bug that used to make this command silently compute the wrong
+    /// base, with no `Err` at all) is fixed as of `walnut-java` commit `18b7c4b`
+    /// (`bugfix/wb-032`); `convert_ns` now computes the exponent with exact integer
+    /// arithmetic and matches real Walnut.
     Convert(ConvertNsError),
     /// A real I/O failure writing the result.
     Io(std::io::Error),
