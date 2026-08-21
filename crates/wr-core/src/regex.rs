@@ -108,10 +108,12 @@
 //! [`determine_encoded_regex`] now validates every digit against its track's declared
 //! alphabet before it can ever produce a negative encoding (WB-024's fix — see that
 //! function's own docs), and [`set_from_brics_automaton`] now rejects an alphabet size
-//! that the `+128` offset itself cannot safely encode, `65535 - 128 = 65407`, tighter
+//! that the `+128` offset itself cannot safely encode — `65535 - 127 = 65408`, tighter
 //! than the plain `u16`-range check any non-offset caller could use (WB-025's fix — see
-//! that function's own docs). Both mirror `walnut-java` commit `59eda64` exactly,
-//! including message text.
+//! that function's own docs). Both mirror `walnut-java` commit `446dab2` (branch
+//! `bugfix/wb-024-025`) exactly, including message text. (`446dab2` itself corrects an
+//! off-by-one in `59eda64`'s original WB-025 bound — `65407`, one less than correct —
+//! found by adversarial review of this port before it could mirror the mistake.)
 //!
 //! # Character width
 //!
@@ -1168,26 +1170,36 @@ pub fn convert_encoding_for_brics(vector_encoding: i32) -> u16 {
 }
 
 /// `BricsConverter.validateOffsetEncodableAlphabetSize` (`:169-174`) — the WB-025 fix
-/// (`walnut-java` commit `59eda64`, `docs/WALNUT-BUGS.md`).
+/// (`walnut-java` commit `446dab2` on `bugfix/wb-024-025`, `docs/WALNUT-BUGS.md`).
 ///
 /// Before the fix, this guard was `validateBricsAlphabetSize`'s plain `alphabetSize >
 /// MAX_BRICS_CHARACTER` check (`MAX_BRICS_CHARACTER == (1 << 16) - 1 == 65535`, the full
 /// `char`/`u16` range) — sound for a caller that puts a symbol index straight into a
 /// `char` with no further arithmetic, but [`set_from_brics_automaton`]'s only caller does
 /// something different: it feeds every symbol index through
-/// [`convert_encoding_for_brics`]'s `+128` offset first. For `x >= 65408`, `128 + x >=
-/// 65536` overflows `u16`/`char` and the truncating cast wraps back into dk.brics' own
-/// reserved `0..127` range — the very range `+128` exists to escape — even though `x` is
-/// a perfectly legitimate, validator-accepted symbol index, not a user mistake (contrast
-/// WB-024, where the digit itself is out of alphabet). Java has a second, narrower guard
-/// (`validateBricsAlphabetSize` alone, at the original `65535` bound) for
-/// `toDkBricsAutomaton`, which does NOT add the offset and so is safe up to the full
-/// range -- but `toDkBricsAutomaton` itself has no callers anywhere in `walnut-java`
-/// (confirmed by inspection: dead code even in Java), so this port never had a matching
-/// function to give the wider bound to in the first place, and needs only the one,
-/// tightened, guard below.
+/// [`convert_encoding_for_brics`]'s `+128` offset first. An alphabet of size `N` uses
+/// indices `0..N-1`, so the largest character this ever emits is `128 + (N-1)`; that
+/// overflows `u16`/`char` (`>= 65536`) exactly when `N > 65408`, and the truncating cast
+/// wraps back into dk.brics' own reserved `0..127` range — the very range `+128` exists
+/// to escape — even though the index is a perfectly legitimate, validator-accepted
+/// symbol, not a user mistake (contrast WB-024, where the digit itself is out of
+/// alphabet). Java has a second, narrower guard (`validateBricsAlphabetSize` alone, at
+/// the original `65535` bound) for `toDkBricsAutomaton`, which does NOT add the offset
+/// and so is safe up to the full range -- but `toDkBricsAutomaton` itself has no
+/// *production* callers anywhere in `walnut-java` (it does have test-only callers, e.g.
+/// `Main/EqualityUtils.faEqual`, the Java suite's own language-equivalence oracle — not
+/// dead code, just production-unreachable), and this port has no equivalent of either
+/// the function or its test callers, so it never had anything to give the wider bound to
+/// in the first place, and needs only the one, tightened, guard below.
+///
+/// **The bound itself: `65408`, not `65407`.** An earlier revision of this function used
+/// `(1 << 16) - 1 - 128 == 65407`, one less than correct — alphabet size `65408` (max
+/// index `65407`, encoded char `65535`) never wraps and was being rejected
+/// unnecessarily. Found by adversarial review (which independently re-derived the
+/// boundary arithmetic rather than trusting the just-landed `walnut-java` fix at face
+/// value) and corrected upstream first (`446dab2`), then here to match.
 fn validate_offset_encodable_alphabet_size(alphabet_size: usize) -> Result<(), RegexError> {
-    const MAX_OFFSET_ENCODABLE_ALPHABET_SIZE: usize = (1 << 16) - 1 - 128;
+    const MAX_OFFSET_ENCODABLE_ALPHABET_SIZE: usize = (1 << 16) - 128;
     if alphabet_size > MAX_OFFSET_ENCODABLE_ALPHABET_SIZE {
         return Err(RegexError::Walnut(format!(
             "size of input alphabet exceeds the limit of {MAX_OFFSET_ENCODABLE_ALPHABET_SIZE}"

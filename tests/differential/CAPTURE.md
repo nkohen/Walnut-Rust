@@ -555,13 +555,20 @@ nothing to copy into `fixtures/`. The test asserts this captured text verbatim t
 actually uses (per `java_bugfix_wb010.rs`'s own established practice), not just through
 `wr_core::regex::determine_encoded_regex` directly.
 
-WB-025's boundary (`validateOffsetEncodableAlphabetSize`'s tightened `65407` limit) was
-**not** re-captured through this recipe — driving a 65408-track (or -symbol) alphabet
-declaration through `reg`'s own textual grammar is impractically slow/parser-hostile at
-that scale. It is instead independently verified by the fixed jar's own committed
-regression tests, added in the same fix commit: `./mvnw -q -Dtest=BricsConverterTest,RegTest
-test` (run live in this investigation, JDK 17, from the same isolated worktree) passed
-cleanly, pinning the exact `65407`/`65408` boundary and message text this port's own
-`wb_025_*` tests in `crates/wr-core/src/regex/tests.rs` assert.
+WB-025's boundary (`validateOffsetEncodableAlphabetSize`'s tightened `65408` limit — an
+earlier revision of both the Java fix and this port used `65407`, one less than correct;
+see `crates/wr-core/src/regex.rs`'s `validate_offset_encodable_alphabet_size` doc for the
+full arithmetic and the fixup commit `446dab2`) was **not** re-captured through this
+recipe — driving a 65409-track (or -symbol) alphabet declaration through `reg`'s own
+textual grammar is impractically slow/parser-hostile at that scale. It is instead
+independently verified by the fixed jar's own committed `Automata/FA/BricsConverterTest
+.java` (added in `59eda64`, corrected for the same off-by-one in `446dab2`):
+`./mvnw -q -Dtest=BricsConverterTest test` (run live, JDK 17, from an isolated worktree)
+passed cleanly, pinning the exact `65408`/`65409` boundary and message text this port's
+own `wb_025_*` tests in `crates/wr-core/src/regex/tests.rs` assert. Note
+`Main/Commands/RegTest.java` does NOT cover WB-025 at all (four WB-024 tests only) — WB-025
+has zero `reg`-command-level coverage on either engine; see
+`tests/differential/tests/java_bugfix_wb024_wb025.rs`'s module docs for the same
+correction (an earlier draft of this file wrongly claimed `RegTest` covered it too).
 
 The command file and worktree were removed afterward, matching every recipe above.

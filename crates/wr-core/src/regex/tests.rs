@@ -303,7 +303,11 @@ fn intervals_and_brace_counts_are_unreachable_through_the_reg_command() {
     // parser ever runs, which is a real (and separately pinned, see `wb_024_*` above)
     // behavior but not what THIS test is about. Each digit still becomes exactly one
     // replacement character regardless of alphabet size, so the expected message
-    // positions are unchanged from the original `{0,1}` capture.
+    // positions are unchanged from the original `{0,1}` capture -- and this reasoning
+    // was independently re-verified live by two adversarial reviewers of this unit
+    // against a freshly built fixed jar, not just trusted (see
+    // `tests/differential/tests/reg_brics_regex.rs`'s matching case for the live
+    // re-capture record).
     assert_eq!(
         reg(vec![vec![0, 1, 2, 3, 4, 5]], "<1-5>")
             .expect_err("must fail")
@@ -383,10 +387,21 @@ fn determine_encoded_regex_reports_an_i32_overflowing_vector_element_instead_of_
     // A bare (unbracketed) digit run is NOT this call site: `RE_FOR_AN_ALPHABET_VECTOR`
     // matches one bare digit at a time, so `8888888800` is ten separate one-element
     // vectors and nothing overflows -- only the bracketed form can carry a multi-digit
-    // element. Every one of those ten digits (8s and 0s) is in `{0,1}`'s... wait, `8` is
-    // NOT in `{0,1}` -- this now correctly rejects post-WB-024-fix rather than silently
-    // succeeding, pinning the two failure modes (`NumberFormat` vs `Walnut`) stay
-    // distinguishable rather than conflated.
+    // element. Over an alphabet that actually contains both digits used (`{0,8}`, not
+    // `{0,1}` -- `8 ∉ {0,1}` would instead hit WB-024's guard, a DIFFERENT failure mode
+    // covered separately below), this must succeed and produce exactly ten matches,
+    // positively pinning the "ten separate vectors" parse shape rather than just
+    // asserting some error occurred.
+    assert_eq!(
+        determine_encoded_regex("8888888800", &[vec![0, 8]])
+            .expect("all ten digits are in {0,8}; must not overflow")
+            .len(),
+        10
+    );
+    // The WB-024 guard case: 8 is NOT in {0,1}, so this must be REJECTED post-WB-024-fix
+    // (caught by the alphabet-membership guard, not the overflow path) -- pins the two
+    // failure modes (`NumberFormat` vs `Walnut`) stay distinguishable rather than
+    // conflated.
     let err2 = determine_encoded_regex("8888888800", &[vec![0, 1]])
         .expect_err("8 is not in {0,1}, caught by the WB-024 guard, not the overflow path");
     assert!(matches!(err2, RegexError::Walnut(_)));
@@ -526,26 +541,31 @@ fn wb_024_an_in_alphabet_vector_is_unaffected_by_the_new_guard() {
 
 #[test]
 fn wb_025_the_tightened_guard_rejects_exactly_what_the_offset_cannot_encode() {
-    // `docs/WALNUT-BUGS.md` WB-025, fixed in `walnut-java` commit `59eda64`: unlike
-    // WB-024 (an out-of-alphabet digit producing a negative encoding), this is a
-    // validator-legal symbol index whose `+128` offset itself overflows `u16` (Java
-    // `char`). Before the fix, `validate_brics_alphabet_size`'s `65535` bound
-    // (`MAX_BRICS_CHARACTER == (1 << 16) - 1`, the full `char`/`u16` range) let every
-    // symbol index up to 65534 through, of which [65408, 65534] all wrapped into
-    // dk.brics' reserved range. The fix tightens the guard to
-    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == 65535 - 128 == 65407`, exactly the largest
-    // alphabet size whose every symbol index's `+128` offset still fits in `u16`.
+    // `docs/WALNUT-BUGS.md` WB-025, fixed in `walnut-java` commit `446dab2` on
+    // `bugfix/wb-024-025`: unlike WB-024 (an out-of-alphabet digit producing a negative
+    // encoding), this is a validator-legal symbol index whose `+128` offset itself
+    // overflows `u16` (Java `char`). Before the fix, `validate_brics_alphabet_size`'s
+    // `65535` bound (`MAX_BRICS_CHARACTER == (1 << 16) - 1`, the full `char`/`u16`
+    // range) let every symbol index up to 65534 through, of which [65408, 65534] all
+    // wrapped into dk.brics' reserved range. The fix tightens the guard to
+    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == 65535 - 127 == 65408` (an alphabet of size
+    // N uses indices `0..N-1`, so the largest index a size-N alphabet assigns is
+    // `N - 1`, not `N` -- the bound is on SIZE, one more than the largest safe INDEX).
+    // An earlier revision of both the Java fix and this port used `65407`, one less
+    // than correct (alphabet size `65408`, max index `65407`, encoded char `65535` --
+    // still safe, so it was being rejected unnecessarily) -- found by adversarial
+    // review, corrected upstream first, then here to match.
     //
     // Boundary verified live against the fixed real jar (direct
     // `BricsConverter.setFromBricsAutomaton` invocation, since driving this size through
     // the full `reg` CLI's textual alphabet syntax is impractically slow/parser-hostile
     // at this scale -- see `tests/differential/tests/java_bugfix_wb024_wb025.rs`'s module
-    // docs): `65408` throws `"size of input alphabet exceeds the limit of 65407"`.
-    assert!(validate_offset_encodable_alphabet_size(65407).is_ok());
-    let err = validate_offset_encodable_alphabet_size(65408).expect_err("one past the boundary");
+    // docs): `65409` throws `"size of input alphabet exceeds the limit of 65408"`.
+    assert!(validate_offset_encodable_alphabet_size(65408).is_ok());
+    let err = validate_offset_encodable_alphabet_size(65409).expect_err("one past the boundary");
     assert_eq!(
         err.message(),
-        "size of input alphabet exceeds the limit of 65407"
+        "size of input alphabet exceeds the limit of 65408"
     );
 
     // The OLD bound (65535) is now correctly rejected too -- every symbol index in
@@ -576,9 +596,10 @@ fn wb_025_convert_encoding_for_brics_still_wraps_the_same_way_when_called_direct
         );
     }
     // Symbols just below the wraparound boundary do NOT collide -- pins the boundary
-    // itself, not just "somewhere in this range". This is exactly
-    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE - 1`, i.e. the largest symbol index a
-    // `validate_offset_encodable_alphabet_size`-accepted alphabet ever assigns.
+    // itself, not just "somewhere in this range". `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE`
+    // is `65408` (an accepted alphabet SIZE), so the largest INDEX such an alphabet ever
+    // assigns is `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE - 1 == 65407` -- exactly the value
+    // tested here.
     assert!(convert_encoding_for_brics(65407) > 127);
 }
 
@@ -870,30 +891,30 @@ fn from_regex_over_alphabet_rejects_an_empty_or_out_of_range_alphabet() {
 #[test]
 fn set_from_brics_automaton_rejects_an_alphabet_wider_than_a_java_char() {
     // Post-WB-025-fix: the limit named in the message is the tightened
-    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE` (65407), not the plain `char`/`u16` range
+    // `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE` (65408), not the plain `char`/`u16` range
     // (65535) -- this alphabet size exceeds both, so it was already rejected before the
     // fix, but now with the tighter number in the message.
     assert_eq!(
         set_from_brics_automaton(65_536, &u16s("x"))
             .expect_err("must fail")
             .message(),
-        "size of input alphabet exceeds the limit of 65407"
+        "size of input alphabet exceeds the limit of 65408"
     );
 }
 
 /// WB-025's exact boundary (`docs/WALNUT-BUGS.md`), through the real public entry point
 /// `set_from_brics_automaton` rather than the private guard directly -- confirms the
 /// guard is actually wired up at the one call site that matters, not just present.
-/// `65408` verified live against the fixed real jar (direct `BricsConverter.
+/// `65409` verified live against the fixed real jar (direct `BricsConverter.
 /// setFromBricsAutomaton` invocation -- see
 /// `tests/differential/tests/java_bugfix_wb024_wb025.rs`); `65535` (the OLD, too-wide
 /// bound) is a size that used to be validator-legal and must now also be rejected.
 #[test]
 fn set_from_brics_automaton_rejects_an_alphabet_in_wb025s_former_danger_zone() {
-    let err = set_from_brics_automaton(65_408, &u16s("x")).expect_err("one past the boundary");
+    let err = set_from_brics_automaton(65_409, &u16s("x")).expect_err("one past the boundary");
     assert_eq!(
         err.message(),
-        "size of input alphabet exceeds the limit of 65407"
+        "size of input alphabet exceeds the limit of 65408"
     );
     assert!(set_from_brics_automaton(65_535, &u16s("x")).is_err());
 }

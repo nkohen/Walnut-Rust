@@ -87,9 +87,13 @@ fn corpus() -> Vec<(&'static str, Vec<Vec<i32>>, &'static str)> {
         // r19 used to live here: `2*` over `{0,1}` — a bare out-of-alphabet digit, the
         // same WB-024 shape as r50/r58 (removed below for the same reason: WB-024's fix
         // makes this reject, not silently build the `{ε}`-language automaton mainline
-        // used to). See `wb_024_out_of_alphabet_digits_are_now_cleanly_rejected` in
-        // `crates/wr-core/src/regex/tests.rs` for the closest surviving unit-level
-        // coverage of a bare out-of-alphabet digit.
+        // used to). See `determine_encoded_regex_reports_an_i32_overflowing_vector_
+        // element_instead_of_panicking`'s `err3` case (`determine_encoded_regex("9",
+        // &[vec![0, 1]])`) in `crates/wr-core/src/regex/tests.rs` for the closest
+        // surviving unit-level coverage of a BARE out-of-alphabet digit specifically
+        // (`wb_024_out_of_alphabet_digits_are_now_cleanly_rejected` in that same file
+        // covers r50's BRACKETED-vector shape, `[9,9]`, not this one — an earlier
+        // revision of this comment pointed at the wrong test).
         ("r20", b2(), "~()"),
         ("r21", b2(), "0 1 *"),
         ("r22", b2(), "((0|1)(0|1))*"),
@@ -205,7 +209,13 @@ fn reg_parse_errors_match_real_walnut_messages() {
     // the same way), but not what this test is about. Widened to `{0,...,5}` so every
     // digit mentioned is genuinely in the declared alphabet; each digit still becomes
     // exactly one replacement character regardless of alphabet size, so the expected
-    // message positions (captured against the original `{0,1}` alphabet) are unchanged.
+    // message positions (captured against the original `{0,1}` alphabet) are unchanged
+    // -- reasoned, not re-captured against a fresh jar run when this rebase first
+    // landed, but independently RE-CAPTURED and confirmed live by two adversarial
+    // reviewers of this unit (`reg p1 {0,1,2,3,4,5} "<1-5>";` -> `interval syntax error
+    // at position 5`; `reg p2 {0,1,2,3,4,5} "0{2,3}";` -> `integer expected at position
+    // 3`, both byte-identical to the values below), so the reasoning is now verified,
+    // not just plausible. See `../CAPTURE.md`'s "reg corpus" section for the recipe.
     fn b6() -> Vec<Vec<i32>> {
         vec![vec![0, 1, 2, 3, 4, 5]]
     }

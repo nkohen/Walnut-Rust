@@ -1333,32 +1333,44 @@ bug costs a silent wrong answer somewhere downstream.
   `(1<<16)-1` bound and same truncating cast confirmed live against the real `BricsConverter.java`
   source (`:151-165`); not a hypothetical reading, the arithmetic is unconditional once
   `alphabetSize` is in the affected range.
-- **Rust port:** `fixed, matches walnut-java as of commit 59eda64` (branch `bugfix/wb-024-025`, same
-  commit as WB-024). `wr_core::regex::validate_brics_alphabet_size` is renamed
-  `validate_offset_encodable_alphabet_size` (mirroring Java's own
+- **Rust port:** `fixed, matches walnut-java as of commit 446dab2` (branch `bugfix/wb-024-025`, ON TOP
+  OF `59eda64`, the commit WB-024 also fixed). `wr_core::regex::validate_brics_alphabet_size` is
+  renamed `validate_offset_encodable_alphabet_size` (mirroring Java's own
   `validateOffsetEncodableAlphabetSize`) and its bound tightened to
-  `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == (1 << 16) - 1 - 128 == 65407`, exactly Java's fix. Java's
-  OTHER guard at the wider `65535` bound (plain `validateBricsAlphabetSize`, used by
-  `toDkBricsAutomaton`, which does not add the `+128` offset) has no Rust counterpart, because
-  `toDkBricsAutomaton` itself is dead code in Java (confirmed by inspection: no callers anywhere in
-  `walnut-java`) and so was never ported — this port only ever needed the one, now-tightened, guard.
-  `convert_encoding_for_brics` itself is UNCHANGED (same reasoning as WB-024: Java's fix didn't touch
-  `convertEncodingForBrics` either, only its guard), so the truncating-cast wraparound this entry
-  describes is still reachable by calling that function directly with a symbol index the tightened
-  guard would now reject — just no longer through `set_from_brics_automaton`/`reg`. Pinned by
-  `wb_025_*` in `crates/wr-core/src/regex/tests.rs` (the tightened boundary at `65407`/`65408`
-  through both the private guard directly and through the public `set_from_brics_automaton` entry
-  point, plus a direct-call test confirming `convert_encoding_for_brics` itself still wraps the same
-  way). Not independently re-verified through `tests/differential/tests/java_bugfix_wb024_wb025.rs`
-  (driving a `65408`-track alphabet through `reg`'s own textual grammar is impractically slow/
-  parser-hostile at that scale — see that file's own module docs); instead independently confirmed
-  against the real fixed jar's own committed regression tests, added in the same fix commit
-  (`Automata/FA/BricsConverterTest.java`, `Main/Commands/RegTest.java`), re-run live in this
-  investigation (`./mvnw -q -Dtest=BricsConverterTest,RegTest test`, JDK 17) and passing.
-- **Upstream:** fixed, `walnut-java` commit `59eda64` on branch `bugfix/wb-024-025`, same commit as
-  WB-024. Tightened `validateOffsetEncodableAlphabetSize`'s bound to `65535 - 128 = 65407`, exactly
-  this entry's own suggested fix, while leaving `toDkBricsAutomaton`'s own (dead) call to the wider
-  `validateBricsAlphabetSize` at the full `65535` bound.
+  `MAX_OFFSET_ENCODABLE_ALPHABET_SIZE == (1 << 16) - 128 == 65408`, exactly Java's (corrected)
+  fix — see the next paragraph for why this is `65408`, not the `65407` an earlier revision of both
+  this port and the Java fix itself used. Java's OTHER guard at the wider `65535` bound (plain
+  `validateBricsAlphabetSize`, used by `toDkBricsAutomaton`, which does not add the `+128` offset)
+  has no Rust counterpart: `toDkBricsAutomaton` has no *production* callers in `walnut-java` (it does
+  have test-only callers, e.g. `Main/EqualityUtils.faEqual`, the Java suite's own language-equivalence
+  oracle — production-unreachable, not dead code) and this port has no equivalent of either the
+  function or its test callers, so it was never ported — this port only ever needed the one,
+  now-tightened, guard. `convert_encoding_for_brics` itself is UNCHANGED (same reasoning as WB-024:
+  Java's fix didn't touch `convertEncodingForBrics` either, only its guard), so the truncating-cast
+  wraparound this entry describes is still reachable by calling that function directly with a symbol
+  index the tightened guard would now reject — just no longer through `set_from_brics_automaton`/
+  `reg`. Pinned by `wb_025_*` in `crates/wr-core/src/regex/tests.rs` (the tightened boundary at
+  `65408`/`65409` through both the private guard directly and through the public
+  `set_from_brics_automaton` entry point, plus a direct-call test confirming
+  `convert_encoding_for_brics` itself still wraps the same way). Not independently re-verified through
+  `tests/differential/tests/java_bugfix_wb024_wb025.rs` (driving a `65409`-track alphabet through
+  `reg`'s own textual grammar is impractically slow/parser-hostile at that scale — see that file's own
+  module docs); instead independently confirmed against the real fixed jar's own committed
+  `Automata/FA/BricsConverterTest.java` (`Main/Commands/RegTest.java` does NOT cover WB-025 at all —
+  an earlier revision of this port's own differential-test docs wrongly claimed it did; corrected
+  after adversarial review actually read the file).
+  **The `65407`→`65408` off-by-one**: found by adversarial review of this port's own initial fix,
+  which independently re-derived the boundary arithmetic rather than trusting the just-landed
+  `walnut-java` fix at face value — an alphabet of size `N` uses indices `0..N-1`, so the largest
+  character ever emitted is `128 + (N-1)`, safe iff `N <= 65408`; the original fix used
+  `(1 << 16) - 1 - 128 == 65407`, rejecting the perfectly safe size `65408` (max index `65407`,
+  encoded char `65535`, no wrap). This is a bug in code authored as part of this same fix effort, not
+  a pre-existing Walnut quirk, so it was corrected directly in both repos (`walnut-java` commit
+  `446dab2` first, this port to match) rather than logged as a divergence.
+- **Upstream:** fixed, `walnut-java` commit `446dab2` on branch `bugfix/wb-024-025` (on top of
+  `59eda64`, WB-024's commit). Tightened `validateOffsetEncodableAlphabetSize`'s bound to
+  `65535 - 127 = 65408`, correcting `59eda64`'s own off-by-one (`65407`) along the way — see the
+  Rust-port note above for the full arithmetic and provenance.
 - **Severity:** low-to-moderate (as filed) — same silently-wrong-answer/spurious-parse-error shape as
   WB-024, but gated behind an alphabet size (`> 65408`) far outside any plausible hand-written Walnut
   query. Now closed on both engines.

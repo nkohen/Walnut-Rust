@@ -66,31 +66,34 @@
 //!
 //! WB-025's fix ([`validate_offset_encodable_alphabet_size` in
 //! `crates/wr-core/src/regex.rs`](../../../crates/wr-core/src/regex.rs)) tightens the
-//! alphabet-size guard `set_from_brics_automaton` enforces to `65407`. Driving a
-//! `65408`-track (or `65408`-symbol single-track) alphabet declaration through this
+//! alphabet-size guard `set_from_brics_automaton` enforces to `65408`. Driving a
+//! `65409`-track (or `65409`-symbol single-track) alphabet declaration through this
 //! dispatch layer's own textual grammar (`Alphabet.determineAlphabetsAndNS`, an
 //! `{n1,n2,…}`-style literal set or a `msd_k`/custom-base declaration) is impractically
 //! slow and, for the literal-set form, outright impractical to type — see
 //! `crates/wr-core/src/regex/tests.rs`'s `wb_025_*` tests' own doc comments for the same
-//! conclusion at the `wr_core::regex` layer. So WB-025's boundary is instead verified two
-//! ways, neither of which is a test in THIS file:
+//! conclusion at the `wr_core::regex` layer. So WB-025's boundary is instead verified
+//! directly, at the `wr_core::regex` layer (`validate_offset_encodable_alphabet_size`,
+//! `convert_encoding_for_brics`, `set_from_brics_automaton`) by
+//! `crates/wr-core/src/regex/tests.rs`'s `wb_025_*` tests, cross-checked against the
+//! real fixed jar's own committed `Automata/FA/BricsConverterTest.java`
+//! (`validateOffsetEncodableAlphabetSize(65408)` does not throw;
+//! `validateOffsetEncodableAlphabetSize(65409)` throws with a message containing
+//! `"65408"`; `convertEncodingForBrics(65407)` stays at code point `65535` with no
+//! wraparound, `convertEncodingForBrics(65408)` wraps to code point `0`) — re-run live
+//! (`./mvnw -q -Dtest=BricsConverterTest test`, JDK 17, in an isolated worktree) against
+//! the real fixed jar.
 //!
-//! 1. Directly, at the `wr_core::regex` layer (`validate_offset_encodable_alphabet_size`,
-//!    `convert_encoding_for_brics`, `set_from_brics_automaton`) by
-//!    `crates/wr-core/src/regex/tests.rs`'s `wb_025_*` tests.
-//! 2. Independently, against the real fixed jar's own COMMITTED regression tests —
-//!    `bugfix/wb-024-025` commit `59eda64` added `Automata/FA/BricsConverterTest.java`
-//!    (`validateOffsetEncodableAlphabetSize(65407)` does not throw;
-//!    `validateOffsetEncodableAlphabetSize(65408)` throws with a message containing
-//!    `"65407"`; `convertEncodingForBrics(65407)` stays at code point `65535` with no
-//!    wraparound, `convertEncodingForBrics(65408)` wraps to code point `0`) and
-//!    `Main/Commands/RegTest.java` (a `reg` command over a `65420`-track alphabet, inside
-//!    WB-025's documented `(65408, 65535]` danger zone, throws the same message). Both
-//!    were re-run live in this investigation
-//!    (`cd /tmp/walnut-java-wb024025-resume && ./mvnw -q
-//!    -Dtest=BricsConverterTest,RegTest test`, JDK 17) and passed cleanly against the
-//!    real fixed jar, independently confirming the exact literal `"65407"` boundary this
-//!    port's own tests assert.
+//! **`Main/Commands/RegTest.java` does NOT cover WB-025** — an earlier revision of this
+//! module doc claimed it contained a `reg`-command-level WB-025 test (a `65420`-track
+//! alphabet inside the danger zone); that claim was fabricated, not verified, and is
+//! corrected here after adversarial review actually read the file: `RegTest.java`
+//! contains exactly four tests, all WB-024 (out-of-alphabet-digit) cases, no WB-025
+//! (alphabet-size) case at all. **WB-025's boundary genuinely has zero `reg`-command-level
+//! coverage on either engine** — only the direct `BricsConverter`/`validate_offset_
+//! encodable_alphabet_size`-layer tests exist, on both sides. Stated honestly rather
+//! than papered over: closing this gap (a real `reg` command over a >65408-symbol
+//! alphabet, on both engines) is a legitimate follow-up, not part of this unit.
 //!
 //! # Capture recipe (reproducible), all four WB-024 cases below
 //!
