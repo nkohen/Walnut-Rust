@@ -120,26 +120,34 @@
 //!   section at all** (not "every state," just nothing); otherwise, one line per
 //!   accepting state, ascending id order.
 //!
-//! ## WB-021 (logged to `docs/WALNUT-BUGS.md`): `exportToBA` has no
-//! `TRUE_FALSE_AUTOMATON` guard, unlike its two siblings
+//! ## `docs/WALNUT-BUGS.md` WB-021 lived on this path — now FIXED
 //!
-//! Both `writeToTxtFormat` and `writeToGV` special-case `FA.isTRUE_FALSE_AUTOMATON()`
-//! before touching `Q`/alphabet/transition state (which are meaningless/stale on a
+//! `exportToBA` used to have no `FA.isTRUE_FALSE_AUTOMATON()` guard, unlike its two
+//! siblings `writeToTxtFormat`/`writeToGV`, which both special-case the trivial
+//! automaton before touching `Q`/alphabet/transition state (meaningless/stale on a
 //! trivial automaton — see [`crate::reader`]'s and `wr_core::fa`'s own docs on this).
-//! `exportToBA` has no such guard. Empirically confirmed (not just read) against the
-//! real `walnut-java` CLI: it does not crash, but for BOTH the TRUE and the FALSE
-//! automaton it silently produces **byte-identical** output — just `"0\n"` (the
-//! default-valued, never-actually-existing "state 0" as the sole initial-state line;
-//! zero transitions since `FA.t` is empty; the final-states section elided by the
-//! "vacuously all states accept" rule above, since there are zero states to disagree).
-//! The TRUE and FALSE automata are indistinguishable in `.ba` output, and neither
-//! carries any information about which automaton it was. Reachable from the plain
-//! CLI: `[export ... BA]` on any query whose result happens to be the trivial
-//! TRUE/FALSE automaton, which the golden corpus shows is common (13% of
-//! `automaton*` fixtures per [`crate::reader`]'s docs). This crate's
-//! [`export_to_ba`] reproduces the same behavior verbatim (it never special-cases
-//! [`Fa::is_true_false_automaton`], exactly matching Java's omission), per
-//! `CLAUDE.md`'s mechanical-port rule — see `docs/WALNUT-BUGS.md`'s WB-021 entry.
+//! It fell straight through to `FAtoCompactNFA` on those stale fields instead.
+//! Empirically confirmed (not just read) against the pre-fix real `walnut-java` CLI: it
+//! did not crash, but for BOTH the TRUE and the FALSE automaton it silently produced
+//! **byte-identical** output — just `"0\n"` (the default-valued, never-actually-existing
+//! "state 0" as the sole initial-state line; zero transitions since `FA.t` is empty; the
+//! final-states section elided by the "vacuously all states accept" rule above, since
+//! there are zero states to disagree). The TRUE and FALSE automata were indistinguishable
+//! in `.ba` output, and neither carried any information about which automaton it was.
+//! Reachable from the plain CLI: `export ... BA;` on any query whose result happens to be
+//! the trivial TRUE/FALSE automaton, which the golden corpus shows is common (13% of
+//! `automaton*` fixtures per [`crate::reader`]'s docs).
+//!
+//! As of `walnut-java` commit `c0d7fff` (branch `bugfix/wb-021`), `exportToBA` checks
+//! `isTRUE_FALSE_AUTOMATON()` first and writes the trivial shape directly instead of
+//! falling through to `FAtoCompactNFA`: TRUE writes a single accepting state (the
+//! initial-state line `"0"`, final-states section elided — byte-identical to the old,
+//! buggy output, so TRUE's export is unchanged), FALSE writes **nothing at all** (a
+//! genuine 0-byte file, `BAWriter`'s own convention for the empty language over zero
+//! states). This crate's [`export_to_ba`] follows suit — it now special-cases
+//! [`Fa::is_true_false_automaton`]/[`Fa::is_true_automaton`] exactly as Java's fix does,
+//! rather than reproducing the omission. `docs/WALNUT-BUGS.md`'s WB-021 entry carries the
+//! full historical diagnosis.
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -389,14 +397,36 @@ impl From<io::Error> for BaWriteError {
     }
 }
 
-/// `AutomatonWriter.exportToBA`'s stream half (`:161-173`, minus the file-open
-/// try/catch — see [`export_automaton_to_ba`] for that, and this module's docs for
-/// the format derivation and WB-021). Takes the raw [`Fa`] (not a track-aware
-/// [`Automaton`]), matching Java's `FA a` parameter: `.ba` has no track concept, so
-/// every transition symbol is written as its raw encoded integer, never decoded.
+/// `AutomatonWriter.exportToBA`'s stream half (`:161-173` post-WB-021-fix, minus the
+/// file-open try/catch — see [`export_automaton_to_ba`] for that, and this module's
+/// docs for the format derivation and the fixed WB-021 guard below). Takes the raw
+/// [`Fa`] (not a track-aware [`Automaton`]), matching Java's `FA a` parameter: `.ba`
+/// has no track concept, so every transition symbol is written as its raw encoded
+/// integer, never decoded.
 pub fn export_to_ba<W: Write>(fa: &Fa, out: &mut W, is_dfao: bool) -> Result<(), BaWriteError> {
     if is_dfao {
         return Err(BaWriteError::DfaoNotSupported);
+    }
+
+    // WB-021 fix (`walnut-java` `bugfix/wb-021`, commit `c0d7fff`): like
+    // `write_txt`/`write_gv`, a trivial TRUE/FALSE `Fa`'s `q`/alphabet/transition-table
+    // fields are meaningless/stale, so don't fall through to the general encoding below
+    // on them (that used to produce byte-identical ".ba" output for both TRUE and
+    // FALSE). Write the two trivial shapes directly instead:
+    //  - TRUE: a single accepting state, no transitions -- the initial-state line "0"
+    //    with the final-states section elided (real `BAWriter` elides it whenever every
+    //    state -- vacuously, the one state here -- is accepting). Byte-identical to the
+    //    pre-fix output, so TRUE's export is unchanged.
+    //  - FALSE: zero states at all, so `BAWriter`'s own rules (no initial-state line
+    //    when there isn't exactly one state; no transitions when there are no states; no
+    //    final-states section since "every state accepts" holds vacuously over zero
+    //    states) all agree the correct output is empty -- the standard representation of
+    //    the empty language.
+    if fa.is_true_false_automaton() {
+        if fa.is_true_automaton() {
+            writeln!(out, "0")?;
+        }
+        return Ok(());
     }
 
     // `writeInitialState`: this crate's `Fa` always has exactly one `q0`, the
@@ -418,8 +448,8 @@ pub fn export_to_ba<W: Write>(fa: &Fa, out: &mut W, is_dfao: bool) -> Result<(),
     }
 
     // `writeFinalStates`: vacuously "all accepting" (and hence WRITE NOTHING) when
-    // `fa.q == 0`, faithfully reproducing the trivial-automaton edge case WB-021
-    // describes.
+    // `fa.q == 0` -- real `BAWriter`'s general rule, independent of the (now
+    // separately-guarded, above) TRUE/FALSE trivial-automaton case.
     let all_accepting = (0..fa.q).all(|q| fa.is_accepting(q));
     if !all_accepting {
         for q in 0..fa.q {
@@ -719,27 +749,38 @@ mod tests {
 
     #[test]
     fn ba_matches_real_walnut_output_for_true_automaton_wb021() {
-        // WB-021: the TRUE automaton's `.ba` export is just "0\n" -- see module docs.
+        // WB-021 (fixed, `walnut-java` commit `c0d7fff`): the TRUE automaton's `.ba`
+        // export is a single accepting sentinel state -- just "0\n" -- see module docs.
+        // Byte-identical to the pre-fix output, so this specific assertion is unchanged
+        // from before the fix; what changed is the FALSE case below.
         let a = wr_core::automaton::Automaton::true_false(true);
         let mut buf = Vec::new();
         export_to_ba(&a.fa, &mut buf, false).unwrap();
         assert_eq!(buf, fixture_bytes("writer_true.ba"));
+        assert_eq!(buf, b"0\n");
     }
 
     #[test]
     fn ba_matches_real_walnut_output_for_false_automaton_wb021() {
-        // WB-021: byte-identical to the TRUE automaton's output above -- that's the
-        // bug.
+        // WB-021 (fixed, `walnut-java` commit `c0d7fff`): the FALSE automaton's `.ba`
+        // export is now a genuine 0-byte file -- the empty language's standard
+        // representation, and no longer byte-identical to the TRUE automaton's "0\n"
+        // above. Captured live against the real, fixed jar (`bugfix/wb-021`) -- see
+        // `tests/differential/CAPTURE.md`.
         let a = wr_core::automaton::Automaton::true_false(false);
         let mut buf = Vec::new();
         export_to_ba(&a.fa, &mut buf, false).unwrap();
         assert_eq!(buf, fixture_bytes("writer_false.ba"));
-        assert_eq!(
+        assert!(
+            buf.is_empty(),
+            "WB-021 fixed: FALSE's .ba export must be empty"
+        );
+        assert_ne!(
             fixture_bytes("writer_true.ba"),
             fixture_bytes("writer_false.ba"),
-            "WB-021: real walnut-java's exportToBA is genuinely indistinguishable \
-             between TRUE and FALSE -- if this ever fails, WB-021 needs re-verifying \
-             against a fresh real-jar run, not this test relaxed"
+            "WB-021 fixed: real walnut-java's exportToBA must now distinguish TRUE from \
+             FALSE -- if this ever fails, WB-021's fix needs re-verifying against a \
+             fresh real-jar run, not this test relaxed back to the pre-fix behavior"
         );
     }
 

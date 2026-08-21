@@ -1069,15 +1069,27 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** Phase 3a, U12 (`wr-io`'s `AutomatonWriter` port), 2026-08-12, while deriving the `.ba` format from real
   `walnut-java` output (the plan's `.ba`-format-fidelity retiering explicitly called for empirical verification, not
   guessing). Confirmed live: both the no-crash result and the byte-identical output were run, not inferred.
-- **Rust port:** `ported verbatim (quirk)` — `wr_io::writer::export_to_ba` never special-cases
-  `Fa::is_true_false_automaton`, exactly matching Java's omission; the trivial-`Fa` shape (`q0 = 0, q = 0`) naturally
-  falls through the same general algorithm to the same `"0\n"` output. Pinned by
-  `ba_matches_real_walnut_output_for_true_automaton_wb016` and `ba_matches_real_walnut_output_for_false_automaton_wb016`
-  in `crates/wr-io/src/writer.rs`, the latter also asserting the two real fixture files are themselves byte-identical
-  (so the test can't silently pass if a future re-verification run shows Java's behavior has changed).
-- **Upstream:** not filed. A ~3-line fix would add the same `isTRUE_FALSE_AUTOMATON()` guard `writeToTxtFormat`/
-  `writeToGV` already have — e.g. writing a single well-known sentinel state (accepting for TRUE, non-accepting for
-  FALSE) instead of falling through to `FAtoCompactNFA` on stale/empty fields.
+- **Rust port:** `fixed, matches walnut-java as of commit c0d7fff` (PR-7 of `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`,
+  branch `bugfix/wb-021`) — `wr_io::writer::export_to_ba` now checks `Fa::is_true_false_automaton`/
+  `Fa::is_true_automaton` first, exactly mirroring Java's fix: TRUE writes `"0\n"` (unchanged from the pre-fix
+  output), FALSE writes nothing (a genuine 0-byte output), and the general `FAtoCompactNFA`-equivalent encoding below
+  is reached only for a non-trivial automaton. Pinned by `ba_matches_real_walnut_output_for_true_automaton_wb021` and
+  `ba_matches_real_walnut_output_for_false_automaton_wb021` in `crates/wr-io/src/writer.rs` (both fixture files
+  re-captured against the real, fixed jar — `writer_true.ba` stays `"0\n"`, `writer_false.ba` is now 0 bytes — and the
+  latter test now asserts the two fixtures are DIFFERENT, the inverse of what it asserted pre-fix), plus a new
+  differential test, `tests/differential/tests/java_bugfix_wb021.rs`, against real `walnut-java` output captured from
+  the fixed branch.
+- **Upstream:** fixed, `walnut-java` commit `c0d7fff` (branch `bugfix/wb-021`, stacked on `bugfix/wb-032`).
+  `exportToBA` now checks `isTRUE_FALSE_AUTOMATON()` first, exactly the guard `writeToTxtFormat`/`writeToGV` already
+  had, and writes the trivial shape directly instead of falling through to `FAtoCompactNFA`: TRUE writes a single
+  accepting state (initial-state line `"0"`, final-states section elided by the same vacuous-all-accepting rule —
+  byte-identical to the old, buggy output, so TRUE's export is unchanged); FALSE writes **nothing at all**, a genuine
+  0-byte file, `BAWriter`'s own convention for the empty language over zero states (a lone non-accepting sentinel
+  state was considered and rejected — re-deriving `BAWriter`'s bytecode showed its final-states section is empty
+  either way a single state is accepting or not, so it would not have distinguished TRUE from FALSE). Re-verified
+  live after the fix, both via a direct `exportToBA` driver and end-to-end through the real CLI's `export $name BA`
+  command on `eval`-produced TRUE/FALSE automata: `true.ba` is `"0\n"` (unchanged), `false.ba` is now 0 bytes, and the
+  two differ.
 - **Severity:** moderate — silent, information-losing wrong output (not a crash) reachable from the plain CLI export
   command, on an automaton shape (trivial TRUE/FALSE) the golden corpus shows is common, not a contrived corner case;
   bounded by the fact that a `.ba` export of a trivial automaton is presumably a rare real workflow (most `export`

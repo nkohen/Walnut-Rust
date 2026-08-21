@@ -638,3 +638,64 @@ so the converted language stays `{ε}`, matching the untotalized `msd_1000` sour
 
 The command files and hand-authored automaton files were deleted from the isolated
 worktree afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb021.rs` (plus a re-capture of
+`crates/wr-io/tests/fixtures/writer_true.ba`/`writer_false.ba`)
+
+Captured 2026-08-20 for `tests/differential/tests/java_bugfix_wb021.rs`, verifying
+`wr_io::writer`'s port of WB-021's real upstream fix (`walnut-java` commit `c0d7fff`,
+branch `bugfix/wb-021`) — **not mainline**, per this project's now-standard practice for
+these follow-up units.
+
+`bugfix/wb-021` was already checked out at the main `~/dev/walnut-java` working tree
+when this was captured (same situation `java_bugfix_wb032.rs`'s own recipe hit), so the
+worktree below is added by commit hash (detached), not by branch name, to avoid git's
+"branch already checked out" refusal:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb021 c0d7fff
+cd /tmp/walnut-java-wb021
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+cat > "Command Files/wb021_capture.txt" <<'EOF'
+eval wb021true "?msd_2 Ex x = 1";
+eval wb021false "?msd_2 Ex (x = 1 & x = 2)";
+export $wb021true BA;
+export $wb021false BA;
+EOF
+java -jar target/Walnut-all.jar wb021_capture.txt < /dev/null
+
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb021 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain
+(`/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1`) — the shell's default
+`java` resolves to a JDK 11 too old for this project's class file version.
+
+Console output confirmed both `eval`s landed on the trivial automaton this test needs:
+`eval wb021true "?msd_2 Ex x = 1";` prints `TRUE` (a satisfiable formula under one `∃`,
+no free variables left); `eval wb021false "?msd_2 Ex (x = 1 & x = 2)";` prints `FALSE`
+(an unsatisfiable conjunction under one `∃`).
+
+`Session/<timestamp>/Result/wb021true.ba` (2 bytes, `"0\n"`) was copied over
+`crates/wr-io/tests/fixtures/writer_true.ba` — that fixture's own re-capture against the
+fixed jar. Byte-identical to what was there before (TRUE's export is unchanged by the
+fix, confirming that half of the claim directly).
+
+`Session/<timestamp>/Result/wb021false.ba` (**0 bytes**) was copied over
+`crates/wr-io/tests/fixtures/writer_false.ba`, replacing what used to be the same
+`"0\n"` as the TRUE fixture — this is the actual behavior change WB-021's fix makes,
+confirmed live rather than assumed from reading the Java diff alone.
+
+`tests/differential/tests/java_bugfix_wb021.rs`'s own test reruns the same two `eval`s
+plus `export … BA;` through the real `wr-cli` dispatch path and asserts the written
+`Result/*.ba` files are byte-identical to the two captures above (inlined as `&[u8]`
+constants, not re-read from the `crates/wr-io` fixtures — the two crates' test fixtures
+are independent copies of the same captured bytes, matching this project's established
+practice of not creating a cross-crate test-fixture dependency for a two-byte/zero-byte
+constant).
+
+The command file was deleted from the isolated worktree afterward, matching every
+recipe above.
