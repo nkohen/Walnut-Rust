@@ -2164,9 +2164,9 @@ bug costs a silent wrong answer somewhere downstream.
   WB-024's regex case, Walnut's own corpus contains no library file with an out-of-alphabet
   transition digit — and `AutomatonReaderTest` gained four tests (ordinary automaton, transducer,
   wildcard-not-rejected, well-formed-file-unaffected).
-- **Severity:** medium — this is silent wrong output on a plausible input (a hand-edited or
-  corrupted library file), not just a crash; outcome (b) is the more concerning half since it
-  produces no diagnostic at all.
+- **Severity:** medium — this was silent wrong output on a plausible input (a hand-edited or
+  corrupted library file), not just a crash; outcome (b) was the more concerning half since it
+  produced no diagnostic at all.
 
 ---
 
