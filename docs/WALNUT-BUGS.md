@@ -2637,18 +2637,44 @@ bug costs a silent wrong answer somewhere downstream.
 - **Found:** the negative-base port (`docs/NEGATIVE-BASE-SPLIT-DISPATCH.md`, Layer A),
   2026-08-20, while writing the Tier-2 replica of `testNegArithmeticOrdering` — the port's own
   new `x - y = -1` fixture failed against the ported code, and chasing why led here.
-- **Rust port:** ported verbatim. `wr_core::numsys::NumberSystem::arithmetic_const_c` passes
-  `op` (not `ArithmeticOp::Plus`) on this arm, exactly as Java does, and
-  `negative_constant_as_the_result` pins the resulting `b = a - |c|` language with an explicit
-  reference back to this entry — so a future "cleanup" that silently corrects the algebra
-  fails a test rather than quietly diverging from the oracle.
-- **Upstream:** not filed. Fixing it in `walnut-java` would also require changing
-  `NumberSystemTest.testNegArithmeticOrdering`'s assertion, which currently encodes the bug;
-  that is a deliberate PR plus explicit sign-off on a port divergence per `CLAUDE.md`'s
-  log-then-decide process, not something to resolve mid-port.
-- **Severity:** latent. Wrong output, but currently unreachable from every production caller —
-  it becomes a live wrong-answer bug the moment anyone adds a call site that passes a negative
-  constant as the result of a `MINUS`.
+- **Upstream:** **fixed**, `walnut-java` commit `f846cad` (branch `bugfix/wb-043`, stacked on
+  `bugfix/wb-035`): the recursive call at `:913` now passes `ArithmeticOperator.Ops.PLUS`
+  explicitly instead of `arithmeticOperator`. The sibling `PLUS` arm two methods up
+  (`:861-864`) is untouched — its own re-dispatch with `arithmeticOperator` is correct there
+  by coincidence, since that branch's guard conjunct really is `PLUS`.
+
+  `NumberSystemTest.testNegArithmeticOrdering`'s second assertion was **deliberately flipped**
+  (not a regression): it used to pin the buggy equality (`arithmetic("a","b",-1,MINUS)` ==
+  `arithmetic("a",1,"b",MINUS)`, i.e. `b = a - 1`); it now asserts the contract-correct one
+  (== `arithmetic("a",1,"b",PLUS)`, i.e. `b = a + 1`). Two new tests were added:
+  `testNegArithmeticOrderingMinusRewriteSecondMagnitude` (a second sign/magnitude case over
+  `msd_neg_5`, `c = -5`, checked by direct word-simulation rather than cross-comparing two
+  constructed automata, so it can't be fooled by both sides sharing the same bug) and
+  `testPosArithmeticPlusRewriteUnaffectedByWb043Fix` (a control confirming the sibling `PLUS`
+  arm's output is unchanged). Verified live against a freshly built jar, before and after: pre-fix
+  `ns.arithmetic("a","b",-1,MINUS)` matched `b=a-1`, not `b=a+1`; post-fix, the reverse. Also
+  reconfirmed live post-fix that `?msd_neg_3 x - y = _1` (the CLI surface syntax) still produces
+  the same automaton as `?msd_neg_3 y = x + 1` on both sides of the fix — this bug's
+  "unreachable from production" characterization holds unchanged, since the CLI parser never
+  routed through this arm.
+- **Rust port:** **fixed, matches walnut-java as of commit `f846cad`** — the negative-constant
+  rewrite in `wr_core::numsys::NumberSystem::arithmetic_const_c` now passes `ArithmeticOp::Plus`
+  explicitly instead of `op` on the `c.signum() < 0 && MINUS` branch, mirroring Java's one-line
+  fix exactly. The sibling `PLUS` arm in `arithmetic_const_a` is untouched.
+
+  Every test that used to pin the buggy `b = a - |c|` result was flipped, not deleted, to assert
+  the correct `b = a + |c|` result: `neg_arithmetic_ordering`'s second half (now compares against
+  `arithmetic_const_b(..., ArithmeticOp::Plus, ...)`) and `negative_constant_as_the_result`'s
+  `c < 0 && MINUS` section (now asserts `y = x + 1` is accepted and the old `y = x - 1` is
+  rejected, and cross-checks against `arithmetic_const_b(..., ArithmeticOp::Plus, ...)`). Two new
+  tests mirror Java's additions: `neg_arithmetic_ordering_minus_rewrite_second_magnitude`
+  (`msd_neg_5`, `c = -5`, direct word-simulation) and
+  `pos_arithmetic_plus_rewrite_unaffected_by_wb043_fix` (the sibling-arm control, `msd_neg_4`,
+  `a = -1`). All new/flipped tests were mutation-verified: temporarily reverting the fix (passing
+  `op` again) makes every one of them fail with the predicted old-buggy symptom, and the sibling
+  control test stays green throughout, confirming it — correctly — doesn't move.
+- **Severity:** was latent (wrong output, but unreachable from every production caller); now
+  fixed on both sides before it could ever become a live wrong-answer bug.
 
 ---
 

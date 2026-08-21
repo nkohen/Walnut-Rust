@@ -2183,6 +2183,11 @@ impl NumberSystem {
     /// [`NumberSystem::arithmetic_const_a`]: a negative `c` with `PLUS` falls to the
     /// `else` and calls `getConstant(c)` on a negative value deliberately — the second
     /// live entry point into `NumberSystem::constant`'s negative arm.
+    ///
+    /// `docs/WALNUT-BUGS.md` **WB-043 (fixed)**: this rewrite used to re-dispatch with
+    /// `arithmeticOperator` (`MINUS` on this branch) instead of `PLUS`, computing
+    /// `b = a - |c|` where the contract requires `b = a + |c|`. Fixed to match
+    /// `walnut-java` commit `f846cad`; see the inline comment at the call site below.
     pub fn arithmetic_const_c(
         &self,
         a: &str,
@@ -2200,10 +2205,16 @@ impl NumberSystem {
         // b" while naming the variable `C` -- a stale copy-paste, preserved as-is.
         let c_name = format!("{a}{b}");
         // `if (c.signum() < 0 && arithmeticOperator.equals(MINUS))` (`:910-913`).
+        //
+        // WB-043 (fixed): this used to re-dispatch with `op` (== `Minus` on this branch,
+        // by the guard's own conjunct), computing `b = a - |c|` where the rewrite Java's
+        // own comment states ("we rewrite `a-b=c` and `a+(-c)=b`") requires `b = a + |c|`
+        // -- the reflection of the correct answer through `a`. `walnut-java` commit
+        // `f846cad` fixed this to pass `PLUS` explicitly, matched here.
         let (m, n) = if c.sign() == Sign::Minus && op == ArithmeticOp::Minus {
             let mut n = self.get_constant(&(-c), logging)?;
             n.bind(names(&[&c_name]));
-            (self.arithmetic(a, &c_name, b, op)?, n)
+            (self.arithmetic(a, &c_name, b, ArithmeticOp::Plus)?, n)
         } else {
             let mut n = self.get_constant(c, logging)?;
             n.bind(names(&[&c_name]));
@@ -3499,12 +3510,15 @@ mod tests {
     /// directive — Walnut's own suite uses Brics `faEqual` for exactly this), plus the
     /// label vector, which is what the Java assertion was actually reaching for.
     ///
-    /// **The second half of this test is `docs/WALNUT-BUGS.md` WB-043's live evidence.**
-    /// Java asserts `arithmetic("a", "b", -1, MINUS)` (contract: `-1 = a - b`, i.e.
-    /// `b = a + 1`) equals `arithmetic("a", 1, "b", MINUS)` (`b = a - 1`) — two
-    /// genuinely different relations. It passes because the negative-constant rewrite at
-    /// `:913` re-dispatches with `MINUS` where the algebra needs `PLUS`. Ported verbatim,
-    /// so this replica asserts the same (wrong) equality Java's does.
+    /// **The second half of this test used to be `docs/WALNUT-BUGS.md` WB-043's live
+    /// evidence.** Java's assertion at this spot used to compare
+    /// `arithmetic("a", "b", -1, MINUS)` (contract: `-1 = a - b`, i.e. `b = a + 1`)
+    /// against `arithmetic("a", 1, "b", MINUS)` (`b = a - 1`) — two genuinely different
+    /// relations, equal only because the negative-constant rewrite at `:913` used to
+    /// re-dispatch with `MINUS` where the algebra needs `PLUS`. `walnut-java` commit
+    /// `f846cad` fixed the rewrite and deliberately flipped this assertion's right-hand
+    /// side to `arithmetic("a", 1, "b", PLUS)` (the actually-correct relation); this
+    /// replica is flipped to match.
     #[test]
     fn neg_arithmetic_ordering() {
         let ns = NumberSystem::new("msd_neg_3").unwrap();
@@ -3530,18 +3544,81 @@ mod tests {
         assert!(accepts_digits(&check, &[("a", "01"), ("b", "00")]));
         assert!(!accepts_digits(&check, &[("a", "00"), ("b", "01")]));
 
-        // "Very similar case" (Java's comment) -- and WB-043: this equality holds only
-        // because the `c < 0 && MINUS` rewrite is wrong. See this test's doc comment.
+        // "Similar case, but through arithmetic(String, String, BigInteger, MINUS)'s c<0
+        // rewrite" (Java's comment, post-WB-043-fix) -- contract: c = a - b, so c = -1
+        // means -1 = a - b, i.e. b = a + 1, NOT b = a - 1. Flipped from `MINUS` to `PLUS`
+        // on the right-hand side to match `walnut-java` commit `f846cad`'s deliberate
+        // flip of `NumberSystemTest.testNegArithmeticOrdering`.
         let mut a = ns
             .arithmetic_const_c("a", "b", &big(-1), ArithmeticOp::Minus, log)
             .unwrap();
         let mut b = ns
-            .arithmetic_const_b("a", &big(1), "b", ArithmeticOp::Minus, log)
+            .arithmetic_const_b("a", &big(1), "b", ArithmeticOp::Plus, log)
             .unwrap();
         a.canonize();
         b.canonize();
         assert_eq!(a.label, b.label);
         assert!(same_language(&a, &b));
+    }
+
+    /// `NumberSystemTest.testNegArithmeticOrderingMinusRewriteSecondMagnitude`
+    /// (`walnut-java` commit `f846cad`) — a second WB-043 pin at a different
+    /// sign/magnitude combination than [`neg_arithmetic_ordering`]'s `c = -1` case
+    /// (which cross-compares two constructed automata). This one simulates the
+    /// automaton on concrete `msd_neg_5` digit strings directly, so it can't be fooled
+    /// by both sides of a comparison sharing the same underlying bug. Contract:
+    /// `c = a - b` with `c = -5`, i.e. `-5 = a - b`, i.e. `b = a + 5`.
+    ///
+    /// Base -5, 3-digit words `d2 d1 d0` (digits 0..4), place values 25, -5, 1:
+    /// `"000" = 0`, `"140" = 25 - 20 + 0 = 5`, `"003" = 3`, `"143" = 25 - 20 + 3 = 8`,
+    /// `"010" = -5`, `"013" = -5 + 3 = -2`.
+    #[test]
+    fn neg_arithmetic_ordering_minus_rewrite_second_magnitude() {
+        let ns = NumberSystem::new("msd_neg_5").unwrap();
+        let a = ns
+            .arithmetic_const_c(
+                "a",
+                "b",
+                &big(-5),
+                ArithmeticOp::Minus,
+                &mut crate::logging::Logging::new(),
+            )
+            .unwrap();
+        assert_eq!(a.get_arity(), 2);
+
+        // Correct algebra: b = a + 5.
+        assert!(accepts_digits(&a, &[("a", "000"), ("b", "140")])); // 0 + 5 = 5
+        assert!(accepts_digits(&a, &[("a", "003"), ("b", "143")])); // 3 + 5 = 8
+
+        // The old bug's algebra, b = a - 5, must NOT be accepted.
+        assert!(!accepts_digits(&a, &[("a", "000"), ("b", "010")])); // 0 - 5 = -5, wrong
+        assert!(!accepts_digits(&a, &[("a", "003"), ("b", "013")])); // 3 - 5 = -2, wrong
+    }
+
+    /// `NumberSystemTest.testPosArithmeticPlusRewriteUnaffectedByWb043Fix`
+    /// (`walnut-java` commit `f846cad`) — the sibling arm two methods up,
+    /// [`NumberSystem::arithmetic_const_a`]'s `a < 0 && PLUS` rewrite, also re-dispatches
+    /// with `op`, but there the branch guard's conjunct is `PLUS`, so the required
+    /// rewrite (`c + (-a) = b`) genuinely IS `PLUS` -- the WB-043 fix (which only
+    /// touches the sibling MINUS arm in [`NumberSystem::arithmetic_const_c`]) does not
+    /// touch this code at all. Pinned explicitly so a future change can't quietly break
+    /// it while "fixing" the other arm. Contract: `c = a + b`, `a = -1`, so
+    /// `-1 + b = c`, i.e. `b = c + 1`.
+    #[test]
+    fn pos_arithmetic_plus_rewrite_unaffected_by_wb043_fix() {
+        let ns = NumberSystem::new("msd_neg_4").unwrap();
+        let log = &mut crate::logging::Logging::new();
+        let mut a = ns
+            .arithmetic_const_a(&big(-1), "b", "c", ArithmeticOp::Plus, log)
+            .unwrap();
+        a.canonize();
+
+        let mut right = ns
+            .arithmetic_const_b("c", &big(1), "b", ArithmeticOp::Plus, log)
+            .unwrap(); // b = c + 1
+        right.canonize();
+        assert_eq!(a.label, right.label);
+        assert!(same_language(&a, &right));
     }
 
     /// `NumberSystemTest.testNegConstant` (`:164-169`) — `msd_neg_10`, the one fixture
@@ -3670,41 +3747,40 @@ mod tests {
         assert!(!accepts_digits(&sum_is_one, &[("x", "1"), ("y", "1")])); // 1 + 1 = 2
 
         // …and the arm that IS rewritten (`c < 0 && MINUS`), which is
-        // `docs/WALNUT-BUGS.md` **WB-043**: the contract says this is `x - y = -1`
-        // (i.e. `y = x + 1`), but Java re-dispatches the rewrite with `MINUS` where the
-        // algebra needs `PLUS`, so what it actually builds is `y = x - 1`. Ported
-        // verbatim; this pins the buggy language on purpose, so a silent "cleanup"
-        // fails here instead of diverging from the oracle.
+        // `docs/WALNUT-BUGS.md` **WB-043 (fixed)**: the contract says this is
+        // `x - y = -1` (i.e. `y = x + 1`). Before the fix, Java re-dispatched the
+        // rewrite with `MINUS` where the algebra needs `PLUS`, so it actually built
+        // `y = x - 1` instead; `walnut-java` commit `f846cad` corrected the rewrite to
+        // pass `PLUS`, so this now pins the CONTRACT-correct language.
         //
         // Base -3 place values 1, -3, 9: "00" = 0, "01" = 1, "12" = -1, "002" = 2.
         let diff_is_minus_one = arith("x", "y", -1, ArithmeticOp::Minus);
         assert_eq!(diff_is_minus_one.get_arity(), 2);
-        // What Java (and so this port) computes -- `y = x - 1`:
+        // The contract's answer, `y = x + 1`, is now what gets built and accepted:
         assert!(accepts_digits(
-            &diff_is_minus_one,
-            &[("x", "00"), ("y", "12")]
-        )); // 0-1 = -1
-        assert!(accepts_digits(
-            &diff_is_minus_one,
-            &[("x", "01"), ("y", "00")]
-        )); // 1-1 = 0
-            // What the CONTRACT would require (`y = x + 1`) -- correctly NOT accepted here,
-            // which is precisely the bug:
-        assert!(!accepts_digits(
             &diff_is_minus_one,
             &[("x", "00"), ("y", "01")]
-        ));
-        assert!(!accepts_digits(
+        )); // 0+1 = 1
+        assert!(accepts_digits(
             &diff_is_minus_one,
             &[("x", "001"), ("y", "002")]
-        ));
-        // …and `x - 1 = y` really is the same automaton, the WB-043 equality:
+        )); // 1+1 = 2
+            // The old bug's algebra, `y = x - 1`, must NOT be accepted anymore:
+        assert!(!accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "00"), ("y", "12")]
+        )); // 0-1 = -1, wrong
+        assert!(!accepts_digits(
+            &diff_is_minus_one,
+            &[("x", "01"), ("y", "00")]
+        )); // 1-1 = 0, wrong
+            // …and `x + 1 = y` really is the same automaton, the post-fix WB-043 equality:
         let via_const_b = ns
             .arithmetic_const_b(
                 "x",
                 &big(1),
                 "y",
-                ArithmeticOp::Minus,
+                ArithmeticOp::Plus,
                 &mut crate::logging::Logging::new(),
             )
             .unwrap();
