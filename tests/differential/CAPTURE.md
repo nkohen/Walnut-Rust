@@ -911,3 +911,104 @@ corrected fact.
 
 The command files, the nine hand-authored library files and both worktrees were removed
 afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb013.rs` / `java_bugfix_wb033.rs` / `java_bugfix_wb034.rs`
+
+Captured 2026-08-21 for PR-12 of `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md` (WB-013 + WB-033 +
+WB-034), against the FIXED branch `bugfix/wb-013-033-034` (commit `c75e630`, stacked on
+`bugfix/wb-043`) — **not mainline**, per this project's now-standard practice for these
+follow-up units. All three bugs share one root cause (`Automaton.NS`/`getNS().get(i)` is a
+literal `null` for a `{...}`-declared track, and three call sites used to dereference it
+unguarded) and one fix (a shared `NumberSystem.requireNumberSystem(ns, subject)` helper),
+so all three were captured in one session:
+
+```bash
+cd ~/dev/walnut-java   # bugfix/wb-013-033-034, already built: target/Walnut-all.jar
+
+# WB-033: a one-track {0,1} automaton (no msd_k/lsd_k) for `convert`.
+cat > "Automata Library/wb033nsless.txt" <<'EOF'
+{0,1}
+
+0 1
+0 -> 0
+1 -> 0
+EOF
+
+# WB-034: a two-track (Thue-Morse-shaped) {0,1} word automaton for `transduce`,
+# transduced through the repo's own shipped `Transducer Library/RUNSUM2.txt`.
+cat > "Word Automata Library/wb034nsless.txt" <<'EOF'
+{0,1}
+
+0 0
+0 -> 0
+1 -> 1
+
+1 1
+0 -> 1
+1 -> 0
+EOF
+
+# WB-013: a two-track word automaton, "msd_2 {0,1}" -- track 0 is a real number
+# system, track 1 (indexed by the repeated variable i below) is not.
+cat > "Word Automata Library/wb013T.txt" <<'EOF'
+msd_2 {0,1}
+
+0 0
+0 0 -> 0
+0 1 -> 0
+1 0 -> 0
+1 1 -> 0
+EOF
+
+cat > "Command Files/wb033_capture.txt" <<'EOF'
+convert $wb033out msd_4 $wb033nsless;
+EOF
+cat > "Command Files/wb034_capture.txt" <<'EOF'
+transduce wb034out RUNSUM2 wb034nsless;
+EOF
+cat > "Command Files/wb013_capture.txt" <<'EOF'
+eval wb013out "wb013T[i][i] = @1";
+EOF
+
+java -jar target/Walnut-all.jar wb033_capture.txt < /dev/null > /tmp/wb033_out.txt 2> /tmp/wb033_err.txt
+java -jar target/Walnut-all.jar wb034_capture.txt < /dev/null > /tmp/wb034_out.txt 2> /tmp/wb034_err.txt
+java -jar target/Walnut-all.jar wb013_capture.txt < /dev/null > /tmp/wb013_out.txt 2> /tmp/wb013_err.txt
+```
+
+`convert`'s `$` sigil on BOTH names means "not a DFAO" — i.e. read/write the *plain*
+Automata Library, not Word Automata Library (`ProverHelper.determineInLibrary`); this
+matches the WB-033 entry's own trigger example. All three runs' `stderr.txt` was **empty**
+(the fixed exception is a genuine, handled `WalnutException`).
+
+## Captured stdout (each command echoed first, per `Prover.readBuffer`)
+
+WB-033 (`convert $wb033out msd_4 $wb033nsless;`):
+```text
+the automaton being converted has no attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)
+```
+
+WB-034 (`transduce wb034out RUNSUM2 wb034nsless;`):
+```text
+the automaton being transduced has no attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)
+```
+
+WB-013 (`eval wb013out "wb013T[i][i] = @1";`) — printed TWICE, per `EvalDef.compute`'s own
+catch-log-then-rethrow shape (`Logging.printTruncatedStackTrace(e)` on the original
+exception, then a second `WalnutException` wrapping `message + "\n\t: char at " +
+t.getPositionInPredicate()`, caught again by `Prover.dispatch`'s own top-level catch):
+```text
+the track indexed by the repeated variable i in wb013T has no attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)
+the track indexed by the repeated variable i in wb013T has no attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)
+	: char at 0
+```
+(that last line's leading whitespace is one literal tab character, `\t`.)
+
+None of the three commands writes a result file (each errors out before ever writing one),
+so there is no `.txt` fixture to capture — only the printed lines, exactly like the
+closed-formula cases this file's `wb037`/`wb044` entries above already established this
+convention for.
+
+The three hand-authored library files and command files were deleted from the checkout
+afterward, matching every recipe above.

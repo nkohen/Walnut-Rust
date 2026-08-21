@@ -199,12 +199,15 @@
 //! that no end-to-end answer
 //! can currently distinguish.
 //!
-//! # WB-034: a track with no number system NPEs before the transduction even starts
+//! # WB-034: a track with no number system used to NPE before the transduction even started
 //!
 //! See `docs/WALNUT-BUGS.md` and [`Transducer::transduce_non_deterministic`]'s doc.
-//! `Transducer.java:286` dereferences `M.getNS().get(0)` unguarded, and that entry is
-//! `null` for any track declared with an explicit `{…}` alphabet. Ported verbatim as
-//! [`TransduceError::NoNumberSystem`].
+//! `Transducer.java:286` used to dereference `M.getNS().get(0)` unguarded, and that entry
+//! is `null` for any track declared with an explicit `{…}` alphabet. Fixed upstream in
+//! `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`): the same call site now
+//! passes through the shared `NumberSystem.requireNumberSystem` helper, raising a real,
+//! diagnosable `WalnutException` instead. This port's [`TransduceError::NoNumberSystem`]
+//! needed no behavioral change — only its `Display` text, to match the fixed message.
 //!
 //! # Logging
 //!
@@ -238,8 +241,9 @@ use std::time::Instant;
 /// The errors `Transducer.java` raises, as a typed enum rather than Walnut's
 /// stringly-typed `WalnutException` (`PORTING.md`'s type/error mapping table). The
 /// first three carry Java's message text verbatim; [`TransduceError::NoNumberSystem`]
-/// carries Java's `NullPointerException` text verbatim (WB-034); the last has no Java
-/// counterpart — see its own doc.
+/// carries Java's fixed `WalnutException` text verbatim (WB-034, fixed upstream in
+/// `walnut-java` commit `c75e630` — see that variant's own doc for the pre-fix history);
+/// the last has no Java counterpart — see its own doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransduceError {
     /// `Transducer.java:271` — `M.getNS().size() != 1`. (Java's message says the
@@ -252,17 +256,22 @@ pub enum TransduceError {
     /// one destination.
     MultipleTransitionsPerInput,
     /// **WB-034** (`docs/WALNUT-BUGS.md`) — `Transducer.java:286`'s
-    /// `M.getNS().get(0).isMsd()` dereferences a `null` `NumberSystem`, which is what
-    /// `ParseMethods.parseAlphabetDeclaration` puts in `NS` for a track declared with an
-    /// explicit alphabet (`{0,1}`) rather than `msd_k`/`lsd_k`. This crate's stand-in
-    /// for that `null` is `Automaton::msd[0] == None`, so the guard is `is_none()`.
+    /// `M.getNS().get(0).isMsd()` used to dereference a `null` `NumberSystem` unguarded,
+    /// which is what `ParseMethods.parseAlphabetDeclaration` puts in `NS` for a track
+    /// declared with an explicit alphabet (`{0,1}`) rather than `msd_k`/`lsd_k`. This
+    /// crate's stand-in for that `null` is `Automaton::msd[0] == None`, so the guard is
+    /// `is_none()`.
     ///
-    /// Ported verbatim as a *rejection*, not a divergence: Java's NPE is an unchecked
-    /// `RuntimeException` that `Prover.dispatch`'s top-level `catch (RuntimeException)`
-    /// recovers from — the message prints and the session continues — so a `Result::Err`
-    /// whose `Display` is Java's own NPE text is more faithful than a Rust `panic!`
-    /// would be (this port has no `catch_unwind` boundary; a panic would kill the
-    /// process). Same treatment, and the same defect class, as WB-033/WB-013.
+    /// **Fixed upstream** in `walnut-java` commit `c75e630` (branch
+    /// `bugfix/wb-013-033-034`): the same call site now passes through
+    /// `NumberSystem.requireNumberSystem`, raising a real `WalnutException` naming the
+    /// automaton (`"the automaton being transduced has no attached number system …"`)
+    /// instead of the old raw `NullPointerException`. This port's own `Result::Err` shape
+    /// needed no behavioral change — it was never a `panic!` (Java's old NPE was an
+    /// unchecked `RuntimeException` that `Prover.dispatch`'s top-level
+    /// `catch (RuntimeException)` recovered from, so an uncaught Rust `panic!` here would
+    /// have been *less* faithful, not more) — only its `Display` text changes, to match
+    /// the fixed message. Same treatment, and the same defect class, as WB-033/WB-013.
     NoNumberSystem,
     /// **No Java counterpart as a checked error.** `transduceMsdDeterministic` has no
     /// guard at all against a `TRUE_FALSE_AUTOMATON` input: such an automaton has zero
@@ -464,12 +473,16 @@ impl fmt::Display for TransduceError {
                     "Automaton must have at most one transition per input per state."
                 )
             }
-            // Java's own NPE text, reproduced verbatim (captured from
-            // `Walnut-all.jar`, 2026-08-13) so CLI output still matches. See WB-034.
+            // Java's fixed `WalnutException.noNumberSystem(subject)` text, verbatim —
+            // `walnut-java` commit `c75e630` (WB-034, `docs/WALNUT-BUGS.md`). `subject` is
+            // `transduceNonDeterministic`'s own `"the automaton being transduced"`. Before
+            // the fix this was Java's own raw NPE text (captured from `Walnut-all.jar`,
+            // 2026-08-13): `"Cannot invoke \"Automata.NumberSystem.isMsd()\" because the
+            // return value of \"java.util.List.get(int)\" is null"`.
             TransduceError::NoNumberSystem => write!(
                 f,
-                "Cannot invoke \"Automata.NumberSystem.isMsd()\" because the return value of \
-                 \"java.util.List.get(int)\" is null"
+                "the automaton being transduced has no attached number system (its alphabet \
+                 was declared explicitly, e.g. {{0,1}}, rather than as msd_k/lsd_k)"
             ),
             TransduceError::TrivialAutomaton => write!(
                 f,
@@ -974,17 +987,20 @@ impl Transducer {
     /// # `M.getNS().get(0).isMsd()` and this crate's `msd: Vec<Option<bool>>`
     ///
     /// Java reads a `NumberSystem` object out of `M.getNS()` and calls `.isMsd()` on it
-    /// with no null check (`Transducer.java:286`). A track declared with an **explicit
-    /// alphabet** (`{0,1}`) rather than `msd_k`/`lsd_k` has a literal `null` there
+    /// (`Transducer.java:286`), now guarded by `NumberSystem.requireNumberSystem` as of
+    /// `walnut-java` commit `c75e630`. A track declared with an **explicit alphabet**
+    /// (`{0,1}`) rather than `msd_k`/`lsd_k` has a literal `null` there
     /// (`ParseMethods.parseAlphabetDeclaration:91-96`), and such a file is perfectly
-    /// valid input everywhere else — so real Walnut throws
-    /// `NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()" …` on it.
-    /// That is **WB-034**, and it is reachable straight from `wr_io::reader`'s
+    /// valid input everywhere else — so real Walnut now throws a real, diagnosable
+    /// `WalnutException` naming the automaton on it (before the fix: a raw
+    /// `NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()" …`). That is
+    /// **WB-034**, and it is reachable straight from `wr_io::reader`'s
     /// `HeaderToken::Set(..)` branch, which is exactly what produces `msd[0] == None`.
     ///
     /// This port replicates it as [`TransduceError::NoNumberSystem`] rather than
-    /// silently treating `None` as msd — see that variant's doc for why a `Result::Err`
-    /// (not a `panic!`) is the faithful representation of Java's unchecked NPE here.
+    /// silently treating `None` as msd — see that variant's doc for the full history of
+    /// why a `Result::Err` (never a `panic!`) is the faithful representation here, both
+    /// before and after Java's own fix.
     pub fn transduce_non_deterministic(
         &self,
         m: &mut Automaton,
@@ -1571,13 +1587,13 @@ mod tests {
 
     /// **WB-034** (`docs/WALNUT-BUGS.md`). A track declared with an explicit `{0,1}`
     /// alphabet instead of `msd_k`/`lsd_k` has a `null` `NumberSystem` in Java, and
-    /// `Transducer.java:286` dereferences it unguarded. Empirically confirmed against
-    /// the real `walnut-java` CLI (`target/Walnut-all.jar`, 2026-08-13): a `{0,1}` word
-    /// automaton through `transduce … RUNSUM2 …` prints
-    /// `java.lang.NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()"
-    /// because the return value of "java.util.List.get(int)" is null / at
-    /// Automata.Transducer.transduceNonDeterministic(Transducer.java:286)` and returns
-    /// to the REPL. Ported verbatim as a rejection carrying that very message.
+    /// `Transducer.java:286` used to dereference it unguarded. Originally this pinned
+    /// Java's raw NPE message, empirically confirmed against the real `walnut-java` CLI
+    /// (`target/Walnut-all.jar`, 2026-08-13). As of `walnut-java` commit `c75e630`
+    /// (branch `bugfix/wb-013-033-034`) Java throws a real `WalnutException` instead, so
+    /// this now pins the fixed message text — verified live against the fixed jar, see
+    /// `tests/differential/tests/java_bugfix_wb034.rs`. No behavioral change was needed
+    /// on this port's side, only the message text.
     #[test]
     fn wb034_a_track_with_no_number_system_is_rejected() {
         let mut logging = Logging::new();
@@ -1592,8 +1608,8 @@ mod tests {
         );
         assert_eq!(
             TransduceError::NoNumberSystem.to_string(),
-            "Cannot invoke \"Automata.NumberSystem.isMsd()\" because the return value \
-             of \"java.util.List.get(int)\" is null"
+            "the automaton being transduced has no attached number system (its alphabet \
+             was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)"
         );
 
         // The guard sits at Java's own position — after the arity check (`:271`) and

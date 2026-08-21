@@ -794,20 +794,27 @@ impl LoggableError for ProverError {
             // `Integer.parseInt(m.group(GROUP_CONVERT_BASE))` (`Prover.java:740`) —
             // `NumberFormatException`, same bucket as `ProverError::NumberFormat`.
             ProverError::Convert(ConvertError::InvalidBase(_)) => false,
-            // WB-033: `ns.parseBase()` on a `null` NS is a `NullPointerException`.
-            ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)) => false,
+            // WB-033 fixed upstream (`walnut-java` commit `c75e630`,
+            // `bugfix/wb-013-033-034`): `convertNS`'s `ns.parseBase()` now passes through
+            // `NumberSystem.requireNumberSystem`, which raises a real `WalnutException`
+            // instead of the old raw `NullPointerException` — `ConvertNsError::
+            // NoNumberSystem` now belongs in the same bucket as every other `convertNS`
+            // throw below, not its own `false` arm. (Same shape as WB-037's own fix, see
+            // that entry's `ProverError::Join(_)` bucket move above.) Used to be `false`.
+            //
             // WB-032's fix (`UtilityMethods.exactIntegerExponent`, `walnut-java` commit
             // `18b7c4b` on `bugfix/wb-032`): both of its own guards throw
-            // `IllegalArgumentException`, not a `WalnutException` -- same bucket as
-            // `NoNumberSystem` above. Unreachable through `convert_ns`'s real call sites
-            // (see `wr_core::logicalops::exact_integer_exponent`'s doc comment) but
-            // classified for fidelity anyway, matching this file's own precedent for
-            // defensive-only ported guards.
+            // `IllegalArgumentException`, not a `WalnutException` -- its own, still-`false`
+            // bucket below. Unreachable through `convert_ns`'s real call sites (see
+            // `wr_core::logicalops::exact_integer_exponent`'s doc comment) but classified
+            // for fidelity anyway, matching this file's own precedent for defensive-only
+            // ported guards.
             ProverError::Convert(ConvertError::Convert(
                 ConvertNsError::InvalidRoot { .. } | ConvertNsError::NotAnExactPower { .. },
             )) => false,
-            // The remaining `convertNS` failures, and `convertDFAOIntoFunction`, are
-            // deliberately-thrown `WalnutException`s.
+            // The remaining `convertNS` failures (including, as of the fix above,
+            // `NoNumberSystem`), and `convertDFAOIntoFunction`, are deliberately-thrown
+            // `WalnutException`s.
             ProverError::Convert(_) => true,
             // `ost`: `ParseMethods.parseList`'s `UtilityMethods.parseInt` throws a plain
             // `NumberFormatException` on an `int`-overflowing digit run (`ost o
@@ -2701,10 +2708,6 @@ mod tests {
                 ProverError::Convert(ConvertError::InvalidBase("x".to_string())),
                 "Integer.parseInt throws NumberFormatException",
             ),
-            (
-                ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)),
-                "WB-033 is a NullPointerException",
-            ),
         ] {
             assert!(!e.is_handled(), "{why}");
         }
@@ -2745,6 +2748,11 @@ mod tests {
             (
                 ProverError::Convert(ConvertError::Convert(ConvertNsError::NoCommonRoot)),
                 "convertNS's inline WalnutException",
+            ),
+            (
+                ProverError::Convert(ConvertError::Convert(ConvertNsError::NoNumberSystem)),
+                "WB-033 fixed upstream: convertNS now throws a real WalnutException \
+                 (NumberSystem.requireNumberSystem) before the old NullPointerException site",
             ),
             (
                 ProverError::Image(ImageError::NotUnaryWordAutomaton {

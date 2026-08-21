@@ -2360,6 +2360,7 @@ impl Word {
                         m,
                         &mut quantify,
                         logging,
+                        &self.name,
                     )?;
                 }
                 Expression::Arithmetic(ae) => {
@@ -2540,6 +2541,7 @@ impl Function {
                         m,
                         &mut quantify,
                         logging,
+                        &self.name,
                     )?;
                 }
                 Expression::Arithmetic(ae) => {

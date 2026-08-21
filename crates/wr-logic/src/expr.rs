@@ -108,21 +108,42 @@ pub enum ExprError {
         java_class_name: &'static str,
     },
     /// `VariableExpression.act`'s repeated-identifier branch (`VariableExpression.java:38`):
-    /// `ns.equality.clone()` on a `null` `ns`. A real Java `NullPointerException`, not a
-    /// `WalnutException` — reachable whenever the SAME variable indexes an
-    /// explicit-alphabet-declared track (`Word.java:62`: `wordAutomaton.getNS().get(i)`
-    /// is `null` for any `{...}`-declared track, per `ParseMethods.parseAlphabetDeclaration`
-    /// `bases.add(null)`) more than once in one `eval`/`def` query — e.g. `T[i][i] = @1`
-    /// where `T`'s second track is declared `{0,1}` rather than `msd_k`/`lsd_k`. Logged as
-    /// WB-013 (`docs/WALNUT-BUGS.md`). Represented as a `Result::Err` here, deliberately
-    /// **not** a `panic!`: Java's own NPE is an unchecked `RuntimeException` that
-    /// `Prover.dispatch`'s top-level `catch (RuntimeException e)` recovers from (prints a
-    /// stack trace, the session continues) — an uncaught Rust `panic!` here would unwind
-    /// and, absent a `catch_unwind` boundary this port doesn't have yet, kill the whole
-    /// process instead, the opposite of Java's actual behavior. (Same argument
-    /// `wr_core::logging`'s module doc makes for `dedent()`'s `IllegalArgumentException`,
-    /// applied here to a different unchecked-exception call site.)
-    RepeatedIdentifierMissingNumberSystem { identifier: String },
+    /// reachable whenever the SAME variable indexes an explicit-alphabet-declared track
+    /// (`Word.java:62`: `wordAutomaton.getNS().get(i)` is `null` for any `{...}`-declared
+    /// track, per `ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)`) more than
+    /// once in one `eval`/`def` query — e.g. `T[i][i] = @1` where `T`'s second track is
+    /// declared `{0,1}` rather than `msd_k`/`lsd_k`. Logged as WB-013 (`docs/WALNUT-BUGS.md`).
+    ///
+    /// **Fixed upstream** in `walnut-java` commit `c75e630` (branch
+    /// `bugfix/wb-013-033-034`): `ns` now passes through the shared
+    /// `NumberSystem.requireNumberSystem(ns, subject)` helper, which throws a real,
+    /// diagnosable `WalnutException` naming the offending variable and token instead of
+    /// letting the old raw `NullPointerException` escape. This port already represented the
+    /// (pre-fix) NPE as a `Result::Err` rather than a `panic!` — see the historical note
+    /// below — so no behavioral change was needed here beyond following the message text
+    /// (and its now-`handled` classification, see `wr_logic::eval`'s `LoggableError for
+    /// ActError` impl) to match. `token_name` is `t.toString()` from Java's call site
+    /// (`VariableExpression.act(Token t, ...)`) — the `Word`/`Function` occurrence's own
+    /// name (`T` in `T[i][i]`) — needed because the fixed message names it:
+    /// `"the track indexed by the repeated variable {identifier} in {token_name} has no
+    /// attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather
+    /// than as msd_k/lsd_k)"`, `WalnutException.noNumberSystem`'s exact wording.
+    ///
+    /// **Historical note** (why this was a `Result::Err` here even before the Java-side
+    /// fix): Java's old NPE was an unchecked `RuntimeException` that `Prover.dispatch`'s
+    /// top-level `catch (RuntimeException e)` recovered from (prints a stack trace, the
+    /// session continues) — an uncaught Rust `panic!` here would have unwound and, absent a
+    /// `catch_unwind` boundary this port doesn't have, killed the whole process instead, the
+    /// opposite of Java's actual behavior. (Same argument `wr_core::logging`'s module doc
+    /// makes for `dedent()`'s `IllegalArgumentException`, applied here to a different
+    /// unchecked-exception call site.) That reasoning is moot now that Java throws a real
+    /// `WalnutException` here, but the `Result::Err` shape stays unchanged either way.
+    RepeatedIdentifierMissingNumberSystem {
+        identifier: String,
+        /// `t.toString()` at Java's throw site — the `Word`/`Function` occurrence's own
+        /// name (e.g. `T` in `T[i][i]`), not the repeated variable's name.
+        token_name: String,
+    },
     /// Propagated out of `this.base.getConstant(this.value)` in
     /// [`NumberLiteralExpression::act`] (`NumberLiteralExpression.java:62`). Java lets the
     /// `WalnutException` from `NumberSystem` escape unchanged; this wraps it so the caller
@@ -152,10 +173,19 @@ impl fmt::Display for ExprError {
                 context,
                 java_class_name,
             } => write!(f, "{context} cannot be of type {java_class_name}"),
-            ExprError::RepeatedIdentifierMissingNumberSystem { identifier } => write!(
+            // Java's fixed `WalnutException.noNumberSystem(subject)` text, verbatim —
+            // `walnut-java` commit `c75e630` (WB-013, `docs/WALNUT-BUGS.md`). `subject` is
+            // `VariableExpression.act`'s own `"the track indexed by the repeated variable "
+            // + this.identifier + " in " + t` (`t.toString()` is the `Word`/`Function`
+            // occurrence's name).
+            ExprError::RepeatedIdentifierMissingNumberSystem {
+                identifier,
+                token_name,
+            } => write!(
                 f,
-                "variable {identifier} was repeated under a track with no attached number \
-                 system (Java: NullPointerException in VariableExpression.act, see WB-013)"
+                "the track indexed by the repeated variable {identifier} in {token_name} has \
+                 no attached number system (its alphabet was declared explicitly, e.g. \
+                 {{0,1}}, rather than as msd_k/lsd_k)"
             ),
             ExprError::NumberSystem(e) => write!(f, "{e}"),
         }
@@ -424,9 +454,15 @@ impl VariableExpression {
     /// than `msd_k`/`lsd_k` (`ParseMethods.parseAlphabetDeclaration`'s `bases.add(null)`
     /// branch). `ns` is only ever dereferenced in the repeated-identifier branch below
     /// (the first-occurrence branch never touches it, in Java or here), so a first
-    /// occurrence is safe with `ns = None`; a *repeated* occurrence with `ns = None` is
-    /// exactly the shape that NPEs in Java — see [`ExprError::RepeatedIdentifierMissingNumberSystem`]'s
-    /// docs and WB-013 for the full call chain and trigger.
+    /// occurrence is safe with `ns = None`; a *repeated* occurrence with `ns = None` now
+    /// reports [`ExprError::RepeatedIdentifierMissingNumberSystem`], the fixed
+    /// (`c75e630`) Java behavior — see that variant's docs and WB-013 for the full call
+    /// chain and trigger.
+    ///
+    /// `token_name` is `t.toString()` at Java's call site — needed only to build the
+    /// fixed error message's `subject` string (`"... in {t}"`); not consulted at all on
+    /// the first-occurrence path, exactly like `ns`.
+    #[allow(clippy::too_many_arguments)]
     pub fn act(
         &self,
         fresh: &mut FreshIdentifiers,
@@ -435,6 +471,7 @@ impl VariableExpression {
         acc: Automaton,
         quantify: &mut Vec<String>,
         logging: &mut wr_core::logging::Logging,
+        token_name: &str,
     ) -> Result<Automaton, ExprError> {
         if !identifiers.contains(&self.identifier) {
             identifiers.push(self.identifier.clone());
@@ -442,6 +479,7 @@ impl VariableExpression {
         } else {
             let ns = ns.ok_or_else(|| ExprError::RepeatedIdentifierMissingNumberSystem {
                 identifier: self.identifier.clone(),
+                token_name: token_name.to_string(),
             })?;
             let new_identifier = format!("{}{}", self.identifier, fresh.next_identifier());
             let mut eq = ns.equality.clone();
@@ -1031,6 +1069,7 @@ mod tests {
                 Automaton::true_false(true),
                 &mut quantify,
                 &mut wr_core::logging::Logging::new(),
+                "T",
             )
             .unwrap();
         assert_eq!(identifiers, vec!["a".to_string()]);
@@ -1046,7 +1085,7 @@ mod tests {
     /// A first occurrence never dereferences `ns` (matching Java: the repeated-identifier
     /// branch is the only place `ns` is touched), so `ns = None` must be safe here even
     /// though it would fail a repeated occurrence -- see
-    /// [`variable_expression_act_repeated_occurrence_with_no_ns_reports_the_java_npe_shape`].
+    /// [`variable_expression_act_repeated_occurrence_with_no_ns_matches_fixed_java`].
     #[test]
     fn variable_expression_act_first_occurrence_tolerates_missing_number_system() {
         let ve = VariableExpression::new("a");
@@ -1061,6 +1100,7 @@ mod tests {
                 Automaton::true_false(true),
                 &mut quantify,
                 &mut wr_core::logging::Logging::new(),
+                "T",
             )
             .unwrap();
         assert_eq!(identifiers, vec!["a".to_string()]);
@@ -1082,6 +1122,7 @@ mod tests {
                 Automaton::true_false(true),
                 &mut quantify,
                 &mut wr_core::logging::Logging::new(),
+                "T",
             )
             .unwrap();
         assert_eq!(fresh.issued(), 1);
@@ -1095,11 +1136,15 @@ mod tests {
     }
 
     /// Pins finding #1 from Phase 3a U2's adversarial review: `T[i][i] = @1` where track
-    /// `i` is declared `{0,1}` (no `msd_k`/`lsd_k`) reaches Java's `ns.equality` on a
-    /// `null` `ns` -- a real `NullPointerException`, not a `WalnutException`. This must
+    /// `i` is declared `{0,1}` (no `msd_k`/`lsd_k`) reaches `ns.equality` on a missing
+    /// `ns`. Originally this pinned Java's raw `NullPointerException` shape; as of
+    /// `walnut-java` commit `c75e630` (WB-013, `docs/WALNUT-BUGS.md`) Java throws a real,
+    /// diagnosable `WalnutException` instead, so this now pins the fixed message text
+    /// (verified live against the fixed jar — see
+    /// `tests/differential/tests/java_bugfix_wb013.rs`), not the old NPE shape. Still must
     /// surface as an explicit, documented error here, never a silently-wrong default.
     #[test]
-    fn variable_expression_act_repeated_occurrence_with_no_ns_reports_the_java_npe_shape() {
+    fn variable_expression_act_repeated_occurrence_with_no_ns_matches_fixed_java() {
         let ve = VariableExpression::new("i");
         let mut fresh = FreshIdentifiers::new();
         let mut identifiers = vec!["i".to_string()]; // already seen once, e.g. T[i][i]
@@ -1112,13 +1157,21 @@ mod tests {
                 Automaton::true_false(true),
                 &mut quantify,
                 &mut wr_core::logging::Logging::new(),
+                "T",
             )
             .unwrap_err();
         assert_eq!(
             err,
             ExprError::RepeatedIdentifierMissingNumberSystem {
-                identifier: "i".to_string()
+                identifier: "i".to_string(),
+                token_name: "T".to_string(),
             }
+        );
+        assert_eq!(
+            err.to_string(),
+            "the track indexed by the repeated variable i in T has no attached number \
+             system (its alphabet was declared explicitly, e.g. {0,1}, rather than as \
+             msd_k/lsd_k)"
         );
         assert_eq!(fresh.issued(), 0, "must fail before minting a fresh name");
     }

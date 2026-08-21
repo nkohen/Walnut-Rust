@@ -1570,11 +1570,12 @@ pub fn combine(
 // Number-system conversion: `convertNS` and its five private helpers (U18).
 // ---------------------------------------------------------------------------
 
-/// Every failure [`convert_ns`] can report. All but [`ConvertNsError::NoNumberSystem`] are
-/// `WalnutException`s Java throws from `convertNS`/`convertMsdBaseToExponent`/
-/// `convertLsdBaseToRoot`, with their messages preserved verbatim in the [`fmt::Display`]
-/// impl (each one checked against the real `walnut-java` CLI, not transcribed from source);
-/// `NoNumberSystem` stands in for a genuine Java `NullPointerException` — see its own docs
+/// Every failure [`convert_ns`] can report. Every variant, including
+/// [`ConvertNsError::NoNumberSystem`], is now a real `WalnutException` Java throws from
+/// `convertNS`/`convertMsdBaseToExponent`/`convertLsdBaseToRoot`, with their messages
+/// preserved verbatim in the [`fmt::Display`] impl (each one checked against the real
+/// `walnut-java` CLI, not transcribed from source); `NoNumberSystem` used to stand in for a
+/// genuine Java `NullPointerException` before it was fixed upstream — see its own docs
 /// and `docs/WALNUT-BUGS.md` WB-033.
 ///
 /// `Result` rather than `panic!`, per `PORTING.md`'s exception-mapping rule and for the
@@ -1590,18 +1591,26 @@ pub enum ConvertNsError {
     /// TRUE/FALSE automaton, which has no tracks at all — matching Java, whose trivial
     /// automata carry an empty `NS` list.
     NotSingleInput,
-    /// The track exists but has **no numeration system** — Java's `A.getNS().get(0)` is
-    /// `null`, and `ns.parseBase()` (`:462`) dereferences it unguarded.
+    /// The track exists but has **no numeration system** — Java's `A.getNS().get(0)` used
+    /// to be dereferenced unguarded by `ns.parseBase()` (`:462`); as of `walnut-java`
+    /// commit `c75e630` (branch `bugfix/wb-013-033-034`) it instead passes through the
+    /// shared `NumberSystem.requireNumberSystem(ns, subject)` helper, which throws a real,
+    /// diagnosable `WalnutException` naming the automaton.
     ///
     /// Reachable from the plain CLI on a perfectly valid input: an automaton `.txt` whose
     /// alphabet is declared explicitly (`{0,1}`) rather than as `msd_k`/`lsd_k` gets a
     /// literal `null` NS entry from `ParseMethods.parseAlphabetDeclaration`
-    /// (`Automata/ParseMethods.java:91-96`, `bases.add(null)`), and `convert`ing it throws
-    /// `NullPointerException: Cannot invoke "Automata.NumberSystem.parseBase()" because
-    /// "ns" is null` — confirmed live against `Walnut-all.jar`, see `docs/WALNUT-BUGS.md`
-    /// WB-033. Ported as this `Err` variant rather than replicated as a `panic!`, matching
-    /// how WB-013 (the same "null NS reaches an unguarded dereference" shape) is already
-    /// handled in `wr-logic`.
+    /// (`Automata/ParseMethods.java:91-96`, `bases.add(null)`), and `convert`ing it now
+    /// prints `"the automaton being converted has no attached number system (its alphabet
+    /// was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)"` — confirmed live
+    /// against the fixed jar, see `docs/WALNUT-BUGS.md` WB-033. Before the fix, the same
+    /// input threw a raw `NullPointerException: Cannot invoke
+    /// "Automata.NumberSystem.parseBase()" because "ns" is null`; this port never
+    /// reproduced that as a `panic!` — it was always this `Err` variant, matching how
+    /// WB-013 (the same "null NS reaches an unguarded dereference" shape) is handled in
+    /// `wr-logic` — so the fix here is message-text-only (see also this variant's
+    /// `is_handled()` classification in `wr_cli::prover`, which moved out of its own
+    /// stale `false` arm into the general `ProverError::Convert(_) => true` bucket).
     NoNumberSystem,
     /// `NumberSystem.parseBase`'s own guard (`NumberSystem.java:237-243`):
     /// `"Base of automaton's number system must be > 1 and int, found: <base>"`.
@@ -1697,9 +1706,13 @@ impl fmt::Display for ConvertNsError {
             ConvertNsError::NotSingleInput => {
                 write!(f, "Automaton must have exactly one input to be converted.")
             }
+            // Java's fixed `WalnutException.noNumberSystem(subject)` text, verbatim —
+            // `walnut-java` commit `c75e630` (WB-033, `docs/WALNUT-BUGS.md`). `subject` is
+            // `convertNS`'s own `"the automaton being converted"`.
             ConvertNsError::NoNumberSystem => write!(
                 f,
-                "Cannot invoke \"Automata.NumberSystem.parseBase()\" because \"ns\" is null"
+                "the automaton being converted has no attached number system (its alphabet \
+                 was declared explicitly, e.g. {{0,1}}, rather than as msd_k/lsd_k)"
             ),
             ConvertNsError::BaseNotAPositiveInt { found } => write!(
                 f,
@@ -5599,19 +5612,24 @@ mod tests {
     }
 
     /// `docs/WALNUT-BUGS.md` WB-033: a track declared `{0,1}` rather than `msd_k`/`lsd_k`
-    /// has a `null` `NumberSystem` in Java, and `convertNS`'s `ns.parseBase()` NPEs on it.
-    /// Surfaced here as an `Err`, per WB-013's established convention for a *recoverable*
-    /// Java NPE — the Java message is reproduced verbatim so the CLI text still matches.
+    /// has a `null` `NumberSystem` in Java. Originally this pinned Java's raw NPE message
+    /// (reproduced verbatim so the CLI text matched); as of `walnut-java` commit `c75e630`
+    /// Java throws a real `WalnutException` instead, so this now pins the fixed message —
+    /// verified live against the fixed jar, see
+    /// `tests/differential/tests/java_bugfix_wb033.rs`. Surfaced here as an `Err`, per
+    /// WB-013's established convention — no behavioral change was needed on this port's
+    /// side, only the message text.
     #[test]
     fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
         let mut a = epsilon_only(2, true);
         a.msd = vec![None];
         let err = convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new())
-            .expect_err("Java NPEs here");
+            .expect_err("must reject a track with no attached number system");
         assert_eq!(err, ConvertNsError::NoNumberSystem);
         assert_eq!(
             err.to_string(),
-            "Cannot invoke \"Automata.NumberSystem.parseBase()\" because \"ns\" is null"
+            "the automaton being converted has no attached number system (its alphabet was \
+             declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)"
         );
     }
 

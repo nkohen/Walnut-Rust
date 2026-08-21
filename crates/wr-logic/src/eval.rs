@@ -235,20 +235,34 @@
 //! own docs, `is_handled()` mirrors Java's `e instanceof WalnutException` triage: almost
 //! every [`ActError`] variant corresponds to a real, deliberately-thrown
 //! `WalnutException` and is `handled` (message-only console/log line, no stack frames).
-//! The one remaining documented exception is a genuine Walnut (Java) bug already logged
-//! in `docs/WALNUT-BUGS.md` — a real, UNCAUGHT `NullPointerException`, not a
-//! `WalnutException` — reported here as `is_handled() == false` with the closest honest
-//! `kind()` text (`"java.lang.NullPointerException"`) and an empty `stack_trace_lines()`
-//! (this port has no JVM frames to report; see `wr_core::logging`'s own module docs on
-//! why frame text has no Rust analogue and is a documented, not silent, fidelity limit):
 //!
-//! * [`crate::expr::ExprError::RepeatedIdentifierMissingNumberSystem`] — WB-013.
+//! As of this writing every [`ActError`] variant this crate can currently construct is
+//! `handled` — there is no live entry in this list. Both of the two variants that used to
+//! be documented exceptions here are Walnut (Java) bugs, both since fixed upstream, so
+//! both moved from `is_handled() == false` (the closest honest `kind()` text, an empty
+//! `stack_trace_lines()` — this port has no JVM frames to report; see `wr_core::logging`'s
+//! own module docs on why frame text has no Rust analogue and is a documented, not
+//! silent, fidelity limit) to `true`:
 //!
-//! (WB-002, the `I` quantifier's own former `NullPointerException` trigger via
-//! `wr_core::infinite::infinite`, used to be the second entry here — `ActError::Infinite`
-//! wrapping `wr_core::infinite::InfiniteError`. Fixed upstream, `walnut-java` commit
-//! `aa4a241`: `infinite()` no longer errors on any input, so this port's `ActError` has
-//! no `Infinite` variant to classify anymore.)
+//! * [`crate::expr::ExprError::RepeatedIdentifierMissingNumberSystem`] — WB-013. Fixed
+//!   upstream, `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`):
+//!   `VariableExpression.act`'s repeated-identifier branch now throws a real
+//!   `WalnutException` (via the shared `NumberSystem.requireNumberSystem` helper) instead
+//!   of letting the old raw `NullPointerException` escape, so this port's matching arm now
+//!   reports `is_handled() == true` — the `kind()` arm that used to name
+//!   `"java.lang.NullPointerException"` for this variant is gone; `kind()`'s default
+//!   `"Main.WalnutException"` arm covers it now, exactly like every other real
+//!   `WalnutException`-backed variant.
+//! * WB-002, the `I` quantifier's own former `NullPointerException` trigger via
+//!   `wr_core::infinite::infinite`, used to be the other entry here — `ActError::Infinite`
+//!   wrapping `wr_core::infinite::InfiniteError`. Fixed upstream, `walnut-java` commit
+//!   `aa4a241`: `infinite()` no longer errors on any input, so this port's `ActError` has
+//!   no `Infinite` variant to classify anymore.
+//!
+//! This is an emptied-out list, not a deleted mechanism: the trait and its triage stay in
+//! place for whatever future `ActError` variant — a new Walnut (Java) bug this port
+//! chooses to reproduce as a `Result::Err`, per `CLAUDE.md`'s "log it, don't silently fix
+//! or replicate it" rule — needs it next.
 
 use std::fmt;
 use std::time::Instant;
@@ -358,9 +372,12 @@ fn expr_error_is_handled(e: &ExprError) -> bool {
         ExprError::AutomatonArgumentWrongArity { .. }
         | ExprError::AutomatonArgumentUnlabeled { .. }
         | ExprError::InvalidType { .. } => true,
-        // WB-013: a real, UNCAUGHT `NullPointerException` in Java, not a
-        // `WalnutException`.
-        ExprError::RepeatedIdentifierMissingNumberSystem { .. } => false,
+        // WB-013, fixed upstream (`walnut-java` commit `c75e630`,
+        // `bugfix/wb-013-033-034`): `VariableExpression.act`'s repeated-identifier branch
+        // now throws a real `WalnutException` (`NumberSystem.requireNumberSystem`) instead
+        // of the old raw, UNCAUGHT `NullPointerException` — see this module's own docs for
+        // the full history. Used to be `false`.
+        ExprError::RepeatedIdentifierMissingNumberSystem { .. } => true,
         ExprError::NumberSystem(e) => num_sys_error_is_handled(e),
     }
 }
@@ -464,9 +481,6 @@ impl LoggableError for ActError {
 
     fn kind(&self) -> String {
         match self {
-            ActError::Expr(ExprError::RepeatedIdentifierMissingNumberSystem { .. }) => {
-                "java.lang.NullPointerException".to_string()
-            }
             // The three `NumSysError`s `num_sys_error_is_handled` classifies as unhandled
             // each name a *different* uncaught JVM exception — see that function's own
             // per-variant comments for the throw site each one stands in for.

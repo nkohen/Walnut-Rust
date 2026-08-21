@@ -631,31 +631,68 @@ bug costs a silent wrong answer somewhere downstream.
   (`VariableExpression.java:34-48` -> `Word.java:62` -> `ParseMethods.java:84-109`'s
   `bases.add(null)` branch), not yet run against a live crash reproduction — the arithmetic/control
   flow is unambiguous (an unconditional dereference of a value provably `null` on this path).
-- **Rust port:** `ported verbatim (quirk)`, but represented as an explicit, documented
+- **Rust port:** was `ported verbatim (quirk)`, represented as an explicit, documented
   `Result::Err` rather than a `panic!`. `VariableExpression::act`'s `ns` parameter is
   `Option<&NumberSystem>` (`None` standing in for Java's `null`); the repeated-identifier branch
-  returns `Err(ExprError::RepeatedIdentifierMissingNumberSystem)` instead of dereferencing. A
+  returned `Err(ExprError::RepeatedIdentifierMissingNumberSystem)` instead of dereferencing. A
   `panic!` was deliberately rejected here (unlike, e.g., `relational_op_from_symbol`'s panic for an
-  unreachable-by-construction internal invariant): Java's NPE is an unchecked `RuntimeException`
-  that `Prover.dispatch`'s top-level `catch (RuntimeException e)` (`Prover.java:390`) recovers from
-  — prints a stack trace, the session continues — so an uncaught Rust `panic!` here would be *less*
-  faithful, not more: absent a `catch_unwind` boundary this port doesn't have yet, it would unwind
-  and kill the whole process, the opposite of Java's actual recoverable behavior. (Same reasoning
-  `wr_core::logging`'s module doc already applies to `dedent()`'s `IllegalArgumentException`, and
-  the same "recoverable crash on raw user-typed input stays a `Result`" convention WB-011's entry
-  above documents for `parse_morphism`.) Pinned by
-  `variable_expression_act_repeated_occurrence_with_no_ns_reports_the_java_npe_shape` in
-  `expr.rs`. Not yet wired to any real caller — `Word`/`Function` (the only real source of a `None`
-  `ns`) are deferred to U4, so this is a signature-level fix ahead of its first live call site, not
-  something exercised through the CLI yet.
-- **Upstream:** not filed. A ~3-line guard in `VariableExpression.act` (throw a real
-  `WalnutException` naming the offending variable/track when `ns == null` in the repeated-identifier
-  branch, rather than falling through to the NPE) would fix it in Java too.
+  unreachable-by-construction internal invariant): Java's (pre-fix) NPE was an unchecked
+  `RuntimeException` that `Prover.dispatch`'s top-level `catch (RuntimeException e)` (`Prover.java:390`)
+  recovered from — prints a stack trace, the session continues — so an uncaught Rust `panic!` here
+  would have been *less* faithful, not more: absent a `catch_unwind` boundary this port doesn't have,
+  it would unwind and kill the whole process, the opposite of Java's actual recoverable behavior.
+  (Same reasoning `wr_core::logging`'s module doc already applies to `dedent()`'s
+  `IllegalArgumentException`, and the same "recoverable crash on raw user-typed input stays a
+  `Result`" convention WB-011's entry above documents for `parse_morphism`.)
+
+  **Correction to this entry's original "not yet wired to any real caller" claim**: that was true
+  only through Phase 3a's own U2 (when this entry was first written) — `Word`/`Function` token
+  construction landed a few units later in the SAME phase (U4), so `T[i][i]`-style repeated-variable
+  indexing has in fact been reachable straight from `eval`/`def` for essentially this whole project's
+  history. The claim went stale and was never revisited until this fix; nothing was silently wrong
+  as a result (the port's `Result::Err` behavior was correct all along, live or not), but the doc
+  itself was inaccurate. Corrected here rather than left to mislead a future reader.
+- **Upstream:** **fixed**, `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`, grouped
+  with WB-033/WB-034 as one PR per `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`'s PR-12 — all three are the
+  same defect *class*, a `null` `NumberSystem` from a `{...}`-declared track reaching an unguarded
+  dereference, in three different methods). A single shared static helper,
+  `NumberSystem.requireNumberSystem(NumberSystem ns, String subject)`, null-checks and throws a real
+  `WalnutException` (`WalnutException.noNumberSystem(subject)`) instead of falling through to the
+  NPE; `VariableExpression.act`'s call site supplies `subject = "the track indexed by the repeated
+  variable " + this.identifier + " in " + t` (`t.toString()` is the `Word`/`Function` occurrence's own
+  name, e.g. `T` in `T[i][i]`). Verified live against a freshly built jar, before and after:
+  `eval r "T[i][i] = @1";` on an `msd_2 {0,1}`-declared two-track word automaton went from a raw
+  `NullPointerException: Cannot read field "equality" because "ns" is null / at
+  Main.EvalComputations.Expressions.VariableExpression.act(VariableExpression.java:39)` to `"the
+  track indexed by the repeated variable i in T has no attached number system (its alphabet was
+  declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)"`, session continues either way (the
+  session always survived — `Prover.dispatch`'s top-level catch recovers from both the old NPE and
+  the new `WalnutException`), so this fix is strictly about message quality/diagnosability, not crash
+  recovery, matching this entry's own pre-fix framing.
 - **Severity:** moderate — a real crash (not silent-wrong-answer) on syntactically valid, plausible
   input (any multi-track word automaton mixing an `msd_k`/`lsd_k` track with an explicit-alphabet
-  track, indexed by a repeated variable) rather than a contrived construction; not yet reachable
-  through walnut-rs's own CLI (no lexer/`Word`/`Function` yet), so no *live* user impact in this port
-  today.
+  track, indexed by a repeated variable) rather than a contrived construction; reachable through
+  walnut-rs's own CLI (see the "not yet wired" correction above) — this WAS live user impact in this
+  port, contrary to this entry's original framing.
+- **Resolved (2026-08-21):** upstream fixed as described above (commit `c75e630`; verified live).
+  **Rust port: fixed, matches walnut-java as of commit `c75e630`.** No functional change: this port
+  already computed/reported a clean, recoverable `Result::Err`, never the raw Java crash. The only
+  change is the message TEXT (Java's fixed `WalnutException.noNumberSystem(subject)` wording,
+  verbatim) plus a new `token_name` field on `ExprError::RepeatedIdentifierMissingNumberSystem` to
+  carry the `subject` string's `Word`/`Function`-name half (threaded from `Word::act`/`Function::act`
+  through `VariableExpression::act`'s new `token_name: &str` parameter) — and moving this variant's
+  `ActError::is_handled()` classification (in `wr_logic::eval`) from its own `false` arm ("a real,
+  UNCAUGHT `NullPointerException`") to `true` (a genuine `WalnutException`), the same shape WB-037's
+  own fix took for `JoinError::NoAutomataSpecified`. The renamed test
+  `variable_expression_act_repeated_occurrence_with_no_ns_matches_fixed_java` (formerly
+  `..._reports_the_java_npe_shape`) now pins the fixed message and the new `token_name` field, not
+  the old NPE shape. Differential coverage against a live capture from the fixed branch:
+  `tests/differential/tests/java_bugfix_wb013.rs`'s
+  `wb013_repeated_variable_indexing_a_track_with_no_number_system_matches_fixed_java`, which drives
+  the real `eval` command end-to-end through `wr_cli::prover::Prover::read_buffer` and asserts both
+  the fixed stdout text (including `EvalDef.compute`'s own double-print/`": char at N"` wrapping,
+  generic to any `act()` failure) and an empty stderr — the same shape `java_bugfix_wb037.rs`
+  established for catching a stale `is_handled()` classification, not just a stale message string.
 
 ---
 
@@ -1891,29 +1928,54 @@ bug costs a silent wrong answer somewhere downstream.
   None` stand-in for a null `NumberSystem` as "msd, carry on" and documenting the case as having
   "no Java counterpart to be faithful to." Adversarial review falsified that claim against the real
   jar with the input above; the divergence was unauthorized (no user sign-off) and is now removed.
-- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than a
-  `panic!` — `wr_core::transducer::TransduceError::NoNumberSystem`, whose `Display` reproduces
-  Java's NPE message verbatim so CLI output still matches. The reasoning is WB-033's and WB-013's,
-  unchanged: Java's NPE is an unchecked `RuntimeException` that `Prover.dispatch` (`Prover.java:390`)
-  catches and prints before continuing the session, so an uncaught Rust `panic!` would be *less*
-  faithful, not more (this port has no `catch_unwind` boundary; a panic would kill the process).
-  The guard sits at Java's own position — after the arity check and after the
-  alphabet-compatibility loop — so those two still win when they also apply. Pinned by
-  `wb034_a_track_with_no_number_system_is_rejected`, which also asserts the message text and that
-  ordering.
+- **Rust port:** was `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than
+  a `panic!` — `wr_core::transducer::TransduceError::NoNumberSystem`, whose `Display` reproduced
+  Java's (pre-fix) NPE message verbatim so CLI output still matched. The reasoning was WB-033's and
+  WB-013's, unchanged: Java's (pre-fix) NPE was an unchecked `RuntimeException` that
+  `Prover.dispatch` (`Prover.java:390`) caught and printed before continuing the session, so an
+  uncaught Rust `panic!` would have been *less* faithful, not more (this port has no `catch_unwind`
+  boundary; a panic would kill the process). The guard sits at Java's own position — after the arity
+  check and after the alphabet-compatibility loop — so those two still win when they also apply.
+  Pinned by `wb034_a_track_with_no_number_system_is_rejected`, which also asserts the message text
+  and that ordering.
 - **Reachability in this port:** live, not theoretical. `crates/wr-io/src/reader.rs`'s
   `HeaderToken::Set(..)` branch is exactly what produces `msd: None` for an explicit-alphabet
   track, so U26's `transduce` CLI command hits this the moment it is wired up.
-- **Upstream:** not filed. A two-line guard (throw a real `WalnutException` naming the automaton
-  when `M.getNS().get(0) == null`, e.g. "the automaton to transduce must have a number system") is
-  the minimal fix; the more useful fix is arguably to *support* the case — a track with no
-  numeration has no msd/lsd direction, so "don't reverse" is a defensible default — but that is a
-  semantic decision, not a bug fix, and should not be made silently in the port. Best fixed
-  together with WB-013 and WB-033, since all three are the same missing null check.
+- **Upstream:** **fixed**, `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`, grouped
+  with WB-013/WB-033 as one PR — all three are the same defect class). The same shared
+  `NumberSystem.requireNumberSystem(ns, subject)` helper WB-013/WB-033 use now guards
+  `Transducer.java:286`'s `M.getNS().get(0).isMsd()`, with `subject = "the automaton being
+  transduced"`. The "support the case instead" alternative this entry originally floated (treat a
+  no-numeration track as a defensible "don't reverse" default) was NOT the fix chosen — Java still
+  refuses the input, just with a real diagnosable message instead of a raw NPE. Verified live against
+  a freshly built jar, before and after: `transduce out RUNSUM2 in;` on a `{0,1}`-declared
+  Thue-Morse-shaped word automaton went from
+  `NullPointerException: Cannot invoke "Automata.NumberSystem.isMsd()" because the return value of
+  "java.util.List.get(int)" is null / at Automata.Transducer.transduceNonDeterministic
+  (Transducer.java:286)` to `"the automaton being transduced has no attached number system (its
+  alphabet was declared explicitly, e.g. {0,1}, rather than as msd_k/lsd_k)"`, session continues
+  either way.
 - **Severity:** low-to-moderate — a loud crash rather than a silently wrong answer, and the session
   survives it; but it fires on valid, ordinary input (an explicit-alphabet word automaton is a
   normal thing to have in `Word Automata Library/`) with no adversarial shape at all, and the
-  message names an internal class rather than telling the user what is wrong with their file.
+  (pre-fix) message named an internal class rather than telling the user what was wrong with their
+  file.
+- **Resolved (2026-08-21):** upstream fixed as described above (commit `c75e630`; verified live).
+  **Rust port: fixed, matches walnut-java as of commit `c75e630`.** No functional change: this port
+  already computed/reported a clean, recoverable `Result::Err`, never the raw Java crash. The only
+  change is the message TEXT (Java's fixed `WalnutException.noNumberSystem(subject)` wording,
+  verbatim) — `wb034_a_track_with_no_number_system_is_rejected` now pins the fixed text instead of
+  the old NPE text. `ProverError::Transduce(_) => true` (`wr_cli::prover`) already unconditionally
+  classified every `TransduceError` (including this one) as a handled `WalnutException`, a
+  pre-existing coarse bucket that does not distinguish this variant from WB-035's own two
+  still-genuinely-NPE-mimicking variants (`NoTransducerTransition`/`NoTransducerOutput`, upstream
+  not yet fixed) — so unlike WB-013's/WB-033's sibling fixes, no `is_handled()` code change was
+  needed here specifically; this fix is message-text-only. Differential coverage against a live
+  capture from the fixed branch: `tests/differential/tests/java_bugfix_wb034.rs`'s
+  `wb034_transduce_on_a_track_with_no_number_system_matches_fixed_java`, which drives the real
+  `transduce` command end-to-end through `wr_cli::prover::Prover::read_buffer` and asserts both the
+  fixed stdout text and an empty stderr (confirming the pre-existing coarse classification is still
+  correct for this variant, not just that the message string changed).
 
 ---
 
@@ -2045,22 +2107,45 @@ bug costs a silent wrong answer somewhere downstream.
   `convert $out msd_4 $in;` prints
   `java.lang.NullPointerException: Cannot invoke "Automata.NumberSystem.parseBase()" because "ns" is
   null / at Automata.AutomatonLogicalOps.convertNS(AutomatonLogicalOps.java:462)`.
-- **Rust port:** `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than a
-  `panic!` — `wr_core::logicalops::ConvertNsError::NoNumberSystem`, whose `Display` reproduces Java's
-  NPE message verbatim so CLI output still matches. The reasoning is WB-013's, unchanged: Java's NPE
-  is an unchecked `RuntimeException` that `Prover.dispatch`'s top-level `catch (RuntimeException e)`
-  (`Prover.java:390`) recovers from — the message is printed and the session continues — so an
-  uncaught Rust `panic!` would be *less* faithful, not more (absent a `catch_unwind` boundary this
-  port doesn't have, it would kill the process). This crate's stand-in for a `null` `NumberSystem` is
-  `Automaton::msd[i] == None`, so the guard is a `let Some(from_msd) = a.msd[0] else { ... }`. Pinned
-  by `convert_ns_rejects_a_track_with_no_number_system_wb033`.
-- **Upstream:** not filed. A two-line guard in `convertNS` (throw a real `WalnutException` naming the
-  automaton/track when `A.getNS().get(0) == null`, e.g. "cannot convert the number system of an
-  automaton whose input has no number system") would fix it in Java.
+- **Rust port:** was `ported verbatim (quirk)`, represented as an explicit `Result::Err` rather than
+  a `panic!` — `wr_core::logicalops::ConvertNsError::NoNumberSystem`, whose `Display` reproduced
+  Java's (pre-fix) NPE message verbatim so CLI output still matched. The reasoning was WB-013's,
+  unchanged: Java's (pre-fix) NPE was an unchecked `RuntimeException` that `Prover.dispatch`'s
+  top-level `catch (RuntimeException e)` (`Prover.java:390`) recovered from — the message was printed
+  and the session continued — so an uncaught Rust `panic!` would have been *less* faithful, not more
+  (absent a `catch_unwind` boundary this port doesn't have, it would kill the process). This crate's
+  stand-in for a `null` `NumberSystem` is `Automaton::msd[i] == None`, so the guard is a
+  `let Some(from_msd) = a.msd[0] else { ... }`. Pinned by
+  `convert_ns_rejects_a_track_with_no_number_system_wb033`.
+- **Upstream:** **fixed**, `walnut-java` commit `c75e630` (branch `bugfix/wb-013-033-034`, grouped
+  with WB-013/WB-034 as one PR — all three are the same defect class). The same shared
+  `NumberSystem.requireNumberSystem(ns, subject)` helper guards `convertNS`'s
+  `NumberSystem ns = A.getNS().get(0);` line, with `subject = "the automaton being converted"`.
+  Verified live against a freshly built jar, before and after: `convert $out msd_4 $in;` on a
+  one-track `{0,1}` automaton went from
+  `NullPointerException: Cannot invoke "Automata.NumberSystem.parseBase()" because "ns" is null / at
+  Automata.AutomatonLogicalOps.convertNS(AutomatonLogicalOps.java:462)` to `"the automaton being
+  converted has no attached number system (its alphabet was declared explicitly, e.g. {0,1}, rather
+  than as msd_k/lsd_k)"`, session continues either way.
 - **Severity:** low-to-moderate — a real crash rather than a silently wrong answer, on valid input
   reachable straight from the CLI, but the combination (an explicit-alphabet automaton being handed
   to `convert`, a command that exists precisely to change a *number system*) is an unlikely thing to
-  ask for, and the failure is loud.
+  ask for, and the (pre-fix) failure was loud but undiagnosable.
+- **Resolved (2026-08-21):** upstream fixed as described above (commit `c75e630`; verified live).
+  **Rust port: fixed, matches walnut-java as of commit `c75e630`.** No functional change: this port
+  already computed/reported a clean, recoverable `Result::Err`, never the raw Java crash. The only
+  change is the message TEXT (Java's fixed `WalnutException.noNumberSystem(subject)` wording,
+  verbatim) plus moving `ConvertNsError::NoNumberSystem`'s `ProverError::is_handled()` classification
+  (`wr_cli::prover`) from its own `false` arm ("`ns.parseBase()` on a `null` NS is a
+  `NullPointerException`") into the general `ProverError::Convert(_) => true` bucket — the same shape
+  WB-037's own fix took for `JoinError::NoAutomataSpecified`.
+  `convert_ns_rejects_a_track_with_no_number_system_wb033` now pins the fixed message text. Differential
+  coverage against a live capture from the fixed branch:
+  `tests/differential/tests/java_bugfix_wb033.rs`'s
+  `wb033_convert_on_a_track_with_no_number_system_matches_fixed_java`, which drives the real
+  `convert` command end-to-end through `wr_cli::prover::Prover::read_buffer` and asserts both the
+  fixed stdout text and an empty stderr — the same shape `java_bugfix_wb037.rs` established for
+  catching a stale `is_handled()` classification, not just a stale message string.
 
 ---
 
