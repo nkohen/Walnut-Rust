@@ -81,28 +81,25 @@ pub enum ParseMethodsError {
     /// `WalnutException("Morphism has no valid mappings.")` (`ParseMethods.java:190`,
     /// `parseMorphism`).
     NoValidMorphismMappings,
-    /// **Genuine Walnut (Java) bug, logged as `docs/WALNUT-BUGS.md` WB-011, ported
-    /// verbatim.** `parseMorphism` calls plain `Integer.parseInt` on a morphism
-    /// symbol's bracketed text (`ParseMethods.java:172-174,182-184`) — NOT
-    /// `UtilityMethods.parseInt`, which strips whitespace — even though the pattern
-    /// backing it (`\[(?:[+\-])?\s*\d+\]`) explicitly permits whitespace between the
-    /// sign and the digits. `"[+ 5]"` therefore matches the regex but then throws an
-    /// uncaught `NumberFormatException` in real Walnut. Also reachable from plain
-    /// `i32` overflow (same underlying `Integer.parseInt` call, an ordinary and
-    /// already-precedented divergence elsewhere in this port, e.g.
-    /// `NumSysError::BaseNotAnI32`). The `String` is the exact text Java would have
-    /// handed to `Integer.parseInt`.
-    IntegerParseFailure(String),
     /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on an
-    /// `i32`-overflowing digit run in a state declaration, a transition line, or an
-    /// alphabet set — every `\d+` group in this file's patterns constrains shape, not
-    /// magnitude, and the text behind them comes straight out of a `.txt` library file.
+    /// `i32`-overflowing digit run in a state declaration, a transition line, an
+    /// alphabet set, or (as of the WB-011 fix below) a morphism symbol — every `\d+`
+    /// group in this file's patterns constrains shape, not magnitude, and the text
+    /// behind them comes straight out of a `.txt` library file or raw command text.
     ///
-    /// Distinct from [`Self::IntegerParseFailure`], which is WB-011's *plain*
-    /// `Integer.parseInt` call in `parseMorphism` (no whitespace stripping, so it also
-    /// fires on `"[+ 5]"`). This one is the whitespace-stripping `UtilityMethods.parseInt`
-    /// used everywhere else, so its payload is the STRIPPED text, exactly as Java's
-    /// message would carry it.
+    /// `parseMorphism`'s two symbol-parsing call sites (`ParseMethods.java:185,187`)
+    /// used to call plain `Integer.parseInt` instead — **a genuine Walnut (Java) bug,
+    /// logged as `docs/WALNUT-BUGS.md` WB-011** — even though the shared bracket
+    /// grammar (`MORPHISM_COMMON_SYMBOL = "\[(?:[+\-])?\s*\d+\]"`) explicitly permits
+    /// whitespace between an optional sign and the digits, so `"[+ 5]"` matched the
+    /// regex but then crashed on the un-stripped `"+ 5"` (previously surfaced here as
+    /// a since-removed `IntegerParseFailure` variant). Fixed upstream (`walnut-java`
+    /// commit `50dab9e`) by swapping both call sites to `UtilityMethods.parseInt`,
+    /// matching every other numeric-text-to-`int` conversion in this file; ported by
+    /// routing [`try_match_morphism_mapping`]'s two symbol parses through
+    /// [`try_parse_int`] the same as every other call site below, so both the
+    /// whitespace-after-sign crash AND ordinary `i32` overflow on a morphism symbol
+    /// now report as this variant instead.
     ///
     /// Recoverable rather than a `panic!`, for the reason `wr_core::util::try_parse_int`
     /// documents: `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`)
@@ -122,9 +119,6 @@ impl std::fmt::Display for ParseMethodsError {
         match self {
             ParseMethodsError::NoValidMorphismMappings => {
                 write!(f, "Morphism has no valid mappings.")
-            }
-            ParseMethodsError::IntegerParseFailure(text) => {
-                write!(f, "For input string: \"{text}\"")
             }
             // `NumberFormatException.getMessage()` verbatim.
             ParseMethodsError::NumberFormat(e) => write!(f, "{e}"),
@@ -173,7 +167,7 @@ fn is_word_byte(b: u8) -> bool {
 /// transition line, ...) has fully matched — a candidate digit run that's part of an
 /// ultimately-failing larger match never reaches `parseInt` at all in Java. So every
 /// caller here must do the same: collect spans while probing, and defer
-/// [`parse_int`]/[`parse_plain_i32`] to a final step that runs only once the caller's
+/// [`parse_int_span`]/[`try_parse_int`] to a final step that runs only once the caller's
 /// own full pattern is confirmed. (Getting this backwards is exactly
 /// `docs/WALNUT-BUGS.md`-adjacent territory in spirit, though it's a port bug, not a
 /// Java one: an i32-overflowing digit run inside a probe that Java's own backtracking
@@ -825,19 +819,12 @@ pub fn parse_list(s: &str) -> Result<Vec<Option<i32>>, ParseMethodsError> {
 // parseMorphism
 // ---------------------------------------------------------------------------
 
-/// `text.parse::<i32>()` with no whitespace stripping — the Rust stand-in for
-/// Java's plain `Integer.parseInt(String)` as called directly (not via
-/// `UtilityMethods.parseInt`) at `ParseMethods.java:187` / `:185`. See
-/// [`ParseMethodsError::IntegerParseFailure`] and `docs/WALNUT-BUGS.md` WB-011.
-fn parse_plain_i32(text: &str) -> Result<i32, ParseMethodsError> {
-    text.parse::<i32>()
-        .map_err(|_| ParseMethodsError::IntegerParseFailure(text.to_string()))
-}
-
 /// Matches `\[(?:[+\-])?\s*\d+\]` syntactically — the bracket form shared by
 /// `MORPHISM_INPUT_SYMBOL` and `MORPHISM_IMAGE_SYMBOL` (`MORPHISM_COMMON_SYMBOL`).
 /// Returns the raw inner text's byte range (sign + whitespace + digits, NOT
-/// stripped — see [`parse_plain_i32`]) and the offset just past the closing `]`.
+/// stripped — [`try_match_morphism_mapping`] whitespace-strips it via
+/// `wr_core::util::try_parse_int` once the whole mapping is confirmed) and the
+/// offset just past the closing `]`.
 fn match_bracket_syntax(bytes: &[u8], pos: usize) -> Option<(usize, usize, usize)> {
     if bytes.get(pos) != Some(&b'[') {
         return None;
@@ -915,8 +902,8 @@ fn match_morphism_image_symbol_span(bytes: &[u8], pos: usize) -> Option<((usize,
 /// EXACTLY at `pos` (not a scan — the caller does the scanning, mirroring
 /// `Matcher.find()`'s own leftmost-search behavior). `Ok(None)` = no syntactic
 /// match at this exact position (keep scanning); `Err` = the syntax matched but a
-/// symbol's `Integer.parseInt` failed (propagates immediately, matching Java's
-/// uncaught exception aborting the whole `parseMorphism` call).
+/// symbol's `UtilityMethods.parseInt` failed (propagates immediately, matching
+/// Java's uncaught exception aborting the whole `parseMorphism` call).
 ///
 /// Symbols are matched as SPANS first and parsed only once the whole mapping (input
 /// symbol, arrow, zero-or-more image symbols) is confirmed — see
@@ -925,6 +912,18 @@ fn match_morphism_image_symbol_span(bytes: &[u8], pos: usize) -> Option<((usize,
 /// caller ([`parse_morphism`]) already retries at every subsequent byte position on a
 /// failed attempt here, which has the same net effect as backtracking a greedy `\d+`
 /// down to shorter runs one position at a time.
+///
+/// Parses via [`try_parse_int`] (`UtilityMethods.parseInt`'s whitespace-stripping
+/// equivalent), not a plain non-stripping `str::parse`. `docs/WALNUT-BUGS.md` WB-011:
+/// Java's real `parseMorphism` used to call plain `Integer.parseInt` at these two
+/// call sites (`ParseMethods.java:185,187`, pre-fix), even though the shared bracket
+/// grammar (`MORPHISM_COMMON_SYMBOL = "\[(?:[+\-])?\s*\d+\]"`) explicitly permits
+/// whitespace between an optional sign and the digits — so `"[+ 5]"` matched the
+/// regex but then crashed `Integer.parseInt` on the un-stripped `"+ 5"`. Fixed
+/// upstream (`walnut-java` `50dab9e`) by swapping both call sites to
+/// `UtilityMethods.parseInt`, matching every other numeric-text-to-`int` conversion
+/// in this file; ported here by using [`try_parse_int`] the same way this file's
+/// other call sites already do (e.g. [`parse_int_span`]).
 fn try_match_morphism_mapping(
     s: &str,
     pos: usize,
@@ -945,12 +944,12 @@ fn try_match_morphism_mapping(
         i = end;
     }
     // Fully matched -- now, and only now, safe to parse (mirrors Java, where
-    // Integer.parseInt is only called on m1.group(1) / each m2 piece AFTER m1.find()
-    // has already confirmed the whole INPUT -> IMAGE* mapping).
-    let key = parse_plain_i32(&s[key_span.0..key_span.1])?;
+    // UtilityMethods.parseInt is only called on m1.group(1) / each m2 piece AFTER
+    // m1.find() has already confirmed the whole INPUT -> IMAGE* mapping).
+    let key = try_parse_int(&s[key_span.0..key_span.1])?;
     let mut image = Vec::with_capacity(image_spans.len());
     for sp in image_spans {
-        image.push(parse_plain_i32(&s[sp.0..sp.1])?);
+        image.push(try_parse_int(&s[sp.0..sp.1])?);
     }
     Ok(Some((key, image, i)))
 }
@@ -1399,12 +1398,35 @@ mod tests {
     }
 
     #[test]
-    fn morphism_bracket_whitespace_quirk_wb_011() {
-        // docs/WALNUT-BUGS.md WB-011: the bracket regex allows whitespace between
-        // the sign and the digits, but Java's plain Integer.parseInt on that
-        // captured text then throws. Ported verbatim as an Err here.
-        let err = parse_morphism("[+ 5] -> 1").unwrap_err();
-        assert!(matches!(err, ParseMethodsError::IntegerParseFailure(_)));
+    fn morphism_bracket_whitespace_after_sign_now_parses_wb_011() {
+        // docs/WALNUT-BUGS.md WB-011 (fixed, `walnut-java` commit `50dab9e`): the
+        // bracket regex allows whitespace between the sign and the digits, and
+        // Java's `parseMorphism` used to call plain `Integer.parseInt` on that
+        // captured text, which throws on the embedded space -- a crash on syntax
+        // its own grammar declared valid. Fixed by swapping to the
+        // whitespace-stripping `UtilityMethods.parseInt`; ported the same way, via
+        // `try_parse_int`. Both the input side and the image side are checked, plus
+        // a negative-sign variant, mirroring `walnut-java`'s new
+        // `ParseMethodsTest` coverage.
+        let map = parse_morphism("[+ 5] -> 1").unwrap();
+        assert_eq!(map.get(&5), Some(&vec![1]));
+
+        let map = parse_morphism("[- 3] -> 0").unwrap();
+        assert_eq!(map.get(&-3), Some(&vec![0]));
+
+        let map = parse_morphism("0 -> [+ 2][- 1]").unwrap();
+        assert_eq!(map.get(&0), Some(&vec![2, -1]));
+    }
+
+    #[test]
+    fn morphism_bracket_no_whitespace_is_unaffected_by_wb_011s_fix() {
+        // The pre-existing no-whitespace bracket shape (e.g. `MorphismTest`'s
+        // `[11]`/`[12]`) never hit WB-011 either way -- confirm it still parses
+        // identically after the fix.
+        let map = parse_morphism("[11]->012 [12]->02 0->01").unwrap();
+        assert_eq!(map.get(&0), Some(&vec![0, 1]));
+        assert_eq!(map.get(&11), Some(&vec![0, 1, 2]));
+        assert_eq!(map.get(&12), Some(&vec![0, 2]));
     }
 
     // -- MorphismTest (walnut-java, Automata/MorphismTest.java) mirrors -------

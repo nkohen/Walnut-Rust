@@ -520,14 +520,26 @@ bug costs a silent wrong answer somewhere downstream.
   Verified directly against the actual compiled Java `Pattern`/`Integer.parseInt` behavior (not just
   read) via a standalone `javac`'d reproduction using the real regex strings copied from
   `ParseMethods.java`.
-- **Rust port:** `ported verbatim (quirk)` — `wr_io::parse_methods::parse_morphism` reproduces the
-  same crash, surfaced as `Err(ParseMethodsError::IntegerParseFailure)` rather than Java's uncaught
-  `NumberFormatException` (a `Result` rather than a panic, following this port's convention of
-  keeping anything reachable straight from raw user-typed command text recoverable — see
-  `NumSysError::BaseNotAnI32` for the same convention applied elsewhere). Pinned by
-  `morphism_bracket_whitespace_quirk_wb_011` in `crates/wr-io/src/parse_methods.rs`.
-- **Upstream:** not filed. Fix in Java would be using `UtilityMethods.parseInt` (whitespace-stripping)
-  at both call sites, matching every other numeric-text-to-`int` conversion in the same file.
+- **Upstream:** fixed, `walnut-java` commit `50dab9e` (branch `bugfix/wb-011`) — both call sites in
+  `parseMorphism` swapped from plain `Integer.parseInt` to `UtilityMethods.parseInt`
+  (whitespace-stripping), matching every other numeric-text-to-`int` conversion in the same file.
+  Live-verified: `[+ 5] -> 1` now parses to `{5=[1]}`, `[- 3] -> 0` to `{-3=[0]}`, whitespace on the
+  image side too, and the pre-existing no-whitespace bracket shape is unaffected. New
+  `ParseMethodsTest` coverage (previously zero bracket-notation tests in that file).
+- **Rust port:** fixed, matches `walnut-java` as of commit `50dab9e`. `wr_io::parse_methods`'s
+  `try_match_morphism_mapping` now parses both the input symbol and each image symbol via
+  `wr_core::util::try_parse_int` (the whitespace-stripping equivalent already used by every other
+  call site in this file), instead of the removed `parse_plain_i32` helper that called plain
+  `str::parse` with no stripping. The now-dead `ParseMethodsError::IntegerParseFailure` variant
+  (WB-011's sole trigger) is removed — `try_parse_int` failing on a morphism symbol (e.g. genuine
+  `i32` overflow) now reports through the pre-existing `ParseMethodsError::NumberFormat` variant,
+  matching every other numeric-parse failure in this file rather than a WB-011-specific one. Pinned
+  by `morphism_bracket_whitespace_after_sign_now_parses_wb_011` (the fix, both the input and image
+  side, plus a negative-sign variant) and `morphism_bracket_no_whitespace_is_unaffected_by_wb_011s_fix`
+  in `crates/wr-io/src/parse_methods.rs`. This bug has no CLI/golden-corpus reachability (per its own
+  "Found" note, `parseMorphism` has no golden-corpus coverage at all) — coverage stays at the
+  `wr_io::parse_methods` unit-test level on both engines, matching how it was originally scoped; no
+  differential test was added.
 - **Severity:** low — reachable only via bracket-notation morphism symbols with an internal space
   after the sign, a narrow and untested corner of an already narrow (no golden-corpus coverage at
   all, per the Phase-3a plan's gap #11) feature; flagged per `CLAUDE.md`'s bug-logging rule (a crash
