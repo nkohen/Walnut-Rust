@@ -1090,3 +1090,92 @@ bazout   walnut-rs port limitation (real Walnut computes this successfully): ...
 ```
 
 and wrote no result files at all.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb014.rs` — a "divergence closed" unit, not a "port bug fixed" one
+
+Captured 2026-08-22 for `tests/differential/tests/java_bugfix_wb014.rs`, `docs/
+WALNUT-JAVA-BUGFIX-DISPATCH.md`'s PR-14. Unlike every other entry in this file, this
+capture is NOT verifying a Rust-side fix — `wr_core::numsys::NumberSystem::
+with_custom_base_files` never reproduced WB-014's `ConcurrentModificationException` in the
+first place (its constructor takes already-parsed automata and does no I/O, so it cannot
+re-enter a name→`NumberSystem` cache the way Java's constructor does; see `docs/
+WALNUT-BUGS.md` WB-014's "Rust port" bullet, and `wr_io::reader::
+read_automaton_txt_with_custom_bases`'s own module docs, both unchanged by this unit). What
+changed is that **Java's bug is now fixed too** (`walnut-java` commit `6580f71`, branch
+`bugfix/wb-014`, stacked on `bugfix/wb-011`) — so the divergence WB-014's entry originally
+recorded (Rust succeeds, Java crashes) is now closed: both engines succeed and compute the
+same automaton. This capture is what proves that, rather than trusting the upstream commit
+message.
+
+`bugfix/wb-014` was already checked out at the main `~/dev/walnut-java` working tree when
+this was captured (the same situation `java_bugfix_wb021.rs`/`java_bugfix_wb032.rs`/
+`java_bugfix_wb035.rs`/`java_bugfix_wb038.rs` hit), so the worktree below is added by
+commit hash (detached), not by branch name, to avoid git's "branch already checked out"
+refusal:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb014 6580f71
+cd /tmp/walnut-java-wb014
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+# WALNUT-BUGS.md's exact minimal WB-014 repro, unchanged:
+printf 'msd_2 msd_2 msd_2\n\n0 1\n0 0 0 -> 0\n' > "Custom Bases/msd_wrtest_addition.txt"
+
+cat > "Command Files/wb014_capture.txt" <<'EOF'
+eval wrtest1 "?msd_wrtest x=x";
+eval wrtest3 "?msd_wrtest Ex x=x";
+EOF
+java -cp target/Walnut-all.jar Main.Prover wb014_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb014 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain (`/Users/nkohen/Library/Java/
+JavaVirtualMachines/openjdk-19.0.1/Contents/Home` — the shell's default `java` resolves to
+a JDK 11 too old for this project's class file version). `</dev/null` matters: without it
+the process runs the command file and then blocks in the interactive REPL.
+
+`stderr.txt` was empty (no `ConcurrentModificationException`, nothing at all).
+`stdout.txt`, up to the REPL banner that follows the command file:
+
+```text
+eval wrtest1 "?msd_wrtest x=x";
+eval wrtest3 "?msd_wrtest Ex x=x";
+____
+TRUE
+```
+
+`Session/<timestamp>/Automata Library/wrtest1.txt`:
+
+```text
+msd_wrtest
+
+0 1
+0 -> 0
+1 -> 0
+```
+
+— the 1-state, output-1, self-looping-on-every-digit accept-all shape `x=x` should always
+collapse to. Small enough to inline directly in `java_bugfix_wb014.rs` as
+`WRTEST1_CAPTURED`, matching the "inline a small captured fixture" convention
+`java_bugfix_wb032.rs`'s Case 2 and `java_bugfix_wb035.rs`'s dead-letter cases already use
+— no `fixtures/wb014/` directory was created. `wrtest3.txt` (the closed `Ex x=x` case) was
+also written by both engines but is not captured as a fixture, per this project's
+established convention for a trivial closed-formula result (the `fixtures/u11/`/
+`fixtures/lsd/` entries above): the printed `TRUE` verdict is the meaningful observable,
+checked directly against `Automaton::fa::is_true_automaton()`.
+
+**Before writing any test, the current release build of `walnut-rs` (`cargo build -p
+wr-cli --release`) was run live against the identical repro**, to independently
+re-confirm the "architecturally immune" claim `docs/WALNUT-BUGS.md` WB-014's entry made,
+rather than trusting it: a fresh `--home-dir` tree with the same `Custom Bases/
+msd_wrtest_addition.txt`, `eval wrtest1 "?msd_wrtest x=x";` and `eval wrtest3 "?msd_wrtest
+Ex x=x";` through the `walnut-rs` binary produced, respectively, the identical
+`Automata Library/wrtest1.txt` content shown above and `____`/`TRUE` on stdout — confirming
+the claim held before any test was written to pin it.
+
+The command file, the hand-authored `Custom Bases/` file, and the worktree were removed
+afterward, matching every recipe above.

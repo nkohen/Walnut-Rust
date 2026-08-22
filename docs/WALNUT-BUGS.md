@@ -822,13 +822,58 @@ bug costs a silent wrong answer somewhere downstream.
   That is a divergence, and it is the one this entry exists to make deliberate — recorded here rather
   than replicated, since replicating it would mean deliberately engineering a self-modification panic
   into the resolver.
-- **Upstream:** not filed. Two independent fixes exist in Java: (a) replace `computeIfAbsent` with an
-  explicit `get`/construct/`put` (which is reentrancy-safe and preserves the existing
-  "failed construction is not negatively cached" behavior), or (b) resolve the alphabet declaration's
-  number systems lazily, after the outer construction completes.
+- **Upstream:** **fixed**, `walnut-java` commit `6580f71` (branch `bugfix/wb-014`, stacked on
+  `bugfix/wb-011`). Took option (a) from the two this entry originally offered: `getComputeIfAbsent`
+  replaced `numberSystemHash.computeIfAbsent(base, NumberSystem::new)` with an explicit
+  `get`/construct-if-absent/`put` sequence — reentrancy-safe (a nested call for a DIFFERENT base
+  populates the map via its own separate `put`, which `computeIfAbsent`'s structural-modification
+  detector only fires on a mutation from *inside* its own mapping-function callback, never sees), and
+  preserves the pre-existing "a failed construction is not negatively cached" contract by construction
+  (a thrown exception never reaches the `put`). A genuinely self-referential base (e.g.
+  `msd_wrfoo_addition.txt` whose header is `msd_wrfoo msd_wrfoo msd_wrfoo`) is explicitly NOT fixed by
+  this and was not expected to be — that recurses unboundedly and dies with `StackOverflowError` both
+  before and after, which this entry's own original trigger note already called "arguably user error"
+  (a self-referential number-system definition can't be well-founded). Verified live against freshly
+  built jars, before and after: the exact minimal repro below went from
+  `java.util.ConcurrentModificationException` to a successful 1-state accept-all automaton for
+  `x=x`; the self-referential variant's `StackOverflowError` is unchanged (same exception class, same
+  recursive-construction shape) either side of the fix. Three new tests in `NumberSystemTest.java`
+  (`testGetComputeIfAbsentResolvesCrossBaseReferenceInHeader`,
+  `testGetComputeIfAbsentWithExplicitSetHeaderStillWorks`,
+  `testGetComputeIfAbsentDoesNotNegativelyCacheAFailedConstruction`), all going through the public
+  `getComputeIfAbsent` rather than the constructor directly. Full `./mvnw -q test`: 1120 tests, 0
+  failures, 0 errors.
 - **Severity:** moderate — a hard crash with a useless message (not a silent wrong answer), on
   syntactically valid input, but only for a user authoring their own custom base with an `msd_k`-style
   alphabet header. Nothing in the shipped corpus triggers it, so no golden fixture covers it.
+- **Resolved (2026-08-22) — divergence CLOSED, not a port bug fixed.** This is the one entry in this
+  series where the Rust port never reproduced the Java bug in the first place — see the "Rust port"
+  bullet above, unchanged and still accurate: `wr_core::numsys::NumberSystem::with_custom_base_files`
+  takes already-parsed automata and performs no I/O, so its constructor cannot re-enter a
+  name→`NumberSystem` cache the way Java's constructor does, and the cache that lives outside
+  `wr-core` (now `wr_cli::session`'s `SessionPaths`/`PredicateEnv`) is a `RefCell` whose lookup borrow
+  is released before construction runs — a reentrant resolution there was always a plain nested
+  function call, never a mid-mutation re-entrancy. So there is **no walnut-rs code change in this
+  PR** — what changed is that Java now ALSO succeeds on this input (by a different mechanism: an
+  explicit cache sequence, vs. this port's architectural immunity), so the divergence this entry
+  originally recorded ("Rust succeeds where Java crashes, and that gap is deliberate/undocumented as
+  a byte-for-byte parity issue") is now closed: **both engines succeed, and compute the same
+  automaton.** That claim was independently re-verified rather than trusted from the Java commit
+  message: the current release build of `walnut-rs` was run live against this entry's exact minimal
+  repro (`Custom Bases/msd_wrtest_addition.txt` header `msd_2 msd_2 msd_2`,
+  `eval wrtest1 "?msd_wrtest x=x";`) before any test was written, confirming it still succeeds and
+  still produces the 1-state accept-all automaton the "Rust port" bullet always claimed. New
+  differential coverage closes a real, separate gap this entry's own "Rust port" bullet flagged but
+  never filled: `wr_io::reader::read_automaton_txt_with_custom_bases`'s recursive resolution of a
+  cross-referencing custom-base header had no test anywhere in this repo driving it end-to-end
+  through the real CLI dispatch path (a repo-wide search for `msd_wrtest`/similar shapes found
+  nothing) — it was asserted architecturally, never exercised. `tests/differential/tests/
+  java_bugfix_wb014.rs` (two cases, checked against a fresh capture from `walnut-java`'s
+  `bugfix/wb-014` branch, commit `6580f71`) closes that gap: the exact minimal repro run to
+  completion (byte-identical output, plus `wr_core::equiv` semantic equivalence per this project's
+  Prime Directive), and the same cross-referencing base composed with a real `∃` quantifier
+  (`Ex x=x`, closed, `TRUE` on both engines) — proving the custom base's `NumberSystem` construction
+  genuinely composes with `wr_core::quantify`, not just with equality.
 
 ---
 
