@@ -1495,3 +1495,82 @@ by this fix either way: `parseParenthesizedArguments`'s `$`/`#` guard rejects it
 to lock in that this fix (substitution logic only) left that ordering untouched, matching
 `walnut-java`'s own new `macroCallArgumentWithDollarSignStillBlockedBeforeSubstitutionRuns`
 test.
+
+## Follow-up capture: the SILENT-WRONG-ANSWER half (`\x=1`), both sides
+
+Added 2026-08-22, closing a real coverage gap: every case above pins the CRASH half of
+WB-019 (errors on both sides of the fix), never the higher-severity half — an argument
+that used to silently compute and WRITE a wrong answer. Bare `\x` can't demonstrate that
+(it isn't a complete predicate even with the backslash dropped); `\x=1` can, since
+dropping the backslash turns it into the perfectly valid predicate `x=1`.
+
+**Post-fix side**, same `~/dev/walnut-java` tree as above (already on `bugfix/wb-019`,
+freshly rebuilt jar from the same session):
+
+```bash
+cat > "Macro Library/wb019scratch_echo.txt" <<'EOF'
+%0
+EOF
+printf 'eval wb019scratch_out4 "#wb019scratch_echo(\\x=1)";\n' \
+    > "Command Files/wb019scratch_capture2.txt"
+java -cp target/Walnut-all.jar Main.Prover wb019scratch_capture2.txt \
+    >stdout2.txt 2>stderr2.txt </dev/null
+```
+
+`stdout2.txt`: `eval wb019scratch_out4 "#wb019scratch_echo(\x=1)";` then `Undefined token:
+char at 0`; `stderr2.txt` empty; `Session/*/Automata Library/` empty. Cleaned up the same
+way as above afterward.
+
+**Pre-fix side** — since the fixed branch was already checked out in the main working
+tree, an isolated `git worktree` was used instead of switching branches in place (this
+project's fleet-hygiene convention: never disturb a shared working tree mid-session), off
+the commit immediately BEFORE `cee8352` (`0cf02d3`, `bugfix/wb-040`'s tip):
+
+```bash
+git worktree add /tmp/wj-prefix-check 0cf02d3
+cp ~/dev/walnut-java/.java-version /tmp/wj-prefix-check/.java-version   # untracked,
+    # not copied by `git worktree add`; without it `jenv` picks the wrong JDK and the
+    # jar fails to load with UnsupportedClassVersionError
+cd /tmp/wj-prefix-check && ./mvnw -q clean package -DskipTests -Pfat-jar
+cat > "Macro Library/wb019scratch_echo.txt" <<'EOF'
+%0
+EOF
+printf 'eval wb019scratch_out4 "#wb019scratch_echo(\\x=1)";\n' \
+    > "Command Files/wb019scratch_capture2.txt"
+java -cp target/Walnut-all.jar Main.Prover wb019scratch_capture2.txt \
+    >stdout2.txt 2>stderr2.txt </dev/null
+```
+
+`stdout2.txt`: `eval wb019scratch_out4 "#wb019scratch_echo(\x=1)";` then `Converted from
+brics:2 states - 5ms` — no error at all. `stderr2.txt` empty. And, unlike every other case
+in this file, a real file now exists:
+`Session/2026_08_22_03_19_03/Automata Library/wb019scratch_out4.txt`, containing:
+
+```text
+msd_2
+
+0 0
+0 -> 0
+1 -> 1
+
+1 1
+```
+
+— a genuine two-state automaton accepting exactly the representation of `1`: the query
+the user's literal `\x=1` argument was silently turned into, and silently persisted, with
+no diagnostic of any kind. Worktree removed afterward (`git worktree remove --force
+/tmp/wj-prefix-check`); `~/dev/walnut-java`'s own working tree (`git status`) was
+untouched by this side-trip.
+
+Before writing the new test assertion, `wr-cli`'s own dispatch was independently
+re-confirmed to match the post-fix capture above (via `Prover::read_buffer` in the test
+itself, not a separate CLI invocation this time, since the existing `prover()` test
+harness already exercises the identical code path the other three cases use). Added as
+`wb019_backslash_prefixed_valid_predicate_argument_no_longer_silently_computes_wrong_result`
+in `java_bugfix_wb019.rs` (now four test functions total in that file), and as a
+positive-case unit test in `predicate.rs`
+(`macro_call_argument_substitution_is_rescanned_so_a_nested_percent_n_gets_double_substituted`)
+covering the related, previously-unpinned descending-substitution-order rescanning claim
+(`#two2(1,x=%0)` on macro body `x=%0 & %1` succeeds as `x=1 & x=1`) — both mutation-
+verified (reverting the fix, and flipping the substitution order, respectively, were each
+confirmed to make the corresponding new test fail before being reverted).

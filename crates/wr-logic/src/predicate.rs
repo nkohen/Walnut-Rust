@@ -396,7 +396,7 @@ impl Patterns {
             )),
             // `PATTERN_FOR_MACRO` (`:102`) — the ONE pattern whose leading whitespace is
             // captured (Java's `group(1)`, re-emitted by `putMacro` into the rewritten
-            // predicate, `:442`); its name is Java's `group(2)`.
+            // predicate, `:455`); its name is Java's `group(2)`.
             macro_call: compile(&format!(
                 r"(?<ws>{ws})#(?<name>{alnum}){ws}\(",
                 ws = WHITESPACE,
@@ -595,7 +595,7 @@ impl Predicate {
         Ok(p)
     }
 
-    /// `Predicate.getPostOrder()` (`:513-515`).
+    /// `Predicate.getPostOrder()` (`:526-528`).
     pub fn post_order(&self) -> &[Token] {
         &self.post_order
     }
@@ -1086,7 +1086,7 @@ impl Predicate {
         Ok(i + 1)
     }
 
-    /// `Predicate.putFunction(String)` (`:448-491`). See [`Self::put_word`] on the
+    /// `Predicate.putFunction(String)` (`:461-504`). See [`Self::put_word`] on the
     /// clone-and-scan strategy.
     fn put_function(
         &mut self,
@@ -1102,7 +1102,7 @@ impl Predicate {
         let function_name = self.predicate[name_span.range()].to_string();
         let match_end = caps.get_match().expect("matched").end();
 
-        // `Automaton.readAutomatonFromFile(functionName)` (`:451`).
+        // `Automaton.readAutomatonFromFile(functionName)` (`:466`).
         let automaton = env.function_with_ctx(&function_name, ctx.as_deref_mut())?;
 
         let parse_result = self.parse_parenthesized_arguments(match_end)?;
@@ -1119,7 +1119,7 @@ impl Predicate {
             )?);
         }
 
-        // `:466-468`: a single, empty (or whitespace-only) argument means zero
+        // `:479-481`: a single, empty (or whitespace-only) argument means zero
         // arguments, e.g. `$foo()`.
         if arguments.len() == 1 && arguments[0].post_order().is_empty() {
             arguments.remove(0);
@@ -1153,7 +1153,7 @@ impl Predicate {
         // `msd_k`/`lsd_k` bases; see that method's docs.
         let ns = env.fresh_number_system(default_number_system, logging)?;
 
-        // `:485-487`: `new Function(defaultNumberSystem, realStartingPosition +
+        // `:497-499`: `new Function(defaultNumberSystem, realStartingPosition +
         // matcher.start(1), matcher.group(1), A, arguments.size())`.
         let f = Function::new(
             self.position(name_span.start),
@@ -1163,7 +1163,7 @@ impl Predicate {
             ns,
         )?;
         self.post_order.push(Token::Function(Box::new(f)));
-        // `:490`: `return parseResult.endIndex + 1;`.
+        // `:503`: `return parseResult.endIndex + 1;`.
         Ok(parse_result.end_index + 1)
     }
 
@@ -1238,7 +1238,7 @@ impl Predicate {
         }))
     }
 
-    /// `Predicate.putMacro()` (`:419-446`) — rewrites `self.predicate` in place and
+    /// `Predicate.putMacro()` (`:419-459`) — rewrites `self.predicate` in place and
     /// resumes scanning from the (preserved) leading whitespace, per `predicate_env.rs`'s
     /// Ruling 3. Every offset/string this needs is extracted from `caps`/computed before
     /// `self.predicate` is reassigned, so nothing holds a borrow of the OLD buffer across
@@ -1259,7 +1259,7 @@ impl Predicate {
 
         let parse_result = self.parse_parenthesized_arguments(match_end)?;
 
-        // `:435-437`: `for (int arg = arguments.size() - 1; arg >= 0; arg--)` --
+        // `:448-450`: `for (int arg = arguments.size() - 1; arg >= 0; arg--)` --
         // DESCENDING order, ported verbatim. This is load-bearing, not stylistic: `%1`
         // is a literal-text substring of `%10`, so substituting `%1` first would mangle
         // any later `%10` before it is ever reached, and — for the same reason —
@@ -1271,7 +1271,7 @@ impl Predicate {
             macro_text = macro_text.replace(&format!("%{arg_index}"), &arg.text);
         }
 
-        // `:441-442`: `predicate = predicate.substring(0, matcher.start()) +
+        // `:454-455`: `predicate = predicate.substring(0, matcher.start()) +
         // matcher.group(1) + macro + predicate.substring(parseResult.endIndex + 1);`
         let tail = &self.predicate[parse_result.end_index + 1..];
         let mut new_predicate =
@@ -1282,7 +1282,7 @@ impl Predicate {
         new_predicate.push_str(tail);
         self.predicate = new_predicate;
 
-        // `:445`: `return matcher.start();` -- resume scanning from the (re-inserted)
+        // `:458`: `return matcher.start();` -- resume scanning from the (re-inserted)
         // leading whitespace, so the SAME buffer is re-tokenized from there. No
         // `initializeMatchers()` counterpart is needed (see the module docs' Ruling 2):
         // `regex_automata`'s `Input` is per-call, not bound to a haystack.
@@ -1307,7 +1307,7 @@ struct ParseResult {
 }
 
 impl std::fmt::Display for Predicate {
-    /// `Predicate.toString()` (`:517-519`):
+    /// `Predicate.toString()` (`:530-532`):
     /// `UtilityMethods.genericListString(postOrder, ":")`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", generic_list_string(&self.post_order, ":"))
@@ -2321,7 +2321,7 @@ mod tests {
     }
 
     /// Regression guard for the DESCENDING substitution order `put_macro` uses
-    /// (`Predicate.java:435`'s `for (int arg = arguments.size()-1; arg >= 0; arg--)`,
+    /// (`Predicate.java:448`'s `for (int arg = arguments.size()-1; arg >= 0; arg--)`,
     /// mirrored by this port's `.rev()` iterator). With only single-digit placeholders
     /// present, ascending vs. descending order is unobservable (no `%N` is a prefix of
     /// another `%M`) — every OTHER macro test in this file tops out at `%2`, so none of
@@ -2651,7 +2651,7 @@ mod tests {
     /// being a perfectly ordinary `Variable` token) is itself the pin that the
     /// backslash was preserved, not dropped. Matches real, fixed `walnut-java` exactly.
     #[test]
-    fn wb019_macro_argument_backslash_escapes_the_following_character() {
+    fn wb019_macro_argument_backslash_and_following_character_are_both_preserved() {
         let env = InMemoryPredicateEnv::new().with_macro("echo", "%0");
         assert_eq!(
             err_with(&env, "#echo(\\x)"),
@@ -2660,6 +2660,37 @@ mod tests {
              backslash would leave the perfectly valid Variable token \"x\" and this \
              would NOT be an error at all"
         );
+    }
+
+    /// Positive-case pin for the descending-substitution-order doc comment on
+    /// [`Predicate::put_macro`] (`:448-450`): a SUCCESSFULLY-substituted argument's own
+    /// `%0` placeholder gets RE-substituted by a later pass over the same buffer, since
+    /// each `.replace` call rescans the whole `macro_text`, not just the newly-inserted
+    /// span. `two2`'s body is `x=%0 & %1`; called as `#two2(1,x=%0)`, the descending
+    /// pass first replaces `%1` with the raw argument text `"x=%0"` (verbatim, `%0` NOT
+    /// yet substituted -- arguments are never pre-expanded before being spliced in),
+    /// giving `"x=%0 & x=%0"`; the NEXT (and last) pass then replaces `%0` with `"1"`
+    /// EVERYWHERE that string now appears, including inside the just-inserted argument
+    /// text, giving `"x=1 & x=1"` -- confirmed live against real, fixed `walnut-java`
+    /// (2026-08-22): `eval` on this predicate succeeds, matching this test's expected
+    /// post-order exactly. (The companion negative case Opus's investigation also
+    /// confirmed live, `#two2(1,x=\%0)` -> `Undefined token: char at 8`, needs no
+    /// separate pin here: it's just this same rescanning behavior colliding with
+    /// WB-019's already-covered backslash-preservation, and a preserved-then-rejected
+    /// `\` is exactly what every other test in this section already pins.)
+    #[test]
+    fn macro_call_argument_substitution_is_rescanned_so_a_nested_percent_n_gets_double_substituted()
+    {
+        let env = InMemoryPredicateEnv::new().with_macro("two2", "x=%0 & %1");
+        let p = Predicate::new(&env, "#two2(1,x=%0)").expect("must tokenize");
+        assert_eq!(
+            p.predicate(),
+            "x=1 & x=1",
+            "the argument's own %0 must be caught by the SAME descending pass that \
+             substitutes %0 for the top-level placeholder, not left as literal \"x=%0\" \
+             text -- that's the rescanning the doc comment on put_macro claims"
+        );
+        assert_eq!(p.to_string(), "x:1:=_msd_2:x:1:=_msd_2:&");
     }
 
     // -- Ruling 3: no macro-expansion depth/cycle guard ------------------------------

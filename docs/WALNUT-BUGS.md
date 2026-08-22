@@ -1115,7 +1115,7 @@ bug costs a silent wrong answer somewhere downstream.
 
 ## WB-019 — `putMacro`'s `%N` argument substitution inherits `Matcher.appendReplacement`'s `$`/`\` escaping, crashing on a trailing backslash
 
-- **Where:** `Main/Predicate.java`, `putMacro` (`:435-437`): `macro =
+- **Where (historical, before the fix below):** `Main/Predicate.java`, `putMacro` (`:435-437`): `macro =
   new StringBuilder(macro.toString().replaceAll("%" + arg, arguments.get(arg)));`. Java's
   `String.replaceAll(regex, replacement)` compiles `regex` as a pattern (harmless here — `"%" + arg`
   is always plain digits, no metacharacters) but ALSO parses `replacement` through
@@ -1161,9 +1161,10 @@ bug costs a silent wrong answer somewhere downstream.
   (`macroCallArgumentWithTrailingBackslashIsPreservedNotAnUncheckedCrash`,
   `macroCallArgumentWithBackslashEscapeSequencePreservesBothCharacters`,
   `macroCallArgumentWithDollarSignStillBlockedBeforeSubstitutionRuns`).
-- **Rust port:** fixed, matches `walnut-java` as of commit `cee8352`, and this fix is a genuine
-  SIMPLIFICATION of the port, not just a behavior change: Rust's `str::replace` was already a
-  purely literal replace with no escape semantics on either side, so `put_macro`'s call site now
+- **Rust port:** was `ported verbatim (quirk)`, now `diverged (fixed)` and matching `walnut-java`
+  as of commit `cee8352` — and this fix is a genuine SIMPLIFICATION of the port, not just a
+  behavior change: Rust's `str::replace` was already a purely literal replace with no escape
+  semantics on either side, so `put_macro`'s call site now
   reads `macro_text.replace(&format!("%{arg_index}"), &arg.text)` directly. The now-dead
   `java_replace_all_literal`/`expand_java_replacement` functions (which used to reproduce
   `Matcher.appendReplacement`'s replacement-string parsing) and the
@@ -1171,17 +1172,20 @@ bug costs a silent wrong answer somewhere downstream.
   removed outright — real, working, quirk-replication machinery deleted because the quirk it
   replicated no longer exists upstream, not a stub or a workaround. Pinned by
   `wb019_macro_argument_trailing_backslash_is_preserved_not_an_uncaught_crash` and
-  `wb019_macro_argument_backslash_escapes_the_following_character` (both flipped from asserting
-  the old buggy behavior to asserting the computed language, matching fixed Java: both now expect
-  `LexError::UndefinedToken` at char 0, since a preserved-but-then-correctly-rejected `\`/`\x` is
-  exactly what a plain literal replace followed by ordinary tokenizing produces);
+  `wb019_macro_argument_backslash_and_following_character_are_both_preserved` (both flipped from
+  asserting the old buggy behavior to asserting the computed language, matching fixed Java: both
+  now expect `LexError::UndefinedToken` at char 0, since a preserved-but-then-correctly-rejected
+  `\`/`\x` is exactly what a plain literal replace followed by ordinary tokenizing produces);
   `macro_call_argument_containing_dollar_is_also_blocked` (unchanged in substance, doc-comment
   updated) still confirms the `$`-group-reference half stays unreachable through this port's own
   call graph, before and after. A new differential suite
-  (`tests/differential/tests/java_bugfix_wb019.rs`, three cases) confirms `wr-cli`'s real dispatch
+  (`tests/differential/tests/java_bugfix_wb019.rs`, four cases) confirms `wr-cli`'s real dispatch
   matches freshly captured `walnut-java` output (`bugfix/wb-019`, `cee8352`) byte-for-byte on both
-  stdout and stderr, including the `$`-argument control case; capture recipe in
-  `tests/differential/CAPTURE.md`.
+  stdout and stderr, including the `$`-argument control case and, separately, the higher-severity
+  SILENT-WRONG-ANSWER half of this bug (`\x=1`, captured on both sides of the fix — pre-fix it
+  silently computed and wrote a real automaton file for `x=1`; post-fix it cleanly errors and
+  writes nothing); capture recipes in `tests/differential/CAPTURE.md` and this file's own module
+  docs.
 - **Severity (historical, before the fix above):** low-moderate — an uncaught, unformatted crash
   on a plausible-if-unusual input (a macro argument containing a stray trailing backslash), plus a
   silent, undocumented character-dropping transformation on any argument containing `\` followed
