@@ -367,9 +367,9 @@ impl Morphism {
     /// Java's own fix (`walnut-java` commit `732bec0`) immediately AFTER that
     /// `NumberSystem` construction and before `setFields` — so `NumberSystemNotDefined`
     /// still wins over `DomainDoesNotCoverImageRange` when both apply, exactly the
-    /// priority Java's fix commit message calls out deliberately ("a morphism that's
-    /// both msd_1-shaped and domain-gap-shaped still reports the NumberSystem error
-    /// first"). Before the fix this ordering only held by accident (the
+    /// priority Java's fix commit message calls out deliberately (a morphism that's
+    /// both msd_1-shaped and domain-gap-shaped must keep reporting the NumberSystem
+    /// error first). Before the fix this ordering only held by accident (the
     /// `IndexOutOfBoundsException` never fired until `AutomatonWriter`'s write path,
     /// well after `toWordAutomaton` had already returned or thrown); it is now a real,
     /// deliberate statement order inside `toWordAutomaton` itself, matching the check
