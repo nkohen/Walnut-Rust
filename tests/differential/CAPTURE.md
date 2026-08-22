@@ -1179,3 +1179,105 @@ the claim held before any test was written to pin it.
 
 The command file, the hand-authored `Custom Bases/` file, and the worktree were removed
 afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb036.rs`
+
+Captured 2026-08-22 for `tests/differential/tests/java_bugfix_wb036.rs`, verifying
+`wr_core::morphism`'s message text now matches WB-036's real upstream fix (`walnut-java`
+commit `732bec0`, branch `bugfix/wb-036`, stacked on `bugfix/wb-026` (`051208a`)) — **not
+mainline**, per this project's now-standard practice for these follow-up units.
+
+**Safety note (this capture is a repeat offender's exact trigger shape):** a prior agent
+working on this bug accidentally overwrote two real shipped files in
+`Word Automata Library/` (`P.txt`/`P2.txt`, real fixture content) by using the bare names
+`P`/`P2` as `promote` destinations while working directly in the shared `~/dev/walnut-java`
+checkout. This capture instead (a) runs in a **detached worktree**, never the shared
+checkout's own tracked tree, and (b) prefixes every morphism/promote name with
+`wb036scratch_`, which cannot collide with any real Library file.
+
+`bugfix/wb-036` was already checked out at the main `~/dev/walnut-java` working tree when
+this was captured (the same situation `java_bugfix_wb021.rs`/`java_bugfix_wb032.rs`/
+`java_bugfix_wb035.rs`/`java_bugfix_wb038.rs`/`java_bugfix_wb014.rs` hit), so the worktree
+below is added by commit hash (detached), not by branch name:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb036 732bec0
+cd /tmp/walnut-java-wb036
+export JAVA_HOME=/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1/Contents/Home
+export PATH="$JAVA_HOME/bin:$PATH"
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+# WB-036's own repro shape, plus the two control cases (docs/WALNUT-BUGS.md), all with
+# scratch-prefixed names per the safety note above:
+cat > "Command Files/wb036_capture.txt" <<'EOF'
+morphism wb036scratch_badmor "0->05 1->10";
+promote wb036scratch_out1 wb036scratch_badmor;
+morphism wb036scratch_h2 "0->00 1->00";
+promote wb036scratch_out2 wb036scratch_h2;
+morphism wb036scratch_dualmor "0->5 1->0";
+promote wb036scratch_out3 wb036scratch_dualmor;
+EOF
+java -cp target/Walnut-all.jar Main.Prover wb036_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+
+rm -f "Command Files/wb036_capture.txt"
+rm -rf Session
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb036 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain (the shell's default `java`
+resolves to a JDK 11 too old for this project's class file version, and `JAVA_HOME` must
+point at the `Contents/Home` subdirectory or `mvnw` refuses to start). `</dev/null` matters
+too: without it the process runs the command file and then blocks in the interactive REPL.
+
+`stderr.txt` was empty (confirming the domain-gap case now renders as a HANDLED
+`WalnutException` — message-only, nothing on stderr — not the old unhandled-JDK-exception
+shape). `stdout.txt`, up to the REPL banner that follows the command file:
+
+```text
+morphism wb036scratch_badmor "0->05 1->10";
+Defined with domain [0, 1] and range {0, 1, 5}promote wb036scratch_out1 wb036scratch_badmor;
+A morphism's domain must cover every value referenced in its own images: found the value 5 in some image, but the domain only has 2 letters.
+morphism wb036scratch_h2 "0->00 1->00";
+Defined with domain [0, 1] and range {0}promote wb036scratch_out2 wb036scratch_h2;
+morphism wb036scratch_dualmor "0->5 1->0";
+Defined with domain [0, 1] and range {0, 5}promote wb036scratch_out3 wb036scratch_dualmor;
+Number system msd_1 is not defined.
+```
+
+Three confirmations from this one capture, matching `docs/WALNUT-BUGS.md` WB-036's own
+"Verified against a live-built jar" bullets exactly:
+- **The WB-036 shape** (`wb036scratch_badmor`, domain `{0,1}` but an image referencing `5`)
+  now reports the clean message above instead of the old bare
+  `java.lang.IndexOutOfBoundsException: Index 2 out of bounds for length 2`, and no
+  `wb036scratch_out1.txt` is written anywhere under `Session/<timestamp>/` (confirmed —
+  only `wb036scratch_out2.txt`, the mirror-shape control below, exists under
+  `Word Automata Library/`).
+- **The MIRROR-shape control** (`wb036scratch_h2`, domain `{0,1}`, images only ever
+  reference `0`) is completely unaffected: `promote` succeeds silently (no printed line —
+  Java's `promote` prints nothing on success absent a `::` suffix), and
+  `Session/<timestamp>/Word Automata Library/wb036scratch_out2.txt` reads
+  ```text
+  msd_2
+
+  0 0
+  0 -> 0
+  1 -> 0
+  ```
+  — the 1-state, self-looping-on-both-digits shape `Morphism::to_word_automaton`'s own
+  `to_word_automaton_tolerates_a_domain_wider_than_the_image_range` test (`crates/wr-core/
+  src/morphism.rs`) already pins.
+- **The ordering control** (`wb036scratch_dualmor`, `0->5 1->0`, both `msd_1`-shaped AND
+  WB-036-shaped) still reports `Number system msd_1 is not defined.`, confirming Java's
+  fix preserves the pre-existing precedence (its own commit message calls this out
+  explicitly).
+
+**The same three commands, re-run against a release build of this port
+(`cargo build -p wr-cli --release`) over a freshly created, otherwise-empty
+`--home-dir` tree** (same `wb036scratch_`-prefixed command file, copied verbatim) produced
+**byte-identical** `stdout`/`stderr` (modulo the session-timestamp line) and a
+byte-identical `wb036scratch_out2.txt` — confirming the message-text fix and the
+already-correct catch-point/mirror-shape/ordering behavior together, before any test was
+written to pin it.

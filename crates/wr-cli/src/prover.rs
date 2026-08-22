@@ -114,6 +114,11 @@ use regex_automata::Input;
 use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
 use wr_core::logicalops::ConvertNsError;
+// Only referenced from `#[cfg(test)] mod tests` below, as of WB-036's fix
+// (`docs/WALNUT-BUGS.md`) merging `MorphismError::DomainDoesNotCoverImageRange` into
+// the same `is_handled()`/`kind()` bucket as every other `MorphismError` variant --
+// production code no longer matches on `MorphismError` directly anywhere in this file.
+#[cfg(test)]
 use wr_core::morphism::MorphismError;
 use wr_core::util::validate_file;
 use wr_core::walnut_panic::{catch_walnut_panic_detailed, CaughtPanic};
@@ -810,18 +815,22 @@ impl LoggableError for ProverError {
             // exception kind and stack-trace prefix — which is what `is_handled() == false`
             // selects. Getting this wrong is a Tier-1 normalized-text divergence.
 
-            // WB-036: real Java's `toWordAutomaton` builds a malformed FA and then throws
-            // `IndexOutOfBoundsException` on the very next write.
-            ProverError::Morphism(MorphismCommandError::Promote(
-                MorphismError::DomainDoesNotCoverImageRange,
-            )) => false,
             // `UtilityMethods.validateFile` (`:153-159`) throws `IllegalArgumentException`,
             // exactly like `ProverError::InvalidFile` above.
             ProverError::Morphism(MorphismCommandError::InvalidFile(_)) => false,
             // Every other `promote`/`morphism` failure IS a `WalnutException`:
             // `parseMorphism`'s "Morphism has no valid mappings.",
             // `WalnutException.morphismNegative()`, `morphismNotUniform()`, and
-            // `NumberSystem`'s "Number system msd_k is not defined."
+            // `NumberSystem`'s "Number system msd_k is not defined." WB-036 fixed
+            // upstream (`walnut-java` commit `732bec0`, branch `bugfix/wb-036`):
+            // `Morphism.toWordAutomaton` now guards `newD.size() < maxEntry + 1` and
+            // raises a real `WalnutException` (`WalnutException.morphismDomainGap`)
+            // instead of the old, later `IndexOutOfBoundsException` --
+            // `MorphismError::DomainDoesNotCoverImageRange` now belongs in this same
+            // bucket, not its own `false` arm (which used to route it to the
+            // kind-prefixed stderr rendering real fixed Walnut no longer uses for
+            // this shape). Same move as WB-037's own fix made for `ProverError::
+            // Join(_)` below.
             ProverError::Morphism(_) => true,
 
             // WB-037 fixed upstream (`Join.java` now guards `subautomata.isEmpty()` before
@@ -2796,12 +2805,6 @@ mod tests {
         // NOT WalnutException -> kind + stack trace.
         for (e, why) in [
             (
-                ProverError::Morphism(MorphismCommandError::Promote(
-                    MorphismError::DomainDoesNotCoverImageRange,
-                )),
-                "WB-036 is an IndexOutOfBoundsException",
-            ),
-            (
                 ProverError::Morphism(MorphismCommandError::InvalidFile("x".to_string())),
                 "validateFile throws IllegalArgumentException",
             ),
@@ -2944,6 +2947,17 @@ mod tests {
             (
                 ProverError::Morphism(MorphismCommandError::Promote(MorphismError::NegativeValue)),
                 "WalnutException.morphismNegative",
+            ),
+            (
+                ProverError::Morphism(MorphismCommandError::Promote(
+                    MorphismError::DomainDoesNotCoverImageRange {
+                        max_entry: 5,
+                        domain_size: 2,
+                    },
+                )),
+                "WB-036 fixed upstream: Morphism.toWordAutomaton now throws a real \
+                 WalnutException (WalnutException.morphismDomainGap) before the old \
+                 IndexOutOfBoundsException site",
             ),
             (
                 ProverError::Join(JoinError::LabelMismatch {

@@ -55,23 +55,33 @@
 //! workspace that adding it to `Fa` itself would break).
 //!
 //! **A second genuine bug found while porting this method, logged as WB-036 (see
-//! `docs/WALNUT-BUGS.md`).** Java's `toWordAutomaton` builds `Q = maxEntry + 1`
+//! `docs/WALNUT-BUGS.md`) and fixed upstream as of `walnut-java` commit `732bec0`
+//! (branch `bugfix/wb-036`).** Java's `toWordAutomaton` builds `Q = maxEntry + 1`
 //! states but a transition table (`newD`) with only `mapping.size()` entries, indexed
-//! by DOMAIN-LETTER SORT POSITION, not by the letter's own value — with no check that
-//! the two agree. Whenever the morphism's domain doesn't cover every value up to
-//! `maxEntry` (e.g. `0->05 1->10`: two domain letters, but images reference value `5`,
-//! so `Q = 6` while the transition list has only 2 entries), any later access to a
-//! state past `mapping.size() - 1` — confirmed to include `AutomatonWriter`'s own
-//! per-state loop, i.e. `promote`'s ordinary output path — throws Java's
-//! `IndexOutOfBoundsException`. [`Morphism::to_word_automaton`] reproduces this as
+//! by DOMAIN-LETTER SORT POSITION, not by the letter's own value. Before the fix,
+//! nothing checked the two agreed, and whenever the morphism's domain didn't cover
+//! every value up to `maxEntry` (e.g. `0->05 1->10`: two domain letters, but images
+//! reference value `5`, so `Q = 6` while the transition list has only 2 entries), any
+//! later access to a state past `mapping.size() - 1` — confirmed to include
+//! `AutomatonWriter`'s own per-state loop, i.e. `promote`'s ordinary output path —
+//! threw Java's `IndexOutOfBoundsException` with no useful diagnostic. Java's fix adds
+//! a guard (`newD.size() < maxEntry + 1`) immediately after the `NumberSystem`
+//! construction and before the equivalent of `setFields`, raising a clean
+//! `WalnutException.morphismDomainGap(maxEntry, newD.size())` that names the real
+//! precondition directly. [`Morphism::to_word_automaton`] reproduces this as
 //! [`MorphismError::DomainDoesNotCoverImageRange`], checked at construction time
 //! (before ever handing back a malformed automaton whose `Fa::d.len() != Fa::q`,
-//! an invariant essentially every other algorithm in this crate assumes) rather than
-//! deferred to wherever Java's crash happens to surface — see WB-036 for the full
-//! empirical repro against real `walnut-java`. The MIRROR case (a domain *larger* than
-//! the image range needs, e.g. `0->00 1->00`) is not an error in Java and is not one
-//! here either: Java silently ignores the dangling transition rows (every consumer loops
-//! `0..Q`), which this port reproduces by truncating `newD` to `Q`.
+//! an invariant essentially every other algorithm in this crate assumes) — this is
+//! essentially the same point Java's own fixed guard now runs at too, though this
+//! port's check predates Java's fix and exists for a broader reason than matching
+//! Java's crash point: letting the malformed `Fa` escape at all would plant a live
+//! panic for ANY later caller in this crate, not just the one write path Java used to
+//! hit first — see WB-036 for the full empirical repro (both before and after the
+//! upstream fix) and the message-text-matching history. The MIRROR case (a domain
+//! *larger* than the image range needs, e.g. `0->00 1->00`) is not an error in Java
+//! (before or after the fix) and is not one here either: Java silently ignores the
+//! dangling transition rows (every consumer loops `0..Q`), which this port reproduces
+//! by truncating `newD` to `Q`.
 //!
 //! **The `NumberSystem` construction at `Morphism.java:90` is a VALIDATION step, not
 //! just metadata.** `new NumberSystem("msd_" + maxImageLength)` throws
@@ -147,12 +157,21 @@ pub enum MorphismError {
     NegativeValue,
     /// WB-036 (`docs/WALNUT-BUGS.md`): the morphism's domain doesn't cover every
     /// value `0..=maxEntry` referenced in some image, so `toWordAutomaton` would
-    /// build an `FA` with more states than transition-table entries — a shape real
-    /// Java doesn't reject either, but that reliably throws
-    /// `IndexOutOfBoundsException` the moment anything (in practice,
-    /// `AutomatonWriter`'s own per-state loop) touches one of the missing states.
-    /// See the module docs and WB-036 for the full derivation and empirical repro.
-    DomainDoesNotCoverImageRange,
+    /// build an `FA` with more states than transition-table entries. Before Java's
+    /// fix (`walnut-java` commit `732bec0`, branch `bugfix/wb-036`), this shape wasn't
+    /// rejected at all and reliably threw `IndexOutOfBoundsException` the moment
+    /// anything (in practice, `AutomatonWriter`'s own per-state loop) touched one of
+    /// the missing states. Java now raises a clean `WalnutException` instead
+    /// (`WalnutException.morphismDomainGap`), naming the same two values this variant
+    /// carries. See the module docs and WB-036 for the full derivation and empirical
+    /// repro, both before and after the upstream fix.
+    DomainDoesNotCoverImageRange {
+        /// The largest value referenced in any image (`maxEntry`).
+        max_entry: i32,
+        /// The morphism's domain size (`newD.size()` / `mapping.size()`), which
+        /// does not cover `0..=max_entry`.
+        domain_size: usize,
+    },
     /// `new NumberSystem(NumberSystem.MSD_UNDERSCORE + maxImageLength)`
     /// (`Morphism.java:90`) — Java's `NumberSystem` constructor is **validating**, not
     /// just metadata storage: `setAdditionAutomaton` (`NumberSystem.java:322-331`) has
@@ -184,11 +203,18 @@ impl fmt::Display for MorphismError {
             MorphismError::NegativeValue => {
                 write!(f, "Cannot promote a morphism with negative values.")
             }
-            MorphismError::DomainDoesNotCoverImageRange => write!(
+            // Verbatim `WalnutException.morphismDomainGap(maxEntry, domainSize)`
+            // (`WalnutException.java`, added by `walnut-java` commit `732bec0`,
+            // branch `bugfix/wb-036`). See this variant's own doc comment for the
+            // pre-fix text this replaced.
+            MorphismError::DomainDoesNotCoverImageRange {
+                max_entry,
+                domain_size,
+            } => write!(
                 f,
-                "morphism domain does not cover every value referenced in an image \
-                 (WB-036: real Walnut throws IndexOutOfBoundsException for this shape \
-                 once the promoted automaton is written)"
+                "A morphism's domain must cover every value referenced in its own \
+                 images: found the value {max_entry} in some image, but the domain \
+                 only has {domain_size} letters."
             ),
             // Verbatim `NumberSystem.java:330`'s `"Number system " + name + " is not
             // defined."`, with `name` being the `MSD_UNDERSCORE + maxImageLength` the
@@ -337,10 +363,17 @@ impl Morphism {
     /// **Statement order matters and is ported exactly.** Java runs
     /// `determineMaxEntry` (which throws on a negative image value) at `:82`, well
     /// before the `NumberSystem` construction at `:90` — so `NegativeValue` wins over
-    /// `NumberSystemNotDefined` when both apply. Conversely WB-036's
-    /// `IndexOutOfBoundsException` is not thrown inside `toWordAutomaton` at all (it
-    /// surfaces later, at write time), so the `NumberSystem` throw beats it: the check
-    /// below sits between the two, reproducing Java's real priority in both directions.
+    /// `NumberSystemNotDefined` when both apply. WB-036's domain-gap guard is placed by
+    /// Java's own fix (`walnut-java` commit `732bec0`) immediately AFTER that
+    /// `NumberSystem` construction and before `setFields` — so `NumberSystemNotDefined`
+    /// still wins over `DomainDoesNotCoverImageRange` when both apply, exactly the
+    /// priority Java's fix commit message calls out deliberately ("a morphism that's
+    /// both msd_1-shaped and domain-gap-shaped still reports the NumberSystem error
+    /// first"). Before the fix this ordering only held by accident (the
+    /// `IndexOutOfBoundsException` never fired until `AutomatonWriter`'s write path,
+    /// well after `toWordAutomaton` had already returned or thrown); it is now a real,
+    /// deliberate statement order inside `toWordAutomaton` itself, matching the check
+    /// below's own placement.
     pub fn to_word_automaton(&self) -> Result<crate::automaton::Automaton, MorphismError> {
         use crate::automaton::Automaton;
         use crate::fa::Fa;
@@ -353,7 +386,8 @@ impl Morphism {
         // (`:90`) -- the constructor's own validation, which is the only part of it this
         // crate's representation cannot store. See the doc comment above for why this
         // sits AFTER `determine_max_entry` (Java's `:82` throws first) but BEFORE the
-        // WB-036 check (whose Java crash happens later still, outside this method).
+        // WB-036 check (which Java's own fix, `walnut-java` commit `732bec0`, now also
+        // raises right here, immediately after this construction).
         if max_image_length < 2 {
             return Err(MorphismError::NumberSystemNotDefined(max_image_length));
         }
@@ -361,14 +395,20 @@ impl Morphism {
         // WB-036: `newD.len() == self.mapping.len()`, indexed by domain-letter SORT
         // POSITION, not value; `Q = max_entry + 1` states are about to be declared.
         // If the domain doesn't cover every value up to `max_entry`, some state in
-        // `mapping.len()..Q` has no transition-table entry at all -- Java doesn't
-        // check this either, it just crashes the first time anything touches that
-        // state's row. Checked here, before ever building the malformed `Fa`, whose
-        // `d.len() != q` would otherwise be a live landmine for every other algorithm
-        // in this crate (all of which assume that invariant).
+        // `mapping.len()..Q` has no transition-table entry at all. Java's own fix
+        // (commit `732bec0`) now checks this too, raising a clean
+        // `WalnutException.morphismDomainGap(maxEntry, newD.size())` right here --
+        // before the fix Java didn't check this at all, crashing later, the first
+        // time anything touched that state's row. Checked here regardless, before
+        // ever building the malformed `Fa`, whose `d.len() != q` would otherwise be a
+        // live landmine for every other algorithm in this crate (all of which assume
+        // that invariant).
         let q = max_entry as usize + 1;
         if new_d.len() < q {
-            return Err(MorphismError::DomainDoesNotCoverImageRange);
+            return Err(MorphismError::DomainDoesNotCoverImageRange {
+                max_entry,
+                domain_size: new_d.len(),
+            });
         }
         // The OTHER side of the same `newD.len() != Q` mismatch: a domain LARGER than
         // the image range needs (e.g. `0->00 1->00`, where no image ever references a
@@ -378,7 +418,9 @@ impl Morphism {
         // `for q in 0..Q`) iterates `0..Q` and simply never touches the dangling rows.
         // Truncating here reproduces that observable behavior exactly while restoring
         // this crate's `d.len() == q` invariant; REJECTING instead would diverge from
-        // Java on input Java genuinely accepts.
+        // Java on input Java genuinely accepts. Unaffected by WB-036's fix: the
+        // guard's condition (`newD.size() < maxEntry + 1`) is a strict less-than, so
+        // this wider-domain shape still passes it, on both the pre-fix and fixed jar.
         new_d.truncate(q);
 
         let mut fa = Fa {
@@ -741,10 +783,13 @@ mod tests {
 
     #[test]
     fn to_word_automaton_number_system_check_beats_wb036() {
-        // The reverse priority: WB-036's Java crash happens at WRITE time, outside
-        // `toWordAutomaton`, whereas the `NumberSystem` throw is inside it. `0->5`
-        // (one domain letter, maxEntry 5, so Q=6 > 1 transition row) is a WB-036 shape,
-        // but its maxImageLength is 1, so real Java reports `msd_1` first.
+        // The reverse priority: even after Java's fix (`walnut-java` commit
+        // `732bec0`) moved WB-036's guard inside `toWordAutomaton`, it still runs
+        // AFTER the `NumberSystem` construction (Java's own fix commit message calls
+        // this out deliberately), so a morphism that trips both conditions still
+        // reports the `NumberSystem` error first. `0->5` (one domain letter, maxEntry
+        // 5, so Q=6 > 1 transition row) is a WB-036 shape, but its maxImageLength is
+        // 1, so real Java reports `msd_1` first, on both the pre-fix and fixed jar.
         let h = Morphism::from_mapping(map(&[(0, &[5])]));
         assert_eq!(
             h.to_word_automaton().unwrap_err(),
@@ -782,14 +827,27 @@ mod tests {
     fn to_word_automaton_wb036_domain_gap_is_rejected_up_front() {
         // "0->05 1->10": two domain letters {0,1}, but the image of `0` references
         // value 5, which is not itself a domain letter -- Q = 6 but the transition
-        // table has only 2 entries. Real Java doesn't reject this either; it
-        // silently builds the malformed `FA` and crashes with
-        // `IndexOutOfBoundsException` the first time anything touches states
-        // 2..=5 -- confirmed empirically against real `walnut-java`'s `promote`
-        // command. See WB-036 in `docs/WALNUT-BUGS.md`.
+        // table has only 2 entries. Before Java's fix (`walnut-java` commit
+        // `732bec0`), real Java didn't reject this either; it silently built the
+        // malformed `FA` and crashed with `IndexOutOfBoundsException` the first time
+        // anything touched states 2..=5 -- confirmed empirically against real
+        // `walnut-java`'s `promote` command. Real Java now raises a clean
+        // `WalnutException` here too, with the exact message below (confirmed
+        // against the fixed jar) -- see WB-036 in `docs/WALNUT-BUGS.md`.
         let h = Morphism::from_mapping(map(&[(0, &[0, 5]), (1, &[1, 0])]));
         let err = h.to_word_automaton().unwrap_err();
-        assert_eq!(err, MorphismError::DomainDoesNotCoverImageRange);
+        assert_eq!(
+            err,
+            MorphismError::DomainDoesNotCoverImageRange {
+                max_entry: 5,
+                domain_size: 2,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "A morphism's domain must cover every value referenced in its own images: \
+             found the value 5 in some image, but the domain only has 2 letters."
+        );
     }
 
     #[test]
@@ -800,8 +858,9 @@ mod tests {
         // representable (see its own doc comment), so this pins what
         // `to_word_automaton` does with it rather than leaving it undefined. Following
         // Java's statement order: `maxImageLength = 0`, so the `NumberSystem("msd_0")`
-        // construction at `:90` throws before WB-036's later, write-time crash on the
-        // same input (`maxEntry = 0`, `Q = 1`, zero transition rows) could ever happen.
+        // construction at `:90` throws before WB-036's guard (now, post-fix,
+        // positioned immediately after that same construction) on the same input
+        // (`maxEntry = 0`, `Q = 1`, zero transition rows) could ever run.
         let h = Morphism::from_mapping(BTreeMap::new());
         let err = h.to_word_automaton().unwrap_err();
         assert_eq!(err, MorphismError::NumberSystemNotDefined(0));
@@ -1099,10 +1158,11 @@ mod tests {
     ///   ([`MorphismError::NumberSystemNotDefined`]).
     /// * images ⊆ domain, because otherwise nearly every generated case would be
     ///   `docs/WALNUT-BUGS.md` **WB-036** (`toWordAutomaton` declaring more states than its
-    ///   own transition table has rows, which real Java crashes on at write time and this
-    ///   port rejects up front) — rediscovering an already-logged, already-ported quirk on
-    ///   most inputs and drowning the signal this property exists to check. WB-036 is
-    ///   covered deliberately, and as an *expected* outcome, by the second property below.
+    ///   own transition table has rows, which real Java now cleanly rejects, as of
+    ///   `walnut-java` commit `732bec0`, and this port rejects up front too) —
+    ///   rediscovering an already-logged, already-ported quirk on most inputs and drowning
+    ///   the signal this property exists to check. WB-036 is covered deliberately, and as
+    ///   an *expected* outcome, by the second property below.
     fn arb_uniform_covering_morphism() -> impl Strategy<Value = (Morphism, usize, usize)> {
         (1usize..=3, 2usize..=3).prop_flat_map(|(d, l)| {
             prop::collection::vec(prop::collection::vec(0i32..d as i32, l), d).prop_map(
@@ -1191,8 +1251,9 @@ mod tests {
         /// (a) never panic, (b) succeed exactly when all three of Java's guards pass, and
         /// (c) report the guards in Java's own statement ORDER when more than one fails —
         /// `determineMaxEntry`'s negative-value throw (`Morphism.java:82`) first, then the
-        /// `NumberSystem` constructor (`:90`), then WB-036's domain/image mismatch (whose
-        /// Java crash happens later still, at write time).
+        /// `NumberSystem` constructor (`:90`), then WB-036's domain/image mismatch (which
+        /// Java's own fix, commit `732bec0`, now also raises inside `toWordAutomaton`,
+        /// immediately after the `NumberSystem` construction — see the module docs).
         ///
         /// The three predicates are recomputed here straight off the `BTreeMap` — a fold
         /// for the max image value, a fold for the longest image, a length comparison —
@@ -1220,7 +1281,10 @@ mod tests {
             } else if h.mapping.len() < max_entry as usize + 1 {
                 prop_assert_eq!(
                     result.unwrap_err(),
-                    MorphismError::DomainDoesNotCoverImageRange
+                    MorphismError::DomainDoesNotCoverImageRange {
+                        max_entry,
+                        domain_size: h.mapping.len(),
+                    }
                 );
             } else {
                 let p = result.expect("all three guards pass");

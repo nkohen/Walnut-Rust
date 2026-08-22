@@ -444,10 +444,24 @@ mod tests {
         .unwrap();
 
         let err = promote_command(&session, "", "badmor", "P").unwrap_err();
-        assert!(matches!(
-            err,
-            MorphismCommandError::Promote(MorphismError::DomainDoesNotCoverImageRange)
-        ));
+        match &err {
+            MorphismCommandError::Promote(MorphismError::DomainDoesNotCoverImageRange {
+                max_entry,
+                domain_size,
+            }) => {
+                assert_eq!(*max_entry, 5);
+                assert_eq!(*domain_size, 2);
+            }
+            other => panic!("expected DomainDoesNotCoverImageRange, got {other:?}"),
+        }
+        // WB-036 fixed upstream (`walnut-java` commit `732bec0`, branch
+        // `bugfix/wb-036`): the message text below is now Java's own fixed wording,
+        // not this port's previously-invented one -- see `docs/WALNUT-BUGS.md`.
+        assert_eq!(
+            err.to_string(),
+            "A morphism's domain must cover every value referenced in its own images: \
+             found the value 5 in some image, but the domain only has 2 letters."
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

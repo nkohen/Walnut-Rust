@@ -2379,14 +2379,47 @@ bug costs a silent wrong answer somewhere downstream.
   later, at write time. So a morphism that is both `msd_1`-shaped and WB-036-shaped reports the
   number-system error in Java — reproduced by `MorphismError::NumberSystemNotDefined`, checked
   before this guard (`to_word_automaton_number_system_check_beats_wb036`).
-- **Upstream:** not filed. A guard in `toWordAutomaton` (e.g. reject when `newD.size() < maxEntry +
-  1`, or better, require the domain be exactly `{0, …, maxEntry}` and say so) would fix it in Java;
-  the more useful fix is documenting that `promote`'s morphism must have domain = image-value-range
-  (a real, load-bearing precondition nothing in Walnut currently states anywhere).
+- **Upstream:** **fixed**, `walnut-java` commit `732bec0` (branch `bugfix/wb-036`, stacked on
+  `bugfix/wb-026`): `toWordAutomaton` gained exactly the guard predicted above (`if
+  (newD.size() < maxEntry + 1) throw WalnutException.morphismDomainGap(maxEntry, newD.size());`),
+  placed immediately after the `NumberSystem` construction and before the `setFields` call that used
+  to build the malformed automaton — preserving Java's pre-existing precedence (a morphism that's
+  both `msd_1`-shaped and WB-036-shaped still reports the `NumberSystem` error first, confirmed live
+  both before and after the fix). New message: `"A morphism's domain must cover every value
+  referenced in its own images: found the value {maxEntry} in some image, but the domain only has
+  {domainSize} letters."` The MIRROR shape (`0->00 1->00`) is confirmed unaffected — Java's guard
+  condition is a strict less-than, so a domain wider than the image range needs still passes.
 - **Severity:** low — a loud crash rather than a silently wrong answer, on an input shape (a
   morphism whose image references a value outside its own domain) that is easy to construct by
   accident but that every real Walnut fixture and test avoids; not reachable through `image`
   (`Image.image` never calls `toWordAutomaton`).
+- **Resolved (2026-08-22):** upstream fixed as described above (commit `732bec0`; verified live,
+  `morphism badmor "0->05 1->10"; promote wb036scratch_out badmor;`-shaped input now prints the
+  clean message above with nothing on stderr, no stack trace, and the session survives into the
+  next command). **Rust port: Case A — already caught the shape at CONSTRUCTION time (more
+  robustly than Java's old write-time crash) and already computed/reported a clean, recoverable
+  `Result::Err`, never the raw Java crash, and now also matches the fixed Java message exactly, as
+  of commit `732bec0`.** No functional change to WHEN or WHY this port rejects the shape: the
+  robustness argument in the "Rust port" bullet above (protecting `Fa`'s `d.len() == q` invariant
+  for any later caller in this crate, not just the one write path Java happened to hit first) is
+  independent of Java's own fix and stands unchanged — Java's fix happens to land its own guard at
+  essentially the same construction-time point this port already used, but that is a coincidence of
+  where Java chose to place its check, not something this port needed to match.
+  `MorphismError::DomainDoesNotCoverImageRange` gained the two fields (`max_entry`, `domain_size`)
+  Java's new exception carries, and its `Display` impl now renders Java's exact fixed wording,
+  replacing this port's own previously-invented text. The other real change: `ProverError::
+  is_handled()`'s arm for this variant moved from its own `false` ("unhandled JDK exception,
+  kind-prefixed stderr rendering") into the same `true` bucket every other `promote`/`morphism`
+  `WalnutException` already uses — real Java's OLD `IndexOutOfBoundsException` was genuinely
+  unhandled, but the FIXED `WalnutException` is handled, and the port's classification needed to
+  track that, not just the message text (the same shape WB-037's own fix required, see that entry
+  above). `to_word_automaton_wb036_domain_gap_is_rejected_up_front` (`wr-core`) and
+  `promote_command_wb036_domain_gap_surfaces_as_an_error_not_a_panic` (`wr-cli`) both now additionally
+  pin the exact field values and message text. Differential coverage against a live capture from the
+  fixed branch: `tests/differential/tests/java_bugfix_wb036.rs`'s
+  `wb036_domain_gap_matches_fixed_java` (plus `wb036_mirror_shape_still_succeeds_identically` and
+  `wb036_number_system_check_still_beats_the_domain_gap`, the two control cases, both confirmed
+  unaffected on both engines).
 
 ---
 
