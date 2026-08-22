@@ -1587,23 +1587,45 @@ bug costs a silent wrong answer somewhere downstream.
   while reading `parseArgs` to establish who is responsible for appending the trailing `/` to
   `--home-dir=`/`--session-dir=` values (`Prover.java:304-313`) that `Session`'s string
   concatenation assumes.
-- **Rust port:** `ported verbatim (bug)` **as of Phase 3b's U21** (was `not yet reached` while the
-  defect's owning file, `Prover.parseArgs`, was unported; U14 ports only `Session`'s path builders,
-  and the builder involved, `SessionPaths::read_address_for_command_files`, is faithful).
-  `crates/wr-cli/src/prover.rs`'s `parse_args` replicates the ordering exactly, including the odd
-  part this entry predicted: it constructs a **throwaway** `SessionPaths::new(Some(""), Some(""),
-  false)` — an explicitly empty home directory, matching Java's still-uninitialized
-  `Session.mainWalnutDir` static — purely to run a validation whose result is then discarded by
-  `run`'s correct re-validation. The explicit `Some("")` (rather than `None`) matters: `None` would
-  apply `setPathsAndNames`' "working directory ends in `bin` → `../`" rule, which has *not* run at
-  this point in Java. Pinned by `run_command_file_validation_ignores_home_dir_wb_026`, which
-  asserts the reported path has no home-directory prefix. **The user's sign-off this entry asked
-  for was not obtained**; U21 applied `CLAUDE.md`'s stated default (replicate) rather than deciding
-  the divergence on its own authority. Flipping to the one-line fix later is a two-line change here
-  plus that test.
-- **Upstream:** not filed. Fix is a one-line deletion: drop `:318` entirely and let `run`'s `:326`
-  do the validation (it already does, correctly). If an early "unknown file" diagnostic is wanted,
-  it has to move below `:321`.
+- **Upstream:** fixed, `walnut-java` commit `051208a` (branch `bugfix/wb-026`, stacked on
+  `bugfix/wb-014`) — the premature `UtilityMethods.validateFile(...)` call at `:318` is deleted
+  outright; `run`'s already-correct re-validation at `:326` (unchanged) is now the sole validation
+  point. Verified against a live-built jar: `--home-dir=whome probe.txt` (run from `whome`'s
+  parent) crashed pre-fix exactly as this entry's **Trigger** section shows, and now succeeds,
+  evaluating the command file's `eval` to `TRUE` — matching the behavior of running from inside
+  `whome` with no `--home-dir`. A genuinely-missing command file still errors cleanly with the same
+  `IllegalArgumentException`, now reported from `Prover.run` instead of `Prover.parseArgs`. New
+  `ProverTest` coverage: `testHomeDirCommandFileValidationWb026` (builds a `--home-dir=` tree
+  outside the working directory, confirms `parseArgs`+`run` both succeed — this would have crashed
+  pre-fix) and `testMissingCommandFileStillValidatedWb026` (confirms the missing-file case still
+  throws, now from `Prover.run` rather than `Prover.parseArgs`, so removing one validation point
+  didn't silently remove validation of the genuine-error case).
+- **Rust port:** `fixed, matches walnut-java as of commit 051208a` (PR-15 of
+  `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`, branch `bugfix/wb-026`) — `crates/wr-cli/src/prover.rs`'s
+  `parse_args` no longer performs the premature validation at all (the throwaway
+  `SessionPaths::new(Some(""), Some(""), false)` + `validate_file(...)` block this entry
+  previously described is deleted; the `filename.is_none()` arm is now just
+  `filename = Some(arg.clone())`), leaving `run_with_input`'s existing, correct validation
+  (`crates/wr-cli/src/prover.rs:2065`, run *after* `SessionPaths` is built from the real
+  `session_dir`/`home_dir`/`global_session` values) as the sole check — unaffected by this change
+  and confirmed still correct. The prior pinning test,
+  `run_command_file_validation_ignores_home_dir_wb_026`, is flipped (not deleted) to
+  `run_command_file_validation_now_honors_home_dir_wb_026`: `parse_args` now succeeds on the
+  `--home-dir=`-plus-command-file case, and `run_with_input` both finds and runs the file. A new
+  companion test, `run_still_rejects_a_genuinely_missing_command_file_wb_026` (mirroring Java's
+  `testMissingCommandFileStillValidatedWb026`), confirms a genuinely-missing command file still
+  errors via `run_with_input`'s `ProverError::InvalidFile`. No CLI-argument-level differential test
+  was added: this is a pure argument-parsing/session-setup bug with no query/automaton shape to
+  compare, and the flipped unit test already exercises `parse_args` and `run_with_input` together
+  through the real public API, end-to-end, the same reasoning `docs/WALNUT-BUGS.md` WB-011 used for
+  its own no-natural-differential-shape case (see PR-13, `bugfix/wb-011`).
+
+  This entry originally noted **"the user's sign-off this entry asked for was not obtained"** —
+  U21 (Phase 3b) applied `CLAUDE.md`'s stated default (replicate a genuine Java bug verbatim rather
+  than silently diverge) instead of deciding the divergence on its own authority, and no sign-off
+  was sought before that. That concern is now moot: this is not an unauthorized divergence but a
+  genuine upstream fix (commit `051208a`) being ported through this project's normal bugfix-series
+  process, per `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`.
 - **Severity:** moderate — a hard crash with a misleading path in the message, on a documented,
   plausible invocation (`--home-dir=` is one of only three flags Walnut accepts, and it exists
   precisely to run against a home tree that is not the working directory). No golden fixture

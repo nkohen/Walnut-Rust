@@ -2222,16 +2222,20 @@ pub enum ArgsOutcome {
     },
 }
 
-/// `Prover.parseArgs(String[])` (`:293-323`), **including WB-026 verbatim**.
+/// `Prover.parseArgs(String[])` (`:293-323`).
 ///
-/// The command-file validation at `:318` runs *inside* the argument loop, i.e. before
-/// `Session.setPathsAndNames` at `:321`, so it resolves the file against Java's
-/// still-uninitialized `Session.mainWalnutDir` (`""`) and ignores `--home-dir=`
-/// entirely. That is a genuine Walnut bug (`docs/WALNUT-BUGS.md` WB-026); per
-/// `CLAUDE.md`'s mechanical-port rule it is replicated, not fixed — which is why this
-/// function builds a throwaway `SessionPaths` with an explicitly empty home directory
-/// purely to run a check whose result is then thrown away (`run` re-validates
-/// correctly at `:326`). `run_command_file_validation_ignores_home_dir_wb_026` pins it.
+/// **WB-026, fixed** (`docs/WALNUT-BUGS.md`; `walnut-java` commit `051208a`): Java used
+/// to validate the command file *inside* the argument loop, before
+/// `Session.setPathsAndNames` ran, so the check resolved the file against the
+/// still-uninitialized `Session.mainWalnutDir` (`""`) and ignored `--home-dir=`
+/// entirely — a valid `--home-dir=<dir> <file>` invocation crashed even though the
+/// file genuinely existed under `<dir>`. The check was also redundant: `run` (`:326`,
+/// [`Prover::run_with_input`] below) re-validates the same path *after* the real
+/// session paths are built, which is the only validation that can ever be correct.
+/// Fixed upstream by deleting the premature call outright; ported the same way — this
+/// function no longer validates the file at all, leaving `run`'s validation as the
+/// sole check. `run_command_file_validation_now_honors_home_dir_wb_026` and
+/// `run_still_rejects_a_genuinely_missing_command_file_wb_026` pin both directions.
 pub fn parse_args(args: &[String]) -> Result<ArgsOutcome, ProverError> {
     let mut filename: Option<String> = None;
     let mut session_dir: Option<String> = None;
@@ -2257,11 +2261,8 @@ pub fn parse_args(args: &[String]) -> Result<ArgsOutcome, ProverError> {
         } else if arg == GLOBAL_SESSION_ARG {
             global_session = true;
         } else if filename.is_none() {
-            // WB-026, verbatim: resolved against an EMPTY home directory, because Java's
-            // `Session.mainWalnutDir` static initializer has not been overwritten yet.
-            let premature = SessionPaths::new(Some(""), Some(""), false);
-            validate_file(&premature.read_address_for_command_files(arg))
-                .map_err(ProverError::InvalidFile)?;
+            // WB-026 (fixed): no validation here -- `run`'s later, correct validation
+            // (against the real session paths built just below) is the only check.
             filename = Some(arg.clone());
         }
     }
@@ -3977,21 +3978,67 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// WB-026, pinned: the command file is validated against `""` + `Command Files/`,
-    /// i.e. the CURRENT WORKING DIRECTORY, before `--home-dir=` is applied — so a file
-    /// that genuinely exists under the home tree is rejected.
+    /// WB-026 (fixed, `walnut-java` commit `051208a`): `parse_args` used to validate
+    /// the command file against an empty home directory (i.e. the current working
+    /// directory) BEFORE `--home-dir=` was applied, so a file that genuinely existed
+    /// under the home tree was rejected. Confirms the fix end-to-end: `parse_args`
+    /// no longer validates at all, and `run_with_input` -- now the sole validation
+    /// point, using the REAL session paths built from `--home-dir=` -- both finds and
+    /// successfully runs the file.
     #[test]
-    fn run_command_file_validation_ignores_home_dir_wb_026() {
+    fn run_command_file_validation_now_honors_home_dir_wb_026() {
         let (dir, dir_str) = temp_tree("wb026");
         fs::write(dir.join("Command Files").join("probe.txt"), "exit;\n").unwrap();
 
-        let err =
-            parse_args(&[format!("--home-dir={dir_str}"), "probe.txt".to_string()]).unwrap_err();
+        let outcome =
+            parse_args(&[format!("--home-dir={dir_str}"), "probe.txt".to_string()]).unwrap();
+        let (filename, session) = match outcome {
+            ArgsOutcome::Run { filename, session } => (filename, session),
+            ArgsOutcome::Help => panic!("expected Run"),
+        };
+        assert_eq!(filename.as_deref(), Some("probe.txt"));
+
+        let logging = Logging::with_writers(Box::new(io::sink()), Box::new(io::sink()));
+        let mut prover = Prover::with_output(session, logging, Box::new(io::sink()));
+        let mut console = io::Cursor::new(Vec::new());
+        prover
+            .run_with_input(filename.as_deref(), &mut console)
+            .expect("the command file genuinely exists under --home-dir=; run must now succeed");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Companion control for the fix above (matching `walnut-java`'s own
+    /// `testMissingCommandFileStillValidatedWb026`): removing the premature check
+    /// must not remove validation of a genuinely-missing command file -- it must
+    /// still error, just now from `run_with_input`'s validation instead of
+    /// `parse_args`'s.
+    #[test]
+    fn run_still_rejects_a_genuinely_missing_command_file_wb_026() {
+        let (dir, dir_str) = temp_tree("wb026missing");
+
+        let outcome = parse_args(&[
+            format!("--home-dir={dir_str}"),
+            "definitely_missing.txt".to_string(),
+        ])
+        .unwrap();
+        let (filename, session) = match outcome {
+            ArgsOutcome::Run { filename, session } => (filename, session),
+            ArgsOutcome::Help => panic!("expected Run"),
+        };
+        assert_eq!(filename.as_deref(), Some("definitely_missing.txt"));
+
+        let logging = Logging::with_writers(Box::new(io::sink()), Box::new(io::sink()));
+        let mut prover = Prover::with_output(session, logging, Box::new(io::sink()));
+        let mut console = io::Cursor::new(Vec::new());
+        let err = prover
+            .run_with_input(filename.as_deref(), &mut console)
+            .unwrap_err();
         match &err {
-            ProverError::InvalidFile(m) => assert_eq!(
-                m, "File does not exist or is not a valid file: Command Files/probe.txt",
-                "the reported path must have NO home-dir prefix -- that is the bug"
-            ),
+            ProverError::InvalidFile(m) => {
+                assert!(m.starts_with("File does not exist or is not a valid file: "));
+                assert!(m.contains("definitely_missing.txt"));
+            }
             other => panic!("expected InvalidFile, got {other}"),
         }
         fs::remove_dir_all(&dir).ok();
