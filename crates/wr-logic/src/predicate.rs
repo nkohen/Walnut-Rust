@@ -206,34 +206,22 @@ pub enum LexError {
         name: String,
         position: usize,
     },
-    /// **WB-019** (`docs/WALNUT-BUGS.md`): `putMacro`'s `%N` argument substitution
-    /// (`Predicate.java:436`) is `String.replaceAll("%" + arg, arguments.get(arg))`, so
-    /// the REPLACEMENT text — a macro call's raw argument, verbatim user input — is run
-    /// through `java.util.regex.Matcher`'s replacement-string parsing, which gives `$`
-    /// and `\` special meaning `WalnutException`'s machinery never sees or catches: a
-    /// real, UNCAUGHT `IllegalArgumentException`/`IndexOutOfBoundsException`, confirmed
-    /// empirically against `walnut-java`. `$`/`#` can never reach this point (blocked
-    /// earlier by [`Self::InternalMacroInArgument`]), so `message` in practice is always
-    /// the backslash-escaping half of the quirk (a lone trailing `\` in an argument).
-    /// Ported as a recoverable `Result::Err` — like [`crate::expr::ExprError`]'s WB-013
-    /// entry, a real Java unchecked exception that `Prover`'s top-level `catch
-    /// (RuntimeException)` recovers from, not a Rust `panic!` that would abort this
-    /// process outright with no equivalent boundary (yet).
-    MacroArgumentReplacementError { message: &'static str },
     /// `java.lang.NumberFormatException` from `UtilityMethods.parseInt` on the `@N`
     /// alphabet-letter token (`Predicate.java:220`) when `N` overflows `i32` — e.g.
     /// `?msd_2 T[x] = @8888888888`. The pattern behind that branch is a syntactic
     /// `\d+`, which bounds the token's *shape* and not its magnitude, so this is
     /// reachable straight from the user's query text.
     ///
-    /// Like [`Self::MacroArgumentReplacementError`] this is an UNCHECKED Java exception
-    /// rather than a `WalnutException`, recovered by `Prover.readBuffer`'s `catch
-    /// (RuntimeException)` (`Prover.java:390-392`) — confirmed by running
-    /// `walnut-java/target/Walnut-all.jar` on the reproducer above: the command reports
-    /// the exception and the next command in the same session still evaluates. Ported
-    /// as a recoverable `Result::Err` for the same reason that variant gives; a Rust
-    /// `panic!` here (which is what Tier-5 fuzzing found, Phase 4 U30 finding F1) would
-    /// abort the process with no equivalent boundary.
+    /// This is an UNCHECKED Java exception rather than a `WalnutException`, recovered
+    /// by `Prover.readBuffer`'s `catch (RuntimeException)` (`Prover.java:390-392`) —
+    /// confirmed by running `walnut-java/target/Walnut-all.jar` on the reproducer
+    /// above: the command reports the exception and the next command in the same
+    /// session still evaluates. Ported as a recoverable `Result::Err`, matching this
+    /// crate's convention for every other real Java unchecked exception `Prover`'s
+    /// top-level `catch (RuntimeException)` recovers from (e.g.
+    /// [`crate::expr::ExprError`]'s WB-013 entry) — a Rust `panic!` here (which is what
+    /// Tier-5 fuzzing found, Phase 4 U30 finding F1) would abort the process with no
+    /// equivalent boundary.
     NumberFormat(NumberFormatError),
 }
 
@@ -294,14 +282,6 @@ impl std::fmt::Display for LexError {
             } => write!(
                 f,
                 "argument {index} of the function {name} cannot be empty: char at {position}"
-            ),
-            // Not a `WalnutException` at all -- an uncaught Java `RuntimeException` from
-            // `Matcher.appendReplacement` (WB-019); `message` is that exception's own
-            // verbatim text.
-            LexError::MacroArgumentReplacementError { message } => write!(
-                f,
-                "{message} (uncaught Java exception from Predicate.putMacro's %N \
-                 substitution, see docs/WALNUT-BUGS.md WB-019)"
             ),
             // `NumberFormatException.getMessage()` verbatim.
             LexError::NumberFormat(e) => write!(f, "{e}"),
@@ -1288,8 +1268,7 @@ impl Predicate {
         // substitution. Both are Java's real behavior, reproduced by literally
         // replaying its loop rather than trying to special-case around it.
         for (arg_index, arg) in parse_result.arguments.iter().enumerate().rev() {
-            macro_text =
-                java_replace_all_literal(&macro_text, &format!("%{arg_index}"), &arg.text)?;
+            macro_text = macro_text.replace(&format!("%{arg_index}"), &arg.text);
         }
 
         // `:441-442`: `predicate = predicate.substring(0, matcher.start()) +
@@ -1325,102 +1304,6 @@ struct ParsedArgument {
 struct ParseResult {
     arguments: Vec<ParsedArgument>,
     end_index: usize,
-}
-
-/// `String.replaceAll(literalPattern, replacement)` as `Predicate.putMacro` uses it
-/// (`:436`): `literal_pattern` is always `"%" + N` for a non-negative `N` — plain
-/// digits, no regex metacharacters — so no real regex compilation is needed here. But
-/// the REPLACEMENT text (`arguments.get(arg)`, a macro call's raw argument) is still run
-/// through `java.util.regex.Matcher`'s replacement-string parsing, which gives `$`/`\`
-/// special meaning — see [`expand_java_replacement`] and **WB-019**
-/// (`docs/WALNUT-BUGS.md`).
-fn java_replace_all_literal(
-    haystack: &str,
-    literal_pattern: &str,
-    replacement: &str,
-) -> Result<String, LexError> {
-    let mut out = String::with_capacity(haystack.len());
-    let mut rest = haystack;
-    while let Some(idx) = rest.find(literal_pattern) {
-        out.push_str(&rest[..idx]);
-        out.push_str(&expand_java_replacement(replacement, literal_pattern)?);
-        rest = &rest[idx + literal_pattern.len()..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// `Matcher.appendReplacement`'s replacement-string parsing (OpenJDK's
-/// `java.util.regex.Matcher`), specialized to a pattern with ZERO capturing groups —
-/// every pattern [`java_replace_all_literal`] is ever called with is `"%" + N`, plain
-/// digits — so group 0 (`whole_match`, i.e. the entire `%N` token) is the only valid
-/// group reference. `$1`..`$9` always fail (`groupCount() == 0 < 1`), matching a real,
-/// empirically-confirmed `IndexOutOfBoundsException`; a lone trailing `\` also fails
-/// (`IllegalArgumentException`), also confirmed empirically. **WB-019**, ported
-/// verbatim: `$`/`#` can never reach this function in practice (blocked earlier by
-/// [`LexError::InternalMacroInArgument`]), so the `\`-escaping arm is the one real
-/// callers exercise; the `$`-group-reference arm is implemented anyway, in the same
-/// spirit as `putWord`'s unreachable-but-ported [`LexError::UnbalancedBracket`] check,
-/// and is unreachable through this crate's own call graph today. **Its fidelity is
-/// narrower than that comparison implies**, flagged during adversarial review: real
-/// `Matcher.appendReplacement` extends a `$NNN` group reference digit-by-digit for as
-/// long as the accumulated number stays a valid group index (here, `groupCount()==0`,
-/// so it can extend through any number of leading `0`s before failing on the first
-/// nonzero digit), then treats any REMAINING digits as literal text — e.g. real Java's
-/// `"$007"` consumes both `0`s into the group reference and appends `whole_match+"7"`.
-/// This arm consumes exactly one digit after `$` (`"$007"` here would append
-/// `whole_match+"07"` instead). Since the whole arm is provably dead code, this
-/// divergence has zero live effect — recorded here rather than silently left
-/// undocumented, since a future change that makes this arm reachable must fix this
-/// first.
-fn expand_java_replacement(replacement: &str, whole_match: &str) -> Result<String, LexError> {
-    let chars: Vec<char> = replacement.chars().collect();
-    let mut out = String::with_capacity(replacement.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        match chars[i] {
-            '\\' => {
-                i += 1;
-                let c = *chars
-                    .get(i)
-                    .ok_or(LexError::MacroArgumentReplacementError {
-                        message: "character to be escaped is missing",
-                    })?;
-                out.push(c);
-                i += 1;
-            }
-            '$' => {
-                i += 1;
-                let d = *chars
-                    .get(i)
-                    .ok_or(LexError::MacroArgumentReplacementError {
-                        message: "Illegal group reference: group index is missing",
-                    })?;
-                if !d.is_ascii_digit() {
-                    return Err(LexError::MacroArgumentReplacementError {
-                        message: "Illegal group reference",
-                    });
-                }
-                // `groupCount() == 0`: any FIRST digit other than `0` already exceeds
-                // it (Java's own digit-extension loop can only ever shrink the
-                // candidate group number back down to this same first digit, never
-                // grow past it while staying <= 0), so only `$0` (the whole match) is
-                // ever valid here.
-                if d != '0' {
-                    return Err(LexError::MacroArgumentReplacementError {
-                        message: "No group",
-                    });
-                }
-                i += 1;
-                out.push_str(whole_match);
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    Ok(out)
 }
 
 impl std::fmt::Display for Predicate {
@@ -2571,8 +2454,11 @@ mod tests {
 
     /// Same check, triggered by `$` rather than `#` — confirms `internalMacro` fires on
     /// EITHER reserved character, not just the one that happens to start a nested macro
-    /// call, and rules out (see WB-019's doc comment) the `$`-group-reference half of
-    /// that bug: `$` can never reach `putMacro`'s substitution step at all.
+    /// call. This is also the control case for `docs/WALNUT-BUGS.md`'s (now-fixed)
+    /// WB-019 entry: `$` can never reach `putMacro`'s substitution step at all
+    /// (blocked here, earlier, by [`LexError::InternalMacroInArgument`]) — unaffected
+    /// by WB-019's fix either before or after, confirmed unchanged against real
+    /// `walnut-java`.
     #[test]
     fn macro_call_argument_containing_dollar_is_also_blocked() {
         let env = macro_test_env();
@@ -2733,31 +2619,47 @@ mod tests {
         assert_eq!(post_with(&env, "F[a][b=1"), "a:F");
     }
 
-    // -- WB-019: `putMacro`'s `%N` substitution inherits Java's replacement-string quirks
+    // -- WB-019 (fixed): `putMacro`'s `%N` substitution is now a plain literal
+    // -- `String.replace`/`str::replace` on both engines -- no more `$`/`\`
+    // -- replacement-string escaping. See `docs/WALNUT-BUGS.md`'s WB-019 entry and
+    // -- `walnut-java` commit `cee8352` (branch `bugfix/wb-019`).
 
-    /// **WB-019**: a macro-call argument ending in a lone, unescaped backslash makes the
-    /// substitution step fail with the exact (uncaught, non-`WalnutException`) message
-    /// Java's `Matcher.appendReplacement` reports for a dangling escape.
+    /// **WB-019, fixed**: a macro-call argument ending in a lone, unescaped backslash
+    /// used to make the substitution step fail with an uncaught, non-`WalnutException`
+    /// Java exception (`character to be escaped is missing`). Now the backslash is
+    /// preserved literally in the expanded macro text (`"\"`, one character), which
+    /// tokenizing then correctly rejects the ordinary way -- `\` matches no token
+    /// pattern in Walnut's grammar (which has no escape syntax at all), so this is a
+    /// ordinary, well-formatted `LexError::UndefinedToken` at char 0, not a crash.
+    /// Matches real, fixed `walnut-java` exactly (`Undefined token: char at 0`,
+    /// confirmed live -- see `tests/differential/tests/java_bugfix_wb019.rs`).
     #[test]
-    fn wb019_macro_argument_trailing_backslash_reports_javas_exception_text() {
+    fn wb019_macro_argument_trailing_backslash_is_preserved_not_an_uncaught_crash() {
         let env = InMemoryPredicateEnv::new().with_macro("echo", "%0");
-        match lex_with(&env, "#echo(\\)").unwrap_err() {
-            LexError::MacroArgumentReplacementError { message } => {
-                assert_eq!(message, "character to be escaped is missing");
-            }
-            other => panic!("expected MacroArgumentReplacementError, got {other}"),
-        }
+        assert_eq!(
+            err_with(&env, "#echo(\\)"),
+            "Undefined token: char at 0",
+            "the backslash must survive substitution as literal text and THEN be \
+             rejected by the tokenizer, not vanish or crash the substitution itself"
+        );
     }
 
-    /// **WB-019**: `\x` in an argument silently becomes literal `x` (the backslash is
-    /// swallowed as an escape character), rather than passing the two-character
-    /// sequence through as literal argument text.
+    /// **WB-019, fixed**: `\x` in an argument used to silently become literal `x` (the
+    /// backslash consumed as an escape character). Now both characters survive
+    /// substitution verbatim (`"\x"`, not `"x"`) -- and the very fact that tokenizing
+    /// this then throws (where the old buggy one-character `"x"` alone would NOT, `x`
+    /// being a perfectly ordinary `Variable` token) is itself the pin that the
+    /// backslash was preserved, not dropped. Matches real, fixed `walnut-java` exactly.
     #[test]
     fn wb019_macro_argument_backslash_escapes_the_following_character() {
         let env = InMemoryPredicateEnv::new().with_macro("echo", "%0");
-        let p = Predicate::new(&env, "#echo(\\x)").unwrap();
-        assert_eq!(p.predicate(), "x");
-        assert_eq!(p.to_string(), "x");
+        assert_eq!(
+            err_with(&env, "#echo(\\x)"),
+            "Undefined token: char at 0",
+            "both '\\' and 'x' must survive substitution verbatim; a dropped \
+             backslash would leave the perfectly valid Variable token \"x\" and this \
+             would NOT be an error at all"
+        );
     }
 
     // -- Ruling 3: no macro-expansion depth/cycle guard ------------------------------

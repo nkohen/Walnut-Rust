@@ -1146,28 +1146,49 @@ bug costs a silent wrong answer somewhere downstream.
     11"` (`WalnutException.internalMacro`) — confirming the `$`-group-reference half of this same
     Java quirk is blocked upstream and never reaches `replaceAll` at all.
 - **Found:** Phase 3a, U4 (`crates/wr-logic/src/predicate.rs`, `Predicate::put_macro`), 2026-08-12.
-- **Rust port:** `ported verbatim (quirk)`. `java_replace_all_literal`/`expand_java_replacement`
-  reproduce `Matcher.appendReplacement`'s replacement-string parsing (specialized to the
-  zero-capturing-group case every real call here has), including the trailing-backslash failure and
-  the backslash-escapes-the-next-character behavior. Ported as a recoverable
-  `LexError::MacroArgumentReplacementError` (a `Result::Err`), not a Rust `panic!`: like
-  `ExprError`'s WB-013 entry, this is a real Java UNCHECKED exception that `Prover`'s top-level
-  `catch (RuntimeException)` recovers from (prints a stack trace, session continues) — a Rust
-  `panic!` here would abort the whole process instead, with no `catch_unwind` boundary yet to
-  mirror that recovery. Pinned by `wb019_macro_argument_trailing_backslash_reports_javas_exception_text`
-  and `wb019_macro_argument_backslash_escapes_the_following_character`, reproducing both empirical
-  triggers above; `macro_call_argument_containing_dollar_is_also_blocked` pins that the
-  `$`-group-reference half stays unreachable through this port's own call graph too (same ordering:
-  `parse_parenthesized_arguments`'s `#`/`$` check runs before substitution).
-- **Upstream:** not filed. Fix is mechanical: escape `arguments.get(arg)` for `replaceAll`'s
-  replacement-string dialect (`Matcher.quoteReplacement(...)`) before substituting, or switch to a
-  literal (non-regex) replace entirely, e.g. `StringBuilder`-based splicing.
-- **Severity:** low-moderate — an uncaught, unformatted crash on a plausible-if-unusual input (a
-  macro argument containing a stray trailing backslash), plus a silent, undocumented
-  character-dropping transformation on any argument containing `\` followed by another character.
-  Walnut's predicate grammar has no legitimate use for a literal `\` in a macro argument, so this
-  is unlikely to bite an ordinary user, but it is a real crash on input that is otherwise
-  syntactically unremarkable. No golden fixture uses a backslash in a macro-call argument.
+- **Upstream:** fixed, `walnut-java` commit `cee8352` (branch `bugfix/wb-019`) — `putMacro`'s
+  substitution swapped from `String.replaceAll(regex, replacement)` to plain
+  `String.replace(CharSequence, CharSequence)`, which does no regex/replacement-string parsing on
+  either side (both the always-plain-digits pattern and the arbitrary user-typed replacement text
+  are now treated as pure literal text, which is what this substitution actually needs — neither
+  side was ever meant to carry regex/replacement-string semantics). Live-verified: a trailing-
+  backslash argument now preserves the literal `\` (confirmed via a temporary debug print, then
+  correctly rejected later by the tokenizer for an unrelated reason — Walnut's grammar has no
+  escape syntax, so a bare `\` in predicate text is `Undefined token`, which is expected and
+  correct); a `\x`-style argument now preserves BOTH characters. The `$`-argument control case is
+  unaffected (still blocked by `parseParenthesizedArguments`'s pre-existing `$`/`#` guard, before
+  substitution ever runs). New `PredicateTest` coverage
+  (`macroCallArgumentWithTrailingBackslashIsPreservedNotAnUncheckedCrash`,
+  `macroCallArgumentWithBackslashEscapeSequencePreservesBothCharacters`,
+  `macroCallArgumentWithDollarSignStillBlockedBeforeSubstitutionRuns`).
+- **Rust port:** fixed, matches `walnut-java` as of commit `cee8352`, and this fix is a genuine
+  SIMPLIFICATION of the port, not just a behavior change: Rust's `str::replace` was already a
+  purely literal replace with no escape semantics on either side, so `put_macro`'s call site now
+  reads `macro_text.replace(&format!("%{arg_index}"), &arg.text)` directly. The now-dead
+  `java_replace_all_literal`/`expand_java_replacement` functions (which used to reproduce
+  `Matcher.appendReplacement`'s replacement-string parsing) and the
+  `LexError::MacroArgumentReplacementError` variant (and its `Display` arm) that they fed are
+  removed outright — real, working, quirk-replication machinery deleted because the quirk it
+  replicated no longer exists upstream, not a stub or a workaround. Pinned by
+  `wb019_macro_argument_trailing_backslash_is_preserved_not_an_uncaught_crash` and
+  `wb019_macro_argument_backslash_escapes_the_following_character` (both flipped from asserting
+  the old buggy behavior to asserting the computed language, matching fixed Java: both now expect
+  `LexError::UndefinedToken` at char 0, since a preserved-but-then-correctly-rejected `\`/`\x` is
+  exactly what a plain literal replace followed by ordinary tokenizing produces);
+  `macro_call_argument_containing_dollar_is_also_blocked` (unchanged in substance, doc-comment
+  updated) still confirms the `$`-group-reference half stays unreachable through this port's own
+  call graph, before and after. A new differential suite
+  (`tests/differential/tests/java_bugfix_wb019.rs`, three cases) confirms `wr-cli`'s real dispatch
+  matches freshly captured `walnut-java` output (`bugfix/wb-019`, `cee8352`) byte-for-byte on both
+  stdout and stderr, including the `$`-argument control case; capture recipe in
+  `tests/differential/CAPTURE.md`.
+- **Severity (historical, before the fix above):** low-moderate — an uncaught, unformatted crash
+  on a plausible-if-unusual input (a macro argument containing a stray trailing backslash), plus a
+  silent, undocumented character-dropping transformation on any argument containing `\` followed
+  by another character. Walnut's predicate grammar has no legitimate use for a literal `\` in a
+  macro argument, so this was unlikely to bite an ordinary user, but it was a real crash on input
+  that was otherwise syntactically unremarkable. No golden fixture uses a backslash in a
+  macro-call argument.
 
 ---
 

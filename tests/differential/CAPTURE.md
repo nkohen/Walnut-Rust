@@ -1412,3 +1412,86 @@ rather than only inferring it from `ExportRequest`'s `&Automaton` signature.
 
 The hand-authored `Automata Library`/`Command Files` scratch files and the worktree were
 removed afterward, matching every recipe above.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb019.rs`
+
+Captured 2026-08-22 for `tests/differential/tests/java_bugfix_wb019.rs`, verifying
+`docs/WALNUT-BUGS.md` WB-019's real upstream fix (`walnut-java` commit `cee8352`, branch
+`bugfix/wb-019`, stacked on `bugfix/wb-040`) — **not mainline**, per this project's
+now-standard practice for these follow-up units. PR-18 of
+`docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`, the last entry in this mechanical batch.
+
+The main `~/dev/walnut-java` working tree was already checked out on `bugfix/wb-019` (same
+situation `java_bugfix_wb014.rs`/`wb021.rs`/`wb032.rs`/`wb035.rs`/`wb036.rs`/`wb038.rs`/
+`wb040.rs` hit), so no separate worktree was needed — only scratch-prefixed untracked files
+were touched, all removed afterward:
+
+```bash
+cd ~/dev/walnut-java   # already on bugfix/wb-019 (cee8352)
+export JAVA_HOME=/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1/Contents/Home
+export PATH="$JAVA_HOME/bin:$PATH"
+./mvnw -q clean package -DskipTests -Pfat-jar   # do NOT skip this even if a jar already
+                                                 # exists -- see the "stale jar" note below
+
+cat > "Macro Library/wb019scratch_echo.txt" <<'EOF'
+%0
+EOF
+printf 'eval wb019scratch_out "#wb019scratch_echo(\\)";\neval wb019scratch_out2 "#wb019scratch_echo(\\x)";\neval wb019scratch_out3 "#wb019scratch_echo($5)";\n' \
+    > "Command Files/wb019scratch_capture.txt"
+
+java -cp target/Walnut-all.jar Main.Prover wb019scratch_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+
+rm -f "Macro Library/wb019scratch_echo.txt" "Command Files/wb019scratch_capture.txt"
+rm -rf Session
+```
+
+**A stale-jar trap, caught and worth recording**: the first run above (against a jar built
+before this session but still timestamped after `cee8352` was committed) reproduced the
+OLD pre-fix crash (`java.lang.IllegalArgumentException: character to be escaped is missing`
+on stderr, for the FIRST command only — the second and third commands' output looked
+plausible on their own, which is exactly the kind of partial-looking-correct result that
+would have silently corrupted this capture). `grep`-ing `Predicate.java`'s source confirmed
+the fix (`String.replace`, not `String.replaceAll`) WAS present on disk; a fresh
+`./mvnw -q clean package -DskipTests -Pfat-jar` produced a jar that actually reflected it.
+Lesson for future entries in this file: when a "capture against the fixed branch" run
+produces output that looks even partially like the pre-fix bug, rebuild the jar before
+trusting the run — do not assume "already built" from a previous session is still current.
+
+`stderr.txt` was empty for all three commands on the freshly rebuilt jar (confirming no
+uncaught exception of any kind). `stdout.txt`, up to the REPL banner that follows the
+command file:
+
+```text
+eval wb019scratch_out "#wb019scratch_echo(\)";
+Undefined token: char at 0
+eval wb019scratch_out2 "#wb019scratch_echo(\x)";
+Undefined token: char at 0
+eval wb019scratch_out3 "#wb019scratch_echo($5)";
+a function/macro cannot be called from inside another function/macro's argument list: char at 19
+```
+
+`Session/*/Automata Library/` was empty afterward — none of the three commands writes an
+automaton (every one fails inside `EvalDef.compute`'s predicate-assembly step, before a
+result could ever be produced). Inlined directly into `java_bugfix_wb019.rs`'s three test
+functions (`wb019_trailing_backslash_argument_matches_fixed_java`,
+`wb019_backslash_escape_sequence_argument_matches_fixed_java`,
+`wb019_dollar_argument_control_case_unaffected_by_fix`) — no `fixtures/wb019/` directory
+was created, matching `java_bugfix_wb040.rs`'s "inline a small captured fixture" precedent.
+
+**Before writing the differential test, the current release build of `walnut-rs`
+(`cargo build -p wr-cli --release --bin walnut-rs`) was run live against the identical
+repro** (a fresh `--home-dir=PATH` tree with the same `Macro Library/wb019scratch_echo.txt`
+and the same three `eval` commands, adapted only for this port's `--home-dir=PATH` argument
+syntax), independently re-confirming the port's own behavior matches the capture above
+byte-for-byte on stdout, with nothing under `Session/*/Automata Library/` — before any test
+assertion was written from memory or inference.
+
+The `$`-argument control case (`wb019scratch_out3`, `#wb019scratch_echo($5)`) is unaffected
+by this fix either way: `parseParenthesizedArguments`'s `$`/`#` guard rejects it before
+`putMacro`'s substitution ever runs, on both engines, before and after the fix — included
+to lock in that this fix (substitution logic only) left that ordering untouched, matching
+`walnut-java`'s own new `macroCallArgumentWithDollarSignStillBlockedBeforeSubstitutionRuns`
+test.
