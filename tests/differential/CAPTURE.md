@@ -1281,3 +1281,134 @@ Three confirmations from this one capture, matching `docs/WALNUT-BUGS.md` WB-036
 byte-identical `wb036scratch_out2.txt` — confirming the message-text fix and the
 already-correct catch-point/mirror-shape/ordering behavior together, before any test was
 written to pin it.
+
+---
+
+# Ground-truth capture: `java_bugfix_wb040.rs`
+
+Captured 2026-08-22 for `tests/differential/tests/java_bugfix_wb040.rs`, verifying
+`docs/WALNUT-BUGS.md` WB-040's real upstream fix (`walnut-java` commit `0cf02d3`, branch
+`bugfix/wb-040`, stacked on `bugfix/wb-036` (`732bec0`)) — **not mainline**, per this
+project's now-standard practice for these follow-up units.
+
+`bugfix/wb-040` was already checked out at the main `~/dev/walnut-java` working tree when
+this was captured (the same situation `java_bugfix_wb014.rs`/`wb021.rs`/`wb032.rs`/
+`wb035.rs`/`wb036.rs`/`wb038.rs` hit), so the worktree below is added by commit hash
+(detached), not by branch name:
+
+```bash
+git -C ~/dev/walnut-java worktree add --detach /tmp/walnut-java-wb040 0cf02d3
+cd /tmp/walnut-java-wb040
+export JAVA_HOME=/Users/nkohen/Library/Java/JavaVirtualMachines/openjdk-19.0.1/Contents/Home
+export PATH="$JAVA_HOME/bin:$PATH"
+./mvnw -q clean package -DskipTests -Pfat-jar
+
+# WB-040's own recorded trigger fixture, unchanged -- and the exact shape real
+# walnut-java's own new AutomatonWriterTest/ReverseTest regression tests use: state 1 has
+# no edge back to state 0, so post-reverse (edges reversed, but fa.q0 left stale), a
+# canonize() BFS from the stale q0 can only reach itself.
+printf 'msd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n' \
+    > "Automata Library/wb040scratch_base.txt"
+
+cat > "Command Files/wb040scratch_capture.txt" <<'EOF'
+reverse wb040scratch_revbNoExport $wb040scratch_base::
+[export 0 ba]reverse wb040scratch_revbBa $wb040scratch_base::
+[export 0 gv]reverse wb040scratch_revbGv $wb040scratch_base::
+EOF
+java -cp target/Walnut-all.jar Main.Prover wb040scratch_capture.txt \
+    >stdout.txt 2>stderr.txt </dev/null
+
+rm -f "Automata Library/wb040scratch_base.txt" "Command Files/wb040scratch_capture.txt"
+rm -rf Session
+git -C ~/dev/walnut-java worktree remove /tmp/walnut-java-wb040 --force
+```
+
+`java`/`mvnw` above actually ran under a JDK 17+ toolchain (the shell's default `java`
+resolves to a JDK 11 too old for this project's class file version, and `JAVA_HOME` must
+point at the `Contents/Home` subdirectory or `mvnw` refuses to start). `</dev/null` matters
+too: without it the process runs the command file and then blocks in the interactive REPL.
+
+`stderr.txt` was empty (confirming no `IndexOutOfBoundsException`, no anything -- the
+pre-fix crash this entry's own "Trigger" bullet recorded is gone). `stdout.txt`, up to the
+REPL banner that follows the command file:
+
+```text
+reverse wb040scratch_revbNoExport $wb040scratch_base::
+reversing:2 states
+ Determinizing [#0, strategy: SC]: 2 states
+ Determinized: 2 states - 7ms
+ Minimizing: 2 states.
+ Minimized:2 states - 2ms.
+reversed:2 states - 15ms
+[export 0 ba]reverse wb040scratch_revbBa $wb040scratch_base::
+reversing:2 states
+Exporting to:Session/2026_08_22_02_23_14/Result/export_0_pre.ba
+ Determinizing [#0, strategy: SC]: 2 states
+ Determinized: 2 states - 6ms
+ Minimizing: 2 states.
+ Minimized:2 states - 0ms.
+reversed:2 states - 6ms
+[export 0 gv]reverse wb040scratch_revbGv $wb040scratch_base::
+reversing:2 states
+Writing to Session/2026_08_22_02_23_14/Result/export_0_pre.gv
+ Determinizing [#0, strategy: SC]: 2 states
+ Determinized: 2 states - 1ms
+ Minimizing: 2 states.
+ Minimized:2 states - 0ms.
+reversed:2 states - 1ms
+```
+
+All three `reverse`s report `Determinizing […]: 2 states` / `Minimized:2 states` — no drop
+to 1 state, no crash, on any of the three (including the `gv`-exported one, which is the
+one that used to crash). `Session/2026_08_22_02_23_14/Automata Library/` holds
+`wb040scratch_revbNoExport.txt`/`wb040scratch_revbBa.txt`/`wb040scratch_revbGv.txt`, all
+three **byte-identical**:
+
+```text
+lsd_2
+
+0 0
+0 -> 0
+1 -> 1
+
+1 1
+0 -> 1
+1 -> 1
+```
+
+(`lsd_2`, not `msd_2`: `reverse` flips the numeration direction — expected, unrelated to
+WB-040.) Inlined directly in `java_bugfix_wb040.rs` as `CAPTURED_REVERSED`, matching the
+"inline a small captured fixture" convention `java_bugfix_wb014.rs`'s `WRTEST1_CAPTURED`
+already uses — no `fixtures/wb040/` directory was created.
+
+The `Result/` directory additionally holds `export_0_pre.ba` (a genuine, correct read-only
+dump — the `ba` arm never canonizes) and `export_0_pre.gv` (this one now legitimately
+reflects the CLONE-canonized view per the fix, correctly showing only 1 state — the state
+reachable from the reversed graph's stale `q0 = 0` — since that is `canonize()`'s honest
+job on the clone; it no longer corrupts the LIVE object the surrounding `reverse` still
+needed, which is the actual property this fix and this capture are about).
+
+**Before writing any test, the current release build of `walnut-rs`
+(`cargo build -p wr-cli --release`) was run live against the identical repro**, to
+independently re-confirm both WB-040's "Rust port" claim and this port's overall behavior
+on the trigger, rather than trusting either: a fresh `--home-dir` tree with the same
+`Automata Library/wb040scratch_base.txt` and the same three `reverse` commands (adapted
+only for this port's `--home-dir=PATH` argument syntax, which requires the `=` form) through
+the `walnut-rs` binary produced the identical `lsd_2` automaton shown above for all three
+variants — confirming no divergence from fixed Java on the shared observable. Separately,
+inspecting the port's own `Session/*/Result/` directory after the run found **no**
+`_pre.gv`/`_pre.ba` file for any of the three commands — confirming a real, pre-existing
+scope boundary this entry's original "Rust port" bullet didn't call out:
+`wr_cli::prover::tests::export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded`
+(pre-existing, unchanged by this capture) already pins that `[export …]` on `reverse` is
+still parsed-and-discarded, never reaching `wr_core::determinize::ExportRequest` at all —
+so this literal sequence cannot, by itself, exercise the clone-before-canonize primitive
+the way Java's `ReverseTest#testWB040_…` now does. `java_bugfix_wb040.rs` therefore also
+directly exercises `wr_cli::prover_helper::export_automata_to`'s `gv` arm at the primitive
+level, on a fixture matching real `walnut-java`'s own new
+`AutomatonWriterTest#testWriteToGV_doesNotMutateTheOriginalAutomaton` shape (a real,
+declared-but-unreachable-from-`q0` third state) — proving the architectural claim directly
+rather than only inferring it from `ExportRequest`'s `&Automaton` signature.
+
+The hand-authored `Automata Library`/`Command Files` scratch files and the worktree were
+removed afterward, matching every recipe above.

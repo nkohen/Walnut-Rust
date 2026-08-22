@@ -2779,10 +2779,60 @@ bug costs a silent wrong answer somewhere downstream.
   work that wires `[export …]` into the remaining `Commands/*` arms (see
   `wr_cli::prover`'s `export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded`):
   the port must keep exporting a copy, and must NOT "fix" the divergence by matching Java here.
-- **Upstream:** not filed. The Java-side fix is a one-liner in either direction — have `writeToGV`
-  canonize a `clone()`, or (better, since `exportAutomata` is called from a hot dispatcher) drop
-  the `canonize()` and accept the un-permuted state numbering in the `.gv`, which is a rendering
-  detail.
+- **Upstream:** **fixed**, `walnut-java` commit `0cf02d3` (branch `bugfix/wb-040`, stacked on
+  `bugfix/wb-036`). Took option (a) from the two this entry originally offered: `writeToGV` now
+  canonizes a `clone()` of the automaton and renders from the clone, leaving the caller's original
+  `Automaton` object untouched — chosen specifically because it matches the shape this port had
+  already independently converged on (`wr_cli::prover_helper::export_automata`'s `gv` arm, per the
+  "Rust port" bullet above), and because `[export …]` is an opt-in, per-query debugging flag rather
+  than something on every hot path, so `clone()`'s cost is not a real concern there — giving closer
+  cross-engine parity with no countervailing performance reason to prefer option (b) (dropping
+  `canonize()` entirely). Verified live against freshly built jars, before and after, using a
+  fixture shaped to actually trigger the stale-`q0` bug (state 1 has no edge back to state 0, so
+  post-reversal, stale `q0 = 0` can only reach itself): pre-fix, `reverse revb $base::` and
+  `[export 0 ba]reverse revb2 $base::` both succeed with 2 states while `[export 0 gv]reverse revb3
+  $base::` drops to 1 state and crashes with `IndexOutOfBoundsException`, matching this entry's own
+  recorded trigger exactly; post-fix, all three succeed identically with 2 states. The already-
+  canonical control case (`[export * gv] eval e "?msd_2 Ei i < x"::`) produces byte-identical `.gv`
+  output before and after, confirming the fix is targeted (no change to the common, non-buggy case).
+  Two new Java tests: `AutomatonWriterTest#testWriteToGV_doesNotMutateTheOriginalAutomaton`
+  (constructs an automaton with a genuinely unreachable state and confirms `writeToGV` leaves the
+  original object's state count untouched while the written `.gv` file still legitimately reflects
+  the canonized/trimmed view) and `ReverseTest#testWB040_exportGvDuringReverseDoesNotDropAStateOrCrash`
+  (the full `reverse`+`[export gv]` repro via real `Prover` dispatch, compared against the no-export
+  and `ba`-exported baselines by language equivalence). Full `./mvnw -q test` green throughout.
+- **Resolved (2026-08-22) — divergence CLOSED, not a port bug fixed.** Like WB-014, this is a PR in
+  this series where the Rust port never reproduced the Java bug in the first place — see the "Rust
+  port" bullet above, unchanged and still accurate: `wr_core::determinize::ExportRequest` hands its
+  sink a shared `&Automaton`, so this port's export hook cannot mutate the automaton being
+  determinized even in principle, and `wr_cli::prover_helper::export_automata`'s `gv` arm has
+  always explicitly written a deep clone before canonizing it. So there is **no walnut-rs code
+  change in this PR** — what changed is that Java now ALSO avoids the mutation (by a different
+  mechanism: cloning inside `writeToGV` itself, vs. this port's clone-before-call-time at the
+  `wr-cli` boundary), so the divergence this entry originally recorded ("Rust safe, Java crashes on
+  a `reverse`+`[export gv]` sequence") is now closed: **both engines are safe on the trigger, and
+  the ordinary `reverse` result (no export / `ba` export / `gv` export) is the same automaton on
+  both sides.** That claim was independently re-verified rather than trusted from the Java commit
+  message: a release build of `walnut-rs` was run live against this entry's own trigger sequence
+  (`reverse …$base::`, `[export 0 ba]reverse …$base::`, `[export 0 gv]reverse …$base::` over the
+  same stale-`q0` fixture) before any test was written, confirming all three still succeed with 2
+  states — and, separately, confirming a real, pre-existing scope boundary this entry's "Rust port"
+  bullet didn't call out: `[export …]` on `reverse` (and every other non-`eval`/`def` command) is
+  still parsed-and-discarded, never actually reaching `ExportRequest` at all yet (`wr_cli::prover`'s
+  `export_metacommands_on_a_non_eval_command_are_still_accepted_and_discarded`, pre-existing,
+  unchanged by this PR). New differential coverage in `tests/differential/tests/
+  java_bugfix_wb040.rs` (checked against a fresh capture from `walnut-java`'s `bugfix/wb-040`
+  branch, commit `0cf02d3`) closes the gap that boundary leaves open, in two parts: the literal
+  `reverse`+`[export …]` sequence run to completion through real `Prover` dispatch (byte-identical
+  output, plus `wr_core::equiv` semantic equivalence per this project's Prime Directive, against all
+  three variants — matching real fixed `walnut-java`), and a second, primitive-level test exercising
+  `wr_cli::prover_helper::export_automata_to`'s `gv` arm directly on a fixture shaped exactly like
+  Java's own new `AutomatonWriterTest` regression test (a real, declared-but-unreachable-from-`q0`
+  state), proving the ORIGINAL automaton is left with its full state count after the export and only
+  the rendered `.gv` file reflects the canonized/trimmed view — the actual architectural claim this
+  entry's "Rust port" bullet makes, demonstrated directly rather than only inferred from the type
+  signature, and the part the literal `reverse` sequence alone cannot exercise while its export arm
+  remains unwired.
 
 ---
 
