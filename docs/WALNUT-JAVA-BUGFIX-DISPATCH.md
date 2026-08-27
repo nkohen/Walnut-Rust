@@ -1,11 +1,13 @@
 # Dispatch plan: upstream Walnut (Java) bug-fix PRs, then port the fixes
 
-Status: **DRAFT — plan only, nothing executed, nothing filed upstream.** Written 2026-08-20,
-revised the same day after scoping feedback: **this round targets functionality only** — a bug
-qualifies if and only if it makes the program compute a wrong answer or crash on reachable input.
-Dead code, discoverability gaps, diagnostic/log-text-only differences, and export-format cosmetics
-are explicitly OUT, regardless of how they were labeled in `docs/WALNUT-BUGS.md`'s original
-severity tags. This is not a technical-debt cleanup pass.
+Status: **EXECUTED — all 18 planned PRs complete on both repos as local branches (2026-08-20
+through 2026-08-27); nothing filed/pushed upstream yet, pending the user's go-ahead.** Written
+2026-08-20, revised the same day after scoping feedback: **this round targets functionality
+only** — a bug qualifies if and only if it makes the program compute a wrong answer or crash on
+reachable input. Dead code, discoverability gaps, diagnostic/log-text-only differences, and
+export-format cosmetics are explicitly OUT, regardless of how they were labeled in
+`docs/WALNUT-BUGS.md`'s original severity tags. This is not a technical-debt cleanup pass. See
+"Execution status" below for the full per-PR branch/commit table.
 
 Once a fix is upstream, it gets ported into `walnut-rs` and the relevant differential tests get
 re-pointed at the fixed `walnut-java` branch/commit — closing the loop CLAUDE.md's "log it, don't
@@ -13,6 +15,64 @@ silently fix or replicate it" rule opened for each entry.
 
 This doc is the plan, not the execution log. Nothing here should be treated as done until a
 corresponding PR/commit exists and this doc is updated to say so.
+
+## Execution status (started 2026-08-20, all 18 PRs complete as of 2026-08-27)
+
+**All 18 PRs are built, reviewed, and merge-ready on both repos.** `docs/WALNUT-BUGS.md`'s 18
+entries (WB-001 through WB-043, per the batching plan below) are each updated with a "Rust port:
+fixed" status line. Every `wr-core`/`wr-logic`-touching branch went through the full implementer →
+two-independent-split-context-adversarial-reviewer → fixer loop (never the same model authoring and
+reviewing trust-critical code); `wr-cli`/`wr-io`-only branches (no `wr-core`/`wr-logic` diff) were
+reviewed directly by the coordinator per this project's established precedent, not the full loop.
+**Nothing is pushed or opened as a real PR anywhere yet** — these are local branches only, on both
+`walnut-java` and `walnut-rs`, awaiting the user's go-ahead to push/open real PRs.
+
+| PR | Entries | walnut-java branch (tip) | walnut-rs branch (tip) | wr-core/wr-logic? |
+|---|---|---|---|---|
+| PR-11 (dry run) | WB-002, WB-012, WB-037, WB-044 | `bugfix/wb-002-012-037-044` (`d757221`) | `bugfix/wb-002-012-037-044` (`8267429`) | yes — reviewed |
+| PR-2 | WB-008 + WB-009 | `bugfix/wb-008-009` (`b5d462b`) | `bugfix/wb-008-009` (`64f1fdd`) | yes — reviewed |
+| PR-3 | WB-016 | `bugfix/wb-016` (`d6e9799`) | `bugfix/wb-016` (`b5ba61e`) | yes — reviewed |
+| PR-4 | WB-010 | `bugfix/wb-010` (`c5ff914`) | no dedicated branch pointer was ever created — the work landed as commit `a1e9167` (stacked between PR-3's and PR-5's tips; reachable from every later branch) | yes — reviewed |
+| PR-5 | WB-024 + WB-025 | `bugfix/wb-024-025` (`446dab2`) | `bugfix/wb-024-025` (`a57eabe`) | yes — reviewed (found + fixed a real off-by-one in code authored during this same effort) |
+| PR-6 | WB-032 | `bugfix/wb-032` (`18b7c4b`) | `bugfix/wb-032` (`5f94f11`) | yes — reviewed |
+| PR-7 | WB-021 | `bugfix/wb-021` (`c0d7fff`) | `bugfix/wb-021` (`b314d15`) | no — `wr-io` only, coordinator-reviewed |
+| PR-8 | WB-038 | `bugfix/wb-038` (`601a9d2`) | `bugfix/wb-038` (`f863334`) | yes — reviewed (subtle: distinguishing reader-unreachable from still-reachable defensive machinery) |
+| PR-9 | WB-035 | `bugfix/wb-035` (`7f54eff`) | `bugfix/wb-035` (`fa4c844`) | yes — reviewed (fresh dead-state-marker design, 400-case Java-side differential + independent Rust-side structural proof) |
+| PR-10 | WB-043 | `bugfix/wb-043` (`f846cad`) | `bugfix/wb-043` (`5418112`) | yes — reviewed |
+| PR-12 | WB-013 + WB-033 + WB-034 | `bugfix/wb-013-033-034` (`c75e630`) | `bugfix/wb-013-033-034` (`ff12188`) | yes — **4 review rounds**: 2 real wrong-answer-camouflage bugs found and fixed in the port's own fix (see file for the full arc), resolved with a structural rewrite that eliminates the bug class rather than patching another instance |
+| PR-13 | WB-011 | `bugfix/wb-011` (`50dab9e`) | `bugfix/wb-011` (`a8a39c2`) | no — `wr-io` only, coordinator-reviewed |
+| PR-14 | WB-014 | `bugfix/wb-014` (`6580f71`) | `bugfix/wb-014` (`e2ba411`) | no — "divergence closed" PR, port never had the bug (architecturally immune), doc + differential test only |
+| PR-15 | WB-026 | `bugfix/wb-026` (`051208a`) | `bugfix/wb-026` (`87e8e25`) | no — `wr-cli` only, coordinator-reviewed |
+| PR-16 | WB-036 | `bugfix/wb-036` (`732bec0`) | `bugfix/wb-036` (`a5de68a`) | yes — reviewed |
+| PR-17 | WB-040 | `bugfix/wb-040` (`0cf02d3`) | `bugfix/wb-040` (`f9b38ad`) | no — "divergence closed" PR, port never had the bug (exports a defensive clone by design), doc + differential test only |
+| PR-18 | WB-019 | `bugfix/wb-019` (`cee8352`) | `bugfix/wb-019` (`faf44d7`) | yes — reviewed (net-deletion diff, retired now-dead escape-quirk-replication code) |
+| PR-1 | WB-001 | `bugfix/wb-001` (`14509f1`) | `bugfix/wb-001` (`06f4ba5`) | yes — reviewed with the highest scrutiny in the series (critical-severity core-algorithm fix; both sides independently verified with exhaustive/cross-oracle sweeps in the tens/hundreds of thousands of cases before review even started) |
+
+Each walnut-java branch is stacked on the previous in landing order (`main` ← PR-11 ← PR-2 ← PR-3
+← PR-4 ← PR-5 ← PR-6 ← PR-7 ← PR-8 ← PR-9 ← PR-10 ← PR-12 ← PR-13 ← PR-14 ← PR-15 ← PR-16 ← PR-17 ←
+PR-18 ← PR-1). Each walnut-rs branch is stacked the same way, with differential tests capturing
+real output from the FIXED (not-yet-merged) walnut-java jar at each stage — see e.g.
+`tests/differential/tests/java_bugfix_wb002.rs`'s module docs for the pattern every subsequent one
+follows. `cargo test --workspace` is green on the final `bugfix/wb-001` tip; the gated-slow golden
+corpus is unchanged at 670/675 pass (1 known pre-existing text-only divergence, fixture 383,
+unrelated to this batch) throughout every PR in the stack — zero regressions introduced by this
+entire 18-PR effort.
+
+**WB-018 and WB-027 remain explicitly out of this batch**, held for a separate future
+design/semantics decision per this doc's own scoping section below — not mechanical fixes, not
+started.
+
+**Process note (2026-08-20):** dispatching a new walnut-java branch build concurrently with a
+walnut-rs branch's own differential-capture step (which also checks out and builds a walnut-java
+jar in the same shared clone) is a real fleet-hygiene risk — not file-edit collision (the two
+tasks don't touch the same files), but concurrent `mvnw` builds contending over one `target/`
+directory. No corruption occurred, but the sequencing was tightened afterward to avoid a repeat:
+don't dispatch a new walnut-java-side branch while a walnut-rs-side branch's jar-build/capture step
+may still be in flight.
+
+**Next step:** nothing further is scheduled automatically. Pushing branches and opening real PRs
+upstream (on `walnut-java`) and in this repo requires the user's explicit go-ahead per this
+project's standing risky-action confirmation rule — ask before pushing anything.
 
 ---
 

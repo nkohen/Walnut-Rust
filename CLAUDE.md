@@ -1246,3 +1246,37 @@ harness change; `subset-filter.json` records `drop_relevant_count: 0`; the only 
 left are the four deferred-OTF ones and the only failure is the long-standing text-only
 fixture 383. `cargo test --workspace` green (1631); `fmt`/`clippy` clean; fuzz targets and a
 fresh-seed 5,000-query differential-gen run clean.
+
+**The 18-PR walnut-java bug-fix-then-port sweep (`docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`,
+2026-08-20 through 2026-08-27) is complete.** Following the user's original request to fix
+documented Walnut (Java) bugs upstream first, each as a reviewable standalone PR, then port
+the fixes into walnut-rs with differential testing against the fixed walnut-java branches —
+this round scoped to FUNCTIONALITY only (wrong computed output or a crash on reachable
+input; dead code, discoverability, and log-text-only differences explicitly excluded per the
+user's own correction mid-effort). All 18 planned PRs (covering 27 of `docs/WALNUT-BUGS.md`'s
+44 entries; WB-018 and WB-027 held out for a future semantics decision) are built as stacked
+local branches on both repos — implementer → (for any `wr-core`/`wr-logic` diff)
+two-independent-split-context-adversarial-reviewer round, different model from the author →
+fixer, repeated until both reviewers return no unresolved correctness finding. Full branch/
+commit table in `docs/WALNUT-JAVA-BUGFIX-DISPATCH.md`'s "Execution status" section.
+
+The two units worth calling out specifically: **PR-12** (WB-013+033+034, the `getNS().get(i)`
+null-dereference class) went through four review rounds, each finding a genuine, live-verified
+wrong-answer bug in the PREVIOUS round's own fix — a custom-base track's `NumberSystem` kept
+being reconstructed via an ever-more-refined but still-guessable discriminator, until the
+fourth round replaced discrimination entirely with directly computing the one value
+(`ns.equality`) any caller actually reads, closing the whole bug class by construction rather
+than patching another instance of it. **PR-1** (WB-001, held for last as planned) fixed a
+critical-severity silent-wrong-answer bug in the core Valmari minimization algorithm itself —
+a DFA whose `q0` can't reach any accepting state used to silently alias onto whatever
+partition got block id 0, corrupting the minimized language. Both sides were verified with
+exhaustive/cross-oracle sweeps (Java: 196,798 cases against three independent oracles; Rust:
+100,572-case exhaustive sweep plus an 18,308-case cross-check against `wr-cts`'s independent
+Moore minimizer) BEFORE either adversarial review round started, and both reviewers
+independently reproduced the headline verification artifacts from scratch rather than
+trusting the implementer's report. Golden corpus and `cargo test --workspace` stayed green
+(zero regressions) through every one of the 18 PRs.
+
+**Nothing has been pushed to any remote and no real PR has been opened anywhere** — this
+whole effort is local, stacked branches on both `walnut-java` and `walnut-rs`, awaiting the
+user's explicit go-ahead per this project's standing risky-action confirmation rule.
