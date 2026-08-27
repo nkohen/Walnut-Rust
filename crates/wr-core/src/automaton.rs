@@ -1753,8 +1753,9 @@ impl Automaton {
         // unified NFA-shaped table) — not replicated.
         self.fa = crate::minimize::minimize_with_logging(&self.fa, logging).expect(
             "minimize's only OTHER precondition (determinism) always holds here -- the \
-             already-deterministic branch above skips reachability trimming, so WB-001 \
-             (docs/WALNUT-BUGS.md) is reachable, faithfully, not a panic",
+             already-deterministic branch above skips reachability trimming, which used to \
+             reach WB-001 (docs/WALNUT-BUGS.md) before that guard was fixed; this path is \
+             simply correct now",
         );
         // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- see
         // `Automaton::canonized`'s doc comment on why this is manual here.
