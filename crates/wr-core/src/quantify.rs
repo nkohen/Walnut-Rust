@@ -80,9 +80,13 @@
 //!   language-preserving, so the
 //!   divergence is invisible to the correctness bar, and it is the *safer* choice: it
 //!   establishes [`crate::minimize::minimize`]'s documented precondition (every state
-//!   reachable from `q0`; violate it and the "q0 aliasing quirk", `docs/WALNUT-BUGS.md`
-//!   WB-001, silently flips the language) rather than leaving it resting on the separate
-//!   argument that subset construction from `{q0}` already emits only reachable states.
+//!   reachable from `q0`) rather than leaving it resting on the separate argument that
+//!   subset construction from `{q0}` already emits only reachable states. When this was
+//!   written that precondition was load-bearing for CORRECTNESS -- violating it hit the
+//!   "q0 aliasing" bug, `docs/WALNUT-BUGS.md` WB-001, which silently flipped the
+//!   language. WB-001 is now fixed (`walnut-java` commit `14509f1`), so the precondition
+//!   only governs minimality; the extra trim remains as-is, still language-preserving
+//!   and still a size reduction, just no longer a correctness safety net.
 //!   It also shrinks the input to the exponential subset construction. Note this is a
 //!   *narrower* divergence than it looks: [`crate::automaton::Automaton::determinize_and_minimize`]
 //!   (ported in U2) reproduces Java's conditional trim faithfully and is *not* used here,
@@ -285,17 +289,19 @@ pub fn quantify_with_ctx(
             //   `quantify_on_a_zero_state_lsd_automaton_is_a_silent_noop`.
             //
             // One asymmetry worth recording here rather than rediscovering later: this
-            // arm can reach `docs/WALNUT-BUGS.md` WB-001 where the msd arm cannot.
+            // arm used to reach `docs/WALNUT-BUGS.md` WB-001 where the msd arm cannot.
             // `fix_trailing_zeros_problem` closes with `just_minimize`, which never trims
             // (Java's `justMinimize` doesn't either — see `logicalops.rs`'s note on that
             // helper), whereas `fix_leading_zeros_problem` closes with
             // `determinize_and_minimize_from`, whose subset construction re-establishes
             // `minimize`'s reachability precondition on the way through. The ordinary
-            // path is unaffected — `quantify_helper`'s own determinize+minimize leaves
-            // every state reachable from `q0` — so this can only bite when the helper
+            // path was unaffected — `quantify_helper`'s own determinize+minimize leaves
+            // every state reachable from `q0` — so it could only bite when the helper
             // SHORT-CIRCUITED (empty label set, or a label-less automaton) on an input
-            // that already had an unreachable state. Java has the identical shape at the
-            // identical call site, so it is ported verbatim, not guarded.
+            // that already had an unreachable state. WB-001 is fixed (`walnut-java`
+            // commit `14509f1`, ported in `crate::minimize::minimize`), so both arms now
+            // compute the right language; the structural asymmetry itself is unchanged
+            // and still costs minimality on this arm.
             //
             // NOTE the asymmetry this creates for the automata-index counter: unlike its
             // msd sibling, this fixup closes with `just_minimize` and never reaches the
@@ -918,20 +924,24 @@ mod tests {
     // `fix_leading_zeros_problem`/`quantify`), generated over the UNPINNED automaton
     // family.
     //
-    // `phi` is trimmed at construction time so the FIRST of the two explicit `not`
-    // calls below cannot hit `docs/WALNUT-BUGS.md` WB-001 (`not`'s `just_minimize`
-    // calls `minimize` directly with no trim of its own -- the same reasoning
-    // `logicalops.rs`'s De Morgan properties document for their own `not` calls).
-    // WB-001's actual precondition is every state forward-reachable from `q0` (see
-    // `minimize.rs`'s "q0 aliasing quirk" section). The SECOND `not` call (on
-    // `exists_not_phi`, `quantify`'s output) is safe for a DIFFERENT, specific reason,
-    // not just "because `quantify` trims internally": `quantify`'s own
-    // `subset_construction` call never materializes an unreachable metastate (every
-    // metastate it emits is discovered by BFS from the seed), so every state `minimize`
-    // sees there is already forward-reachable, and Valmari's quotient cannot orphan a
-    // reachable block. If `subset_construction` ever changed to pre-allocate or
-    // totalize a dead/unreachable metastate, this argument (and this test's safety
-    // from WB-001) would need re-deriving, not just re-asserting.
+    // `phi` USED TO BE trimmed at construction time so the FIRST of the two explicit
+    // `not` calls below could not hit `docs/WALNUT-BUGS.md` WB-001 (`not`'s
+    // `just_minimize` calls `minimize` directly with no trim of its own -- the same
+    // reasoning `logicalops.rs`'s De Morgan properties documented for their own `not`
+    // calls). WB-001's actual precondition is every state forward-reachable from `q0`.
+    // WB-001 is fixed (`walnut-java` commit `14509f1`, ported in `minimize.rs`), so the
+    // trim is removed and the generator's own pinned invariant -- q0 self-looping on
+    // "x = 0" -- now survives unconditionally, where trimming could previously collapse
+    // it into `trim`'s canonical dead automaton.
+    //
+    // The SECOND `not` call (on `exists_not_phi`, `quantify`'s output) was always safe
+    // for a DIFFERENT, specific reason, not just "because `quantify` trims internally":
+    // `quantify`'s own `subset_construction` call never materializes an unreachable
+    // metastate (every metastate it emits is discovered by BFS from the seed), so every
+    // state `minimize` sees there is already forward-reachable, and Valmari's quotient
+    // cannot orphan a reachable block. That argument no longer carries any correctness
+    // weight now that WB-001 is fixed, but it is what still makes `quantify`'s output
+    // minimal, so it is kept rather than deleted.
 
     use proptest::prelude::*;
 
@@ -941,9 +951,9 @@ mod tests {
     /// its own ∃-only property, not a stronger whole-automaton version (see the
     /// section doc comment above for why the weaker pin is enough). Every OTHER
     /// state's "x = 0" transitions, and every state's "x = 1" transitions, are free --
-    /// genuine random structure everywhere except the one pinned edge. Trimmed at the
-    /// end so every state is reachable from `q0` (see the section doc comment's WB-001
-    /// argument).
+    /// genuine random structure everywhere except the one pinned edge. NOT trimmed: the
+    /// trim that used to close this generator existed only to keep WB-001 out of the
+    /// property (see the section doc comment), and WB-001 is fixed.
     fn arb_self_looping_zero_two_track(q_max: usize) -> impl Strategy<Value = Automaton> {
         (1..=q_max).prop_flat_map(|q| {
             let o = prop::collection::vec(0i32..=1, q);
@@ -984,7 +994,6 @@ mod tests {
                     // one invariant this generator exists to guarantee.
                     a.fa.d[0].insert(zero_y0, vec![0]);
                     a.fa.d[0].insert(zero_y1, vec![0]);
-                    a.fa = trim(&a.fa);
                     a
                 },
             )

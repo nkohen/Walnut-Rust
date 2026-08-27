@@ -447,10 +447,12 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
 /// and [`crate::minimize::minimize`] preserves that reachability on an
 /// already-reachable input (Valmari's partition refinement never reintroduces a
 /// pruned-away state) — so both the first and second `SC` call always receive a
-/// reachable, deterministic input, satisfying the real hypothesis. This is also why
-/// the `minimize.rs` WB-001 quirk (`q0` not co-reachable to acceptance) cannot fire on
-/// the intermediate: a reachable automaton with any accepting state has that state
-/// reachable from `q0`, hence `q0` is co-reachable to it. The mid-sequence minimize
+/// reachable, deterministic input, satisfying the real hypothesis. That same argument
+/// is why the `minimize.rs` WB-001 bug (`q0` not co-reachable to acceptance) could
+/// never fire on the intermediate even while it was live: a reachable automaton with any
+/// accepting state has that state reachable from `q0`, hence `q0` is co-reachable to it.
+/// (WB-001 is now fixed — `walnut-java` commit `14509f1` — so this is a note about why
+/// this path was never affected, not a live constraint.) The mid-sequence minimize
 /// is therefore a genuine performance optimization only (it shrinks what feeds the
 /// potentially-exponential SECOND subset construction — note it's the FIRST one, on
 /// the raw reversed input, that has no such shrinking and is the more surprising cost

@@ -1678,20 +1678,29 @@ impl Automaton {
     /// `determinize`/`minimize` also build fresh values rather than mutating), so the
     /// port reassigns `self.fa` at each step rather than passing `&mut self.fa` through.
     ///
-    /// # `docs/WALNUT-BUGS.md` WB-001 is reachable through this method, faithfully
+    /// # `docs/WALNUT-BUGS.md` WB-001 used to be reachable through this method — FIXED
     ///
     /// When `self.fa` is ALREADY deterministic, the `trim` step above is skipped
     /// entirely (matching `Automaton.java:385` exactly — Java's guard is the same
     /// `!isDeterministic()`), so `minimize` below is called with NO guarantee every
-    /// state is reachable from `q0`. That is WB-001's exact precondition violation: an
+    /// state is reachable from `q0`. That was WB-001's exact precondition violation: an
     /// already-deterministic automaton with a state unreachable from `q0` that also
-    /// cannot reach acceptance gets silently corrupted (a real state's language flips
-    /// from `∅` to `Σ*` in the minimal Walnut-upstream trigger case — see WB-001's
-    /// entry for the minimal example, and `determinize_and_minimize_reaches_wb_001_on_an_already_deterministic_input`
-    /// below, which pins this exact call path). This is faithful to Java (which has
-    /// the identical bug at the identical call site) and therefore ported verbatim per
-    /// `CLAUDE.md`'s mechanical-port rule — NOT fixed here by adding an unconditional
-    /// trim, which would be an undeclared behavioral divergence from `Automaton.java`.
+    /// cannot reach acceptance got silently corrupted (`∅` came back as `Σ*` in the
+    /// minimal trigger case).
+    ///
+    /// **This call site is fixed, upstream and here** — not by adding an undeclared
+    /// unconditional `trim` (which would still be a divergence from `Automaton.java`),
+    /// but inside Valmari itself: `walnut-java` commit `14509f1` made `replaceFields`
+    /// route a parked `q0` to the canonical empty-language automaton, and
+    /// [`crate::minimize::minimize`] ports that guard. This method's conditional trim is
+    /// therefore still a faithful port of `Automaton.java:385`, and it no longer hands
+    /// `minimize` an input it can get wrong. Pinned by
+    /// `determinize_and_minimize_on_an_already_deterministic_unreachable_input_is_correct`
+    /// below, which still exercises this exact call path.
+    ///
+    /// What the skipped `trim` DOES still cost is minimality: an unreachable-from-`q0`
+    /// but co-reachable state survives as an extra block, so the result can have more
+    /// states than the minimal DFA. Faithful to Java, which behaves identically.
     pub fn determinize_and_minimize(&mut self) {
         self.determinize_and_minimize_with_ctx(None, &mut crate::logging::Logging::new());
     }
@@ -2709,10 +2718,16 @@ mod tests {
     }
 
     #[test]
-    fn determinize_and_minimize_reaches_wb_001_on_an_already_deterministic_input() {
-        // Pins `docs/WALNUT-BUGS.md` WB-001 at this exact call boundary (adversarial-
-        // review finding): `determinize_and_minimize`'s already-deterministic branch
-        // skips `trim`, so `minimize` runs without its reachability precondition.
+    fn determinize_and_minimize_on_an_already_deterministic_unreachable_input_is_correct() {
+        // The former `..._reaches_wb_001_on_an_already_deterministic_input`: this call
+        // boundary is one of `docs/WALNUT-BUGS.md` WB-001's four documented reach paths
+        // (an adversarial-review finding of Phase 2 U2) — `determinize_and_minimize`'s
+        // already-deterministic branch skips `trim`, so `minimize` runs without its
+        // reachability precondition. The test is KEPT and FLIPPED, not deleted: it still
+        // exercises exactly that path, and now asserts the correct answer, which
+        // `walnut-java` commit `14509f1` and this port's matching `minimize` guard both
+        // produce.
+        //
         // Minimal Walnut-upstream trigger: q0 non-accepting self-looping, a SEPARATE
         // accepting self-looping state unreachable from q0. True language is `∅`.
         let mut d0 = BTreeMap::new();
@@ -2737,15 +2752,19 @@ mod tests {
 
         a.determinize_and_minimize();
 
-        // Faithful to Java (identical bug, identical call site) -- ported verbatim
-        // per CLAUDE.md's mechanical-port rule, NOT fixed. If this assertion ever
-        // starts failing because a future change added an unconditional trim, that is
-        // a deliberate, documented divergence decision to make explicitly, not an
-        // accidental one this test should silently absorb.
+        // Pre-fix, this asserted `!a.is_empty()` -- the ported WB-001 corruption turned
+        // `∅` into `Σ*` right here. Post-fix (both engines), the language survives.
         assert!(
-            !a.is_empty(),
-            "documents WB-001: the empty-language automaton is corrupted to Σ* here"
+            a.is_empty(),
+            "WB-001 regression: the empty-language automaton was corrupted to Σ*"
         );
+        // ... and specifically to the canonical empty-language shape `minimize`'s guard
+        // produces, so a future regression that merely happened to stay empty-ish (e.g.
+        // an added trim reaching the same answer another way) is still visible as a
+        // change here rather than silently absorbed.
+        assert_eq!(a.fa.q, 1);
+        assert_eq!(a.fa.o, vec![0]);
+        assert!(a.fa.d[0].is_empty());
     }
 
     #[test]

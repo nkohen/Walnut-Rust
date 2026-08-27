@@ -15,9 +15,9 @@
 //! decision this unit authors a small standalone minimizer instead. Consequently this
 //! file is **not** a port of any Java source, and `CLAUDE.md`'s mechanical-port rule 2
 //! ("faithful behavior, including quirks") does **not** apply to it: it implements the
-//! textbook-correct algorithm, and where Walnut's Valmari minimizer is known to be wrong
-//! (`docs/WALNUT-BUGS.md` WB-001, see below) this deliberately does **not** reproduce the
-//! defect.
+//! textbook-correct algorithm. While `docs/WALNUT-BUGS.md` WB-001 was live this was also
+//! the file's one deliberate *divergence* from `wr_core::minimize` (see below); WB-001 is
+//! fixed, so the two now agree there too.
 //!
 //! # The algorithm (Moore, 1956)
 //!
@@ -57,23 +57,26 @@
 //!   `wr_core::trim::trim` first). This function has no such precondition: it prunes
 //!   forward-unreachable states itself, as step 1 above.
 //!
-//! # `docs/WALNUT-BUGS.md` WB-001 is deliberately NOT reproduced here
+//! # `docs/WALNUT-BUGS.md` WB-001 was never reproduced here — and is now fixed on the
+//! Valmari side too
 //!
 //! WB-001 (verified by re-reading `wr-core/src/minimize.rs`'s module docs and the
 //! `WALNUT-BUGS.md` entry): in Walnut's Valmari, states found non-co-reachable are parked
 //! outside every block's tracked range but keep the block id `0` they were initialized
-//! with, and `replaceFields` computes the new start state as `blocks.S[q0]`
+//! with, and `replaceFields` computed the new start state as `blocks.S[q0]`
 //! unconditionally. So if `q0` cannot reach an accepting state *while some accepting
-//! state exists elsewhere*, `q0` silently aliases onto block `0` — which may be the
+//! state exists elsewhere*, `q0` silently aliased onto block `0` — which may be the
 //! accepting block. Its minimal trigger (2 states, alphabet size 1: a non-accepting
-//! self-looping `q0` and a disjoint accepting self-loop) turns the language `∅` into
-//! `Σ*`. `wr_core::minimize::minimize` ports that verbatim, on purpose.
+//! self-looping `q0` and a disjoint accepting self-loop) turned the language `∅` into
+//! `Σ*`. `wr_core::minimize::minimize` ported that verbatim until `walnut-java` commit
+//! `14509f1` fixed it upstream and the port followed.
 //!
-//! Nothing in Moore's algorithm has an analogue of that parked-element/aliasing step, and
-//! this implementation additionally prunes unreachable states up front, so the trigger
-//! shape cannot arise. `moore_gives_the_correct_answer_on_wb_001s_trigger` pins the
-//! divergence explicitly (asserting *both* sides: the wrong Valmari answer and the right
-//! Moore one), so it can never regress into an accidental, undocumented agreement.
+//! Nothing in Moore's algorithm ever had an analogue of that parked-element/aliasing
+//! step, and this implementation additionally prunes unreachable states up front, so the
+//! trigger shape could not arise here in the first place — this file was already right
+//! about that input before Valmari was. `both_minimizers_agree_on_wb_001s_former_trigger`
+//! keeps the fixture, now asserting that *both* sides answer `∅`, so a WB-001 regression
+//! in `wr-core` shows up in this crate too rather than only in `wr-core`'s own tests.
 //!
 //! # Scope note
 //!
@@ -637,17 +640,17 @@ mod tests {
     // ------------------------------------------------- WB-001: deliberate divergence
 
     #[test]
-    fn moore_gives_the_correct_answer_on_wb_001s_trigger() {
+    fn both_minimizers_agree_on_wb_001s_former_trigger() {
         // `docs/WALNUT-BUGS.md` WB-001's minimal verified trigger, verbatim: q0 is
         // non-accepting and self-loops; state 1 is a disjoint accepting self-loop that
         // q0 can never reach. The true language is ∅.
         //
-        // This test asserts BOTH sides on purpose, so the divergence is pinned rather
-        // than merely described:
-        //   * `wr_core::minimize::minimize` (ported Valmari) answers Σ* — the ported bug.
-        //   * this Moore minimizer answers ∅ — the mathematically correct result.
-        // The cross-check property test below therefore MUST scope its inputs to where
-        // WB-001 cannot fire; see its doc comment.
+        // This test asserts BOTH sides on purpose. It used to pin a DIVERGENCE (Valmari
+        // answered Σ*, the ported WB-001 bug; Moore answered ∅, correctly) under the name
+        // `moore_gives_the_correct_answer_on_wb_001s_trigger`. WB-001 is fixed
+        // (`walnut-java` commit `14509f1`), so it now pins AGREEMENT — kept and flipped,
+        // not deleted, so a regression in either implementation is caught from here as
+        // well as from `wr-core`'s own suite.
         let fa = Fa {
             true_false: None,
             q0: 0,
@@ -661,18 +664,24 @@ mod tests {
         let valmari = wr_core::minimize::minimize(&fa).unwrap();
         assert_eq!(valmari.q, 1);
         assert!(
-            valmari.is_accepting(valmari.q0),
-            "ported WB-001: Valmari turns ∅ into Σ* here"
+            !valmari.is_accepting(valmari.q0),
+            "WB-001 regression: Valmari turned ∅ into Σ* here before commit 14509f1"
         );
+        assert!(valmari.is_language_empty());
 
         let moore = minimize(&fa).unwrap();
         assert_eq!(moore.q, 1);
         assert!(
             !moore.is_accepting(moore.q0),
-            "Moore is not bound by the mechanical-port rule and gets this right"
+            "Moore never had this defect: it prunes unreachable states up front"
         );
         assert!(moore.is_language_empty());
         assert_eq!(language_equivalent(&fa, &moore), Ok(true));
+        // The oracle needs total DFAs; Valmari returns a PARTIAL one (its dead state has
+        // no transitions at all), so totalize before comparing the two minimizers.
+        let mut valmari_total = valmari.clone();
+        valmari_total.totalize(0);
+        assert_eq!(language_equivalent(&valmari_total, &moore), Ok(true));
     }
 
     #[test]
@@ -994,29 +1003,28 @@ mod tests {
         ///
         /// # Two adjustments, and why each is the right one rather than a fudge
         ///
-        /// 1. **`trim` on the Valmari side — scoping away `docs/WALNUT-BUGS.md` WB-001.**
-        ///    Verified from `wr-core/src/minimize.rs`'s module docs and the WB-001 entry:
-        ///    the bug fires only when `q0` cannot reach an accepting state *while some
-        ///    accepting state exists*. `wr_core::trim::trim` keeps exactly the states
-        ///    that are both forward-reachable from `q0` and co-reachable to acceptance,
-        ///    so after it either every state can reach acceptance (trigger impossible) or
-        ///    no accepting state exists at all in `trim`'s canonical 1-state dead
-        ///    automaton (trigger impossible again). This is the convention already used
-        ///    for exactly this situation by `minimize.rs`'s own Tier-4 properties and by
-        ///    `logicalops.rs`'s De Morgan tests — re-derived here rather than copied,
-        ///    because those call sites trim for a *caller-side* reason (`not`/
-        ///    `just_minimize` not establishing the precondition) and this one trims for
-        ///    the property's own reason.
+        /// 1. **`trim` on the Valmari side — for MINIMALITY, no longer for
+        ///    `docs/WALNUT-BUGS.md` WB-001.** This adjustment originally had two jobs and
+        ///    now has one. WB-001 (the q0-aliasing bug, which fired only when `q0` could
+        ///    not reach an accepting state *while some accepting state existed*) is fixed
+        ///    — `walnut-java` commit `14509f1`, ported in `wr_core::minimize` — so
+        ///    scoping it away is no longer needed, and
+        ///    `both_minimizers_agree_on_wb_001s_former_trigger` above now asserts the two
+        ///    minimizers AGREE on that very input rather than diverge.
         ///
-        ///    Scoping (option (a)) is the right framing rather than "assert the two
-        ///    disagree on WB-001 inputs" (option (b)): the question this property asks is
-        ///    "do two implementations of the same mathematics agree", which is only
-        ///    meaningful where the mathematically correct answer is unambiguous. The
-        ///    WB-001 divergence is a *deliberate*, separately pinned difference — see
-        ///    `moore_gives_the_correct_answer_on_wb_001s_trigger` above, which asserts it
-        ///    directly on WB-001's own minimal trigger. `trim` is itself property-tested
-        ///    as language-preserving, so this stays an end-to-end check against the
-        ///    ORIGINAL automaton's language.
+        ///    The trim stays because of the OTHER, independent reason, which this
+        ///    property's exact-state-count assertion genuinely depends on:
+        ///    `wr_core::minimize` performs no forward-reachability pruning of its own
+        ///    (only Valmari's backward pass), while this Moore minimizer prunes
+        ///    unreachable states as step 1. On an untrimmed input a state that is
+        ///    unreachable from `q0` but still co-reachable therefore survives on the
+        ///    Valmari side as extra blocks and not on the Moore side, and the counts
+        ///    diverge for a reason that has nothing to do with either being wrong.
+        ///    `wr_core::trim::trim` keeps exactly the states that are both
+        ///    forward-reachable from `q0` and co-reachable to acceptance, which is
+        ///    precisely the domain on which the two agree state-for-state. `trim` is
+        ///    itself property-tested as language-preserving, so this stays an end-to-end
+        ///    check against the ORIGINAL automaton's language.
         ///
         /// 2. **The dead class — the partial-vs-complete difference.** Valmari drops
         ///    every state that cannot reach acceptance, returning the minimal PARTIAL
@@ -1082,5 +1090,119 @@ mod tests {
             prop_assert_eq!(language_equivalent(&totalized(&valmari), &moore), Ok(true));
             prop_assert_eq!(moore.q, nerode_class_count(&fa));
         }
+    }
+
+    // ------------------------------------------------------------------------------
+    // WB-001: the exhaustive UNTRIMMED cross-check
+    //
+    // Every property above hands `wr_core::minimize` a TRIMMED automaton, because it is
+    // the only domain on which an exact state-count comparison between a minimizer that
+    // prunes forward-unreachable states (this one) and one that does not (Valmari, as
+    // Walnut runs it) is meaningful. That leaves the untrimmed domain -- exactly where
+    // `docs/WALNUT-BUGS.md` WB-001 lived -- checked by neither.
+    //
+    // This sweep closes that gap on the one claim that IS meaningful untrimmed: the two
+    // implementations must agree on the LANGUAGE. It is the strongest evidence for the
+    // WB-001 fix available in this repository, because the oracle is a genuinely
+    // independent minimizer in a different crate, written from scratch (see this module's
+    // header) rather than a re-derivation of Valmari's own logic.
+    // ------------------------------------------------------------------------------
+
+    /// Every TOTAL DFA with exactly `q` states over `alphabet_size` symbols: every
+    /// transition table, every accepting set, every start state. Total (rather than
+    /// partial) because [`minimize`] rejects a partial DFA with [`MooreError::NotTotalDfa`]
+    /// -- totalizing first would perturb the very `q0`-reachability structure under test,
+    /// so the enumeration is restricted instead.
+    fn for_each_small_total_dfa(q: usize, alphabet_size: usize, f: &mut impl FnMut(Fa)) {
+        let slots = q * alphabet_size;
+        let tables = (q as u64).pow(slots as u32);
+        for table in 0..tables {
+            let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); q];
+            let mut rest = table;
+            for slot in 0..slots {
+                let dest = (rest % q as u64) as usize;
+                rest /= q as u64;
+                d[slot / alphabet_size].insert((slot % alphabet_size) as i32, vec![dest]);
+            }
+            for o_mask in 0..(1u32 << q) {
+                let o: Vec<i32> = (0..q).map(|s| i32::from(o_mask >> s & 1 == 1)).collect();
+                for q0 in 0..q {
+                    f(Fa {
+                        true_false: None,
+                        q0,
+                        q,
+                        alphabet_size,
+                        o: o.clone(),
+                        d: d.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// `wr_core::minimize` (ported Valmari, post-WB-001-fix) and this Moore minimizer must
+    /// accept the same language on **untrimmed** input, exhaustively over every total DFA
+    /// with at most 3 states and at most 2 symbols.
+    ///
+    /// Pre-fix, exactly **1,506** of these 18,308 cases disagree -- measured, not inferred,
+    /// by forcing `wr_core::minimize`'s guard condition to `false` and counting instead of
+    /// asserting. That set is not merely the same SIZE as `wb_001_shaped` below, it is
+    /// produced by the same run and both counters land on 1,506: every disagreement is an
+    /// input whose `q0` cannot reach an accepting state while some accepting state exists,
+    /// and every such input disagrees. WB-001's reach across this whole domain is exactly
+    /// its documented trigger, with nothing on either side of that boundary.
+    #[test]
+    fn valmari_and_moore_agree_on_the_language_of_untrimmed_input() {
+        let mut total = 0usize;
+        let mut wb_001_shaped = 0usize;
+        for q in 1..=3usize {
+            for alphabet_size in 1..=2usize {
+                for_each_small_total_dfa(q, alphabet_size, &mut |fa| {
+                    total += 1;
+
+                    // Independently computed: does `q0` reach acceptance? This is the
+                    // WB-001 trigger, stated forwards; used only to count how much of the
+                    // sweep exercises it, never to skip a case.
+                    let mut seen = vec![false; fa.q];
+                    let mut stack = vec![fa.q0];
+                    seen[fa.q0] = true;
+                    let mut reaches = false;
+                    while let Some(s) = stack.pop() {
+                        reaches |= fa.is_accepting(s);
+                        for dests in fa.d[s].values() {
+                            for &t in dests {
+                                if !seen[t] {
+                                    seen[t] = true;
+                                    stack.push(t);
+                                }
+                            }
+                        }
+                    }
+                    if !reaches && fa.o.iter().any(|&o| o != 0) {
+                        wb_001_shaped += 1;
+                    }
+
+                    let valmari = wr_core::minimize::minimize(&fa).expect("total DFA");
+                    let moore = minimize(&fa).expect("total DFA with >= 1 state");
+                    assert_eq!(
+                        language_equivalent(&totalized(&valmari), &moore),
+                        Ok(true),
+                        "Valmari and Moore disagree on {fa:?}: {valmari:?} vs {moore:?}"
+                    );
+                    // ... and both agree with the ORIGINAL, so this is not two engines
+                    // being wrong together.
+                    assert_eq!(language_equivalent(&totalized(&valmari), &fa), Ok(true));
+                });
+            }
+        }
+        assert_eq!(
+            total, 18_308,
+            "the sweep's own size, so it cannot silently shrink"
+        );
+        assert_eq!(
+            wb_001_shaped, 1_506,
+            "the number of cases in WB-001's exact trigger shape -- pinned so this sweep \
+             cannot go vacuous with respect to the bug it was written for"
+        );
     }
 }

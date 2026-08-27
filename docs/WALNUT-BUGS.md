@@ -45,9 +45,14 @@ bug costs a silent wrong answer somewhere downstream.
   separate adversarial code reviewers who each re-traced it against source before signing off.
 - **Found:** Phase 1 spike, 2026-08-09, while porting `minimize` (`wr-core/src/minimize.rs`,
   commit `f9475e7`).
-- **Rust port:** `ported verbatim (quirk)` — `wr_core::minimize::minimize` reproduces this exactly
+- **Rust port:** **fixed** as of 2026-08-26 — see the *Resolved* block at the end of this entry.
+  Everything from here to that block is the HISTORICAL record of the bug and of the four live
+  call sites found while it was still being ported verbatim; it is kept because the *call-site
+  inventory* is what the fix had to be checked against, one site at a time.
+
+  Formerly `ported verbatim (quirk)` — `wr_core::minimize::minimize` reproduced this exactly
   (documented at length in that module's doc comment, pinned by
-  `minimize_q0_not_co_reachable_walnut_quirk`). **Was safe through the Phase-1 spike's own
+  `minimize_q0_not_co_reachable_walnut_quirk`, since renamed). **Was safe through the Phase-1 spike's own
   pipeline** (`trim` → `subset_construction` → `minimize`): `subset_construction`'s output only
   ever contains states forward-reachable from its own `q0` by construction, and `trim`'s own
   postcondition is exactly `minimize`'s precondition. **Update (Phase 2, U2, 2026-08-09): a live
@@ -92,11 +97,112 @@ bug costs a silent wrong answer somewhere downstream.
   `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` (`logicalops.rs`). The Tier-4
   round-trip test next to it had to be rescoped as a result — "convert away and back is the
   identity on the language" is **not** universally true in either engine, and its doc now says so.
-- **Upstream:** not filed. A ~3-line guard (`if blocks.loc[q0] >= rr` after the reachability pass,
-  route to the canonical dead-automaton case) would fix it in Java too.
+- **Upstream:** **fixed**, `walnut-java` commit `14509f1` (branch `bugfix/wb-001`, stacked on
+  `bugfix/wb-019`). `ValmariDFA` records the co-reachable-set size in its own field
+  (`numCoreachable`, at the end of `rem_unreachable` — it cannot be read back later, since `rr` is
+  reset to `0` there and `blocks.P[0]`, which momentarily holds the same value, is subsequently
+  mutated by `split()`); `replaceFields` now checks `blocks.L[q0] >= numCoreachable` and routes to a
+  new `replaceWithEmptyLanguage` (one non-accepting state, no transitions) instead of computing
+  `blocks.S[q0]` unconditionally. That target shape is not invented for the fix — it is what the
+  Java codebase already means by "the empty language" in `Trimmer.quotient`'s empty-`statesToKeep`
+  branch and in `ValmariDFA`'s own output when there are no accepting states at all. Verified there
+  by a 196,798-case differential sweep against three independent oracles, with all 1,106
+  integration-test artifacts byte-identical between the fixed and unfixed builds; a new
+  `ValmariDFATest.java` (7 tests) pins it.
 - **Severity:** **critical** — silent wrong answer (not a crash), in the automaton engine's most
   heavily-used operation, for an input shape that's plausible in real usage (any product/intersect
   whose current `q0` happens not to reach an accepting state, called without an intervening trim).
+- **Resolved (2026-08-26): Rust port fixed, matches `walnut-java` as of commit `14509f1`.**
+
+  **The port of the fix.** `crates/wr-core/src/minimize.rs` binds `num_coreachable` at the end of
+  the `rem_unreachable` pass and, as the first statement of the rebuild (Java's own placement, the
+  head of `replaceFields`), returns the canonical minimal empty-language `Fa` — `q = 1`, `q0 = 0`,
+  `o = [0]`, no transitions, `alphabet_size` carried over — whenever `blocks.loc[fa.q0] >=
+  num_coreachable`. One structural difference from Java, stated in the code: Java *must* stash
+  `numCoreachable` in a field because its `rr` is reset to `0`, whereas this port's `rr` is a plain
+  local that is never reset. The binding is taken anyway, so the guard's input is fixed at the one
+  moment it is meaningful rather than resting on `rr` staying untouched through the refinement
+  loop. Reading `blocks.loc[q0]` at rebuild time is safe on both sides for the same reason, now
+  written down: `mark` is only ever called on the tail of a *surviving* transition, a surviving
+  transition's head is co-reachable and hence so is its tail, so no parked position is ever read
+  or written by `mark`/`split`.
+
+  **All four documented call sites, resolved individually** (each already had a dedicated pin test;
+  every one was FLIPPED to the correct answer, none deleted, per `CLAUDE.md`'s merge gate):
+
+  1. `wr_core::minimize::minimize` itself — `minimize_q0_not_co_reachable_walnut_quirk` →
+     `minimize_wb_001_trigger_now_yields_the_empty_language`, which now asserts the canonical empty
+     shape field by field rather than just "the language is empty".
+  2. `Automaton::determinize_and_minimize`'s already-deterministic branch (`Automaton.java:385`'s
+     conditional `trim`, ported faithfully and deliberately *not* changed) —
+     `determinize_and_minimize_reaches_wb_001_on_an_already_deterministic_input` →
+     `determinize_and_minimize_on_an_already_deterministic_unreachable_input_is_correct`.
+  3. The lsd branch of `wr_core::quantify::quantify` via `fix_trailing_zeros_problem`'s closing
+     `just_minimize` — reached end-to-end through the real `fixtrailzero` command, whose pin
+     (`wr_cli::simple_transforms`) moved from `fix_trail_zero_command_reaches_wb_001_on_an_untrimmed_operand`
+     to `fix_trail_zero_command_is_correct_on_an_untrimmed_operand`. The pre-fix table (`∅` coming
+     back as `ε + 0Σ*`, captured live from the unfixed jar) is retained verbatim in its doc comment.
+  4. `convertNS`'s `k -> k^j` regrouping (`logicalops.rs`) —
+     `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` →
+     `convert_ns_no_longer_corrupts_when_regrouping_strands_a_state`, now asserting the correct
+     constant-`1` (and complementary constant-`0`) DFAO. The Tier-4 round-trip test beside it,
+     which had been rescoped *because of* WB-001, keeps its "not universal" caveat but on a new and
+     entirely bug-free footing: `msd_2 -> msd_{2^j}` is genuinely lossy on a length-sensitive
+     automaton, now pinned directly by
+     `convert_ns_round_trip_is_lossy_on_a_length_sensitive_automaton` rather than asserted in prose.
+
+  **Property-test scopes re-widened.** Nine generators/properties had been narrowed *specifically*
+  to keep WB-001 out; each was re-checked and the WB-001 narrowing removed:
+  `minimize_preserves_language`, `minimize_preserves_language_on_partial_dfa`,
+  `not_matches_the_complement_oracle`, both De Morgan identities,
+  `right_quotient_matches_the_brute_force_quotient`,
+  `fix_trailing_zeros_is_exactly_the_right_quotient_by_zeros` (`wr-core`),
+  `fix_zero_commands_establish_their_closure_properties_end_to_end` (`wr-cli`), and
+  `quantify`'s `arb_self_looping_zero_two_track` generator (whose trim could previously destroy the
+  very `q0` self-loop invariant the generator exists to guarantee). `convert_ns_to_a_power_of_two_base_preserves_the_integer_language`
+  lost its `prop_assume!`, recovering the measured 10.7% of its case space that was being
+  discarded. **Three trims were deliberately KEPT**, because their real reason is *minimality*, not
+  WB-001, and outlives the fix: `minimize_agrees_with_moore_reference` and `minimize_is_idempotent`
+  (`wr-core`) and `valmari_and_moore_agree_on_the_minimal_dfa` (`wr-cts`) each assert an exact state
+  count against a reference that prunes forward-unreachable states, which `minimize` — faithfully —
+  still does not; widening them would fail for a reason that has nothing to do with either engine
+  being wrong. Their doc comments now say exactly that, so the distinction cannot be lost again.
+
+  **Verification.** (a) A from-scratch exhaustive sweep, `wb_001_exhaustive_small_sweep`: all
+  **100,572** partial DFAs with ≤3 states over ≤2 symbols (every transition table × every accepting
+  set × every start state), each checked language-preserving against a product BFS over partial
+  DFAs written for this check and calling nothing in the crate. Measured on the pre-fix code path,
+  exactly **13,980** of them computed the wrong language, and the equivalence *wrong ⟺ (`q0` parked
+  AND some accepting state exists)* was asserted case by case across all 100,572 — WB-001's reach
+  is exactly "the language is empty and the automaton does not know it", nothing wider. (b) The
+  no-op claim, the one that matters most given how central `minimize` is: `NON_DEFECTIVE_DIGEST` is
+  an FNV-1a digest of the sweep's full *structural* output (state count, numbering, start state,
+  output vector, transition table) over the **73,926** cases where the guard does not fire, captured
+  by re-running the identical sweep against a build with the guard forced off. The two runs agree
+  exactly. (c) `wb_001_randomized_larger_sweep`: 20,000 fixed-seed cases up to 6 states / 3 symbols.
+  (d) A cross-crate, cross-*implementation* check in `wr-cts`,
+  `valmari_and_moore_agree_on_the_language_of_untrimmed_input`: all **18,308** total DFAs with ≤3
+  states over ≤2 symbols, comparing ported Valmari against the independent from-scratch Moore
+  minimizer on **untrimmed** input — the domain every pre-existing cross-check had to avoid. 1,506
+  of those are in WB-001's exact trigger shape, and pre-fix the test fails on precisely those.
+  `moore_gives_the_correct_answer_on_wb_001s_trigger`, which pinned the two minimizers *diverging*,
+  is now `both_minimizers_agree_on_wb_001s_former_trigger`. (e) Every change was
+  mutation-verified: with the guard's condition forced to `false`, **17** tests across `wr-core`
+  (14), `wr-cts` (2) and `wr-cli` (1) fail, and all pass with it restored. (f) **Live, against a
+  jar built from `walnut-java` `14509f1` itself**, not inferred from its commit message: the two
+  CLI-reachable call sites were re-run end to end and their post-fix output captured verbatim into
+  the corresponding Rust tests — `convert evenmsd4 msd_4 u18even;` (and the complementary
+  odd-parity fixture), whose full two-state constant-`1` / constant-`0` tables the port now matches
+  structurally, and `fixtrailzero u31trailfix u31trail;`, which writes `msd_2\n\n0 0\n` — one
+  non-accepting, transition-less state — exactly as the port does. (g) Tier-1 and Tier-3 are
+  unchanged, which is itself the expected result and matches the Java side's own "all 1,106
+  integration artifacts byte-identical" finding: the golden corpus stays at 675 fixtures / 670
+  pass / 1 fail (383, pre-existing and unrelated) / 4 skip, and two 25,000-query differential-gen
+  runs — one against the UNFIXED parent jar (`cee8352`), one against the FIXED `14509f1` jar —
+  each report 0 divergences. No corpus fixture and no generated `eval` query reaches the defect
+  shape, because every path they take re-establishes `q0`-reachability through subset construction
+  or `trim` first; WB-001's reach is the *untrimmed* API surface, which is what the sweeps above
+  cover.
 
 ---
 

@@ -563,11 +563,12 @@ mod tests {
     // These use single-state automata deliberately: `compare_word_automaton` ends in
     // an `Automaton::determinize_and_minimize` call, and a *disconnected* multi-state
     // fixture (e.g. two states that each only self-loop, with q0 unable to reach the
-    // other) is exactly WB-001's trigger shape (`docs/WALNUT-BUGS.md`) — a q0 that
-    // can't reach an elsewhere-accepting state gets silently misclassified by the
-    // ported Valmari minimizer. Single-state automata sidestep that unrelated,
-    // already-documented quirk entirely, so these tests pin `compare_word_automaton`'s
-    // own behavior instead of accidentally re-testing WB-001.
+    // other) was exactly WB-001's trigger shape (`docs/WALNUT-BUGS.md`) — a q0 that
+    // can't reach an elsewhere-accepting state was silently misclassified by the
+    // ported Valmari minimizer. WB-001 is fixed (`walnut-java` commit `14509f1`), so
+    // that shape is no longer dangerous; the single-state fixtures are kept as-is
+    // because they were chosen to pin `compare_word_automaton`'s OWN behavior with the
+    // minimizer contributing nothing, which is still the right shape for these tests.
 
     #[test]
     fn compare_word_automaton_equal_constant() {
@@ -732,13 +733,17 @@ mod tests {
     }
 
     // Two states, distinct outputs, and CONNECTED (q0 can reach the other state) —
-    // deliberately not the disconnected self-loop-only shape, which is WB-001's
+    // deliberately not the disconnected self-loop-only shape, which WAS WB-001's
     // trigger (`docs/WALNUT-BUGS.md`): `minimize_with_output` uncombines into one
     // boolean sub-automaton per output value, and for the sub-automaton where q0's
     // OWN output isn't the target value, q0 is non-accepting there — if it also
     // couldn't reach the (elsewhere) accepting state, the ported Valmari minimizer
-    // would silently misclassify it, corrupting `combine`'s result. Connected
-    // transitions keep these tests about `minimize_with_output`'s own correctness.
+    // silently misclassified it, corrupting `combine`'s result. WB-001 is fixed
+    // (`walnut-java` commit `14509f1`); the connected fixtures are kept because they
+    // keep these tests about `minimize_with_output`'s own correctness, and the
+    // formerly-dangerous stranded shape is covered head-on by `logicalops.rs`'s
+    // `convert_ns_no_longer_corrupts_when_regrouping_strands_a_state`, which reaches
+    // `minimize_with_output` through exactly that path.
     /// Walks a deterministic, total word automaton's transitions for `word` starting
     /// at `q0` and returns the output at the resulting state. Used below to check the
     /// SECOND fixture state's output post-minimize by REACHING it via a word (symbol

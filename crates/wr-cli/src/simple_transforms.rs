@@ -306,27 +306,23 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// `docs/WALNUT-BUGS.md` **WB-001** reached through the real `fixtrailzero` command,
-    /// on the operand shape the command actually meets in practice: an **untrimmed**
-    /// hand-written `.txt`.
+    /// `docs/WALNUT-BUGS.md` **WB-001**'s `fixtrailzero` reach path, through the real
+    /// command, on the operand shape it actually meets in practice: an **untrimmed**
+    /// hand-written `.txt`. Formerly
+    /// `fix_trail_zero_command_reaches_wb_001_on_an_untrimmed_operand`, which pinned the
+    /// corrupted answer; flipped, not deleted, now that WB-001 is fixed.
     ///
-    /// # Why this test has to exist separately from the property below
+    /// # Why this test still exists separately from the property below
     ///
-    /// `fix_zero_commands_establish_their_closure_properties_end_to_end` trims its
-    /// generated operand before writing it (see its own doc comment — the equality oracles
-    /// are only valid on the shape where WB-001 provably cannot fire). That is correct for
-    /// a property whose job is the exact-language contract, but it means every operand the
-    /// property ever hands `fixtrailzero` is trimmed, and the quirk path gets no coverage
-    /// at all. Real user files are not trimmed, so this is the plausible-input case, not an
-    /// exotic one — it is pinned here rather than avoided, per `CLAUDE.md`'s mechanical-port
-    /// rule (quirks get a dedicated pin test), the same discipline as
-    /// `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` in `wr-core`.
+    /// The property generates operands and drives the same commands, but it is a
+    /// *language*-level contract check. This one pins the exact automaton the command
+    /// writes on a fixed, hand-built operand carrying stranded states — the shape that
+    /// used to be corrupted, and the one a real user's typed `.txt` can have. The `.txt`
+    /// is written **by hand, not by `wr_io::writer`**: the writer emits only the states
+    /// reachable from `q0`, so a round trip through it silently trims and the stranded
+    /// states vanish. Only a file a user typed can carry them.
     ///
-    /// The `.txt` is written **by hand, not by `wr_io::writer`**: the writer emits only the
-    /// states reachable from `q0`, so a round trip through it silently trims and the quirk
-    /// becomes unreachable. Only a file a user typed can carry the stranded state.
-    ///
-    /// # The fixture and why it fires
+    /// # The fixture, and what used to go wrong
     ///
     /// Three states over `msd_2`. `q0` is non-accepting and self-loops on both digits, so
     /// `L(A) = ∅` and the correct `fixtrailzero` answer is `∅` too. States 1 and 2 are
@@ -334,18 +330,11 @@ mod tests {
     /// something (state 1 gains acceptance by reaching 2 on a zero), which is what makes it
     /// call `justMinimize` at all — and `justMinimize` does not trim. Valmari's
     /// co-reachability pre-pass then parks `q0` outside every block while leaving its stale
-    /// `S[q0] = 0`, and `replaceFields` reads that stale 0 as the new start state: `q0`
-    /// aliases onto an **accepting** block.
+    /// `S[q0] = 0`, and `replaceFields` USED TO read that stale 0 as the new start state:
+    /// `q0` aliased onto an **accepting** block and `∅` came back as `ε + 0Σ*`.
     ///
-    /// Result: `∅` comes back as `ε + 0Σ*`. Asserted below both as the exact table and as
-    /// the language, against [`trail_zero_oracle`] — which is what the answer *should* have
-    /// been, so the pin records the size of the divergence, not merely its existence.
-    ///
-    /// # Bug-compatible, verified live
-    ///
-    /// Run against the real `walnut-java/target/Walnut-all.jar` (v8.0-alpha, 2026-08-16) on
-    /// this exact fixture, `fixtrailzero u31trailfix u31trail;` writes precisely this
-    /// automaton:
+    /// Pre-fix, against the real `walnut-java/target/Walnut-all.jar` (v8.0-alpha,
+    /// 2026-08-16), `fixtrailzero u31trailfix u31trail;` on this exact fixture wrote:
     ///
     /// ```text
     /// msd_2
@@ -358,11 +347,22 @@ mod tests {
     /// 1 -> 1
     /// ```
     ///
-    /// — same state count, same start-state output, same transitions as this port produces.
-    /// If a later refactor "fixes" this (an added `trim`, a different minimizer), this test
-    /// fails loudly and the divergence from Java becomes a deliberate, logged decision.
+    /// — which this port reproduced state-for-state. `walnut-java` commit `14509f1` fixes
+    /// the underlying Valmari guard. **Re-captured live from a jar built at that commit**,
+    /// same fixture, same command, the whole written file is now:
+    ///
+    /// ```text
+    /// msd_2
+    ///
+    /// 0 0
+    /// ```
+    ///
+    /// — one non-accepting state with no transitions, the canonical empty-language
+    /// automaton, which is exactly what this port now produces. Asserted below both as
+    /// that exact table and as the language, against [`trail_zero_oracle`], which
+    /// independently says the answer is `∅`.
     #[test]
-    fn fix_trail_zero_command_reaches_wb_001_on_an_untrimmed_operand() {
+    fn fix_trail_zero_command_is_correct_on_an_untrimmed_operand() {
         let (session, dir) = temp_session("fixtrail-wb001");
         let _guard = TempDirGuard(dir.clone());
         fs::write(
@@ -381,41 +381,38 @@ mod tests {
                 .expect("fixtrailzero must succeed on this well-formed (if untrimmed) operand");
         let c = tc.automaton_pairs()[0].automaton().unwrap();
 
-        // The exact quirky table, as real walnut-java writes it.
-        assert_eq!(c.fa.q, 2);
+        // The canonical empty-language automaton `minimize`'s WB-001 guard produces: one
+        // non-accepting state, no transitions. Pre-fix this was a 2-state table with
+        // `o == [1, 1]` and `0 -> 1` / `0,1 -> 1` (see the doc comment).
+        assert_eq!(
+            c.fa.q, 1,
+            "WB-001 regression: q0 aliased onto another block"
+        );
         assert_eq!(c.fa.q0, 0);
-        assert_eq!(
-            c.fa.o,
-            vec![1, 1],
-            "WB-001: q0 aliased onto an accepting block"
-        );
-        assert_eq!(
-            c.fa.d,
-            vec![
-                BTreeMap::from([(0, vec![1])]),
-                BTreeMap::from([(0, vec![1]), (1, vec![1])]),
-            ]
-        );
+        assert_eq!(c.fa.o, vec![0], "WB-001 regression: q0 came back accepting");
+        assert_eq!(c.fa.d, vec![BTreeMap::new()]);
 
-        // ... and the same divergence stated as a language, against the oracle that says
-        // what the answer should have been. `L(A) = ∅`, so the right quotient by `0*` is
-        // `∅` as well -- every one of these words should be REJECTED.
+        // ... and the same result stated as a language, against the independent oracle.
+        // `L(A) = ∅`, so the right quotient by `0*` is `∅` as well -- every one of these
+        // words must be REJECTED, by the oracle and by the command's own output alike.
         for w in all_words_up_to_four() {
             assert!(
                 !trail_zero_oracle(&operand, zero, &w),
                 "the fixture's correct fixtrailzero language is empty, but the oracle \
                  accepts {w:?} -- the fixture, not the port, is wrong"
             );
+            assert!(
+                !c.fa.accepts_word(&w),
+                "fixtrailzero must reject {w:?}: the operand's language is empty"
+            );
         }
+        // Spelled out for the three words the pre-fix corruption (`ε + 0Σ*`) accepted,
+        // so a regression names itself rather than surfacing as a loop index.
+        assert!(!c.fa.accepts_word(&[]), "WB-001 regression: ε accepted");
+        assert!(!c.fa.accepts_word(&[0]), "WB-001 regression: `0` accepted");
         assert!(
-            c.fa.accepts_word(&[]),
-            "WB-001: the empty word is accepted, and the correct answer rejects it"
-        );
-        assert!(c.fa.accepts_word(&[0]), "WB-001: `0` wrongly accepted");
-        assert!(c.fa.accepts_word(&[0, 1]), "WB-001: `01` wrongly accepted");
-        assert!(
-            !c.fa.accepts_word(&[1]),
-            "the corruption is `ε + 0Σ*`, not all of `Σ*` -- `1` is still rejected"
+            !c.fa.accepts_word(&[0, 1]),
+            "WB-001 regression: `01` accepted"
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -577,20 +574,24 @@ mod tests {
     /// closed under REMOVING a trailing zero and NOT under adding one — asserting the
     /// mirror of the first here would be wrong, not merely unproven.
     ///
-    /// # The operand is TRIMMED before it is written to disk
+    /// # The operand is NO LONGER trimmed before it is written to disk
     ///
     /// `fixtrailzero` closes with `FA.justMinimize`, which — faithfully — does not trim,
     /// so an operand carrying a state unreachable from `q0` that also cannot reach
-    /// acceptance hands Valmari a table violating its reachability precondition and
-    /// triggers `docs/WALNUT-BUGS.md` WB-001, a deliberately ported quirk that would show
-    /// up here as an oracle disagreement. `crate::trim::trim` is language-preserving and
-    /// its postcondition is exactly that precondition, so trimming the generated operand
-    /// before writing it constrains the generator's domain rather than weakening the
-    /// oracle. (`fixleadzero` needs no such care: it closes with
-    /// `determinizeAndMinimize(IntSet)`, whose subset construction re-establishes
-    /// reachability. It is trimmed anyway, so both commands see the same operand and the
-    /// two equalities are about one table.) An earlier version of this test claimed the
-    /// trimming without doing it.
+    /// acceptance hands Valmari a table violating its reachability precondition. While
+    /// `docs/WALNUT-BUGS.md` WB-001 was live that corrupted the language and showed up
+    /// here as an oracle disagreement, so this property trimmed its generated operand
+    /// before writing it — a domain restriction, not a weakened oracle. (`fixleadzero`
+    /// never needed the care: it closes with `determinizeAndMinimize(IntSet)`, whose
+    /// subset construction re-establishes reachability. It was trimmed anyway so both
+    /// commands saw one table.) An earlier version of this test claimed the trimming
+    /// without doing it.
+    ///
+    /// WB-001 is fixed (`walnut-java` commit `14509f1`, ported in
+    /// `wr_core::minimize::minimize`), so the trim is removed and both commands now run
+    /// on genuinely untrimmed operands — which is what a real user's hand-written `.txt`
+    /// looks like, and the same shape
+    /// `fix_trail_zero_command_is_correct_on_an_untrimmed_operand` pins deterministically.
     #[test]
     fn fix_zero_commands_establish_their_closure_properties_end_to_end() {
         let (session, dir) = temp_session("zero-closure-props");
@@ -600,7 +601,6 @@ mod tests {
             ProptestConfig::with_cases(24),
             |(a in arb_partial_dfa(3), probe in prop::collection::vec(0i32..2, 0..4))| {
                 let mut original = a;
-                original.fa = wr_core::trim::trim(&original.fa);
                 wr_io::writer::write_automaton_txt(&mut original, &path).unwrap();
 
                 // The operand exactly as the commands themselves see it, so the oracles

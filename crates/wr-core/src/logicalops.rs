@@ -279,9 +279,12 @@ fn flip_output(fa: &mut Fa) {
 ///
 /// `minimize`'s OTHER (documented, unenforced) precondition — every state reachable
 /// from `q0` — is *not* established here, exactly as in Java: `justMinimize` never
-/// trims. So `docs/WALNUT-BUGS.md` WB-001 is reachable through every caller of this
-/// helper ([`not`], [`fix_trailing_zeros_problem`]) whose input has a state unreachable
-/// from `q0`. Ported verbatim per `CLAUDE.md`'s mechanical-port rule.
+/// trims. That used to make `docs/WALNUT-BUGS.md` WB-001 reachable through every caller
+/// of this helper ([`not`], [`fix_trailing_zeros_problem`]) whose input has a state
+/// unreachable from `q0`. **WB-001 is fixed** (`walnut-java` commit `14509f1`, ported in
+/// [`crate::minimize::minimize`]), so those callers now get the right language. The
+/// missing trim still costs *minimality*: an unreachable-but-co-reachable state survives
+/// as an extra block. Faithful to Java either way — no trim is added here.
 fn just_minimize(fa: &Fa, logging: &mut crate::logging::Logging) -> Fa {
     match crate::minimize::minimize_with_logging(fa, logging) {
         Ok(minimized) => minimized,
@@ -808,9 +811,11 @@ pub fn not(a: AutomatonDFA, logging: &mut crate::logging::Logging) -> AutomatonD
 /// If `!skip_subset_check` and `B`'s alphabet is not a subset of `A`'s
 /// (`WalnutException` message ported verbatim).
 ///
-/// `docs/WALNUT-BUGS.md` WB-001 is reachable through the closing
-/// `M.determinizeAndMinimize()` (`:227`) exactly as it is in Java, since `M` inherits
-/// `A`'s (possibly not-fully-`q0`-reachable) state set unchanged.
+/// `docs/WALNUT-BUGS.md` WB-001 used to be reachable through the closing
+/// `M.determinizeAndMinimize()` (`:227`), since `M` inherits `A`'s (possibly
+/// not-fully-`q0`-reachable) state set unchanged. It is fixed (`walnut-java` commit
+/// `14509f1`, ported in [`crate::minimize::minimize`]); the result can still be
+/// non-minimal on such an input, but is language-correct.
 pub fn right_quotient(
     a: &Automaton,
     b: &Automaton,
@@ -2316,15 +2321,22 @@ fn convert_lsd_base_to_root(
 /// this port follows suit. `docs/WALNUT-BUGS.md`'s WB-032 entry carries the full historical
 /// diagnosis.
 ///
-/// # `docs/WALNUT-BUGS.md` WB-001 also lives on this path
+/// # `docs/WALNUT-BUGS.md` WB-001 used to live on this path too — FIXED
 ///
 /// The `k -> k^j` regrouping step can strand states: re-keying the transition table by
 /// digit GROUPS makes any state reachable only "mid-group" unreachable from `q0`, and the
 /// `minimizeSelfWithOutput` that immediately follows it (`:521`) bottoms out in Valmari
-/// minimization with no intervening trim — exactly WB-001's precondition violation. Java
-/// has the identical defect at the identical call site, so it is ported verbatim, not
-/// guarded; `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` pins it against the
-/// behaviour of the real engine.
+/// minimization with no intervening trim — exactly WB-001's precondition violation. This
+/// was the **easiest of WB-001's four call sites to hit from the command line**, because
+/// the stranding is a property of the *conversion*, not of an already-malformed input:
+/// any automaton whose accepting behaviour depends on length parity strands its odd-phase
+/// state the moment two binary digits are grouped into one base-4 digit.
+///
+/// Fixed inside Valmari itself (`walnut-java` commit `14509f1`, ported in
+/// [`crate::minimize::minimize`]), not by adding a trim here — the regrouping step is
+/// still the faithful port of `:513-522`. `convert_ns_no_longer_corrupts_when_regrouping_strands_a_state`
+/// pins the now-correct answer on the very fixture that used to demonstrate the
+/// corruption.
 pub fn convert_ns(
     a: &mut Automaton,
     to_msd: bool,
@@ -3230,22 +3242,26 @@ mod tests {
             assert_connective_matches_oracle(&n_iff, &a_fa, &b_fa, |p, q| p == q);
         }
 
-        /// `not` against the oracle. The input is TRIMMED first, deliberately: `not`'s
-        /// `justMinimize` step establishes none of `minimize`'s `q0`-reachability
-        /// precondition (faithfully -- see [`just_minimize`]), so a randomly-generated
-        /// automaton with a state unreachable from `q0` can legitimately hit
-        /// `docs/WALNUT-BUGS.md` WB-001 and produce a "wrong" complement. That is
-        /// ported behavior, not a port defect, so the generator is constrained to the
-        /// shape where WB-001 provably cannot fire rather than the property being
-        /// weakened to accommodate it.
+        /// `not` against the oracle, on the RAW generated automaton.
+        ///
+        /// # Formerly trimmed for `docs/WALNUT-BUGS.md` WB-001; no longer
+        ///
+        /// `not`'s `justMinimize` step establishes none of `minimize`'s
+        /// `q0`-reachability precondition (faithfully -- see [`just_minimize`]), so while
+        /// WB-001 was live a randomly-generated automaton with a state unreachable from
+        /// `q0` could legitimately hit it and produce a "wrong" complement; this property
+        /// therefore ran `crate::trim::trim` on its input first. WB-001 is fixed
+        /// (`walnut-java` commit `14509f1`, ported in [`crate::minimize::minimize`]) and
+        /// the trim is removed, so `not` is now checked against the complement oracle on
+        /// genuinely untrimmed input -- the shape a real `.txt` operand actually has.
+        /// The missing trim still costs minimality, which this property never asserted.
         #[test]
         fn not_matches_the_complement_oracle(fa in arb_partial_dfa(4, 2)) {
-            let trimmed = crate::trim::trim(&fa);
-            let n = not(single_track(trimmed.clone(), Some(true)).as_dfa(), &mut crate::logging::Logging::new());
+            let n = not(single_track(fa.clone(), Some(true)).as_dfa(), &mut crate::logging::Logging::new());
 
-            let mut trimmed_total = trimmed;
-            trimmed_total.totalize(0);
-            let expected = equiv::complement(&trimmed_total).unwrap();
+            let mut total = fa;
+            total.totalize(0);
+            let expected = equiv::complement(&total).unwrap();
             let mut actual = n.automaton().fa.clone();
             actual.totalize(0);
             prop_assert_eq!(equiv::language_equivalent(&actual, &expected), Ok(true));
@@ -3276,26 +3292,24 @@ mod tests {
     proptest! {
         /// ¬(A ∧ B) ≡ ¬A ∨ ¬B, computed with the real `and`/`or`/`not` from this file.
         ///
-        /// `a_fa`/`b_fa` are TRIMMED first, deliberately -- same rationale as
-        /// `not_matches_the_complement_oracle` above: `not_a`/`not_b` below call `not`
-        /// directly on `a_fa`/`b_fa`, and `not`'s `justMinimize` step establishes none
-        /// of `minimize`'s `q0`-reachability precondition (faithfully -- see
-        /// `just_minimize`'s doc comment). A randomly-generated automaton with a state
-        /// unreachable from `q0` can legitimately hit `docs/WALNUT-BUGS.md` WB-001 and
-        /// produce a "wrong" complement there. That is ported behavior, not a port
-        /// defect (confirmed by first reproducing the untrimmed failure and matching
-        /// it to WB-001's documented trigger shape -- a non-accepting, unreachable-
-        /// from-nothing-else q0 plus a separate unreachable accepting state -- rather
-        /// than assuming it away), so the generator is constrained to the shape where
-        /// WB-001 provably cannot fire rather than the property being weakened to
-        /// accommodate an unrelated bug.
+        /// `a_fa`/`b_fa` used to be TRIMMED first -- same rationale as
+        /// `not_matches_the_complement_oracle` above, and removed for the same reason.
+        /// `not_a`/`not_b` below call `not` directly on `a_fa`/`b_fa`, and `not`'s
+        /// `justMinimize` step establishes none of `minimize`'s `q0`-reachability
+        /// precondition (faithfully -- see `just_minimize`'s doc comment). While
+        /// `docs/WALNUT-BUGS.md` WB-001 was live, a randomly-generated automaton with a
+        /// state unreachable from `q0` could legitimately hit it and produce a "wrong"
+        /// complement there -- confirmed at the time by reproducing the untrimmed failure
+        /// and matching it to WB-001's documented trigger shape (a non-accepting,
+        /// unreachable-from-nothing-else q0 plus a separate unreachable accepting state),
+        /// rather than assuming it away. WB-001 is fixed (`walnut-java` commit `14509f1`,
+        /// ported in [`crate::minimize::minimize`]), so both identities now run on the raw
+        /// generated automata, including that shape.
         #[test]
         fn de_morgan_not_and_equals_or_of_nots(
             a_fa in arb_partial_dfa(4, 2),
             b_fa in arb_partial_dfa(4, 2),
         ) {
-            let a_fa = crate::trim::trim(&a_fa);
-            let b_fa = crate::trim::trim(&b_fa);
             let build = |fa: &Fa| single_track(fa.clone(), Some(true));
 
             // LHS: ¬(A ∧ B). `and` does not mutate its operands, so fresh clones
@@ -3318,15 +3332,14 @@ mod tests {
         }
 
         /// ¬(A ∨ B) ≡ ¬A ∧ ¬B, computed with the real `and`/`or`/`not` from this file.
-        /// `a_fa`/`b_fa` are trimmed first for the same WB-001 reason documented on
-        /// `de_morgan_not_and_equals_or_of_nots` above.
+        /// `a_fa`/`b_fa` used to be trimmed first for the WB-001 reason documented on
+        /// `de_morgan_not_and_equals_or_of_nots` above, and are no longer, for the same
+        /// reason: WB-001 is fixed.
         #[test]
         fn de_morgan_not_or_equals_and_of_nots(
             a_fa in arb_partial_dfa(4, 2),
             b_fa in arb_partial_dfa(4, 2),
         ) {
-            let a_fa = crate::trim::trim(&a_fa);
-            let b_fa = crate::trim::trim(&b_fa);
             let build = |fa: &Fa| single_track(fa.clone(), Some(true));
 
             // LHS: ¬(A ∨ B).
@@ -4046,20 +4059,24 @@ mod tests {
         ///   of DFA."` on genuine nondeterminism — Java and this port alike (see
         ///   `just_minimize`). So a `partial DFA` generator is the primitive's actual
         ///   domain; feeding it an NFA would test the ported rejection, not the quotient.
-        /// * **Trimmed input.** `just_minimize` establishes none of `minimize`'s
-        ///   `q0`-reachability precondition (faithfully — Java's `justMinimize` does not
-        ///   trim either), so an unreachable state can legitimately trigger
-        ///   `docs/WALNUT-BUGS.md` WB-001. Same constraint, for the same reason, as
-        ///   `not_matches_the_complement_oracle`'s. Trimming does not change the quotient:
-        ///   a state that cannot reach acceptance contributes to neither side of the
-        ///   equation.
+        /// * ~~**Trimmed input.**~~ **REMOVED, WB-001 is fixed.** `just_minimize`
+        ///   establishes none of `minimize`'s `q0`-reachability precondition (faithfully
+        ///   — Java's `justMinimize` does not trim either), so while
+        ///   `docs/WALNUT-BUGS.md` WB-001 was live an unreachable state could legitimately
+        ///   trigger it, and this property trimmed its operand for the same reason
+        ///   `not_matches_the_complement_oracle` did. `walnut-java` commit `14509f1`
+        ///   fixes it (ported in [`crate::minimize::minimize`]), so the operand is now
+        ///   used raw — which matters here more than elsewhere, because an untrimmed
+        ///   hand-written `.txt` is exactly what the real `fixtrailzero` command meets
+        ///   (see `wr_cli::simple_transforms`'s own end-to-end test of this path).
+        ///   Trimming never changed the quotient either way: a state that cannot reach
+        ///   acceptance contributes to neither side of the equation.
         #[test]
         fn fix_trailing_zeros_is_exactly_the_right_quotient_by_zeros(
             fa in arb_partial_dfa(4, 2),
             probe in prop::collection::vec(0i32..2, 0..4),
         ) {
-            let mut original = single_track(fa, Some(true));
-            original.fa = crate::trim::trim(&original.fa);
+            let original = single_track(fa, Some(true));
             let mut fixed = original.clone();
             fix_trailing_zeros_problem(&mut fixed, &mut crate::logging::Logging::new());
 
@@ -4892,28 +4909,23 @@ mod tests {
 
         /// Tier-4: `rightQuotient` against the brute-force set-theoretic quotient.
         ///
-        /// Both operands are TRIMMED first, for exactly the reason
-        /// `not_matches_the_complement_oracle` trims: `right_quotient` closes with
-        /// `M.determinizeAndMinimize()`, `M` inherits `A`'s state set verbatim, and a
-        /// randomly generated automaton with a state unreachable from `q0` can therefore
-        /// hit `docs/WALNUT-BUGS.md` WB-001 (the q0-aliasing quirk) and return a
-        /// legitimately "wrong" language. That is ported behavior, not a port defect, so
-        /// the generator is constrained to the shape where WB-001 provably cannot fire
-        /// (`trim` leaves every surviving state reachable from `q0`) rather than the
-        /// property being weakened to accommodate it. Trimming is language-preserving
-        /// and, for the quotient specifically, also *quotient*-preserving: a state that
-        /// cannot reach acceptance in `A` has `L(A from i) = ∅`, so it would have been
-        /// assigned output `0` anyway.
+        /// Both operands used to be TRIMMED first, for exactly the reason
+        /// `not_matches_the_complement_oracle` trimmed: `right_quotient` closes with
+        /// `M.determinizeAndMinimize()`, `M` inherits `A`'s state set verbatim, and while
+        /// `docs/WALNUT-BUGS.md` WB-001 (the q0-aliasing bug) was live a randomly
+        /// generated automaton with a state unreachable from `q0` could therefore return
+        /// a legitimately "wrong" language. WB-001 is fixed (`walnut-java` commit
+        /// `14509f1`, ported in [`crate::minimize::minimize`]) and the trims are removed,
+        /// so the quotient is now checked on untrimmed operands too. (Trimming was never
+        /// unsound here -- it is language-preserving and, for the quotient specifically,
+        /// also *quotient*-preserving, since a state that cannot reach acceptance in `A`
+        /// has `L(A from i) = ∅` and would have been assigned output `0` anyway -- it was
+        /// simply a domain restriction this property no longer needs.)
         #[test]
         fn right_quotient_matches_the_brute_force_quotient(
             a in arb_partial_automaton_over(4, vec![0, 1]),
             b in arb_partial_automaton_over(4, vec![0, 1]),
         ) {
-            let mut a = a;
-            let mut b = b;
-            a.fa = crate::trim::trim(&a.fa);
-            b.fa = crate::trim::trim(&b.fa);
-
             let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
             for x in all_digit_words(&[0, 1], 4) {
                 prop_assert_eq!(
@@ -6014,8 +6026,10 @@ mod tests {
         assert_eq!(a.label, vec!["x".to_string()], "the track keeps its name");
     }
 
-    /// `docs/WALNUT-BUGS.md` WB-001, reached through `convertNS`'s `k -> k^j` regrouping —
-    /// a call site neither engine guards, found by adversarial review of this unit.
+    /// `docs/WALNUT-BUGS.md` WB-001 through `convertNS`'s `k -> k^j` regrouping — the
+    /// call site found by adversarial review of Phase 3b's U18, now asserting the
+    /// CORRECT answer. Formerly `convert_ns_reaches_wb_001_when_regrouping_strands_a_state`;
+    /// flipped, not deleted, per `CLAUDE.md`'s merge gate.
     ///
     /// The fixture is the 2-state parity automaton over `msd_2`: `q0` accepts (even
     /// length), state 1 rejects, every digit toggles. Converting it to `msd_4` groups two
@@ -6026,17 +6040,40 @@ mod tests {
     /// this bite: **every** even-length binary word is a legal base-4 word, so the correct
     /// answer is the constant-`1` DFAO (accept everything).
     ///
-    /// Both engines instead return the constant-`0` DFAO (accept nothing). Verified live
-    /// against `Walnut-all.jar`: `convert evenmsd4 msd_4 u18even;` on exactly this
-    /// automaton writes a one-state `msd_4` DFAO with output `0`, and the complementary
-    /// odd-parity fixture (outputs swapped) likewise writes output `1` where the correct
-    /// answer is `0` — the outputs come out inverted in both directions.
+    /// Pre-fix, both engines returned the constant-`0` DFAO (accept nothing), and the
+    /// complementary odd-parity fixture (outputs swapped) returned `1` where the correct
+    /// answer is `0` — the corruption inverted with the fixture, so it was never a lucky
+    /// constant. Verified live against the unfixed `Walnut-all.jar` at the time
+    /// (`convert evenmsd4 msd_4 u18even;`).
     ///
-    /// Ported verbatim, not fixed (`CLAUDE.md`'s mechanical-port rule); this test exists so
-    /// that a later refactor which happens to "fix" it — an added `trim`, a different
-    /// minimizer — fails loudly and becomes a deliberate, logged decision.
+    /// **Re-verified live against a jar built from `walnut-java` commit `14509f1`**, the
+    /// fix this port follows, with both fixtures. `convert evenmsd4 msd_4 u18even;` now
+    /// writes:
+    ///
+    /// ```text
+    /// msd_4
+    ///
+    /// 0 1
+    /// 0 -> 1
+    /// 1 -> 1
+    /// 2 -> 1
+    /// 3 -> 1
+    ///
+    /// 1 1
+    /// 0 -> 1
+    /// 1 -> 1
+    /// 2 -> 1
+    /// 3 -> 1
+    /// ```
+    ///
+    /// — and `convert oddmsd4 msd_4 u18odd;` writes the same table with both outputs `0`.
+    /// The assertions below pin exactly those two tables, so this test checks agreement
+    /// with the fixed engine structurally, not merely that the port reached *a* correct
+    /// answer. (Both are constant DFAOs carrying a redundant second state: `combine`
+    /// rebuilds the DFAO from the per-output-value sub-automata and does not re-minimize
+    /// the recombination, on both engines alike.)
     #[test]
-    fn convert_ns_reaches_wb_001_when_regrouping_strands_a_state() {
+    fn convert_ns_no_longer_corrupts_when_regrouping_strands_a_state() {
         // q0 accepts (even length), state 1 rejects; both digits toggle.
         let parity = |even_accepts: i32, odd_accepts: i32| {
             Automaton::new(
@@ -6063,19 +6100,86 @@ mod tests {
         assert_eq!(even.msd, vec![Some(true)]);
         assert_eq!(even.alphabet, vec![vec![0, 1, 2, 3]]);
         assert_eq!(
-            even.fa.o[even.fa.q0], 0,
-            "WB-001: should be 1 (every base-4 word has even binary length), and real \
-             walnut-java is wrong in exactly the same direction"
+            even.fa.o[even.fa.q0], 1,
+            "every base-4 word has even binary length, so the answer is constant-1; \
+             pre-fix WB-001 made this 0"
         );
+        assert!(
+            even.fa.accepts_word(&[0, 3, 2]),
+            "constant-1: every base-4 word is accepted"
+        );
+        // The exact table the FIXED jar writes, captured live (see the doc comment):
+        // two states, both output 1, every base-4 digit going to state 1 from both.
+        // Structural, not just "the language is right" -- so the port is pinned to
+        // Java's own post-fix output, not merely to a correct answer of its own.
+        let all_digits_to_one: Vec<BTreeMap<i32, Vec<usize>>> = vec![
+            BTreeMap::from([(0, vec![1]), (1, vec![1]), (2, vec![1]), (3, vec![1])]),
+            BTreeMap::from([(0, vec![1]), (1, vec![1]), (2, vec![1]), (3, vec![1])]),
+        ];
+        assert_eq!(even.fa.q, 2);
+        assert_eq!(even.fa.o, vec![1, 1]);
+        assert_eq!(even.fa.d, all_digits_to_one);
 
-        // The complementary fixture, to show the corruption is not a lucky constant: the
-        // correct answer flips to 0 here, and both engines flip to 1.
+        // The complementary fixture. Pre-fix the corruption inverted with it (0 became 1
+        // here), which is how it was shown not to be a lucky constant; post-fix both
+        // fixtures are simply right.
         let mut odd = parity(0, 1);
         convert_ns(&mut odd, true, 4, &mut crate::logging::Logging::new())
             .expect("the conversion must succeed");
         assert_eq!(
-            odd.fa.o[odd.fa.q0], 1,
-            "WB-001: should be 0, and real walnut-java is wrong in the same direction"
+            odd.fa.o[odd.fa.q0], 0,
+            "odd parity accepts no base-4 word; pre-fix WB-001 made this 1"
+        );
+        assert!(!odd.fa.accepts_word(&[0, 3, 2]));
+        assert_eq!(odd.fa.q, 2);
+        assert_eq!(odd.fa.o, vec![0, 0]);
+        assert_eq!(odd.fa.d, all_digits_to_one);
+    }
+
+    /// The scoping witness for `convert_ns_round_trips_through_every_direction_and_base_step`
+    /// below: `msd_2 -> msd_4 -> msd_2` is **not** the identity in general, and the reason
+    /// is a genuine information loss in the conversion, not any bug.
+    ///
+    /// Same even-parity fixture as the test above (it accepts exactly the even-length
+    /// binary words). Every base-4 word expands to an even-length binary word, so the
+    /// `msd_4` image is constant-`1` — correct, and there is simply nothing left in it
+    /// from which "even length only" could be reconstructed. Converting back therefore
+    /// yields constant-`1` over `msd_2`, which accepts `1` (odd length) where the original
+    /// rejects it.
+    ///
+    /// Written as a separate test rather than a sentence in that doc comment so the
+    /// scoping cannot silently rot: if a future change made the round trip lossless here,
+    /// this fails and the neighbouring test's "NOT universal" caveat gets re-examined.
+    #[test]
+    fn convert_ns_round_trip_is_lossy_on_a_length_sensitive_automaton() {
+        let mut a = Automaton::new(
+            Fa {
+                true_false: None,
+                q0: 0,
+                q: 2,
+                alphabet_size: 2,
+                o: vec![1, 0],
+                d: vec![
+                    BTreeMap::from([(0, vec![1]), (1, vec![1])]),
+                    BTreeMap::from([(0, vec![0]), (1, vec![0])]),
+                ],
+            },
+            vec![vec![0, 1]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        );
+        assert!(a.fa.accepts_word(&[0, 1]), "even length accepted");
+        assert!(!a.fa.accepts_word(&[1]), "odd length rejected");
+
+        convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_4");
+        convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new()).expect("msd_4 -> msd_2");
+
+        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert!(a.fa.accepts_word(&[0, 1]), "even length still accepted");
+        assert!(
+            a.fa.accepts_word(&[1]),
+            "the round trip is LOSSY: odd length, rejected by the original, is now \
+             accepted -- base-4 cannot express representation-length parity"
         );
     }
 
@@ -6087,15 +6191,23 @@ mod tests {
     /// # This is NOT the universal round-trip property, and must not be re-worded as one
     ///
     /// An earlier draft of this test claimed the identity held "for every combination this
-    /// method supports". It does not, and the counterexample is not exotic:
-    /// `convert_ns_reaches_wb_001_when_regrouping_strands_a_state` below round-trips
-    /// **wrongly** — `msd_2 -> msd_4` on a 2-state parity automaton corrupts the language
-    /// outright (WB-001), so converting back cannot restore it. This fixture passes because
-    /// its 5 states leave nothing stranded when digits are regrouped, not because the
-    /// property is universal.
+    /// method supports". It does not.
     ///
-    /// Both engines have the defect, so this is a *known exception* to the invariant rather
-    /// than a port bug; see WB-001's call-site inventory in `docs/WALNUT-BUGS.md`.
+    /// The counterexample originally cited here was WB-001: `msd_2 -> msd_4` on the
+    /// 2-state parity automaton corrupted the language outright, so converting back could
+    /// not restore it. **That reason is gone** — WB-001 is fixed (`walnut-java` commit
+    /// `14509f1`); see `convert_ns_no_longer_corrupts_when_regrouping_strands_a_state`
+    /// below, which now asserts the correct constant-`1` answer.
+    ///
+    /// The round trip is still not universal, for an unrelated and more basic reason that
+    /// has nothing to do with any bug: `msd_2 -> msd_{2^j}` is a genuinely lossy
+    /// restriction on words whose length is not a multiple of `j`. That very same parity
+    /// fixture is the witness — it accepts exactly the even-length binary words, every
+    /// base-4 word has even binary length, so the `msd_4` image is constant-`1` and the
+    /// return trip cannot recover "even length only". Pinned directly by
+    /// `convert_ns_round_trip_is_lossy_on_a_length_sensitive_automaton` below, so this
+    /// scoping is a checked fact rather than a claim in prose. This fixture passes because
+    /// `x < 5` is a genuine value predicate, insensitive to representation length.
     #[test]
     fn convert_ns_round_trips_through_every_direction_and_base_step() {
         // `x < 5` over msd_2, total: states 0..4 count digits, 5 is a dead sink.
@@ -6224,9 +6336,18 @@ mod tests {
         (0..fa.q).map(|s| seen[s][0]).collect()
     }
 
-    /// Can `docs/WALNUT-BUGS.md` **WB-001** fire when `fa` is regrouped into digit groups
-    /// of size `j`? This is WB-001's precondition *on this code path*, derived from the
-    /// call chain rather than approximated:
+    /// Would `docs/WALNUT-BUGS.md` **WB-001** have fired when `fa` is regrouped into digit
+    /// groups of size `j`? WB-001 is **fixed** (`walnut-java` commit `14509f1`), so this no
+    /// longer gates anything: the property below used to `prop_assume!` these cases away
+    /// and now runs on all of them. The predicate and its pin test are KEPT, not deleted,
+    /// for two reasons — the property's own doc quantifies how much of the case space this
+    /// used to discard (10.7%, measured), and that number stays meaningful only if the
+    /// predicate it refers to still exists and is still exactly the condition it claims to
+    /// be; and it remains the precise, derived characterisation of WB-001's trigger *on
+    /// this code path*, which is the thing a future reader will want if the guard in
+    /// [`crate::minimize::minimize`] is ever revisited.
+    ///
+    /// The derivation, from the call chain rather than approximated:
     ///
     /// * `convertMsdBaseToExponent` re-keys the transition table by digit groups, so the
     ///   reachable set collapses to [`reachable_at_a_multiple_of`] — a state reachable
@@ -6240,9 +6361,9 @@ mod tests {
     /// * and Valmari's quirk needs `q0` to be unable to reach ANY accepting state *while
     ///   some accepting state exists* (`minimize.rs`'s "q0 aliasing quirk" docs).
     ///
-    /// Per sub-automaton that reads: `q0` reaches no state whose output is `v`, while some
+    /// Per sub-automaton that read: `q0` reaches no state whose output is `v`, while some
     /// state has output `v` (true by construction — `v` is drawn from `fa.o`, over all
-    /// states, reachable or not). So the exact condition is the one below.
+    /// states, reachable or not). So the exact condition was the one below.
     ///
     /// # Why not just "is every state reachable?"
     ///
@@ -6252,13 +6373,10 @@ mod tests {
     /// state `q0` can reach. Concrete counterexample — the WB-001 parity fixture's own
     /// transition table with both outputs equal: `q = 2`, `j = 2`, `0 --0,1--> 1` and
     /// `1 --0,1--> 0`, outputs `[1, 1]`. State `1` is reachable only at ODD lengths, so
-    /// the all-states form says "skip"; but the only present output value is `1`, which
+    /// the all-states form said "skip"; but the only present output value is `1`, which
     /// `q0` itself carries, so `q0` is trivially co-reachable in the only sub-automaton
-    /// and WB-001 provably cannot fire. Cases of that shape are now tested rather than
-    /// discarded. The property still *constrains its generator away* from the genuinely
-    /// bug-triggering shape (`convert_ns_reaches_wb_001_when_regrouping_strands_a_state`
-    /// pins the 2-state parity fixture where it bites, verified live against the real jar)
-    /// rather than weakening its oracle to accommodate a deliberately-ported quirk.
+    /// and WB-001 could not fire. That refinement recovered 19.3% of the case space while
+    /// the bug was still live; fixing the bug recovered the remaining 10.7%.
     fn wb_001_can_fire_on_regrouping(fa: &Fa, j: usize) -> bool {
         let reachable = reachable_at_a_multiple_of(fa, j);
         let present: BTreeSet<i32> = fa.o.iter().copied().collect();
@@ -6364,31 +6482,24 @@ mod tests {
         /// is untrustworthy — WB-032 is fixed, so the port is unconditionally correct here
         /// now, not merely bug-compatible; see this file's Tier-4
         /// `exact_integer_exponent_recovers_the_exponent_over_the_full_int_alphabet_sweep`
-        /// for the non-circular check that covers every other base. Constrained away from
-        /// WB-001's *actual* triggering shape — see [`wb_001_can_fire_on_regrouping`], which
-        /// is the precondition derived from `minimize_with_output`'s per-output-value
-        /// uncombine, not the coarser "every state reachable" over-approximation an earlier
-        /// draft used.
+        /// for the non-circular check that covers every other base.
         ///
-        /// The filter is a `prop_assume!`, not a bare `return Ok(())`: proptest counts a
-        /// bare early return as an ordinary PASS, so a future change that made every
-        /// generated case hit the skip would leave this property silently vacuous and
-        /// green forever. A rejection is tracked, and starving the property aborts the
-        /// run with "too many local rejects".
+        /// # Formerly scoped away from WB-001; now UNSCOPED
         ///
-        /// Measured over 4,548 generated inputs (a one-off 4,000-case instrumented run):
-        /// the refined condition rejects **10.7%**, where the coarser all-states form
-        /// rejected **30.0%** — so 19.3% of the case space is now actually tested rather
-        /// than discarded, and every one of those cases passes. No input was rejected by
-        /// the refinement that the coarser form accepted, as its derivation requires.
+        /// While `docs/WALNUT-BUGS.md` WB-001 was live this property carried a
+        /// `prop_assume!(!wb_001_can_fire_on_regrouping(&a.fa, j))`: on those inputs both
+        /// engines genuinely corrupted the language, so the property could not have held.
+        /// Measured over 4,548 generated inputs (a one-off instrumented run), that filter
+        /// rejected **10.7%** of the case space (the coarser all-states predicate it
+        /// replaced rejected 30.0%). WB-001 is fixed (`walnut-java` commit `14509f1`,
+        /// ported in [`crate::minimize::minimize`]), the filter is **removed**, and those
+        /// 10.7% are now asserted like every other case. `wb_001_can_fire_on_regrouping`
+        /// is kept — see its own doc comment for why — but no longer gates anything.
         #[test]
         fn convert_ns_to_a_power_of_two_base_preserves_the_integer_language(
             a in arb_total_msd2_automaton(4),
             j in 2usize..=3,
         ) {
-            // WB-001's precondition would be violated: both engines corrupt the language
-            // there, by design. Rejected, not asserted away.
-            prop_assume!(!wb_001_can_fire_on_regrouping(&a.fa, j));
             let to_base = 2i32.pow(j as u32);
             let mut converted = a.clone();
             convert_ns(&mut converted, true, to_base, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_2^j must succeed");

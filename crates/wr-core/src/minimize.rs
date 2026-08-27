@@ -11,18 +11,22 @@
 //! co-reachability pre-pass, and the smaller-half-gets-the-new-index rule are preserved
 //! exactly.
 //!
-//! # Preconditions (both are hard errors / documented, never `debug_assert!`)
+//! # Preconditions
 //!
-//! 1. **Deterministic input.** Java's `FA.justMinimize` calls `convertNFAtoDFA()` first,
-//!    which is a *storage* conversion that throws `"Unexpected NFA instead of DFA."` on
-//!    genuine nondeterminism — it does not subset-construct. The algorithm itself is
-//!    unsound on an NFA: [`Partition::mark`] has no double-mark guard, and two
-//!    transitions sharing a tail *and* a label would land in the same cord and mark the
-//!    same block element twice, corrupting the partition. Mirrored here as
-//!    [`MinimizeError::NotDeterministic`].
-//! 2. **Every state should be reachable from `q0`.** See the "q0 aliasing quirk" section
-//!    below — this is a genuine, faithfully-ported Walnut behavior, not a port artifact.
-//!    Callers should run [`crate::trim::trim`] first if they cannot guarantee it.
+//! 1. **Deterministic input** (a hard error, never a `debug_assert!`). Java's
+//!    `FA.justMinimize` calls `convertNFAtoDFA()` first, which is a *storage* conversion
+//!    that throws `"Unexpected NFA instead of DFA."` on genuine nondeterminism — it does
+//!    not subset-construct. The algorithm itself is unsound on an NFA:
+//!    [`Partition::mark`] has no double-mark guard, and two transitions sharing a tail
+//!    *and* a label would land in the same cord and mark the same block element twice,
+//!    corrupting the partition. Mirrored here as [`MinimizeError::NotDeterministic`].
+//! 2. **Every state reachable from `q0` — for MINIMALITY only, no longer for
+//!    correctness.** Walnut kept only Valmari's *backward* pruning (see the next
+//!    section), so a state that is unreachable from `q0` but can still reach acceptance
+//!    survives as one or more extra blocks and the result is language-correct but not
+//!    minimal. Callers who need the genuinely minimal automaton should run
+//!    [`crate::trim::trim`] first. Until the WB-001 fix below this precondition was
+//!    load-bearing for *correctness* as well; it is not anymore.
 //!
 //! # Two reachability notions — do not conflate them
 //!
@@ -35,21 +39,50 @@
 //! [`crate::trim::trim`], which is the only place in this crate that checks
 //! reachability from `q0` — and `minimize` deliberately does not do `trim`'s job.
 //!
-//! # The q0 aliasing quirk (ported verbatim)
+//! # The q0 aliasing bug (WB-001) — FIXED, matching `walnut-java` commit `14509f1`
 //!
-//! States found non-co-reachable are left parked at positions `>= rr` in the element
-//! array, outside every block's `[F, P)` range, yet their set-id `S[q]` is still `0` from
-//! `init`. `replaceFields` then computes the new start state as `blocks.S[q0]`. So if
-//! `q0` itself cannot reach an accepting state *while some accepting state exists*, the
-//! result's start state silently becomes block `0` — which after the initial
-//! accepting/non-accepting split is not necessarily the dead block, and can even be an
-//! accepting one. Concretely: `q0` self-looping and non-accepting, plus a disjoint
-//! accepting self-loop, minimizes to a 1-state *accepting* automaton (language `∅`
-//! becomes `Σ*`). This cannot happen when every state is reachable from `q0`: a final
-//! state then exists only if `q0` can reach it. Pinned by
-//! `minimize_q0_not_co_reachable_walnut_quirk`. Cataloged as `docs/WALNUT-BUGS.md` WB-001
-//! (upstream fix status, severity, full verification history — this doc comment covers
-//! only the Rust-port-relevant summary).
+//! **The defect.** States found non-co-reachable are left parked at positions `>= rr` in
+//! the element array, outside every block's `[F, P)` range, yet their set-id `S[q]` is
+//! still the `0` that `init` defaulted it to — `Partition::split` only ever rewrites
+//! `set_of` for positions inside a block's own `[F, P)` range, so it never revisits a
+//! parked state. `replaceFields` then computed the new start state as `blocks.S[q0]`
+//! unconditionally. So if `q0` itself cannot reach an accepting state *while some
+//! accepting state exists*, the result's start state silently became block `0` — which
+//! after the initial accepting/non-accepting split is not necessarily the dead block, and
+//! can even be an accepting one. Concretely: `q0` self-looping and non-accepting, plus a
+//! disjoint accepting self-loop, minimized to a 1-state *accepting* automaton (language
+//! `∅` became `Σ*`).
+//!
+//! Note that `q0` parked ⟺ no accepting state is reachable from `q0` ⟺ the language is
+//! empty. **Every** block holds only co-reachable states, so no block's language is ever
+//! empty — which is why *both* polarities of the initial split produced a wrong answer,
+//! not just the spectacular `Σ*` one.
+//!
+//! **The fix** (ported from `ValmariDFA.java`'s `numCoreachable` field + its
+//! `replaceFields` guard + `replaceWithEmptyLanguage`): the co-reachable-set size is
+//! recorded as a `num_coreachable` binding in [`minimize`] at the end of the
+//! `rem_unreachable` pass,
+//! and the rebuild checks `blocks.loc[q0] >= num_coreachable` before reading
+//! `blocks.set_of[q0]`. When it holds, the result is the canonical minimal
+//! empty-language automaton: **one non-accepting state, no transitions**. That shape is
+//! not invented here — it is what this crate and Walnut already mean by "the empty
+//! language" (Java's `Trimmer.quotient` empty-`statesToKeep` branch, and Valmari's own
+//! output when the automaton has no accepting states at all). Both engines' DFAs are
+//! partial, so a transition-less state is a well-formed sink; adding self-loops would
+//! diverge from both precedents.
+//!
+//! The guard necessarily fires for **every** `q0` when there is no accepting state at all
+//! (`num_coreachable == 0`), and there it is provably a no-op: the unguarded rebuild
+//! already produced exactly `q = 1`, `q0 = 0`, `o = [0]`, no transitions on that input
+//! (`blocks.z == 1` from `init`, block `0`'s range is `[0, 0)`, `num_final_states == 0`,
+//! and every transition was dropped by the co-reachability filter). So the only inputs
+//! whose result changes are the defective shape itself. Pinned both ways by
+//! `minimize_wb_001_trigger_now_yields_the_empty_language` and
+//! `the_guard_is_a_no_op_on_every_non_defective_input`.
+//!
+//! Cataloged as `docs/WALNUT-BUGS.md` WB-001 (upstream fix status, severity, the full
+//! four-call-site inventory and verification history — this doc comment covers only the
+//! Rust-port-relevant summary).
 //!
 //! # Scope note
 //!
@@ -300,6 +333,18 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     label.truncate(kept);
     head.truncate(kept);
     blocks.past[0] = rr;
+    // `numCoreachable` (`ValmariDFA.java`, the WB-001 fix): the size of the co-reachable
+    // set, i.e. the exclusive upper bound on the positions that any block will ever
+    // track. Every state at a position `>= num_coreachable` was parked here and carries
+    // a meaningless `set_of` entry forever after — see the module docs.
+    //
+    // Java has to stash this in a field because its `rr` is reset to `0` on this very
+    // line and `blocks.P[0]`, which momentarily holds the same value, is subsequently
+    // mutated by `split()`. This port's `rr` is a plain local that is never reset, so a
+    // binding here is enough; it is taken all the same, so the value the guard reads is
+    // fixed at the one moment it is meaningful rather than depending on `rr` staying
+    // untouched through 70 more lines of refinement.
+    let num_coreachable = rr;
     let num_transitions = tail.len();
 
     // Deviation from Java: `M`/`W` are sized `numTransitions + 1` there, but `M` is also
@@ -369,6 +414,39 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     }
 
     // --- rebuild (`replaceFields` / `determineDfaD` / `determineO`) ---
+
+    // `docs/WALNUT-BUGS.md` WB-001's guard, at Java's own placement (the first statement
+    // of `replaceFields`). `q0` sitting at a parked position means no accepting state is
+    // reachable from it at all, so the language is empty; `blocks.set_of[q0]` below would
+    // read the stale `0` from `Partition::init` and alias `q0` onto whichever block
+    // happens to hold id `0` — never an empty-language block. See the module docs.
+    //
+    // Reading `blocks.loc[q0]` this late is safe (and is what Java does): the refinement
+    // above cannot move a parked element. `mark` is only ever called on `tail[…]` of a
+    // *surviving* transition, and a surviving transition's head is co-reachable, hence so
+    // is its tail — so every element `mark` touches, and every position `mark`/`split`
+    // write to, lies inside some block's range and therefore below `num_coreachable`.
+    //
+    // An out-of-range `fa.q0` still panics identically: `blocks.loc` and `blocks.set_of`
+    // are both `Partition::init`'s `num_states`-length vectors, and pre-fix the first
+    // `q0` index in this function was `blocks.set_of[fa.q0]` a few lines below. Nothing
+    // between the two points indexes by `q0`, so the guard moves neither the panic's
+    // reachability nor its message (Java's `replaceFields` has the same property).
+    if blocks.loc[fa.q0] >= num_coreachable {
+        // `replaceWithEmptyLanguage`: the canonical minimal empty-language automaton —
+        // one non-accepting state, no transitions (Walnut's DFAs are partial, so a
+        // transition-less state is a well-formed sink). `alphabet_size` is carried over
+        // untouched, exactly as Java leaves `FA.alphabetSize` alone here.
+        return Ok(Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size: fa.alphabet_size,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
+        });
+    }
+
     let new_q = blocks.z;
     let new_q0 = blocks.set_of[fa.q0];
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); new_q];
@@ -555,14 +633,18 @@ mod tests {
         );
     }
 
+    /// `docs/WALNUT-BUGS.md` WB-001's minimal verified trigger, now asserting the CORRECT
+    /// answer — the fix landed here and upstream (`walnut-java` commit `14509f1`).
+    ///
+    /// This test formerly asserted the bug (`min.is_accepting(min.q0)`, language `Σ*`)
+    /// under the name `minimize_q0_not_co_reachable_walnut_quirk`. It is flipped, not
+    /// deleted, per `CLAUDE.md`'s merge gate; the pre-fix expectation is recorded in the
+    /// message below so a regression reads as "WB-001 is back", not as an anonymous
+    /// assertion failure.
     #[test]
-    fn minimize_q0_not_co_reachable_walnut_quirk() {
+    fn minimize_wb_001_trigger_now_yields_the_empty_language() {
         // q0 self-loops and is non-accepting; state 1 is a disjoint accepting self-loop
-        // that q0 can never reach. Walnut's `replaceFields` maps the new start state to
-        // `blocks.S[q0]`, and non-co-reachable states keep the `S = 0` they got from
-        // `init` — so q0 aliases onto block 0, which here is the accepting block. The
-        // language flips from ∅ to Σ*. Ported verbatim (mechanical-port discipline);
-        // pinned here so the deviation is visible rather than latent.
+        // that q0 can never reach. The true language is ∅.
         let fa = Fa {
             true_false: None,
             q0: 0,
@@ -572,16 +654,355 @@ mod tests {
             d: vec![row(&[(0, 0)]), row(&[(0, 1)])],
         };
         assert!(fa.is_language_empty());
-        let min = minimize(&fa).unwrap();
-        assert_eq!(min.q, 1);
-        assert!(
-            min.is_accepting(min.q0),
-            "documents Walnut's q0-aliasing quirk, see module docs"
-        );
 
-        // Trimming first restores the expected precondition and the correct answer.
+        let min = minimize(&fa).unwrap();
+        // The canonical empty-language shape, asserted field by field rather than just as
+        // "the language is empty": one non-accepting state, no transitions, start state 0.
+        assert_eq!(min.q, 1);
+        assert_eq!(min.q0, 0);
+        assert_eq!(min.o, vec![0], "WB-001 regression: q0 aliased onto block 0");
+        assert_eq!(min.d, vec![Map::new()]);
+        assert_eq!(
+            min.alphabet_size, fa.alphabet_size,
+            "the guard must not disturb the alphabet"
+        );
+        assert!(min.is_language_empty());
+
+        // Trimming first was the documented workaround while the bug was live; it now
+        // reaches the identical answer by the other route, which is the point.
         let min_trimmed = minimize(&trim(&fa)).unwrap();
         assert!(min_trimmed.is_language_empty());
+        assert_eq!(min_trimmed.q, 1);
+    }
+
+    /// The other half of WB-001's fix claim: the guard is a **no-op** on every input that
+    /// does not hit the defect. Mirrors `walnut-java`'s
+    /// `ordinaryMinimizationIsStructurallyUnchangedByTheGuard`.
+    ///
+    /// The pre-fix outputs below were captured by running the identical fixtures against
+    /// this function with the guard removed, and are asserted **structurally** (state
+    /// count, numbering, start state, exact transition table, exact output vector) rather
+    /// than by language — a language-only check would not detect the guard perturbing
+    /// state numbering, which is what "byte-for-byte identical" has to mean here given
+    /// how central `minimize` is.
+    #[test]
+    fn the_guard_is_a_no_op_on_every_non_defective_input() {
+        // (a) q0 IS co-reachable: "contains at least one 1", plus a stranded but
+        //     co-reachable extra state so the input is genuinely untrimmed.
+        let ordinary = Fa {
+            true_false: None,
+            q0: 0,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 1, 1],
+            d: vec![
+                row(&[(0, 0), (1, 1)]),
+                row(&[(0, 1), (1, 1)]),
+                row(&[(0, 2), (1, 2)]), // unreachable from q0, but accepting
+            ],
+        };
+        let min = minimize(&ordinary).unwrap();
+        assert_eq!(min.q, 2, "the two Σ*-sinks merge; q0 stays separate");
+        assert_eq!(min.o, vec![1, 0]);
+        assert_eq!(min.q0, 1);
+        assert_eq!(
+            min.d,
+            vec![row(&[(0, 0), (1, 0)]), row(&[(0, 1), (1, 0)])],
+            "exact table, pre-fix capture"
+        );
+
+        // (b) num_coreachable == 0 (no accepting state anywhere): the guard fires for
+        //     every q0, and the unguarded path already produced exactly this.
+        let dead = Fa {
+            true_false: None,
+            q0: 1,
+            q: 3,
+            alphabet_size: 2,
+            o: vec![0, 0, 0],
+            d: vec![
+                row(&[(0, 1), (1, 2)]),
+                row(&[(0, 2), (1, 0)]),
+                row(&[(0, 0), (1, 1)]),
+            ],
+        };
+        let min = minimize(&dead).unwrap();
+        assert_eq!(
+            (min.q, min.q0, &min.o, &min.d),
+            (1, 0, &vec![0], &vec![Map::new()])
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // WB-001: the exhaustive + randomized verification sweep
+    //
+    // Mirrors the 196,798-case differential sweep `walnut-java` commit `14509f1` ran
+    // against live-built jars of itself and its parent. That approach (two builds, diff
+    // the dumps) is not available inside one test binary, so the same two claims are
+    // established here by different means, both of them checkable on every run:
+    //
+    //   1. **Correctness.** Every swept automaton's minimized language equals its own,
+    //      decided by `same_language` below -- a from-scratch product BFS over PARTIAL
+    //      DFAs, written for this check and calling nothing in this crate.
+    //   2. **The fix is a no-op off the defect shape.** `NON_DEFECTIVE_DIGEST` is an
+    //      FNV-1a digest of the exhaustive sweep's full output (state count, start
+    //      state, output vector, transition table -- structure, not language) over every
+    //      case where the guard does NOT fire. It was captured by running this very
+    //      sweep against a build with the guard's condition forced to `false`, i.e.
+    //      against the pre-fix code. A guard that perturbed any non-defective case --
+    //      even only its state numbering -- changes this constant.
+    //
+    // ---------------------------------------------------------------------------
+
+    /// Do `a` and `b` accept the same language? A product BFS over `(Option<usize>,
+    /// Option<usize>)` pairs, where `None` means "already fell out of the automaton" --
+    /// both engines' DFAs are partial and a missing transition is an implicit reject, so
+    /// this decides equivalence directly, with no totalization and no word-length bound.
+    ///
+    /// Deliberately does NOT reuse [`crate::equiv`]: it is the oracle for a fix inside
+    /// `minimize`, and `equiv` is a sibling module with its own conventions (it demands
+    /// total DFAs, which would mean pre-processing the very automata under test).
+    /// Terminates because the reachable pair set is finite (`(|A|+1)·(|B|+1)`).
+    fn same_language(a: &Fa, b: &Fa) -> bool {
+        assert_eq!(a.alphabet_size, b.alphabet_size, "different alphabets");
+        let step = |fa: &Fa, s: Option<usize>, sym: i32| -> Option<usize> {
+            let s = s?;
+            fa.d[s].get(&sym).and_then(|dests| dests.first().copied())
+        };
+        let accepts = |fa: &Fa, s: Option<usize>| s.is_some_and(|s| fa.is_accepting(s));
+
+        let start = (Some(a.q0), Some(b.q0));
+        let mut seen: std::collections::BTreeSet<(Option<usize>, Option<usize>)> =
+            [start].into_iter().collect();
+        let mut stack = vec![start];
+        while let Some((x, y)) = stack.pop() {
+            if accepts(a, x) != accepts(b, y) {
+                return false;
+            }
+            for sym in 0..a.alphabet_size as i32 {
+                let next = (step(a, x, sym), step(b, y, sym));
+                if seen.insert(next) {
+                    stack.push(next);
+                }
+            }
+        }
+        true
+    }
+
+    /// Can `q0` reach any accepting state? Plain forward BFS.
+    ///
+    /// This is WB-001's trigger condition stated the other way round from the algorithm's
+    /// own: Valmari parks `q0` exactly when no accepting state is *backward*-co-reachable
+    /// to it, and the two are the same set. Written forwards on purpose, so the sweep's
+    /// expectation is derived independently of the code it is checking.
+    fn q0_reaches_acceptance(fa: &Fa) -> bool {
+        let mut seen = vec![false; fa.q];
+        seen[fa.q0] = true;
+        let mut stack = vec![fa.q0];
+        while let Some(s) = stack.pop() {
+            if fa.is_accepting(s) {
+                return true;
+            }
+            for dests in fa.d[s].values() {
+                for &t in dests {
+                    if !seen[t] {
+                        seen[t] = true;
+                        stack.push(t);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// FNV-1a over the bytes of a stable structural rendering of `fa`. Hand-rolled rather
+    /// than `DefaultHasher`, whose output std does not promise to keep stable across
+    /// releases -- this digest is a captured constant and has to survive toolchain bumps.
+    fn structural_digest(acc: &mut u64, fa: &Fa) {
+        let rendered = format!(
+            "{};{};{};{:?};{:?}",
+            fa.q, fa.q0, fa.alphabet_size, fa.o, fa.d
+        );
+        for b in rendered.as_bytes() {
+            *acc ^= u64::from(*b);
+            *acc = acc.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    /// Every partial DFA with exactly `q` states over `alphabet_size` symbols: every
+    /// transition table (each `(state, symbol)` pair independently absent or pointing at
+    /// any state), every accepting set, and every start state -- the same three axes
+    /// `walnut-java`'s `exhaustiveTinyAutomataKeepTheirLanguage` enumerates.
+    fn for_each_small_partial_dfa(q: usize, alphabet_size: usize, f: &mut impl FnMut(Fa)) {
+        let slots = q * alphabet_size;
+        let radix = (q + 1) as u64; // 0 = no transition; k >= 1 = state k-1
+        let tables = radix.pow(slots as u32);
+        for table in 0..tables {
+            let mut d: Vec<Map<i32, Vec<usize>>> = vec![Map::new(); q];
+            let mut rest = table;
+            for slot in 0..slots {
+                let code = rest % radix;
+                rest /= radix;
+                if code > 0 {
+                    d[slot / alphabet_size]
+                        .insert((slot % alphabet_size) as i32, vec![(code - 1) as usize]);
+                }
+            }
+            for o_mask in 0..(1u32 << q) {
+                let o: Vec<i32> = (0..q).map(|s| i32::from(o_mask >> s & 1 == 1)).collect();
+                for q0 in 0..q {
+                    f(Fa {
+                        true_false: None,
+                        q0,
+                        q,
+                        alphabet_size,
+                        o: o.clone(),
+                        d: d.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// FNV-1a digest of the exhaustive sweep's structural output over every case whose
+    /// `q0` DOES reach acceptance -- i.e. every case the WB-001 guard must not touch.
+    ///
+    /// Captured from a build of this file with the guard's condition forced to `false`
+    /// (the pre-fix code path), running exactly the sweep below. It is therefore direct
+    /// evidence, not a restatement of the current behaviour: if the guard perturbed even
+    /// one non-defective case's state numbering, this constant would not match. The two
+    /// runs agreed exactly, over all 73,926 non-defective cases.
+    ///
+    /// Reproducing the capture: force the `if blocks.loc[fa.q0] >= num_coreachable`
+    /// condition in [`minimize`] to `false`, early-`return` from this sweep's closure on
+    /// `!q0_reaches_acceptance(&fa)` (pre-fix, those cases genuinely compute the wrong
+    /// language and would trip the oracle -- which is itself worth doing once, as
+    /// independent confirmation that this sweep detects WB-001), and print `digest`.
+    const NON_DEFECTIVE_DIGEST: u64 = 11_238_673_596_080_511_772;
+
+    #[test]
+    fn wb_001_exhaustive_small_sweep() {
+        let mut digest: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+        let mut total = 0usize;
+        let mut defective = 0usize;
+        // `Fa` has no `PartialEq` (production type; not derived just for a test), so
+        // the canonical shape is asserted field by field.
+        let assert_canonical_empty = |min: &Fa, fa: &Fa| {
+            assert_eq!(
+                (min.q, min.q0, &min.o, &min.d, min.alphabet_size),
+                (1, 0, &vec![0], &vec![Map::new()], fa.alphabet_size),
+                "WB-001: {fa:?} has an empty language and must minimize to the \
+                 canonical empty automaton"
+            );
+        };
+
+        for q in 1..=3usize {
+            for alphabet_size in 1..=2usize {
+                for_each_small_partial_dfa(q, alphabet_size, &mut |fa| {
+                    total += 1;
+                    let min = minimize(&fa).expect("every generated table is deterministic");
+
+                    // (1) Correctness, against the independent oracle.
+                    assert!(
+                        same_language(&fa, &min),
+                        "minimize changed the language of {fa:?} -> {min:?}"
+                    );
+                    assert!(min.q <= fa.q, "minimize grew {fa:?} -> {min:?}");
+                    assert_eq!(min.alphabet_size, fa.alphabet_size);
+
+                    // (2) The guard fires on exactly the defect shape, and nowhere else.
+                    if q0_reaches_acceptance(&fa) {
+                        structural_digest(&mut digest, &min);
+                    } else {
+                        defective += 1;
+                        assert_canonical_empty(&min, &fa);
+                    }
+                });
+            }
+        }
+
+        assert_eq!(
+            total, 100_572,
+            "the sweep's own size, so it cannot silently shrink"
+        );
+        // Pinned exactly, so that a change which quietly stopped generating (or stopped
+        // classifying) the WB-001 cases cannot leave this test green and vacuous.
+        //
+        // 26,646 of the 100,572 cases have a parked `q0`. Of those, 13,980 ALSO have an
+        // accepting state somewhere and so genuinely computed the wrong language pre-fix;
+        // the remaining 12,666 have no accepting state at all, where the guard is provably
+        // a no-op (module docs). Both figures were measured on the pre-fix code path, and
+        // the equivalence `wrong <=> (parked q0 AND some accepting state)` was asserted
+        // case by case across all 100,572 -- WB-001's reach is exactly "the language is
+        // empty and the automaton does not know it", nothing wider.
+        assert_eq!(defective, 26_646, "guard-fires count");
+        assert_eq!(
+            digest, NON_DEFECTIVE_DIGEST,
+            "the WB-001 guard perturbed a case it must not touch (digest captured from \
+             the pre-fix code path -- see NON_DEFECTIVE_DIGEST)"
+        );
+    }
+
+    /// The randomized half, over automata too large to enumerate: up to 6 states and 3
+    /// symbols, partial, arbitrary start state. Mirrors `walnut-java`'s
+    /// `randomLargerAutomataKeepTheirLanguage`.
+    ///
+    /// Uses a fixed-seed xorshift64* rather than `proptest` so the case set is identical
+    /// on every run and on every machine -- a sweep whose job is to say "N cases, zero
+    /// wrong" should sweep the same N cases each time.
+    #[test]
+    fn wb_001_randomized_larger_sweep() {
+        let mut state: u64 = 0x2026_0820_0000_0001;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut defective = 0usize;
+        const CASES: usize = 20_000;
+
+        for _ in 0..CASES {
+            let q = 1 + (next() % 6) as usize;
+            let alphabet_size = 1 + (next() % 3) as usize;
+            let o: Vec<i32> = (0..q).map(|_| i32::from(next() % 3 == 0)).collect();
+            let mut d: Vec<Map<i32, Vec<usize>>> = vec![Map::new(); q];
+            for (s, row) in d.iter_mut().enumerate() {
+                let _ = s;
+                for sym in 0..alphabet_size {
+                    // ~1 in 4 transitions missing, so partial rows are common but the
+                    // graph is still usually connected enough to be interesting.
+                    if next() % 4 != 0 {
+                        row.insert(sym as i32, vec![(next() % q as u64) as usize]);
+                    }
+                }
+            }
+            let fa = Fa {
+                true_false: None,
+                q0: (next() % q as u64) as usize,
+                q,
+                alphabet_size,
+                o,
+                d,
+            };
+
+            let min = minimize(&fa).expect("generated tables are deterministic by construction");
+            assert!(
+                same_language(&fa, &min),
+                "minimize changed the language of {fa:?} -> {min:?}"
+            );
+            assert!(min.q <= fa.q);
+            if !q0_reaches_acceptance(&fa) {
+                defective += 1;
+                assert_eq!(min.q, 1);
+                assert_eq!(min.o, vec![0]);
+                assert!(min.d[0].is_empty());
+            }
+        }
+        assert!(
+            defective > CASES / 100,
+            "the generator must actually produce the defect shape often enough to be \
+             evidence: only {defective} of {CASES}"
+        );
     }
 
     /// Random small total DFA (`q0 = 0`, every (state, symbol) pair mapped), same shape
@@ -743,6 +1164,15 @@ mod tests {
         /// the property that catches *under*-merging — language preservation and
         /// idempotence are both satisfied by an identity function, this one is not.
         ///
+        /// **This one keeps its `trim`, and NOT for the WB-001 reason its siblings above
+        /// shed theirs.** `minimize` does no forward-reachability pruning of its own
+        /// (module docs, "two reachability notions"), so on an untrimmed input a state
+        /// that is unreachable from `q0` but still co-reachable survives as one or more
+        /// extra blocks — the result is language-correct but larger than minimal, and an
+        /// exact state-count comparison against a reference that *does* prune would fail
+        /// for that reason alone. The trim establishes the minimality precondition, which
+        /// outlives the WB-001 fix.
+        ///
         /// `max(1, ...)` covers the empty language, where Valmari (via `trim`'s canonical
         /// empty automaton) returns a single dead state but zero classes are
         /// co-reachable.
@@ -755,16 +1185,18 @@ mod tests {
 
         /// Tier-4 property #3 (DESIGN.md §5): minimize preserves language, checked
         /// against the `equiv` oracle (both sides totalized, since minimize returns a
-        /// partial DFA).
+        /// partial DFA), on the RAW generated automaton.
         ///
-        /// `trim` is applied first because the generator freely produces automata whose
-        /// q0 cannot reach acceptance, which is outside minimize's documented
-        /// precondition (see the q0-aliasing quirk in the module docs). `trim` is itself
-        /// property-tested as language-preserving, so this remains an end-to-end check
-        /// of minimize against the *original* automaton.
+        /// `trim` used to be applied first because the generator freely produces automata
+        /// whose `q0` cannot reach acceptance — which was WB-001's trigger, and the one
+        /// shape where `minimize` genuinely did not preserve the language. WB-001 is fixed
+        /// (`walnut-java` commit `14509f1`; see the module docs), so the trim is removed
+        /// and the property now covers exactly the case it used to have to exclude. The
+        /// sibling `minimize_agrees_with_moore_reference` still trims, for an unrelated
+        /// reason it explains itself.
         #[test]
         fn minimize_preserves_language(fa in arb_total_dfa(6, 3)) {
-            let min = minimize(&trim(&fa)).unwrap();
+            let min = minimize(&fa).unwrap();
             prop_assert_eq!(
                 language_equivalent(&totalized(&fa), &totalized(&min)),
                 Ok(true)
@@ -772,9 +1204,11 @@ mod tests {
         }
 
         /// Tier-4 property #4 (DESIGN.md §5): minimize is idempotent — a second pass
-        /// finds nothing further to merge, and does not disturb the language. No `trim`
-        /// is needed on the second pass: every state of a minimize output is
-        /// co-reachable by construction, so the q0-aliasing quirk cannot trigger there.
+        /// finds nothing further to merge, and does not disturb the language. The FIRST
+        /// pass keeps its `trim` so that `once` really is the minimal automaton and
+        /// `once.q == twice.q` is the sharp statement rather than a weaker one about an
+        /// arbitrary fixpoint; no `trim` is needed on the second pass, since every state
+        /// of a minimize output is co-reachable and reachable by construction.
         #[test]
         fn minimize_is_idempotent(fa in arb_total_dfa(6, 3)) {
             let once = minimize(&trim(&fa)).unwrap();
@@ -801,10 +1235,10 @@ mod tests {
         /// coverage gap the total-only generator leaves: `rem_unreachable`'s transition
         /// filter and `determineDfaD`'s rebuild both have to cope with rows that are
         /// already sparse going in, not just rows sparsified by dropping non-co-reachable
-        /// heads.
+        /// heads. Also untrimmed, for the same reason as its sibling: WB-001 is fixed.
         #[test]
         fn minimize_preserves_language_on_partial_dfa(fa in arb_partial_dfa(6, 3)) {
-            let min = minimize(&trim(&fa)).unwrap();
+            let min = minimize(&fa).unwrap();
             prop_assert_eq!(
                 language_equivalent(&totalized(&fa), &totalized(&min)),
                 Ok(true)

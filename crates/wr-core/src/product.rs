@@ -578,10 +578,14 @@ fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>)
     // `automaton.rs`'s own "callers are responsible" note). A malformed `Automaton`
     // here (mismatched `alphabet_size`, or a repeated digit within one track) would
     // make two distinct `(a_sym, b_sym)` pairs collide, silently violating
-    // `minimize`'s q0-reachability precondition and reaching WB-001
-    // (`docs/WALNUT-BUGS.md`) instead of a clean panic. Cheap to check, not a
-    // guaranteed catch of every malformed shape (a repeated digit within one
-    // track's alphabet Vec isn't checked here), but catches the common case.
+    // `minimize`'s q0-reachability precondition -- which, while WB-001
+    // (`docs/WALNUT-BUGS.md`) was live, meant a silently wrong language instead of a
+    // clean panic. WB-001 is fixed (`walnut-java` commit `14509f1`), so the same
+    // malformed input now costs minimality rather than correctness; the check is kept
+    // because a malformed `Automaton` is still a caller bug worth catching early.
+    // Cheap to check, not a guaranteed catch of every malformed shape (a repeated
+    // digit within one track's alphabet Vec isn't checked here), but catches the
+    // common case.
     debug_assert_eq!(
         a.fa.alphabet_size,
         a.alphabet.iter().map(|t| t.len()).product::<usize>(),
