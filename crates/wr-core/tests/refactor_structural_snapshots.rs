@@ -30,7 +30,10 @@
 //! that proves the loop-shape change in each function did not alter its output.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
+use wr_core::automaton::Automaton;
 use wr_core::fa::Fa;
+use wr_core::logging::Logging;
 use wr_core::numsys::NumberSystem;
 use wr_core::trim::trim;
 
@@ -503,4 +506,211 @@ fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
     // Same converted loop, direction lsd this time -> both tracks `Some(false)`
     // (confirmed live, not assumed from the msd_3 case above).
     assert_eq!(less_than.msd, vec![Some(false), Some(false)]);
+}
+
+// ---------------------------------------------------------------------------
+// U7 (idiomatic-refactor): `.clone()` reduction in `numsys.rs`/`automaton.rs`.
+//
+// U7's REMOVE-list touches:
+// - [`wr_core::numsys::NumberSystem::set_addition_automaton`] (a `.clone()` of
+//   `addition.alphabet[0]`, used only for the zero/one/per-track-equality
+//   validation reads below it, becomes a borrow).
+// - [`wr_core::numsys::NumberSystem::with_custom_base_files`] (a `.clone()` of
+//   `addition.alphabet[0]`, threaded into `set_less_than_automaton` and
+//   `equality_automaton`, becomes a borrow).
+// - [`wr_core::automaton::Automaton::apply_all_representations`] /
+//   `apply_all_representations_with_output` (the `Rc` clone of
+//   `self.all_reps[i]` becomes an `as_ref()` borrow; the DEEP clone one line
+//   below it, out of the `Rc`, is untouched -- it is mutated via `bind` and is
+//   load-bearing, per that function's own doc comment).
+//
+// None of these change the alphabet, transition table, or any other field of
+// the automata under test -- they only change whether an intermediate local
+// is owned or borrowed. So every value below is either hand-derived from the
+// (unmodified) construction code these functions call, or -- where the
+// downstream computation (a cross product inside `apply_all_representations`)
+// is impractical to hand-trace exactly -- captured from a live run of the
+// current, pre-refactor implementation, same convention as
+// `number_system_new_lsd_3_less_than_is_the_msd_shape_reversed` above.
+// ---------------------------------------------------------------------------
+
+/// Covers [`NumberSystem::set_addition_automaton`]'s alphabet-validation reads
+/// (the `addition.alphabet[0]` clone this unit removes). Hand-derived from
+/// `base_n_addition_automaton(2, Msd)`'s own doc comment: two states, `0`
+/// (accepting, "carry 0") / `1` ("carry 1"), three tracks over `{0,1}` so
+/// `alphabet_size = 8`, and the flat counter `l` runs `i` fastest inside `j`
+/// inside `k` (`l = i + 2*j + 4*k`) -- confirmed against a live run before
+/// being pinned here.
+#[test]
+fn number_system_set_addition_automaton_msd_2_has_the_hand_derived_carry_shape() {
+    let ns = NumberSystem::new("msd_2").expect("msd_2 is a valid ordinary base");
+    let addition = ns.addition();
+    let fa = &addition.fa;
+
+    assert_eq!(fa.q0, 0);
+    assert_eq!(fa.q, 2);
+    assert_eq!(fa.alphabet_size, 8, "three tracks of 2 symbols each: 2^3");
+    assert_eq!(fa.o, vec![1, 0]);
+    assert_eq!(
+        fa.d,
+        vec![
+            map(&[(0, &[0]), (4, &[1]), (5, &[0]), (6, &[0])]),
+            map(&[(1, &[1]), (2, &[1]), (3, &[0]), (7, &[1])]),
+        ]
+    );
+    assert_eq!(addition.msd, vec![Some(true), Some(true), Some(true)]);
+}
+
+/// Covers [`NumberSystem::with_custom_base_files`]'s `alphabet` local (the
+/// `addition.alphabet[0]` clone this unit removes), on its `equality_automaton`
+/// consumer -- the other consumer, `less_than`, is already pinned exactly by
+/// `number_system_new_msd_3_less_than_has_the_hand_derived_lexicographic_shape`
+/// above. Hand-derived from [`wr_core::numsys::equality_automaton`]'s own
+/// construction: a single accepting state self-looping on the diagonal
+/// `i*size+i` for `i` in `0..size`, over alphabet `[0,1,2]` (`size = 3`) ->
+/// symbols `{0, 4, 8}`.
+#[test]
+fn number_system_with_custom_base_files_msd_3_equality_has_the_hand_derived_diagonal_shape() {
+    let ns = NumberSystem::new("msd_3").expect("msd_3 is a valid ordinary base");
+    let eq = &ns.equality;
+
+    assert_eq!(eq.fa.q0, 0);
+    assert_eq!(eq.fa.q, 1);
+    assert_eq!(eq.fa.alphabet_size, 9);
+    assert_eq!(eq.fa.o, vec![1]);
+    assert_eq!(eq.fa.d, vec![map(&[(0, &[0]), (4, &[0]), (8, &[0])])]);
+    assert_eq!(eq.msd, vec![Some(true), Some(true)]);
+}
+
+/// The `lsd_3` twin of the test above: `equality_automaton` "is never reversed
+/// for lsd" (its own doc comment -- `:144` sits outside the `if (!isMsd)`
+/// blocks in Java), so the `(q0, q, o, d)` shape must be BYTE-IDENTICAL to the
+/// `msd_3` case; only the per-track `msd` flag differs. This is exactly what
+/// would break if `with_custom_base_files`'s shared `alphabet` local (used by
+/// BOTH the `less_than` and `equality` constructors) were accidentally given a
+/// direction-dependent value by this unit's edit.
+#[test]
+fn number_system_with_custom_base_files_lsd_3_equality_is_the_same_shape_direction_flag_only() {
+    let ns = NumberSystem::new("lsd_3").expect("lsd_3 is a valid ordinary base");
+    let eq = &ns.equality;
+
+    assert_eq!(eq.fa.q0, 0);
+    assert_eq!(eq.fa.q, 1);
+    assert_eq!(eq.fa.alphabet_size, 9);
+    assert_eq!(eq.fa.o, vec![1]);
+    assert_eq!(eq.fa.d, vec![map(&[(0, &[0]), (4, &[0]), (8, &[0])])]);
+    assert_eq!(eq.msd, vec![Some(false), Some(false)]);
+}
+
+/// A one-track automaton over `{0,1}` accepting the words with no `11`
+/// substring, replicated from `automaton.rs`'s own `no_adjacent_ones` test
+/// helper (private to that module's `#[cfg(test)]`, so re-built here from
+/// public API) -- the restriction shape a Fibonacci-style custom base attaches
+/// to a track.
+fn no_adjacent_ones(label: &str) -> Automaton {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![0]);
+    d0.insert(1, vec![1]);
+    let mut d1 = BTreeMap::new();
+    d1.insert(0, vec![0]);
+    Automaton::new(
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 2,
+            alphabet_size: 2,
+            o: vec![1, 1],
+            d: vec![d0, d1],
+        },
+        vec![vec![0, 1]],
+        vec![label.to_string()],
+        vec![Some(true)],
+    )
+}
+
+/// The `n`-track total automaton over `{0,1}` accepting everything, replicated
+/// from `automaton.rs`'s own `universal_tracks` test helper (same reason as
+/// [`no_adjacent_ones`] above).
+fn universal_tracks(labels: &[&str], output: i32) -> Automaton {
+    let n = labels.len();
+    let alphabet_size = 1usize << n;
+    let mut d0 = BTreeMap::new();
+    for sym in 0..alphabet_size as i32 {
+        d0.insert(sym, vec![0usize]);
+    }
+    Automaton::new(
+        Fa {
+            true_false: None,
+            q0: 0,
+            q: 1,
+            alphabet_size,
+            o: vec![output],
+            d: vec![d0],
+        },
+        vec![vec![0, 1]; n],
+        labels.iter().map(|s| s.to_string()).collect(),
+        vec![Some(true); n],
+    )
+}
+
+/// Covers [`Automaton::apply_all_representations`]'s loop body (the `Rc` clone
+/// of `self.all_reps[i]` this unit turns into an `as_ref()` borrow). Two
+/// tracks, `x` restricted to [`no_adjacent_ones`] and `y` unrestricted --
+/// exactly `automaton.rs`'s own
+/// `apply_all_representations_applies_every_restricted_track`/
+/// `_intersects_the_restricted_track_only` inputs, which pin this same call
+/// only by SEMANTICS (`accepts_word`); this pins the exact resulting
+/// `(q0, q, o, d)` too, captured from a live run of the current (unmodified)
+/// implementation -- the cross product inside `and` is not practical to
+/// hand-trace exactly, same convention as
+/// `number_system_new_lsd_3_less_than_is_the_msd_shape_reversed` above.
+#[test]
+fn apply_all_representations_single_restricted_track_has_this_exact_shape() {
+    let mut a = universal_tracks(&["x", "y"], 1);
+    a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+    a.apply_all_representations(&mut Logging::new());
+
+    assert_eq!(a.fa.q0, 1);
+    assert_eq!(a.fa.q, 2);
+    assert_eq!(a.fa.alphabet_size, 4);
+    assert_eq!(a.fa.o, vec![1, 1]);
+    assert_eq!(
+        a.fa.d,
+        vec![
+            map(&[(0, &[1]), (2, &[1])]),
+            map(&[(0, &[1]), (1, &[0]), (2, &[1]), (3, &[0])]),
+        ]
+    );
+    assert_eq!(a.label, vec!["x", "y"]);
+    assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1]]);
+    assert_eq!(a.msd, vec![Some(true), Some(true)]);
+}
+
+/// The `apply_all_representations_with_output` twin of the test above (covers
+/// the SAME clone-removal shape, in the sibling function this unit also
+/// touches) -- same inputs except the base automaton's single state carries a
+/// DFAO output of `7` rather than the boolean `1`, so this also pins that the
+/// output value survives (`IF_OTHER_OP`, not the plain `and` this function's
+/// sibling uses). Captured from a live run of the current implementation, same
+/// reasoning as above.
+#[test]
+fn apply_all_representations_with_output_single_restricted_track_has_this_exact_shape() {
+    let mut b = universal_tracks(&["x", "y"], 7);
+    b.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None]);
+    b.apply_all_representations_with_output(&mut Logging::new());
+
+    assert_eq!(b.fa.q0, 0);
+    assert_eq!(b.fa.q, 2);
+    assert_eq!(b.fa.alphabet_size, 4);
+    assert_eq!(b.fa.o, vec![7, 7]);
+    assert_eq!(
+        b.fa.d,
+        vec![
+            map(&[(0, &[0]), (1, &[1]), (2, &[0]), (3, &[1])]),
+            map(&[(0, &[0]), (2, &[0])]),
+        ]
+    );
+    assert_eq!(b.label, vec!["x", "y"]);
+    assert_eq!(b.alphabet, vec![vec![0, 1], vec![0, 1]]);
+    assert_eq!(b.msd, vec![Some(true), Some(true)]);
 }
