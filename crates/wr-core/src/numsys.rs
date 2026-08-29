@@ -1755,8 +1755,8 @@ impl NumberSystem {
             return Err(NumSysError::LessThanInputCount(name.to_string()));
         }
         let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
-        for i in 0..less_than.alphabet.len() {
-            let lhs: BTreeSet<i32> = less_than.alphabet[i].iter().copied().collect();
+        for (i, track) in less_than.alphabet.iter().enumerate() {
+            let lhs: BTreeSet<i32> = track.iter().copied().collect();
             if lhs != rhs {
                 return Err(NumSysError::LessThanAlphabetMismatch(name.to_string()));
             }

@@ -163,10 +163,14 @@ fn fa_reverse_with_a_multi_state_seed_marks_every_seed_state_accepting() {
 // Fa::concat_states
 // ---------------------------------------------------------------------------
 
-/// `first`: 2 states, state 1 accepting, no outgoing transitions from state 1.
-/// `other`: 2 states, state 0 (== `other.q0`) accepting -- so `other` accepts
-/// epsilon, which must keep `first`'s own accepting state (state 1) accepting
-/// after concatenation (not just graft `other`'s transitions onto it).
+/// `first`: 2 states, state 1 accepting WITH A DFAO OUTPUT OF `2` (not `1`) --
+/// deliberately, so the assertion below can actually distinguish "collapsed to
+/// `1`" from "left alone": a state that was already `1` before the call would
+/// still read `1` after even if the inlined `Fa::set_output_if_equal` body were
+/// buggily replaced with a no-op. `other`: 2 states, state 0 (== `other.q0`)
+/// accepting -- so `other` accepts epsilon, which must keep `first`'s own
+/// accepting state (state 1) accepting after concatenation (not just graft
+/// `other`'s transitions onto it).
 ///
 /// Hand-derived per `concat_states`'s doc comment: `other`'s states are appended
 /// at indices `original_q..original_q+other.q` (`other` state 0 -> `n` state 2,
@@ -174,7 +178,11 @@ fn fa_reverse_with_a_multi_state_seed_marks_every_seed_state_accepting() {
 /// `+original_q`); `other`'s ACTUAL `q0` (state 0, i.e. `n` state 2)'s
 /// transitions are grafted onto every of `first`'s own accepting states (just
 /// state 1 here); and because `other` accepts epsilon, state 1's accepting flag
-/// is explicitly kept (not cleared).
+/// is explicitly kept -- but per `concat_states`'s own doc comment ("this writes
+/// a plain `0`/`1`... a `first`-operand accepting state with a DFAO output `> 1`
+/// ... has that output collapsed to `1` here, not preserved"), "kept" means
+/// collapsed to the canonical `1`, not left at its original `2` (confirmed
+/// against a live run, not assumed).
 #[test]
 fn fa_concat_states_grafts_other_and_keeps_first_accepting_when_other_accepts_epsilon() {
     let mut n = Fa {
@@ -182,7 +190,7 @@ fn fa_concat_states_grafts_other_and_keeps_first_accepting_when_other_accepts_ep
         q0: 0,
         q: 2,
         alphabet_size: 1,
-        o: vec![0, 1],
+        o: vec![0, 2],
         d: vec![map(&[(0, &[1])]), map(&[])],
     };
     let other = Fa {
@@ -199,7 +207,11 @@ fn fa_concat_states_grafts_other_and_keeps_first_accepting_when_other_accepts_ep
 
     assert_eq!(n.q0, 0, "concat_states never touches q0");
     assert_eq!(n.q, 4);
-    assert_eq!(n.o, vec![0, 1, 1, 0]);
+    assert_eq!(
+        n.o,
+        vec![0, 1, 1, 0],
+        "state 1's DFAO output must collapse from 2 to the canonical 1, not be left at 2"
+    );
     assert_eq!(
         n.d,
         vec![
@@ -398,7 +410,8 @@ fn trim_collapses_to_the_canonical_empty_automaton_with_a_single_symbol_alphabet
 #[test]
 fn number_system_new_msd_3_less_than_has_the_hand_derived_lexicographic_shape() {
     let ns = NumberSystem::new("msd_3").expect("msd_3 is a valid ordinary base");
-    let fa = &ns.less_than().fa;
+    let less_than = ns.less_than();
+    let fa = &less_than.fa;
 
     assert_eq!(fa.q0, 0);
     assert_eq!(fa.q, 2);
@@ -428,6 +441,9 @@ fn number_system_new_msd_3_less_than_has_the_hand_derived_lexicographic_shape() 
             ]),
         ]
     );
+    // The converted loop's ONLY side effect: per-track `msd = Some(direction ==
+    // Msd)`. Two tracks, direction msd -> both `Some(true)` (confirmed live).
+    assert_eq!(less_than.msd, vec![Some(true), Some(true)]);
 }
 
 /// `NumberSystem::new("lsd_3")` takes the SAME `lexicographic_less_than` shape as
@@ -440,7 +456,8 @@ fn number_system_new_msd_3_less_than_has_the_hand_derived_lexicographic_shape() 
 #[test]
 fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
     let ns = NumberSystem::new("lsd_3").expect("lsd_3 is a valid ordinary base");
-    let fa = &ns.less_than().fa;
+    let less_than = ns.less_than();
+    let fa = &less_than.fa;
 
     // `reverse(&mut less_than, MsdFlip::Keep)` here is `crate::logicalops::reverse`
     // (Automaton-level -- takes `&mut Automaton`, not `Fa::reverse`'s
@@ -483,4 +500,7 @@ fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
             ]),
         ]
     );
+    // Same converted loop, direction lsd this time -> both tracks `Some(false)`
+    // (confirmed live, not assumed from the msd_3 case above).
+    assert_eq!(less_than.msd, vec![Some(false), Some(false)]);
 }

@@ -50,10 +50,9 @@ pub fn trim(fa: &Fa) -> Fa {
     let keep: Vec<usize> = (0..fa.q).filter(|&s| forward[s] && backward[s]).collect();
 
     if keep.is_empty() {
-        let mut d0 = BTreeMap::new();
-        for sym in 0..fa.alphabet_size as i32 {
-            d0.insert(sym, vec![0]);
-        }
+        let d0: BTreeMap<i32, Vec<usize>> = (0..fa.alphabet_size as i32)
+            .map(|sym| (sym, vec![0]))
+            .collect();
         return Fa {
             true_false: None,
             q0: 0,

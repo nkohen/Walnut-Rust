@@ -278,14 +278,13 @@ impl Fa {
         self.o.push(sink_output);
         self.q += 1;
         for sym in 0..self.alphabet_size as i32 {
-            for s in 0..sink {
-                self.d[s].entry(sym).or_insert_with(|| vec![sink]);
+            for row in self.d[..sink].iter_mut() {
+                row.entry(sym).or_insert_with(|| vec![sink]);
             }
         }
-        let mut sink_map = BTreeMap::new();
-        for sym in 0..self.alphabet_size as i32 {
-            sink_map.insert(sym, vec![sink]);
-        }
+        let sink_map: BTreeMap<i32, Vec<usize>> = (0..self.alphabet_size as i32)
+            .map(|sym| (sym, vec![sink]))
+            .collect();
         self.d.push(sink_map);
     }
 
@@ -475,9 +474,13 @@ impl Fa {
         // L(first), then read nothing more of other", which is only a concatenation
         // match if other accepts epsilon (WB-009).
         let other_accepts_epsilon = other.is_accepting(other.q0);
-        for q in 0..original_q {
-            if n.is_accepting(q) {
-                n.set_output_if_equal(q, other_accepts_epsilon);
+        // Inlines `Fa::set_output_if_equal` (Java `FA.setOutputIfEqual(int, boolean)`)
+        // rather than calling it: the loop borrows `n.o` mutably via `iter_mut()`, and
+        // a call to `n.set_output_if_equal(...)` needs `&mut n` itself. A future
+        // fidelity fix to `set_output_if_equal` must be mirrored here.
+        for out in n.o[..original_q].iter_mut() {
+            if *out != 0 {
+                *out = i32::from(other_accepts_epsilon);
             }
         }
 
@@ -631,9 +634,15 @@ impl Fa {
     /// output to `1` if it equals `output`, else `0`. Distinct Rust name from
     /// [`Fa::set_output_if_equal`] because Rust has no method overloading; Java
     /// disambiguates the two purely by parameter count.
+    ///
+    /// The loop body inlines the OTHER overload, [`Fa::set_output_if_equal`] (Java's
+    /// `FA.setOutputIfEqual(int, boolean)`), rather than calling it: the loop borrows
+    /// `self.o` mutably via `iter_mut()`, and a call to `self.set_output_if_equal(...)`
+    /// needs `&mut self` itself. A future fidelity fix to that method must be mirrored
+    /// here.
     pub fn restrict_output_to(&mut self, output: i32) {
-        for j in 0..self.o.len() {
-            self.set_output_if_equal(j, self.o[j] == output);
+        for out in self.o.iter_mut() {
+            *out = i32::from(*out == output);
         }
     }
 
@@ -721,10 +730,9 @@ impl Fa {
         if needs_sink {
             self.o.push(sink_output);
             self.q += 1;
-            let mut sink_row = BTreeMap::new();
-            for sym in 0..self.alphabet_size as i32 {
-                sink_row.insert(sym, vec![sink_state]);
-            }
+            let sink_row: BTreeMap<i32, Vec<usize>> = (0..self.alphabet_size as i32)
+                .map(|sym| (sym, vec![sink_state]))
+                .collect();
             self.d.push(sink_row);
         }
         needs_sink
