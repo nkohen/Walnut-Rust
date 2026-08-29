@@ -445,7 +445,7 @@ pub(crate) fn flip_ns(a: &mut Automaton) {
     for slot in a.all_reps.iter_mut() {
         if let Some(all_reps) = slot.as_mut() {
             let mut flipped = (**all_reps).clone();
-            reverse(&mut flipped, false);
+            reverse(&mut flipped, MsdFlip::Keep);
             *all_reps = Rc::new(flipped);
         }
     }
@@ -778,6 +778,16 @@ pub fn not(a: AutomatonDFA, logging: &mut crate::logging::Logging) -> AutomatonD
 // Quotients.
 // ---------------------------------------------------------------------------
 
+/// [`right_quotient`]'s `skipSubsetCheck` argument: whether the "`B`'s alphabet ⊆ `A`'s
+/// alphabet" guard runs before the quotient is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubsetCheck {
+    /// Run the guard (`WalnutException` on failure).
+    Check,
+    /// Skip the guard — [`left_quotient`]'s use, see its doc comment.
+    Skip,
+}
+
 /// `AutomatonLogicalOps.rightQuotient` (`:176-235`) — `L(A) / L(B) = { x : ∃ y ∈ L(B),
 /// xy ∈ L(A) }`.
 ///
@@ -802,13 +812,13 @@ pub fn not(a: AutomatonDFA, logging: &mut crate::logging::Logging) -> AutomatonD
 ///   it is the one edit here that survives, and it survives for a real reason, not a
 ///   test gap). Ported anyway, per `CLAUDE.md`'s mechanical-port rule.
 ///
-/// `skip_subset_check` bypasses the "`B`'s alphabet ⊆ `A`'s alphabet" guard
-/// (`:180-185`); [`left_quotient`] passes `true` — see its doc comment for the genuine
-/// Walnut defect that hides behind that.
+/// `subset_check` bypasses the "`B`'s alphabet ⊆ `A`'s alphabet" guard (`:180-185`) when
+/// [`SubsetCheck::Skip`]; [`left_quotient`] passes `Skip` — see its doc comment for the
+/// genuine Walnut defect that hides behind that.
 ///
 /// # Panics
 ///
-/// If `!skip_subset_check` and `B`'s alphabet is not a subset of `A`'s
+/// If `subset_check` is [`SubsetCheck::Check`] and `B`'s alphabet is not a subset of `A`'s
 /// (`WalnutException` message ported verbatim).
 ///
 /// `docs/WALNUT-BUGS.md` WB-001 used to be reachable through the closing
@@ -819,7 +829,7 @@ pub fn not(a: AutomatonDFA, logging: &mut crate::logging::Logging) -> AutomatonD
 pub fn right_quotient(
     a: &Automaton,
     b: &Automaton,
-    skip_subset_check: bool,
+    subset_check: SubsetCheck,
     logging: &mut crate::logging::Logging,
 ) -> Automaton {
     // `logMessage("right quotient: " + …)` (`:178`) -- no `indent()`/`dedent()` bracket of
@@ -829,7 +839,7 @@ pub fn right_quotient(
         "right quotient: {} state A with {} state A",
         a.fa.q, b.fa.q
     ));
-    if !skip_subset_check {
+    if subset_check == SubsetCheck::Check {
         assert!(
             is_subset_alphabet(&b.alphabet, &a.alphabet),
             "Second A's alphabet must be a subset of the first A's alphabet for right quotient."
@@ -949,9 +959,9 @@ pub fn left_quotient(
 
     let m1 = reverse_and_canonize(a, logging);
     let m2 = reverse_and_canonize(b, logging);
-    let mut m = right_quotient(&m1, &m2, true, logging);
+    let mut m = right_quotient(&m1, &m2, SubsetCheck::Skip, logging);
 
-    reverse_with_ctx(&mut m, true, None, logging);
+    reverse_with_ctx(&mut m, MsdFlip::Flip, None, logging);
     // `logMessage("left quotient complete: " + …)` (`:253`).
     logging.log_message(&format!(
         "left quotient complete: {} states - {}ms",
@@ -967,7 +977,7 @@ pub fn left_quotient(
 /// rather than inverting it.
 fn reverse_and_canonize(a: &Automaton, logging: &mut crate::logging::Logging) -> Automaton {
     let mut m1 = a.clone();
-    reverse_with_ctx(&mut m1, true, None, logging);
+    reverse_with_ctx(&mut m1, MsdFlip::Flip, None, logging);
     m1.force_canonize();
     m1
 }
@@ -1383,15 +1393,29 @@ fn remove_leading_zeros_helper(
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
-        reverse_with_ctx(&mut m, false, ctx, logging);
+        reverse_with_ctx(&mut m, MsdFlip::Keep, ctx, logging);
     }
     Ok(m)
+}
+
+/// [`reverse`]/[`reverse_with_ctx`]'s (and [`crate::word_automaton::reverse_with_output`]'s)
+/// `reverseMsd` argument: whether the language reversal ALSO flips each track's declared
+/// msd/lsd numeration direction, via [`flip_ns`]. `Flip` is Java's `reverseMsd == true`
+/// (`Main/Commands/Reverse.java:15`, `LogicalOperator.java:108`); `Keep` is `false`
+/// (`NumberSystem.java`'s several internal reversals of the LANGUAGE only, at `:315`,
+/// `:333`, `:378`, `:459`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsdFlip {
+    /// Also flip each track's declared msd/lsd direction.
+    Flip,
+    /// Leave every track's declared msd/lsd direction untouched.
+    Keep,
 }
 
 /// `AutomatonLogicalOps.reverse(Automaton, boolean reverseMsd)` (`:414-430`) — replace
 /// `L(A)` by its reversal.
 ///
-/// `reverse_msd` does **not** control the reversal itself (which always happens); it
+/// `msd_flip` does **not** control the reversal itself (which always happens); it
 /// controls the single extra line at `:423-425`, `NumberSystem.flipNS(A.getNS())` —
 /// i.e. whether each track's numeration direction is also flipped from msd to lsd and
 /// back. Java's own doc comment (`:409`) states it that way, and reading the body
@@ -1409,8 +1433,8 @@ fn remove_leading_zeros_helper(
 ///
 /// The result is a DFA (Java's `:412` note: "the output of this is a DFA"), even though
 /// the input may be an NFA.
-pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
-    reverse_with_ctx(a, reverse_msd, None, &mut crate::logging::Logging::new());
+pub fn reverse(a: &mut Automaton, msd_flip: MsdFlip) {
+    reverse_with_ctx(a, msd_flip, None, &mut crate::logging::Logging::new());
 }
 
 /// [`reverse`] with an explicit [`crate::determinize::DeterminizeContext`] — see
@@ -1419,7 +1443,7 @@ pub fn reverse(a: &mut Automaton, reverse_msd: bool) {
 /// `Some(ctx)` this always consumes one automata index.
 pub fn reverse_with_ctx(
     a: &mut Automaton,
-    reverse_msd: bool,
+    msd_flip: MsdFlip,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
     logging: &mut crate::logging::Logging,
 ) {
@@ -1438,7 +1462,7 @@ pub fn reverse_with_ctx(
     let set_of_final_states = a.fa.reverse(&initial);
     a.determinize_and_minimize_from_with_ctx(&set_of_final_states, ctx, logging);
 
-    if reverse_msd {
+    if msd_flip == MsdFlip::Flip {
         flip_ns(a);
     }
     // `Logging.dedent()` sits AFTER `flipNS` (`:427`), not immediately after
@@ -1917,8 +1941,8 @@ fn parse_base(name: &str) -> Result<i32, ConvertNsError> {
 /// [`ConvertNsError::IdenticalNumberSystems`]'s `ns.getName()` (`:467`). Exact for every
 /// base-*k* system, which is the only kind [`convert_ns`] accepts (a custom base's name
 /// would not survive `parseBase()` in the first place).
-fn ns_name(is_msd: bool, base: i32) -> String {
-    let prefix = if is_msd {
+fn ns_name(direction: crate::numsys::Direction, base: i32) -> String {
+    let prefix = if direction == crate::numsys::Direction::Msd {
         crate::numsys::MSD_UNDERSCORE
     } else {
         crate::numsys::LSD_UNDERSCORE
@@ -1935,7 +1959,7 @@ fn ns_name(is_msd: bool, base: i32) -> String {
 /// (`automaton.rs`'s field docs) and `PORTING.md`'s parallel-vector ruling requires every
 /// mutation site to move them **together**, in the same statement as the original.
 ///
-/// * `msd` <- `Some(is_msd)`, the direction encoded in the new system's name.
+/// * `msd` <- `Some(direction == Msd)`, the direction encoded in the new system's name.
 /// * `all_reps` <- `None`. `new NumberSystem(name)` sets `allRepresentations` from
 ///   `loadAutomatonOrNull` (`NumberSystem.java:147-150`), i.e. from a
 ///   `Custom Bases/<name>.txt` file. `wr-core` performs no file I/O (U5's design premise),
@@ -1953,8 +1977,12 @@ fn ns_name(is_msd: bool, base: i32) -> String {
 /// encoder honest instead of relying on Java's stale one happening to be right.
 ///
 /// `label` is deliberately untouched (Java touches neither), so the track keeps its name.
-fn set_number_system_and_alphabet(a: &mut Automaton, is_msd: bool, new_base: i32) {
-    a.msd = vec![Some(is_msd)];
+fn set_number_system_and_alphabet(
+    a: &mut Automaton,
+    direction: crate::numsys::Direction,
+    new_base: i32,
+) {
+    a.msd = vec![Some(direction == crate::numsys::Direction::Msd)];
     a.all_reps = vec![None];
     // Java installs `new NumberSystem(<msd|lsd>_ + newBase)`, whose name is exactly what
     // `Automaton::track_ns_names` reconstructs from the `0..new_base` alphabet installed
@@ -2118,7 +2146,7 @@ fn convert_msd_base_to_exponent(
 
     // `A.getNS().set(0, new NumberSystem(MSD_UNDERSCORE + newBase))` (`:554`) +
     // `setAutomatonAlphabet(A, newBase)` (`:555`).
-    set_number_system_and_alphabet(a, true, new_base);
+    set_number_system_and_alphabet(a, crate::numsys::Direction::Msd, new_base);
     Ok(())
 }
 
@@ -2249,7 +2277,7 @@ fn convert_lsd_base_to_root(
 
     // `A.getNS().set(0, new NumberSystem(LSD_UNDERSCORE + root))` (`:650`) +
     // `setAutomatonAlphabet(A, root)` (`:651`).
-    set_number_system_and_alphabet(a, false, root);
+    set_number_system_and_alphabet(a, crate::numsys::Direction::Lsd, root);
     Ok(())
 }
 
@@ -2374,8 +2402,13 @@ pub fn convert_ns(
     // If the old and new bases are the same, check if only MSD/LSD is changing.
     if from_base == to_base {
         if from_msd == to_msd {
+            let from_direction = if from_msd {
+                crate::numsys::Direction::Msd
+            } else {
+                crate::numsys::Direction::Lsd
+            };
             return Err(ConvertNsError::IdenticalNumberSystems {
-                name: ns_name(from_msd, from_base),
+                name: ns_name(from_direction, from_base),
             });
         }
         // The conversion routines assume a complete transition function; totalize before
@@ -2384,7 +2417,7 @@ pub fn convert_ns(
             totalize(&mut a.fa, logging);
         }
         // If only msd <-> lsd differs, just reverse A.
-        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
+        word_automaton::reverse_with_output_with_ctx(a, MsdFlip::Flip, None, logging);
         return Ok(());
     }
 
@@ -2402,7 +2435,7 @@ pub fn convert_ns(
 
     // If originally LSD, we need to reverse to treat it as MSD for the conversions.
     if !from_msd {
-        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
+        word_automaton::reverse_with_output_with_ctx(a, MsdFlip::Flip, None, logging);
     }
 
     // We'll track if A is reversed relative to original.
@@ -2411,7 +2444,7 @@ pub fn convert_ns(
     // Convert from k^i -> k if needed.
     if from_base != common_root {
         let exponent = exact_integer_exponent(from_base, common_root)?;
-        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
+        word_automaton::reverse_with_output_with_ctx(a, MsdFlip::Flip, None, logging);
         currently_reversed = true;
 
         convert_lsd_base_to_root(a, from_base, common_root, exponent)?;
@@ -2422,7 +2455,7 @@ pub fn convert_ns(
     if to_base != common_root {
         if currently_reversed {
             // Undo reversal from the previous step.
-            word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
+            word_automaton::reverse_with_output_with_ctx(a, MsdFlip::Flip, None, logging);
             currently_reversed = false;
         }
         let exponent = exact_integer_exponent(to_base, common_root)?;
@@ -2432,7 +2465,7 @@ pub fn convert_ns(
 
     // If final desired base is LSD but we are still in MSD form, reverse again.
     if to_msd == currently_reversed {
-        word_automaton::reverse_with_output_with_ctx(a, true, None, logging);
+        word_automaton::reverse_with_output_with_ctx(a, MsdFlip::Flip, None, logging);
     }
     Ok(())
 }
@@ -2684,13 +2717,13 @@ mod tests {
     fn reverse_with_msd_reversal_flips_the_name_a_writer_would_emit() {
         let mut a = single_track(ends_with_one(), Some(true));
         a.set_ns_names(vec![Some("msd_2".to_string())]);
-        reverse(&mut a, true);
+        reverse(&mut a, MsdFlip::Flip);
         assert_eq!(a.track_ns_names(), vec![Some("lsd_2".to_string())]);
 
         // `reverse(A, false)` (`:315`/`:333`/`:378`/`:459`) must NOT touch it.
         let mut b = single_track(ends_with_one(), Some(true));
         b.set_ns_names(vec![Some("msd_2".to_string())]);
-        reverse(&mut b, false);
+        reverse(&mut b, MsdFlip::Keep);
         assert_eq!(b.track_ns_names(), vec![Some("msd_2".to_string())]);
     }
 
@@ -2725,7 +2758,7 @@ mod tests {
         assert_eq!(a.msd, vec![Some(false)], "direction still flips");
         let flipped = a.all_reps[0].as_ref().expect("still present");
         let mut expected = ends_in_one;
-        reverse(&mut expected, false);
+        reverse(&mut expected, MsdFlip::Keep);
         let mut got = flipped.fa.clone();
         got.totalize(0);
         let mut want = expected.fa.clone();
@@ -2875,13 +2908,22 @@ mod tests {
     fn right_quotient_reapplies_the_valid_representation_restriction() {
         let a = restricted(universal());
         let b = single_track(universal(), Some(true));
-        let quotient = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let quotient = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
         accepts_exactly_the_valid_representations(&quotient);
 
         // Discriminator: unrestricted, the same quotient is `Σ*`.
         let a_plain = single_track(universal(), Some(true));
-        let plain_quotient =
-            right_quotient(&a_plain, &b, false, &mut crate::logging::Logging::new());
+        let plain_quotient = right_quotient(
+            &a_plain,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
         assert!(plain_quotient.fa.accepts_word(&[1, 1]));
     }
 
@@ -2892,7 +2934,12 @@ mod tests {
     fn right_quotient_copies_both_halves_of_the_track_metadata_onto_the_second_operand() {
         let a = restricted(universal());
         let b = single_track(universal(), Some(true));
-        let quotient = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let quotient = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
         assert_eq!(quotient.msd, vec![Some(true)]);
         assert!(quotient.all_reps.iter().all(|r| r.is_some()));
     }
@@ -3587,7 +3634,7 @@ mod tests {
     #[test]
     fn reverse_reverses_the_language_and_leaves_number_systems_alone_when_false() {
         let mut a = single_track(ends_with_one(), Some(true));
-        reverse(&mut a, false);
+        reverse(&mut a, MsdFlip::Keep);
 
         // Reversing "ends with 1" gives "starts with 1".
         assert!(a.fa.accepts_word(&[1]));
@@ -3629,7 +3676,7 @@ mod tests {
             "sanity: L = {{ (1,0)(0,0) }}"
         );
 
-        reverse(&mut a, true);
+        reverse(&mut a, MsdFlip::Flip);
 
         assert_eq!(
             a.msd,
@@ -4316,7 +4363,12 @@ mod tests {
             vec!["x".to_string(), "y".to_string()],
             vec![Some(true), Some(true)],
         );
-        let _ = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let _ = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -4347,7 +4399,12 @@ mod tests {
             is_subset_alphabet(&a.alphabet, &b.alphabet),
             "the OPPOSITE containment does hold, so a swapped guard would pass"
         );
-        let _ = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let _ = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
     }
 
     #[test]
@@ -4378,7 +4435,12 @@ mod tests {
             "precondition: the guard WOULD reject this pair if it ran"
         );
 
-        let m = right_quotient(&a, &b, true, &mut crate::logging::Logging::new());
+        let m = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Skip,
+            &mut crate::logging::Logging::new(),
+        );
 
         assert!(m.fa.accepts_word(&[0]));
         assert!(!m.fa.accepts_word(&[]));
@@ -4412,7 +4474,12 @@ mod tests {
         );
         assert_eq!(b.encode(&[1]), 0, "sanity: L(B) = {{\"1\"}}");
 
-        let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let m = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
 
         assert!(m.fa.accepts_word(&[0]), "\"0\" is in L(A)/L(B)");
         assert!(!m.fa.accepts_word(&[]));
@@ -4453,7 +4520,12 @@ mod tests {
         };
         b.label = Vec::new();
 
-        let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+        let m = right_quotient(
+            &a,
+            &b,
+            SubsetCheck::Check,
+            &mut crate::logging::Logging::new(),
+        );
 
         // Same hand-derived answer as the bound case: {"01"} / {"1"} = {"0"}.
         assert!(m.fa.accepts_word(&[0]));
@@ -4926,7 +4998,7 @@ mod tests {
             a in arb_partial_automaton_over(4, vec![0, 1]),
             b in arb_partial_automaton_over(4, vec![0, 1]),
         ) {
-            let m = right_quotient(&a, &b, false, &mut crate::logging::Logging::new());
+            let m = right_quotient(&a, &b, SubsetCheck::Check, &mut crate::logging::Logging::new());
             for x in all_digit_words(&[0, 1], 4) {
                 prop_assert_eq!(
                     accepts_digit_word_from(&m, &BTreeSet::from([m.fa.q0]), &x),
@@ -5400,7 +5472,7 @@ mod tests {
             let mut a = p_automaton();
             a.fa.true_false = Some(t);
             a.clear();
-            reverse(&mut a, true);
+            reverse(&mut a, MsdFlip::Flip);
             assert!(a.is_true_false_automaton());
             assert_eq!(a.is_true_automaton(), t);
             assert!(a.msd.is_empty(), "nothing to flip");
@@ -5443,7 +5515,7 @@ mod tests {
     /// A one-state, no-transition, accepting automaton over `[0..base-1]` — Java's
     /// `A.fa.initBasicFA(IntList.of(1))` plus an explicit alphabet. Accepts exactly the
     /// empty word, and is deliberately NOT total.
-    fn epsilon_only(base: i32, msd: bool) -> Automaton {
+    fn epsilon_only(base: i32, direction: crate::numsys::Direction) -> Automaton {
         let fa = Fa {
             true_false: None,
             q0: 0,
@@ -5456,7 +5528,7 @@ mod tests {
             fa,
             vec![util::int_range_list(base)],
             vec!["x".to_string()],
-            vec![Some(msd)],
+            vec![Some(direction == crate::numsys::Direction::Msd)],
         )
     }
 
@@ -5471,7 +5543,7 @@ mod tests {
     /// would have reversed a Zeckendorf automaton as if it were binary.
     #[test]
     fn convert_ns_parses_the_base_from_the_name_not_the_alphabet_size() {
-        let mut a = epsilon_only(2, true);
+        let mut a = epsilon_only(2, crate::numsys::Direction::Msd);
         a.set_ns_names(vec![Some("msd_fib".to_string())]);
         let err = convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new())
             .expect_err("`fib` is not a base");
@@ -5490,7 +5562,7 @@ mod tests {
 
         // A track with no recorded name still reconstructs exactly (`msd_<alphabet size>`),
         // so plain bases are unaffected by the change.
-        let mut plain = epsilon_only(2, true);
+        let mut plain = epsilon_only(2, crate::numsys::Direction::Msd);
         assert!(matches!(
             convert_ns(&mut plain, true, 2, &mut crate::logging::Logging::new()),
             Err(ConvertNsError::IdenticalNumberSystems { ref name }) if name == "msd_2"
@@ -5558,7 +5630,7 @@ mod tests {
     /// non-total table must be totalized (`:470-471`), and `reverseWithOutput` must run.
     #[test]
     fn convert_ns_same_base_flips_msd_lsd() {
-        let mut a = epsilon_only(2, true);
+        let mut a = epsilon_only(2, crate::numsys::Direction::Msd);
         assert_eq!(simulate(&a.fa, &[]), 1, "language before: {{epsilon}} only");
 
         convert_ns(&mut a, false, 2, &mut crate::logging::Logging::new())
@@ -5579,7 +5651,7 @@ mod tests {
     /// ungrouping runs, behind the `!ns.isMsd()` pre-reversal at `:495-496`.
     #[test]
     fn convert_ns_base_conversion_from_lsd() {
-        let mut a = epsilon_only(4, false);
+        let mut a = epsilon_only(4, crate::numsys::Direction::Lsd);
 
         convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new())
             .expect("the conversion must succeed");
@@ -5603,7 +5675,7 @@ mod tests {
     /// call it directly.
     #[test]
     fn convert_msd_base_to_exponent_rejects_a_non_total_automaton() {
-        let mut a = epsilon_only(2, true); // one state, no transitions -> not total
+        let mut a = epsilon_only(2, crate::numsys::Direction::Msd); // one state, no transitions -> not total
         assert_eq!(
             convert_msd_base_to_exponent(&mut a, 2, 2),
             Err(ConvertNsError::NotDeterministicAndTotal)
@@ -5618,7 +5690,7 @@ mod tests {
     /// (`:313-...`). `root = 2, exponent = 2` expects base 4; the automaton says 3.
     #[test]
     fn convert_lsd_base_to_root_rejects_a_base_mismatch() {
-        let mut a = epsilon_only(3, true);
+        let mut a = epsilon_only(3, crate::numsys::Direction::Msd);
         assert_eq!(
             convert_lsd_base_to_root(&mut a, 3, 2, 2),
             Err(ConvertNsError::BaseMismatch {
@@ -5646,7 +5718,7 @@ mod tests {
     /// side, only the message text.
     #[test]
     fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
-        let mut a = epsilon_only(2, true);
+        let mut a = epsilon_only(2, crate::numsys::Direction::Msd);
         a.msd = vec![None];
         let err = convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new())
             .expect_err("must reject a track with no attached number system");
@@ -6008,10 +6080,10 @@ mod tests {
     /// (`PORTING.md`'s parallel-vector ruling), and the encoder must follow the alphabet.
     #[test]
     fn set_number_system_and_alphabet_moves_every_parallel_track_field() {
-        let mut a = epsilon_only(2, true);
+        let mut a = epsilon_only(2, crate::numsys::Direction::Msd);
         a.label = vec!["x".to_string()];
 
-        set_number_system_and_alphabet(&mut a, false, 5);
+        set_number_system_and_alphabet(&mut a, crate::numsys::Direction::Lsd, 5);
 
         assert_eq!(a.alphabet, vec![vec![0, 1, 2, 3, 4]]);
         assert_eq!(a.fa.alphabet_size, 5);

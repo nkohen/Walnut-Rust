@@ -77,14 +77,14 @@ use wr_core::automaton::Automaton;
 use wr_core::determinize::DeterminizeContext;
 use wr_core::infinite::infinite;
 use wr_core::logicalops::{
-    and, iff, imply, not, or, remove_leading_zeros_with_ctx, reverse_with_ctx, xor,
+    and, iff, imply, not, or, remove_leading_zeros_with_ctx, reverse_with_ctx, xor, MsdFlip,
     RemoveLeadingZerosError,
 };
 use wr_core::numsys::{ArithmeticOp, NumSysError, NumberSystem, RelationalOp};
 use wr_core::quantify::{quantify_with_ctx, QuantifyError};
 use wr_core::word_automaton::{
     apply_word_arith_operator_with_ctx, apply_word_operator_with_ctx, compare_word_automata,
-    compare_word_automaton_with_ctx,
+    compare_word_automaton_with_ctx, OperandOrder,
 };
 
 use crate::expr::{
@@ -1254,7 +1254,7 @@ impl Operator {
         match self.kind {
             // `AutomatonLogicalOps.reverse(a.M, true)` (`:107-108`) — mutates in place and
             // returns void.
-            OperatorKind::Reverse => reverse_with_ctx(&mut m, true, ctx, logging),
+            OperatorKind::Reverse => reverse_with_ctx(&mut m, MsdFlip::Flip, ctx, logging),
             // `a.M = AutomatonLogicalOps.not(a.M.asDFA())` (`:109-110`).
             OperatorKind::Negate => {
                 m = not(m.as_dfa_with_ctx(ctx, logging), logging).into_automaton()
@@ -1795,7 +1795,7 @@ impl Operator {
                     &mut bw.word_automaton,
                     0,
                     ArithmeticOp::Minus,
-                    false,
+                    OperandOrder::Forward,
                     ctx.as_deref_mut(),
                     logging,
                 )?;
@@ -1911,7 +1911,7 @@ impl Operator {
                     &mut aw.word_automaton,
                     k,
                     opp,
-                    true,
+                    OperandOrder::Reversed,
                     ctx.as_deref_mut(),
                     logging,
                 )?;
@@ -1933,7 +1933,7 @@ impl Operator {
                     &mut bw.word_automaton,
                     k,
                     opp,
-                    false,
+                    OperandOrder::Forward,
                     ctx.as_deref_mut(),
                     logging,
                 )?;
@@ -2295,7 +2295,12 @@ fn track_equality_automaton(automaton: &Automaton, i: usize) -> OwnedTrackNs {
         return OwnedTrackNs::NumberSystemUnrecoverable;
     };
     // `setEqualityAutomaton(getAlphabet())` (`NumberSystem.java:144`).
-    let mut equality = wr_core::numsys::equality_automaton(alphabet, is_msd);
+    let direction = if is_msd {
+        wr_core::numsys::Direction::Msd
+    } else {
+        wr_core::numsys::Direction::Lsd
+    };
+    let mut equality = wr_core::numsys::equality_automaton(alphabet, direction);
     // The name half of `equality.getNS().set(i, this)` (see `with_custom_base_files`).
     // `track_ns_names()[i]` is `Some` because both guards above passed: it maps over
     // `msd.zip(alphabet)` and yields `Some` for every track whose `msd` is `Some`.

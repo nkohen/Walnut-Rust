@@ -24,7 +24,7 @@
 
 use wr_core::automaton::Automaton;
 use wr_core::logging::Logging;
-use wr_core::logicalops::reverse_with_ctx as reverse_predicate_with_ctx;
+use wr_core::logicalops::{reverse_with_ctx as reverse_predicate_with_ctx, MsdFlip};
 use wr_core::word_automaton::reverse_with_output_with_ctx;
 use wr_logic::predicate_env::PredicateEnvError;
 
@@ -77,11 +77,11 @@ pub fn reverse_command(
     match is_dfao {
         AutomatonKind::WordAutomaton => {
             // `WordAutomaton.reverseWithOutput(M, true);` (`:13`).
-            reverse_with_output_with_ctx(&mut m, true, None, logging);
+            reverse_with_output_with_ctx(&mut m, MsdFlip::Flip, None, logging);
         }
         AutomatonKind::PlainAutomaton => {
             // `AutomatonLogicalOps.reverse(M, true);` (`:15`).
-            reverse_predicate_with_ctx(&mut m, true, None, logging);
+            reverse_predicate_with_ctx(&mut m, MsdFlip::Flip, None, logging);
         }
     }
 

@@ -165,7 +165,7 @@
 
 use crate::automaton::Automaton;
 use crate::fa::Fa;
-use crate::logicalops::{and, not, reverse};
+use crate::logicalops::{and, not, reverse, MsdFlip};
 use crate::quantify::{quantify_with_ctx, QuantifyError};
 use num_bigint::{BigInt, Sign};
 use std::cell::RefCell;
@@ -920,6 +920,18 @@ pub fn is_ns_differing(
 // Automaton-construction primitives
 // ---------------------------------------------------------------------------
 
+/// A numeration system's declared read direction, replacing the `is_msd`/`isMsd`
+/// booleans threaded through this file's construction primitives. `Msd` is Java's
+/// `isMsd == true` (most-significant digit first); `Lsd` is `isMsd == false`
+/// (least-significant digit first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Most-significant digit first.
+    Msd,
+    /// Least-significant digit first.
+    Lsd,
+}
+
 /// `FA.addNewTransition(src, dest, inp)` (`FA.java:556-561`). Note it *replaces* any
 /// existing destination list for `(src, inp)` (`TransitionsNFA.setNfaDTransition` is a
 /// plain `put`), it does not append — every construction below relies on writing each
@@ -940,7 +952,7 @@ fn init_basic_automaton(
     o: Vec<i32>,
     input_size: usize,
     alphabet: &[i32],
-    is_msd: bool,
+    direction: Direction,
 ) -> Automaton {
     let q = o.len();
     let mut a = Automaton::new(
@@ -956,7 +968,7 @@ fn init_basic_automaton(
         // Java's `Automaton()` leaves `label` an empty list; these automata are bound
         // later, by `comparison`/`arithmetic`.
         Vec::new(),
-        vec![Some(is_msd); input_size],
+        vec![Some(direction == Direction::Msd); input_size],
     );
     a.determine_alphabet_size();
     a
@@ -978,9 +990,9 @@ fn init_basic_automaton(
 /// `init_basic_automaton`'s `determine_alphabet_size` already does a checked `usize`
 /// multiplication, and an `n` that large would need ~2^31 transitions — but noting it
 /// rather than silently "improving" one side of the port.
-fn base_n_addition_automaton(n: i32, is_msd: bool) -> Automaton {
+fn base_n_addition_automaton(n: i32, direction: Direction) -> Automaton {
     let alphabet: Vec<i32> = (0..n).collect();
-    let mut addition = init_basic_automaton(vec![1, 0], 3, &alphabet, is_msd);
+    let mut addition = init_basic_automaton(vec![1, 0], 3, &alphabet, direction);
     let mut l = 0i32;
     for k in 0..n {
         for j in 0..n {
@@ -1025,9 +1037,9 @@ fn base_n_addition_automaton(n: i32, is_msd: bool) -> Automaton {
 ///
 /// Same `l` counter convention as [`base_n_addition_automaton`]: `i` fastest inside `j`
 /// inside `k`, which is this crate's mixed-radix `encode([i, j, k])`.
-fn base_neg_n_addition(n: i32, is_msd: bool) -> Automaton {
+fn base_neg_n_addition(n: i32, direction: Direction) -> Automaton {
     let alphabet: Vec<i32> = (0..n).collect();
-    let mut addition = init_basic_automaton(vec![1, 0, 0], 3, &alphabet, is_msd);
+    let mut addition = init_basic_automaton(vec![1, 0, 0], 3, &alphabet, direction);
     let mut l = 0i32;
     for k in 0..n {
         for j in 0..n {
@@ -1070,9 +1082,9 @@ fn base_neg_n_addition(n: i32, is_msd: bool) -> Automaton {
 /// Unlike [`lexicographic_less_than`], which spells its state-1 self-loop as the swapped
 /// `i * size + j`, this uses Java's plain running counter `l` throughout (`i` fastest
 /// inside `j`, so `l == encode([i, j])`) — as Java does here.
-fn base_neg_n_less_than(n: i32, is_msd: bool) -> Automaton {
+fn base_neg_n_less_than(n: i32, direction: Direction) -> Automaton {
     let alphabet: Vec<i32> = (0..n).collect();
-    let mut less_than = init_basic_automaton(vec![0, 1, 0], 2, &alphabet, is_msd);
+    let mut less_than = init_basic_automaton(vec![0, 1, 0], 2, &alphabet, direction);
     let mut l = 0i32;
     for j in 0..n {
         for i in 0..n {
@@ -1122,14 +1134,14 @@ fn base_neg_n_less_than(n: i32, is_msd: bool) -> Automaton {
 ///
 /// Java builds this with the ONE-argument `initBasicAutomaton(IntList)` overload (no
 /// alphabets, no number systems) and then adds two of each by hand, taking their names
-/// from the NEGATIVE system's own `determineBaseNameUnderscore()` — hence
-/// `base_name_underscore` here rather than a bare `is_msd`, so the caller cannot
-/// accidentally pass the positive system's direction.
-fn base_n_base_change(n: i32, is_msd: bool) -> Automaton {
+/// from the NEGATIVE system's own `determineBaseNameUnderscore()` — hence `direction`
+/// here must be the negative system's own direction, so the caller cannot accidentally
+/// pass the positive system's direction.
+fn base_n_base_change(n: i32, direction: Direction) -> Automaton {
     let alphabet: Vec<i32> = (0..n).collect();
-    let mut base_change = init_basic_automaton(vec![1, 1, 0, 0], 2, &alphabet, is_msd);
+    let mut base_change = init_basic_automaton(vec![1, 1, 0, 0], 2, &alphabet, direction);
     // `baseChange.getNS().add(new NumberSystem(baseNameUnderScore + n))` (`:572-573`).
-    let prefix = if is_msd {
+    let prefix = if direction == Direction::Msd {
         MSD_UNDERSCORE
     } else {
         LSD_UNDERSCORE
@@ -1174,11 +1186,11 @@ fn base_n_base_change(n: i32, is_msd: bool) -> Automaton {
 /// state 1's self-loop uses `i * size + j` (`encode([j, i])`). Because the double loop
 /// enumerates every ordered pair, the state-1 line still installs a self-loop on
 /// *every* symbol; the swapped spelling is cosmetic there, and load-bearing at state 0.
-fn lexicographic_less_than(alphabet: &[i32], is_msd: bool) -> Automaton {
+fn lexicographic_less_than(alphabet: &[i32], direction: Direction) -> Automaton {
     let mut alphabet = alphabet.to_vec();
     alphabet.sort_unstable();
     let size = alphabet.len();
-    let mut less_than = init_basic_automaton(vec![0, 1], 2, &alphabet, is_msd);
+    let mut less_than = init_basic_automaton(vec![0, 1], 2, &alphabet, direction);
     for i in 0..size {
         for j in 0..size {
             if i == j {
@@ -1205,9 +1217,9 @@ fn lexicographic_less_than(alphabet: &[i32], is_msd: bool) -> Automaton {
 /// `wr_logic::token`'s `track_equality_automaton` computes exactly that directly from an
 /// `&Automaton`'s own track data rather than rebuilding a `NumberSystem` around it — see
 /// that function's docs.
-pub fn equality_automaton(alphabet: &[i32], is_msd: bool) -> Automaton {
+pub fn equality_automaton(alphabet: &[i32], direction: Direction) -> Automaton {
     let size = alphabet.len();
-    let mut equality = init_basic_automaton(vec![1], 2, alphabet, is_msd);
+    let mut equality = init_basic_automaton(vec![1], 2, alphabet, direction);
     for i in 0..size {
         add_new_transition(&mut equality.fa, 0, 0, (i * size + i) as i32);
     }
@@ -1265,7 +1277,7 @@ impl CustomBaseCandidates {
             return Some(main);
         }
         if let Some(mut complement) = self.complement {
-            reverse(&mut complement, false);
+            reverse(&mut complement, MsdFlip::Keep);
             return Some(complement);
         }
         None
@@ -1429,6 +1441,27 @@ fn big(v: i32) -> BigInt {
     BigInt::from(v)
 }
 
+/// [`NumberSystem::apply_comparison`]'s `operands` argument (Java's `reverseOperands`):
+/// whether `base` is bound as `(a, b)` (`AsGiven`) or `(b, a)` (`Swapped`) before any
+/// negation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonOperands {
+    /// Bind in the caller's order: `(a, b)`.
+    AsGiven,
+    /// Bind swapped: `(b, a)`.
+    Swapped,
+}
+
+/// [`NumberSystem::apply_comparison`]'s `negation` argument (Java's `negate`): whether
+/// the bound automaton is complemented (`not(...)`) before being returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonNegation {
+    /// Return the bound automaton as-is.
+    Direct,
+    /// Return its complement.
+    Negated,
+}
+
 impl NumberSystem {
     /// `NumberSystem(String name)` (`:132-163`) with no custom-base files supplied — the
     /// plain `msd_k`/`lsd_k` path, and the exact pre-U5 behavior.
@@ -1485,6 +1518,14 @@ impl NumberSystem {
         // `isMsd = msdOrLsd.equals(MSD)` (`:136`) -- anything that is not EXACTLY
         // "msd" (including "MSD", or the empty prefix of a name like "_5") is lsd.
         let is_msd = msd_or_lsd == MSD;
+        // The [`Direction`] boundary conversion for the construction primitives below —
+        // `is_msd` itself stays a plain `bool` because it also feeds the `NumberSystem`
+        // struct field and the `all_representations` branch's `Vec<Option<bool>>` fill.
+        let direction = if is_msd {
+            Direction::Msd
+        } else {
+            Direction::Lsd
+        };
         // `isNeg = name.contains(UNDERSCORE_NEG_UNDERSCORE)` (`:137`).
         let is_neg = name.contains(UNDERSCORE_NEG_UNDERSCORE);
         let base = determine_base(name);
@@ -1499,16 +1540,16 @@ impl NumberSystem {
         logging.disable_print();
 
         let mut addition =
-            Self::set_addition_automaton(name, base, is_msd, files.addition.resolve())?;
+            Self::set_addition_automaton(name, base, direction, files.addition.resolve())?;
         let alphabet = addition.alphabet[0].clone();
         let mut less_than = Self::set_less_than_automaton(
             name,
             base,
             &alphabet,
-            is_msd,
+            direction,
             files.less_than.resolve(),
         )?;
-        let mut equality = equality_automaton(&alphabet, is_msd);
+        let mut equality = equality_automaton(&alphabet, direction);
 
         // `addition.getNS().set(i, this)` (`:364-366`), `lessThan.getNS().set(i, this)`
         // (`:392`) and `initBasicAutomaton`'s equivalent for `equality` install THIS
@@ -1603,7 +1644,7 @@ impl NumberSystem {
     fn set_addition_automaton(
         name: &str,
         base: &str,
-        is_msd: bool,
+        direction: Direction,
         loaded: Option<Automaton>,
     ) -> Result<Automaton, NumSysError> {
         let mut addition = match loaded {
@@ -1621,13 +1662,13 @@ impl NumberSystem {
                     None
                 };
                 let mut addition = match positive {
-                    Some(k) => base_n_addition_automaton(k, is_msd),
+                    Some(k) => base_n_addition_automaton(k, direction),
                     // `else if (UtilityMethods.parseNegNumber(base) > 1)` (`:327-328`).
                     None => {
                         let neg = crate::util::try_parse_neg_number(base)
                             .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
                         if neg > 1 {
-                            base_neg_n_addition(neg, is_msd)
+                            base_neg_n_addition(neg, direction)
                         } else {
                             // `else throw new WalnutException("Number system … is not
                             // defined.")` (`:330`).
@@ -1635,10 +1676,10 @@ impl NumberSystem {
                         }
                     }
                 };
-                if !is_msd {
+                if direction == Direction::Lsd {
                     // `AutomatonLogicalOps.reverse(addition, false)` (`:336`) -- reverse the
                     // LANGUAGE, keep the declared numeration direction (`reverseMsd = false`).
-                    reverse(&mut addition, false);
+                    reverse(&mut addition, MsdFlip::Keep);
                 }
                 addition
             }
@@ -1663,7 +1704,7 @@ impl NumberSystem {
             }
         }
         // `for (i) addition.getNS().set(i, this)` (`:364-366`).
-        addition.msd = vec![Some(is_msd); addition.alphabet.len()];
+        addition.msd = vec![Some(direction == Direction::Msd); addition.alphabet.len()];
         Ok(addition)
     }
 
@@ -1690,7 +1731,7 @@ impl NumberSystem {
         name: &str,
         base: &str,
         alphabet: &[i32],
-        is_msd: bool,
+        direction: Direction,
         loaded: Option<Automaton>,
     ) -> Result<Automaton, NumSysError> {
         let mut less_than = match loaded {
@@ -1700,12 +1741,12 @@ impl NumberSystem {
                 let neg = crate::util::try_parse_neg_number(base)
                     .map_err(|_| NumSysError::BaseNotAnI32(base.to_string()))?;
                 let mut less_than = if neg > 1 {
-                    base_neg_n_less_than(neg, is_msd)
+                    base_neg_n_less_than(neg, direction)
                 } else {
-                    lexicographic_less_than(alphabet, is_msd)
+                    lexicographic_less_than(alphabet, direction)
                 };
-                if !is_msd {
-                    reverse(&mut less_than, false);
+                if direction == Direction::Lsd {
+                    reverse(&mut less_than, MsdFlip::Keep);
                 }
                 less_than
             }
@@ -1719,7 +1760,7 @@ impl NumberSystem {
             if lhs != rhs {
                 return Err(NumSysError::LessThanAlphabetMismatch(name.to_string()));
             }
-            less_than.msd[i] = Some(is_msd);
+            less_than.msd[i] = Some(direction == Direction::Msd);
         }
         Ok(less_than)
     }
@@ -1807,10 +1848,15 @@ impl NumberSystem {
                     // found is only reachable by reflection in Java's own test suite.
                     return Err(NumSysError::NumberSystemCannotCompare);
                 }
-                let mut a = base_n_base_change(neg, self.is_msd);
+                let direction = if self.is_msd {
+                    Direction::Msd
+                } else {
+                    Direction::Lsd
+                };
+                let mut a = base_n_base_change(neg, direction);
                 if self.is_msd {
                     logging.disable_print();
-                    reverse(&mut a, false);
+                    reverse(&mut a, MsdFlip::Keep);
                     logging.enable_print();
                 }
                 a
@@ -1922,17 +1968,17 @@ impl NumberSystem {
         base: &Automaton,
         a: &str,
         b: &str,
-        reverse_operands: bool,
-        negate: bool,
+        operands: ComparisonOperands,
+        negation: ComparisonNegation,
         logging: &mut crate::logging::Logging,
     ) -> Automaton {
         let mut result = base.clone();
-        result.bind(if reverse_operands {
+        result.bind(if operands == ComparisonOperands::Swapped {
             names(&[b, a])
         } else {
             names(&[a, b])
         });
-        if negate {
+        if negation == ComparisonNegation::Negated {
             logging.disable_print();
             result = not(result.as_dfa(), logging).into_automaton();
             logging.enable_print();
@@ -1954,24 +2000,54 @@ impl NumberSystem {
         logging: &mut crate::logging::Logging,
     ) -> Automaton {
         match op {
-            RelationalOp::LessThan => {
-                Self::apply_comparison(&self.less_than, a, b, false, false, logging)
-            }
-            RelationalOp::GreaterThan => {
-                Self::apply_comparison(&self.less_than, a, b, true, false, logging)
-            }
-            RelationalOp::Equal => {
-                Self::apply_comparison(&self.equality, a, b, false, false, logging)
-            }
-            RelationalOp::NotEqual => {
-                Self::apply_comparison(&self.equality, a, b, false, true, logging)
-            }
-            RelationalOp::GreaterEqThan => {
-                Self::apply_comparison(&self.less_than, a, b, false, true, logging)
-            }
-            RelationalOp::LessEqThan => {
-                Self::apply_comparison(&self.less_than, a, b, true, true, logging)
-            }
+            RelationalOp::LessThan => Self::apply_comparison(
+                &self.less_than,
+                a,
+                b,
+                ComparisonOperands::AsGiven,
+                ComparisonNegation::Direct,
+                logging,
+            ),
+            RelationalOp::GreaterThan => Self::apply_comparison(
+                &self.less_than,
+                a,
+                b,
+                ComparisonOperands::Swapped,
+                ComparisonNegation::Direct,
+                logging,
+            ),
+            RelationalOp::Equal => Self::apply_comparison(
+                &self.equality,
+                a,
+                b,
+                ComparisonOperands::AsGiven,
+                ComparisonNegation::Direct,
+                logging,
+            ),
+            RelationalOp::NotEqual => Self::apply_comparison(
+                &self.equality,
+                a,
+                b,
+                ComparisonOperands::AsGiven,
+                ComparisonNegation::Negated,
+                logging,
+            ),
+            RelationalOp::GreaterEqThan => Self::apply_comparison(
+                &self.less_than,
+                a,
+                b,
+                ComparisonOperands::AsGiven,
+                ComparisonNegation::Negated,
+                logging,
+            ),
+            RelationalOp::LessEqThan => Self::apply_comparison(
+                &self.less_than,
+                a,
+                b,
+                ComparisonOperands::Swapped,
+                ComparisonNegation::Negated,
+                logging,
+            ),
         }
     }
 
@@ -2773,7 +2849,8 @@ mod tests {
             // comment); the equivalence oracle needs total DFAs, so totalize copies
             // first — language-preserving, since the added sink is non-accepting.
             let mut spike = less_than_msd(base).fa;
-            let mut ported = lexicographic_less_than(&(0..base).collect::<Vec<_>>(), true).fa;
+            let mut ported =
+                lexicographic_less_than(&(0..base).collect::<Vec<_>>(), Direction::Msd).fa;
             spike.totalize(0);
             ported.totalize(0);
             assert!(
@@ -4008,7 +4085,7 @@ mod tests {
     #[test]
     fn lexicographic_less_than_sorts_a_scrambled_alphabet_first() {
         let scrambled = [7, -2, 0];
-        let a = lexicographic_less_than(&scrambled, true);
+        let a = lexicographic_less_than(&scrambled, Direction::Msd);
         // The track alphabets come out sorted, not in the caller's order.
         assert_eq!(a.alphabet[0], vec![-2, 0, 7]);
         // -2 < 0 < 7 decided on the first digit pair, in VALUE order.
@@ -4026,7 +4103,7 @@ mod tests {
     #[test]
     fn equality_automaton_is_the_diagonal_regardless_of_alphabet_order() {
         let scrambled = [7, -2, 0];
-        let a = equality_automaton(&scrambled, true);
+        let a = equality_automaton(&scrambled, Direction::Msd);
         assert_eq!(a.alphabet[0], vec![7, -2, 0], "the alphabet is NOT sorted");
         assert!(accepts(&a, &[(7, 7), (-2, -2), (0, 0)]));
         assert!(!accepts(&a, &[(7, 7), (-2, 0)]));
@@ -5169,7 +5246,7 @@ mod tests {
         // A deliberately DIFFERENT automaton from anything `base_n_base_change(3)` builds:
         // one state, accepting, self-looping on the diagonal only.
         let marker = || {
-            let mut a = init_basic_automaton(vec![1], 2, &[0, 1, 2], true);
+            let mut a = init_basic_automaton(vec![1], 2, &[0, 1, 2], Direction::Msd);
             add_new_transition(&mut a.fa, 0, 0, 0);
             a
         };
@@ -5221,13 +5298,13 @@ mod tests {
         // reversal; use an asymmetric two-state automaton instead, or the assertion would
         // pass either way.
         let asymmetric = || {
-            let mut a = init_basic_automaton(vec![0, 1], 2, &[0, 1, 2], true);
+            let mut a = init_basic_automaton(vec![0, 1], 2, &[0, 1, 2], Direction::Msd);
             add_new_transition(&mut a.fa, 0, 1, 0);
             add_new_transition(&mut a.fa, 1, 1, 4);
             a
         };
         let mut expected = asymmetric();
-        reverse(&mut expected, false);
+        reverse(&mut expected, MsdFlip::Keep);
         let mut ns = NumberSystem::new("msd_neg_3").unwrap();
         ns.set_base_change_automaton(
             CustomBaseCandidates {
@@ -5595,7 +5672,7 @@ mod tests {
         // Reversing the lsd adder's language must give the msd one back, not leave it
         // unchanged (which is what a missing OR a doubled reverse would produce).
         let mut round_trip = lsd.addition().clone();
-        reverse(&mut round_trip, false);
+        reverse(&mut round_trip, MsdFlip::Keep);
         let mut got = round_trip.fa.clone();
         got.totalize(0);
         let mut want = msd.addition().fa.clone();
@@ -6065,7 +6142,7 @@ mod tests {
 
     #[test]
     fn a_file_loaded_comparator_over_a_different_alphabet_is_a_clean_error() {
-        let mut comparator = lexicographic_less_than(&[0, 1, 2], true);
+        let mut comparator = lexicographic_less_than(&[0, 1, 2], Direction::Msd);
         comparator.msd = vec![None, None];
         let files = CustomBaseFiles {
             addition: CustomBaseCandidates {

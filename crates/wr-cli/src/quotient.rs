@@ -7,7 +7,7 @@
 
 use wr_core::automaton::Automaton;
 use wr_core::logging::Logging;
-use wr_core::logicalops::{left_quotient, right_quotient};
+use wr_core::logicalops::{left_quotient, right_quotient, SubsetCheck};
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_ops::read_from_automata_library;
@@ -126,9 +126,9 @@ fn read_pair(
 /// `Quotient.rightQuotient(String s, String oldName1, String oldName2, String newName)`
 /// (`Quotient.java:9-15`).
 ///
-/// `right_quotient`'s third parameter (`skip_subset_check`) is hardcoded `false` here,
-/// matching Java's own `AutomatonLogicalOps.rightQuotient(M1, M2, false)` call — the real,
-/// non-`skip` subset-alphabet guard runs.
+/// `right_quotient`'s third parameter is `SubsetCheck::Check` here, matching Java's
+/// `AutomatonLogicalOps.rightQuotient(M1, M2, false)` call — the real subset-alphabet
+/// guard runs.
 ///
 /// `logging` is the caller's real, already-`configure_for_command`-d
 /// [`Logging`] (`Prover`'s `self.logging`) — `rightquo`/`leftquo` are not `eval`/`def`
@@ -145,9 +145,10 @@ pub fn right_quotient_command(
     new_name: &str,
 ) -> Result<TestCase, QuotientError> {
     let (m1, m2) = read_pair(session, old_name1, old_name2)?;
-    let mut c =
-        crate::walnut_exception::catch_walnut_panic(|| right_quotient(&m1, &m2, false, logging))
-            .map_err(QuotientError::from_panic)?;
+    let mut c = crate::walnut_exception::catch_walnut_panic(|| {
+        right_quotient(&m1, &m2, SubsetCheck::Check, logging)
+    })
+    .map_err(QuotientError::from_panic)?;
     write_automata(
         session,
         &mut c,

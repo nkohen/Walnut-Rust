@@ -160,23 +160,35 @@ pub fn compare_word_automata(
     m.into_automaton()
 }
 
+/// [`apply_word_arith_operator`]/[`apply_word_arith_operator_with_ctx`]'s `order`
+/// argument: which side of `op` the automaton's own per-state output lands on.
+/// `Forward`: `op(o, wordA[state])`, i.e. `k op T[…]`. `Reversed`: `op(wordA[state], o)`,
+/// i.e. `T[…] op k`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandOrder {
+    /// `op(o, wordA[state])` — the constant `o` first.
+    Forward,
+    /// `op(wordA[state], o)` — the automaton's own output first.
+    Reversed,
+}
+
 /// `WordAutomaton.applyWordArithOperator(Automaton, int, ArithmeticOperator.Ops,
 /// boolean)` (`WordAutomaton.java:69-84`) — rewrites `wordA`'s per-state output IN
-/// PLACE to `o op wordA[state]` (or `wordA[state] op o` if `reverse`), then
-/// re-minimizes as a DFAO via [`minimize_self_with_output`]. Never goes through
+/// PLACE to `o op wordA[state]` (or `wordA[state] op o` if `OperandOrder::Reversed`),
+/// then re-minimizes as a DFAO via [`minimize_self_with_output`]. Never goes through
 /// [`crate::product`] (a single-automaton, per-state loop), so `Result` threads
 /// through cleanly — see this module's docs on fallibility.
 pub fn apply_word_arith_operator(
     word_a: &mut Automaton,
     o: i32,
     op: ArithmeticOp,
-    reverse: bool,
+    order: OperandOrder,
 ) -> Result<(), NumSysError> {
     apply_word_arith_operator_with_ctx(
         word_a,
         o,
         op,
-        reverse,
+        order,
         None,
         &mut crate::logging::Logging::new(),
     )
@@ -191,7 +203,7 @@ pub fn apply_word_arith_operator_with_ctx(
     word_a: &mut Automaton,
     o: i32,
     op: ArithmeticOp,
-    reverse: bool,
+    order: OperandOrder,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
     logging: &mut crate::logging::Logging,
 ) -> Result<(), NumSysError> {
@@ -205,7 +217,7 @@ pub fn apply_word_arith_operator_with_ctx(
     logging.indent();
     for p in 0..word_a.fa.q {
         let this_p = word_a.fa.o[p];
-        word_a.fa.o[p] = if reverse {
+        word_a.fa.o[p] = if order == OperandOrder::Reversed {
             op.arith(this_p, o)?
         } else {
             op.arith(o, this_p)?
@@ -324,13 +336,8 @@ pub fn apply_word_operator_with_ctx(
 /// panic here) rather than catching it — a coding shortcut, not a bug in itself (no
 /// concrete reachable counterexample found; every real word automaton is total), so not
 /// logged as a separate `WALNUT-BUGS.md` entry.
-pub fn reverse_with_output(word_a: &mut Automaton, reverse_msd: bool) {
-    reverse_with_output_with_ctx(
-        word_a,
-        reverse_msd,
-        None,
-        &mut crate::logging::Logging::new(),
-    );
+pub fn reverse_with_output(word_a: &mut Automaton, msd_flip: logicalops::MsdFlip) {
+    reverse_with_output_with_ctx(word_a, msd_flip, None, &mut crate::logging::Logging::new());
 }
 
 /// [`reverse_with_output`] with an explicit
@@ -343,7 +350,7 @@ pub fn reverse_with_output(word_a: &mut Automaton, reverse_msd: bool) {
 /// `REVERSING + ":"` (no space) — both ported verbatim, not unified.
 pub fn reverse_with_output_with_ctx(
     word_a: &mut Automaton,
-    reverse_msd: bool,
+    msd_flip: logicalops::MsdFlip,
     ctx: Option<&mut (dyn crate::determinize::DeterminizeContext + '_)>,
     logging: &mut crate::logging::Logging,
 ) {
@@ -422,7 +429,7 @@ pub fn reverse_with_output_with_ctx(
     // correct new initial state.
     word_a.fa.q0 = 0;
 
-    if reverse_msd {
+    if msd_flip == logicalops::MsdFlip::Flip {
         logicalops::flip_ns(word_a);
     }
 
@@ -629,7 +636,7 @@ mod tests {
     fn apply_word_arith_operator_adds_constant_to_each_state() {
         let mut a = word_automaton(0, &[3], &[[0, 0]]);
         // reverse == false: `o op thisP`, i.e. `10 + 3`.
-        apply_word_arith_operator(&mut a, 10, ArithmeticOp::Plus, false).unwrap();
+        apply_word_arith_operator(&mut a, 10, ArithmeticOp::Plus, OperandOrder::Forward).unwrap();
         assert_eq!(a.fa.o[a.fa.q0], 13);
     }
 
@@ -637,7 +644,7 @@ mod tests {
     fn apply_word_arith_operator_reverse_flips_operand_order() {
         let mut a = word_automaton(0, &[3], &[[0, 0]]);
         // reverse == true: `thisP op o`, i.e. `3 - 10`.
-        apply_word_arith_operator(&mut a, 10, ArithmeticOp::Minus, true).unwrap();
+        apply_word_arith_operator(&mut a, 10, ArithmeticOp::Minus, OperandOrder::Reversed).unwrap();
         assert_eq!(a.fa.o[a.fa.q0], -7);
     }
 
@@ -646,7 +653,8 @@ mod tests {
         // reverse == false computes `arith(op, o, thisP)`, so `thisP == 0` is the
         // divisor.
         let mut a = word_automaton(0, &[0], &[[0, 0]]);
-        let err = apply_word_arith_operator(&mut a, 5, ArithmeticOp::Div, false).unwrap_err();
+        let err = apply_word_arith_operator(&mut a, 5, ArithmeticOp::Div, OperandOrder::Forward)
+            .unwrap_err();
         assert_eq!(err, NumSysError::DivisionByZero);
     }
 
@@ -673,7 +681,7 @@ mod tests {
     #[test]
     fn reverse_with_output_true_false_automaton_is_a_no_op() {
         let mut a = Automaton::true_false(true);
-        reverse_with_output(&mut a, true);
+        reverse_with_output(&mut a, logicalops::MsdFlip::Flip);
         assert!(a.fa.is_true_automaton());
     }
 
@@ -683,7 +691,7 @@ mod tests {
     #[test]
     fn reverse_with_output_empty_string_output_matches_q0_when_q0_is_zero() {
         let mut a = word_automaton(0, &[10, 20], &[[0, 1], [1, 0]]);
-        reverse_with_output(&mut a, false);
+        reverse_with_output(&mut a, logicalops::MsdFlip::Keep);
         assert_eq!(a.fa.o[a.fa.q0], 10);
     }
 
@@ -701,7 +709,7 @@ mod tests {
     fn reverse_with_output_wb016_q0_is_correct_on_non_zero_initial_state() {
         // state 1 (q0), output 10, 0->1, 1->0; state 0, output 20, 0->0, 1->1.
         let mut a = word_automaton(1, &[20, 10], &[[0, 1], [1, 0]]);
-        reverse_with_output(&mut a, false);
+        reverse_with_output(&mut a, logicalops::MsdFlip::Keep);
         assert_eq!(a.fa.o[a.fa.q0], 10);
     }
 

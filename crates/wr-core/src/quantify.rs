@@ -702,7 +702,8 @@ mod tests {
     /// `∃y` really does exercise the projection, and the projected language `1 0+` is
     /// **not** closed under trailing zeros at its left end — `"1"` alone is rejected —
     /// which is exactly what [`crate::logicalops::fix_trailing_zeros_problem`] repairs.
-    fn two_track_needing_the_trailing_fixup(msd: bool) -> Automaton {
+    fn two_track_needing_the_trailing_fixup(direction: crate::numsys::Direction) -> Automaton {
+        let msd = direction == crate::numsys::Direction::Msd;
         let mut a = Automaton::new(
             Fa {
                 true_false: None,
@@ -739,7 +740,7 @@ mod tests {
             digits.iter().map(|&d| a.encode(&[d])).collect()
         };
 
-        let mut lsd = two_track_needing_the_trailing_fixup(false);
+        let mut lsd = two_track_needing_the_trailing_fixup(crate::numsys::Direction::Lsd);
         quantify(&mut lsd, &labels(&["y"])).unwrap();
         assert_eq!(lsd.label, vec!["x".to_string()]);
         // `1 0+` right-quotiented by `0*` is `1 0*`: the trailing zeros became optional.
@@ -758,7 +759,7 @@ mod tests {
         // instead left-quotients by `0*` and closes under PREPENDING zeros, so "1" stays
         // rejected while "01 0" becomes accepted -- the mirror image of the assertions
         // above, and impossible to satisfy with the same fixup.
-        let mut msd = two_track_needing_the_trailing_fixup(true);
+        let mut msd = two_track_needing_the_trailing_fixup(crate::numsys::Direction::Msd);
         quantify(&mut msd, &labels(&["y"])).unwrap();
         assert!(
             !msd.fa.accepts_word(&word(&msd, &[1])),

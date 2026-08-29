@@ -1062,7 +1062,12 @@ impl Transducer {
             logging.log_message("Automaton number system is lsd, reversing");
             to_lsd = true;
             logging.indent();
-            word_automaton::reverse_with_output_with_ctx(m, true, None, logging);
+            word_automaton::reverse_with_output_with_ctx(
+                m,
+                logicalops::MsdFlip::Flip,
+                None,
+                logging,
+            );
             logging.dedent();
         }
 
@@ -1113,7 +1118,12 @@ impl Transducer {
         }
 
         if to_lsd {
-            word_automaton::reverse_with_output_with_ctx(&mut n, true, None, logging);
+            word_automaton::reverse_with_output_with_ctx(
+                &mut n,
+                logicalops::MsdFlip::Flip,
+                None,
+                logging,
+            );
         }
 
         logging.dedent();
