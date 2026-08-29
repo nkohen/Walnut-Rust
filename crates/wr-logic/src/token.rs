@@ -1261,14 +1261,18 @@ impl Operator {
             }
             _ => unreachable!("only the two unary kinds reach this method"),
         }
+        // `Logging.dedent()` (`:112`), THEN `Logging.logAndPrint(COMPUTED + " " + op + a)`
+        // (`:113`) -- Java's own statement order, unchanged (push, THEN dedent, THEN
+        // log). The COMPUTED message is pre-formatted here (a pure expression, not a
+        // `Logging` call) purely so `string_value` can move into the pushed expression
+        // instead of being cloned for it.
+        let computed = format!("computed {string_value}");
         stack.push(Expression::Automaton(AutomatonExpression::new(
-            string_value.clone(),
+            string_value,
             m,
         )));
-        // `Logging.dedent()` (`:112`), THEN `Logging.logAndPrint(COMPUTED + " " + op + a)`
-        // (`:113`).
         logging.dedent();
-        logging.log_and_print(&format!("computed {string_value}"));
+        logging.log_and_print(&computed);
         Ok(())
     }
 
@@ -1353,15 +1357,17 @@ impl Operator {
                 } else {
                     string_value.push_str(&format!(", {operand} "));
                 }
-                // `:133-135`.
-                let Expression::Variable(ve) = &operand else {
+                // `:133-135`. Matched by value (not `&operand`): the error arm below
+                // never reads `operand`, so `ve.identifier` can move straight into
+                // `identifiers_to_quantify` instead of being cloned off a borrow.
+                let Expression::Variable(ve) = operand else {
                     return Err(TokenError::QuantifierRequiresVariableList {
                         op: op.clone(),
                         quantified_variable_count,
                     }
                     .into());
                 };
-                identifiers_to_quantify.push(ve.identifier.clone());
+                identifiers_to_quantify.push(ve.identifier);
             } else {
                 // `:137-154`.
                 string_value.push_str(&operand.to_string());
@@ -1543,9 +1549,14 @@ impl Operator {
             // identical conjuncts. Redundant, not wrong (`and` is idempotent); ported
             // verbatim rather than deduplicated, since deduplicating would change the
             // intermediate state counts the `details*` golden fixtures compare exactly.
-            // Cloned up front only because the loop body clones `word.word_automaton`;
-            // the list itself is never mutated here, in either language.
-            for o in word.word_automaton.fa.o.clone() {
+            // `o: i32` is `Copy`, so iterating a borrow of the output list (rather than
+            // cloning the whole `Vec<i32>` up front) is enough. Java's loop body clones
+            // `wordAutomaton` into a fresh `n` and mutates only `n`; the list itself
+            // (`word.word_automaton.fa.o`) is never mutated here, in either language, so
+            // the per-iteration `.clone()` below — which the loop body genuinely needs,
+            // to hand each iteration its own owned, separately-mutated copy — doesn't
+            // conflict with borrowing `word.word_automaton.fa.o` for the loop.
+            for &o in &word.word_automaton.fa.o {
                 let mut n = word.word_automaton.clone();
                 compare_word_automaton_with_ctx(
                     &mut n,
@@ -1982,7 +1993,10 @@ impl Operator {
             // still indent/dedent internally, just not this method's own level).
             logging.indent();
             let mut acc = Automaton::true_false(true);
-            for o in word.word_automaton.fa.o.clone() {
+            // See the matching loop in `act_relational_body` (arm 1) for why borrowing
+            // here (rather than cloning the whole `Vec<i32>`) is enough: `o` is `Copy`,
+            // and `word.word_automaton` is never mutated through this borrow.
+            for &o in &word.word_automaton.fa.o {
                 let mut n = word.word_automaton.clone();
                 compare_word_automaton_with_ctx(
                     &mut n,
@@ -2681,11 +2695,17 @@ impl Function {
         quantify_with_ctx(&mut anded, &quantify_set, ctx, logging)?;
         logging.dedent();
 
+        // `S.push(...)`, THEN `Logging.logAndPrint(COMPUTED + " " + stringValue)`
+        // (`Function.java:95-97`) -- Java's own statement order, unchanged (push, THEN
+        // log). The COMPUTED message is pre-formatted here (a pure expression, not a
+        // `Logging` call) purely so `string_value` can move into the pushed expression
+        // instead of being cloned for it.
+        let computed = format!("{} {}", wr_core::logging::COMPUTED, string_value);
         stack.push(Expression::Automaton(AutomatonExpression::new(
-            string_value.clone(),
+            string_value,
             anded,
         )));
-        logging.log_and_print(&format!("{} {}", wr_core::logging::COMPUTED, string_value));
+        logging.log_and_print(&computed);
         Ok(())
     }
 }
