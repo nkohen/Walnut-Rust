@@ -1541,15 +1541,15 @@ impl NumberSystem {
 
         let mut addition =
             Self::set_addition_automaton(name, base, direction, files.addition.resolve())?;
-        let alphabet = addition.alphabet[0].clone();
+        let alphabet = &addition.alphabet[0];
         let mut less_than = Self::set_less_than_automaton(
             name,
             base,
-            &alphabet,
+            alphabet,
             direction,
             files.less_than.resolve(),
         )?;
-        let mut equality = equality_automaton(&alphabet, direction);
+        let mut equality = equality_automaton(alphabet, direction);
 
         // `addition.getNS().set(i, this)` (`:364-366`), `lessThan.getNS().set(i, this)`
         // (`:392`) and `initBasicAutomaton`'s equivalent for `equality` install THIS
@@ -1688,7 +1688,7 @@ impl NumberSystem {
         if addition.alphabet.len() != 3 {
             return Err(NumSysError::AdditionInputCount(name.to_string()));
         }
-        let alphabet = addition.alphabet[0].clone();
+        let alphabet = &addition.alphabet[0];
         if !alphabet.contains(&0) {
             return Err(NumSysError::AdditionAlphabetMissingZero(name.to_string()));
         }

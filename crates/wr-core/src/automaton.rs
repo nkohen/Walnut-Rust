@@ -1100,10 +1100,10 @@ impl Automaton {
         // `None` == "K is still `this`" (Java's alias).
         let mut k: Option<Automaton> = None;
         for i in 0..self.alphabet.len() {
-            let Some(n) = self.all_reps[i].clone() else {
+            let Some(n) = self.all_reps[i].as_ref() else {
                 continue;
             };
-            let mut n = (*n).clone();
+            let mut n = (**n).clone();
             n.bind(vec![self.label[i].clone()]);
             logging.log_and_print(&format!("Applying valid representation #{i}"));
             logging.indent();
@@ -1153,10 +1153,10 @@ impl Automaton {
         let flag = self.determine_random_label();
         let mut k: Option<Automaton> = None;
         for i in 0..self.alphabet.len() {
-            let Some(n) = self.all_reps[i].clone() else {
+            let Some(n) = self.all_reps[i].as_ref() else {
                 continue;
             };
-            let mut n = (*n).clone();
+            let mut n = (**n).clone();
             n.bind(vec![self.label[i].clone()]);
             // `Prover.IF_OTHER_OP`, and against `this` -- not against `k`.
             k = Some(crate::product::cross_product(

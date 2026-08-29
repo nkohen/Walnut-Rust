@@ -432,9 +432,9 @@ pub(crate) fn flip_ns(a: &mut Automaton) {
         if a.msd[i].is_none() {
             continue;
         }
-        match a.ns_name.get(i).and_then(|n| n.clone()) {
+        match a.ns_name.get(i).and_then(|n| n.as_deref()) {
             Some(name) => {
-                let new_name = flipped_ns_name(&name);
+                let new_name = flipped_ns_name(name);
                 // `NumberSystem`'s constructor: `isMsd = determineMsdOrLsd(name).equals(MSD)`.
                 a.msd[i] = Some(new_name.starts_with(crate::numsys::MSD_UNDERSCORE));
                 a.ns_name[i] = Some(new_name);
@@ -2394,8 +2394,11 @@ pub fn convert_ns(
     // where real Walnut reports `found: fib` (golden-corpus fixture 554).
     // `Automaton::track_ns_names` supplies the real name, falling back to the exact
     // `msd_<alphabet size>` reconstruction wherever no name was recorded.
-    let from_name = a.track_ns_names()[0]
-        .clone()
+    let from_name = a
+        .track_ns_names()
+        .into_iter()
+        .next()
+        .flatten()
         .expect("msd[0] is Some, so track_ns_names[0] is Some");
     let from_base = parse_base(&from_name)?;
 

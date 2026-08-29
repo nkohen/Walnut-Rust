@@ -509,9 +509,10 @@ fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
 }
 
 // ---------------------------------------------------------------------------
-// U7 (idiomatic-refactor): `.clone()` reduction in `numsys.rs`/`automaton.rs`.
+// U7 (idiomatic-refactor): `.clone()` reduction in `numsys.rs`/`automaton.rs`/
+// `logicalops.rs`.
 //
-// U7's REMOVE-list touches:
+// U7's REMOVE-list touches six sites:
 // - [`wr_core::numsys::NumberSystem::set_addition_automaton`] (a `.clone()` of
 //   `addition.alphabet[0]`, used only for the zero/one/per-track-equality
 //   validation reads below it, becomes a borrow).
@@ -521,8 +522,25 @@ fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
 // - [`wr_core::automaton::Automaton::apply_all_representations`] /
 //   `apply_all_representations_with_output` (the `Rc` clone of
 //   `self.all_reps[i]` becomes an `as_ref()` borrow; the DEEP clone one line
-//   below it, out of the `Rc`, is untouched -- it is mutated via `bind` and is
-//   load-bearing, per that function's own doc comment).
+//   below it, out of the `Rc`, keeps cloning the same thing it always did --
+//   it is re-spelled `(*n).clone()` -> `(**n).clone()` to deref through the
+//   now-borrowed `Rc` instead of an owned one, still the same
+//   mutated-via-`bind`, load-bearing `Automaton::clone()` per that function's
+//   own doc comment).
+// - `wr_core::logicalops::flip_ns` (a `.clone()` of the `Option<String>` read
+//   out of `a.ns_name.get(i)` becomes an `as_deref()` borrow; already pinned
+//   exactly by the pre-existing
+//   `flip_ns_flips_the_recorded_number_system_name_not_just_the_direction`
+//   test in `logicalops.rs`'s own `#[cfg(test)]` module -- `flip_ns` is
+//   `pub(crate)`, so it cannot be exercised directly from this external test
+//   crate, and no new test is added here).
+// - `wr_core::logicalops::convert_ns` (a `.clone()` of
+//   `track_ns_names()[0]`, a temporary with no other reference, becomes
+//   `.into_iter().next().flatten()`; already pinned by the pre-existing
+//   `convert_ns_parses_the_base_from_the_name_not_the_alphabet_size` test in
+//   `logicalops.rs`'s own `#[cfg(test)]` module -- `convert_ns` is `pub`, but
+//   this specific read has no behavioral difference to distinguish from a
+//   fresh test here, so the existing coverage stands in for it).
 //
 // None of these change the alphabet, transition table, or any other field of
 // the automata under test -- they only change whether an intermediate local
