@@ -170,20 +170,16 @@ fn write_initial_row_vector_comment<W: Write>(out: &mut W, v_name: &str, comment
 }
 
 fn write_incidence_matrices_comment<W: Write>(out: &mut W, comment_char: &str) {
-    let _ = writeln!(
-        out,
-        "{comment_char} In what follows, the M_i_x, for a free variable i and a value x, denotes"
-    );
-    let _ = writeln!(
-        out,
-        "{comment_char} an incidence matrix of the underlying graph of (the automaton of)"
-    );
-    let _ = writeln!(out, "{comment_char} the predicate in the query.");
-    let _ = writeln!(
-        out,
-        "{comment_char} For every pair of states p and q, the entry M_i_x[p][q] denotes the number of"
-    );
-    let _ = writeln!(out, "{comment_char} transitions with i=x from p to q.");
+    const LINES: [&str; 5] = [
+        "In what follows, the M_i_x, for a free variable i and a value x, denotes",
+        "an incidence matrix of the underlying graph of (the automaton of)",
+        "the predicate in the query.",
+        "For every pair of states p and q, the entry M_i_x[p][q] denotes the number of",
+        "transitions with i=x from p to q.",
+    ];
+    for line in LINES {
+        let _ = writeln!(out, "{comment_char} {line}");
+    }
 }
 
 fn write_final_column_vector_comment<W: Write>(out: &mut W, w_name: &str, comment_char: &str) {
@@ -192,6 +188,21 @@ fn write_final_column_vector_comment<W: Write>(out: &mut W, w_name: &str, commen
         "{comment_char} The column vector {w_name} denotes the indicator vector of the"
     );
     let _ = writeln!(out, "{comment_char} set of final states.");
+}
+
+/// The shared body of `MapleEmitter.emitInitialRowVector`'s `for (int q = 0; q <
+/// Q; ++q)` loop (`MapleEmitter.java:46-49`) and its three siblings
+/// (`MatlabEmitter.java`, `MathematicaEmitter.java`, `SageEmitter.java`, each
+/// with the identical loop shape, differing only in the separator character):
+/// the length-`q` indicator-vector body, `1` at index `q0` if `q0 < q`, `0`
+/// elsewhere, joined by `sep` (`,` for Maple/Mathematica/Sage, ` ` for MATLAB)
+/// -- factored out since the four emitters differ only in the separator and
+/// the surrounding syntax, not in these values or their ascending order.
+fn indicator_vector_body(q: usize, q0: usize, sep: &str) -> String {
+    (0..q)
+        .map(|qi| if qi == q0 { "1" } else { "0" })
+        .collect::<Vec<_>>()
+        .join(sep)
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +231,7 @@ impl<W: Write> MatrixEmitter for MapleEmitter<W> {
     fn emit_initial_row_vector(&mut self, name: &str, q: usize, q0: usize) {
         write_initial_row_vector_comment(&mut self.out, name, "#");
         let _ = write!(self.out, "{name} := Vector[row]([");
-        for qi in 0..q {
-            let _ = write!(self.out, "{}", if qi == q0 { "1" } else { "0" });
-            if qi < q - 1 {
-                let _ = write!(self.out, ",");
-            }
-        }
+        let _ = write!(self.out, "{}", indicator_vector_body(q, q0, ","));
         let _ = writeln!(self.out, "]);");
         let _ = writeln!(self.out);
         write_incidence_matrices_comment(&mut self.out, "#");
@@ -315,12 +321,7 @@ impl<W: Write> MatrixEmitter for MatlabEmitter<W> {
     fn emit_initial_row_vector(&mut self, name: &str, q: usize, q0: usize) {
         write_initial_row_vector_comment(&mut self.out, name, "%");
         let _ = write!(self.out, "{name} = [");
-        for qi in 0..q {
-            let _ = write!(self.out, "{}", if qi == q0 { "1" } else { "0" });
-            if qi < q - 1 {
-                let _ = write!(self.out, " ");
-            }
-        }
+        let _ = write!(self.out, "{}", indicator_vector_body(q, q0, " "));
         let _ = writeln!(self.out, "];");
         let _ = writeln!(self.out);
         write_incidence_matrices_comment(&mut self.out, "%");
@@ -409,12 +410,7 @@ impl<W: Write> MatrixEmitter for MathematicaEmitter<W> {
         // WB-042: `#`, not `(* *)` -- see this struct's doc comment.
         write_initial_row_vector_comment(&mut self.out, name, "#");
         let _ = write!(self.out, "{name} = {{{{");
-        for qi in 0..q {
-            let _ = write!(self.out, "{}", if qi == q0 { "1" } else { "0" });
-            if qi < q - 1 {
-                let _ = write!(self.out, ",");
-            }
-        }
+        let _ = write!(self.out, "{}", indicator_vector_body(q, q0, ","));
         let _ = writeln!(self.out, "}}}};");
         let _ = writeln!(self.out);
         write_incidence_matrices_comment(&mut self.out, "#");
@@ -499,12 +495,7 @@ impl<W: Write> MatrixEmitter for SageEmitter<W> {
     fn emit_initial_row_vector(&mut self, name: &str, q: usize, q0: usize) {
         write_initial_row_vector_comment(&mut self.out, name, "#");
         let _ = write!(self.out, "{name} = matrix(ZZ, 1, {q}, [");
-        for qi in 0..q {
-            let _ = write!(self.out, "{}", if qi == q0 { "1" } else { "0" });
-            if qi < q - 1 {
-                let _ = write!(self.out, ",");
-            }
-        }
+        let _ = write!(self.out, "{}", indicator_vector_body(q, q0, ","));
         let _ = writeln!(self.out, "])");
         let _ = writeln!(self.out);
         write_incidence_matrices_comment(&mut self.out, "#");
@@ -828,6 +819,17 @@ mod tests {
 
     fn free_vars(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Pins `indicator_vector_body`'s `1`-at-`q0` POSITION and the `q == 1`
+    /// shape directly -- nothing else in this crate or the golden corpus would
+    /// catch `qi == q0` mutated to e.g. `qi == 0`, since every checked-in
+    /// fixture's `q0` happens to be `0`.
+    #[test]
+    fn indicator_vector_body_places_the_one_at_q0_and_joins_with_the_given_separator() {
+        assert_eq!(indicator_vector_body(3, 1, ","), "0,1,0");
+        assert_eq!(indicator_vector_body(1, 0, ","), "1");
+        assert_eq!(indicator_vector_body(3, 1, " "), "0 1 0");
     }
 
     // ------------------------------------------------------------------

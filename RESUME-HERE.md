@@ -26,8 +26,8 @@ resolved as a negative-hypothesis finding with new coverage; U34's Phase 2 is no
 
 | Unit | Scope | Status |
 |---|---|---|
-| U0 | Branch, baselines, sibling assert, guardrails doc, this reconciliation | **in progress** |
-| U1 | matrix_writer loop/param idioms (bytes frozen) | pending |
+| U0 | Branch, baselines, sibling assert, guardrails doc, this reconciliation | **done** (`f8b657f`) |
+| U1 | matrix_writer loop/param idioms (bytes frozen) | **done** — Sonnet impl; Opus+Fable both "no correctness defect" (Opus proved byte-equality with an exhaustive old-vs-new differential harness incl. q==0/q==1/q0>=q); 3 non-blocking findings (helper placement+citation, q0-position pin test, doc nit) applied in a fixer pass. T0 1,723/0; T1 exactly 670/675 (383 only); wr-io 149/0 post-fix. |
 | U2 | wr-cli error consolidation (4-tuple snapshot first) | pending |
 | U3 | wr-cli bool flags → enums | pending |
 | U4 | wr-logic ownership (token.rs, expr.rs; eval.rs excluded) | pending |
