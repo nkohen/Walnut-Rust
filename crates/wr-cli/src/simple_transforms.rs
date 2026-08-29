@@ -56,13 +56,8 @@ impl std::fmt::Display for SimpleTransformError {
     }
 }
 
-impl std::error::Error for SimpleTransformError {}
-
-impl From<std::io::Error> for SimpleTransformError {
-    fn from(e: std::io::Error) -> Self {
-        SimpleTransformError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(SimpleTransformError, std::io::Error => Io);
 
 /// `Prover.minimizeCommand(String s)` (`Prover.java:712-722`). Reads/writes
 /// `Word Automata Library/`, not `Automata Library/` — the one command in this module

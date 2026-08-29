@@ -153,7 +153,8 @@ impl std::fmt::Display for MetaCommandError {
     }
 }
 
-impl std::error::Error for MetaCommandError {}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(MetaCommandError);
 
 impl LoggableError for MetaCommandError {
     /// Exhaustive on purpose, same discipline as `wr_logic::eval`'s `ActError` impl: this

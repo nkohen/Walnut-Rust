@@ -19,6 +19,7 @@ pub mod automaton_ops;
 pub mod automaton_output;
 pub mod convert;
 pub mod describe;
+pub(crate) mod error_support;
 pub mod eval_def;
 pub mod help_messages;
 pub mod image;

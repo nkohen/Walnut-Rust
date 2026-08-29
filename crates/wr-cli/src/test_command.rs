@@ -136,25 +136,13 @@ impl std::fmt::Display for TestError {
     }
 }
 
-impl std::error::Error for TestError {}
-
-impl From<PredicateEnvError> for TestError {
-    fn from(e: PredicateEnvError) -> Self {
-        TestError::Read(e)
-    }
-}
-
-impl From<RemoveLeadingZerosError> for TestError {
-    fn from(e: RemoveLeadingZerosError) -> Self {
-        TestError::RemoveLeadingZeros(e)
-    }
-}
-
-impl From<io::Error> for TestError {
-    fn from(e: io::Error) -> Self {
-        TestError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(
+    TestError,
+    PredicateEnvError => Read,
+    RemoveLeadingZerosError => RemoveLeadingZeros,
+    io::Error => Io,
+);
 
 /// `Test.testCommand(String testName, int needed)` (`:22-32`).
 ///

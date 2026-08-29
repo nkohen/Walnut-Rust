@@ -77,13 +77,8 @@ impl std::fmt::Display for ConvertError {
     }
 }
 
-impl std::error::Error for ConvertError {}
-
-impl From<std::io::Error> for ConvertError {
-    fn from(e: std::io::Error) -> Self {
-        ConvertError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(ConvertError, std::io::Error => Io);
 
 /// `Prover.convertCommand(String s)` (`Prover.java:724-745`). Every argument below is
 /// a raw captured group's text, mirroring Java's own `m.group(...)` call shape at each

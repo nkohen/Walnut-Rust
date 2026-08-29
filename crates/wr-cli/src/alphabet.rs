@@ -140,13 +140,8 @@ impl std::fmt::Display for AlphabetError {
     }
 }
 
-impl std::error::Error for AlphabetError {}
-
-impl From<std::io::Error> for AlphabetError {
-    fn from(e: std::io::Error) -> Self {
-        AlphabetError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(AlphabetError, std::io::Error => Io);
 
 // ---------------------------------------------------------------------------
 // `Alphabet.determineAlphabetsAndNS` -- the shared alphabet-declaration grammar

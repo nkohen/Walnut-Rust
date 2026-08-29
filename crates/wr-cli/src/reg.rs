@@ -51,25 +51,13 @@ impl std::fmt::Display for RegError {
     }
 }
 
-impl std::error::Error for RegError {}
-
-impl From<AlphabetError> for RegError {
-    fn from(e: AlphabetError) -> Self {
-        RegError::Alphabet(e)
-    }
-}
-
-impl From<RegexError> for RegError {
-    fn from(e: RegexError) -> Self {
-        RegError::Regex(e)
-    }
-}
-
-impl From<std::io::Error> for RegError {
-    fn from(e: std::io::Error) -> Self {
-        RegError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(
+    RegError,
+    AlphabetError => Alphabet,
+    RegexError => Regex,
+    std::io::Error => Io,
+);
 
 /// `Reg.reg(String listOfAlphabets, String baseexp, String regName)` (`Reg.java:18-40`).
 ///

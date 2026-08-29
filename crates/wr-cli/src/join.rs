@@ -150,13 +150,8 @@ impl std::fmt::Display for JoinError {
     }
 }
 
-impl std::error::Error for JoinError {}
-
-impl From<std::io::Error> for JoinError {
-    fn from(e: std::io::Error) -> Self {
-        JoinError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(JoinError, std::io::Error => Io);
 
 fn compile(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|e| panic!("join pattern failed to compile: {pattern}: {e}"))

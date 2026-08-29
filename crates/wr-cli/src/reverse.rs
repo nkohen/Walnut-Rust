@@ -52,13 +52,8 @@ impl std::fmt::Display for ReverseError {
     }
 }
 
-impl std::error::Error for ReverseError {}
-
-impl From<std::io::Error> for ReverseError {
-    fn from(e: std::io::Error) -> Self {
-        ReverseError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(ReverseError, std::io::Error => Io);
 
 /// `Reverse.reverseCommand(String s, String inFileName, boolean isDFAO, String newName)`
 /// (`Reverse.java:10-19`). `in_file_name` already carries the `.txt` extension (the

@@ -39,7 +39,8 @@ impl std::fmt::Display for DescribeError {
     }
 }
 
-impl std::error::Error for DescribeError {}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(DescribeError);
 
 /// The `List<NumberSystem>.toString()` rendering Java's `"Number systems:" +
 /// M.getNS()` produces — `[msd_2, null]`-style, via

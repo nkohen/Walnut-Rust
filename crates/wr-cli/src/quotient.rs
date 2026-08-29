@@ -109,13 +109,8 @@ impl std::fmt::Display for QuotientError {
     }
 }
 
-impl std::error::Error for QuotientError {}
-
-impl From<std::io::Error> for QuotientError {
-    fn from(e: std::io::Error) -> Self {
-        QuotientError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(QuotientError, std::io::Error => Io);
 
 fn read_pair(
     session: &Session,

@@ -28,7 +28,7 @@ resolved as a negative-hypothesis finding with new coverage; U34's Phase 2 is no
 |---|---|---|
 | U0 | Branch, baselines, sibling assert, guardrails doc, this reconciliation | **done** (`f8b657f`) |
 | U1 | matrix_writer loop/param idioms (bytes frozen) | **done** — Sonnet impl; Opus+Fable both "no correctness defect" (Opus proved byte-equality with an exhaustive old-vs-new differential harness incl. q==0/q==1/q0>=q); 3 non-blocking findings (helper placement+citation, q0-position pin test, doc nit) applied in a fixer pass. T0 1,723/0; T1 exactly 670/675 (383 only); wr-io 149/0 post-fix. |
-| U2 | wr-cli error consolidation (4-tuple snapshot first) | pending |
+| U2 | wr-cli error consolidation (4-tuple snapshot first) | **done** — snapshot committed first (`795c459`, 412 assertions, 2 pre-existing kind()-routing quirks pinned as-is: MorphismCommandError::InvalidFile falls to WalnutException; reg family unrouted — possible future follow-up, NOT refactor scope); then `simple_error_froms!` macro (18/19 markers, 29/31 Froms; prover.rs+walnut_exception.rs byte-untouched). Opus review: no correctness defect (exhaustive 29/29 mapping comparison); test-gap closed with direct From-routing assertions + doc fixes. T0 ~1,744/0; T1 exactly 670/675. |
 | U3 | wr-cli bool flags → enums | pending |
 | U4 | wr-logic ownership (token.rs, expr.rs; eval.rs excluded) | pending |
 | U5 | wr-core bool flags → enums (numsys/logicalops/automaton/…) | pending |

@@ -137,19 +137,8 @@ impl std::fmt::Display for ImageError {
     }
 }
 
-impl std::error::Error for ImageError {}
-
-impl From<std::io::Error> for ImageError {
-    fn from(e: std::io::Error) -> Self {
-        ImageError::Io(e)
-    }
-}
-
-impl From<EvalError> for ImageError {
-    fn from(e: EvalError) -> Self {
-        ImageError::Eval(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(ImageError, std::io::Error => Io, EvalError => Eval);
 
 /// `Image.image(String s, String morphismFileName, String imageOldName, String
 /// imageNewName, boolean printFlag)` (`Image.java:17-46`).

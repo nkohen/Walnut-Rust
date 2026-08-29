@@ -225,20 +225,12 @@ impl std::fmt::Display for EvalDefError {
     }
 }
 
-impl std::error::Error for EvalDefError {}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(EvalDefError, EvalError => Eval, std::io::Error => Io);
 
-impl From<EvalError> for EvalDefError {
-    fn from(e: EvalError) -> Self {
-        EvalDefError::Eval(e)
-    }
-}
-
-impl From<std::io::Error> for EvalDefError {
-    fn from(e: std::io::Error) -> Self {
-        EvalDefError::Io(e)
-    }
-}
-
+// Not a bare wrap (distributes several source variants across several differently
+// shaped target ones), so it stays hand-written -- see `crate::error_support`'s module
+// docs, "What is deliberately NOT covered".
 impl From<wr_io::matrix_writer::MatrixWriteError> for EvalDefError {
     fn from(e: wr_io::matrix_writer::MatrixWriteError) -> Self {
         use wr_io::matrix_writer::MatrixWriteError as M;

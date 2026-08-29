@@ -141,13 +141,8 @@ impl std::fmt::Display for AutomatonOpsError {
     }
 }
 
-impl std::error::Error for AutomatonOpsError {}
-
-impl From<std::io::Error> for AutomatonOpsError {
-    fn from(e: std::io::Error) -> Self {
-        AutomatonOpsError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(AutomatonOpsError, std::io::Error => Io);
 
 // ---------------------------------------------------------------------------
 // Shared scanners

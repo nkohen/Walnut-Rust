@@ -105,25 +105,13 @@ impl std::fmt::Display for TransduceCommandError {
     }
 }
 
-impl std::error::Error for TransduceCommandError {}
-
-impl From<PredicateEnvError> for TransduceCommandError {
-    fn from(e: PredicateEnvError) -> Self {
-        TransduceCommandError::ReadAutomaton(e)
-    }
-}
-
-impl From<TransduceError> for TransduceCommandError {
-    fn from(e: TransduceError) -> Self {
-        TransduceCommandError::Transduce(e)
-    }
-}
-
-impl From<std::io::Error> for TransduceCommandError {
-    fn from(e: std::io::Error) -> Self {
-        TransduceCommandError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(
+    TransduceCommandError,
+    PredicateEnvError => ReadAutomaton,
+    TransduceError => Transduce,
+    std::io::Error => Io,
+);
 
 /// `wr_core::transducer`'s module doc, "Constructing one (the recipe U26's `transduce`
 /// command needs)" — the mechanical `TransducerData` -> `Transducer` conversion, spelled

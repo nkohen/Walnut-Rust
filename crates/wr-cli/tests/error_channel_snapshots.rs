@@ -1150,3 +1150,168 @@ fn transduce_command_error_variants() {
         MAIN_WALNUT_EXCEPTION,
     );
 }
+
+// ---------------------------------------------------------------------------
+// U2 stage 2 addendum: every macro-generated `From<Foreign> for CommandError` impl,
+// invoked directly.
+//
+// Everything above this point routes every construction through `ProverError::from`,
+// which never calls a command enum's OWN `From` impl -- `ProverError::from(AlphabetError
+// ::Io(e))` just moves an already-built `AlphabetError` one level up, it never exercises
+// `AlphabetError::from(io::Error)` itself. So stage 1 never actually invoked any of the
+// 29 `From` impls `crate::error_support::simple_error_froms!` now generates (U2 stage 2),
+// even though every one of those impls existed by hand before stage 2 too -- the
+// snapshot file passing unmodified through stage 2 proved the macro's OUTPUT matches the
+// old hand-written code closely enough to fool `ProverError::from`'s callers, but not
+// that the `From` impls it generates are individually well-formed and wired to the
+// right variant. This is that missing coverage, added per adversarial review.
+//
+// This also closes the same review's latent-risk note: `simple_error_froms!` cannot by
+// construction generate two `From<T>` impls for the same `T` on one enum (Rust's
+// coherence rules reject the resulting duplicate trait impl at compile time before any
+// test could even run) -- but nothing previously exercised the ONE `From<T>` impl each
+// enum does have, so a future edit that pointed it at the wrong variant (e.g. if
+// `AlphabetError` ever grew a `PredicateEnvError => NumberSystem`/`PredicateEnvError =>
+// Read` pair and someone swapped the two variant names) would have compiled and passed
+// every existing test silently. `matches!` below pins the actual target variant per
+// pair, not just that `From::from` compiles.
+#[test]
+fn every_macro_generated_from_impl_routes_to_its_declared_variant() {
+    // AlphabetError (1 pair)
+    assert!(matches!(
+        AlphabetError::from(io_err("x")),
+        AlphabetError::Io(_)
+    ));
+
+    // AutomatonOpsError (1 pair)
+    assert!(matches!(
+        AutomatonOpsError::from(io_err("x")),
+        AutomatonOpsError::Io(_)
+    ));
+
+    // ConvertError (1 pair)
+    assert!(matches!(
+        ConvertError::from(io_err("x")),
+        ConvertError::Io(_)
+    ));
+
+    // EvalDefError (2 pairs)
+    assert!(matches!(
+        EvalDefError::from(EvalError::NoResult),
+        EvalDefError::Eval(_)
+    ));
+    assert!(matches!(
+        EvalDefError::from(io_err("x")),
+        EvalDefError::Io(_)
+    ));
+
+    // ImageError (2 pairs)
+    assert!(matches!(ImageError::from(io_err("x")), ImageError::Io(_)));
+    assert!(matches!(
+        ImageError::from(EvalError::NoResult),
+        ImageError::Eval(_)
+    ));
+
+    // JoinError (1 pair)
+    assert!(matches!(JoinError::from(io_err("x")), JoinError::Io(_)));
+
+    // MorphismCommandError (1 pair)
+    assert!(matches!(
+        MorphismCommandError::from(io_err("x")),
+        MorphismCommandError::Io(_)
+    ));
+
+    // OstError (3 pairs)
+    assert!(matches!(
+        OstError::from(ParseMethodsError::NoValidMorphismMappings),
+        OstError::Parse(_)
+    ));
+    assert!(matches!(
+        OstError::from(OstrowskiError::EmptyPeriod),
+        OstError::Ostrowski(_)
+    ));
+    assert!(matches!(OstError::from(io_err("x")), OstError::Io(_)));
+
+    // ProverHelperError (4 pairs)
+    assert!(matches!(
+        ProverHelperError::from(BaWriteError::DfaoNotSupported),
+        ProverHelperError::BaWrite(_)
+    ));
+    assert!(matches!(
+        ProverHelperError::from(io_err("x")),
+        ProverHelperError::Io(_)
+    ));
+    assert!(matches!(
+        ProverHelperError::from(PredicateEnvError::FileDoesNotExist {
+            address: "x".to_string()
+        }),
+        ProverHelperError::Read(_)
+    ));
+    assert!(matches!(
+        ProverHelperError::from(RemoveLeadingZerosError::NotFreeVariable("x".to_string())),
+        ProverHelperError::RemoveLeadingZeros(_)
+    ));
+
+    // QuotientError (1 pair)
+    assert!(matches!(
+        QuotientError::from(io_err("x")),
+        QuotientError::Io(_)
+    ));
+
+    // RegError (3 pairs)
+    assert!(matches!(
+        RegError::from(AlphabetError::Walnut("x".to_string())),
+        RegError::Alphabet(_)
+    ));
+    assert!(matches!(
+        RegError::from(RegexError::Brics("x".to_string())),
+        RegError::Regex(_)
+    ));
+    assert!(matches!(RegError::from(io_err("x")), RegError::Io(_)));
+
+    // ReverseError (1 pair)
+    assert!(matches!(
+        ReverseError::from(io_err("x")),
+        ReverseError::Io(_)
+    ));
+
+    // SimpleTransformError (1 pair)
+    assert!(matches!(
+        SimpleTransformError::from(io_err("x")),
+        SimpleTransformError::Io(_)
+    ));
+
+    // SplitError (1 pair -- the macro-generated one only; `From<NumSysError>` stays
+    // hand-written and is out of scope for this addendum, same as `EvalDefError`'s
+    // `From<MatrixWriteError>`)
+    assert!(matches!(SplitError::from(io_err("x")), SplitError::Io(_)));
+
+    // TestError (3 pairs)
+    assert!(matches!(
+        TestError::from(PredicateEnvError::FileDoesNotExist {
+            address: "x".to_string()
+        }),
+        TestError::Read(_)
+    ));
+    assert!(matches!(
+        TestError::from(RemoveLeadingZerosError::NotFreeVariable("x".to_string())),
+        TestError::RemoveLeadingZeros(_)
+    ));
+    assert!(matches!(TestError::from(io_err("x")), TestError::Io(_)));
+
+    // TransduceCommandError (3 pairs)
+    assert!(matches!(
+        TransduceCommandError::from(PredicateEnvError::FileDoesNotExist {
+            address: "x".to_string()
+        }),
+        TransduceCommandError::ReadAutomaton(_)
+    ));
+    assert!(matches!(
+        TransduceCommandError::from(TransduceError::NotSingleInput),
+        TransduceCommandError::Transduce(_)
+    ));
+    assert!(matches!(
+        TransduceCommandError::from(io_err("x")),
+        TransduceCommandError::Io(_)
+    ));
+}

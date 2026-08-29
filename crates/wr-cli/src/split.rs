@@ -109,14 +109,11 @@ impl std::fmt::Display for SplitError {
     }
 }
 
-impl std::error::Error for SplitError {}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(SplitError, std::io::Error => Io);
 
-impl From<std::io::Error> for SplitError {
-    fn from(e: std::io::Error) -> Self {
-        SplitError::Io(e)
-    }
-}
-
+// Not a bare wrap (stringifies the source error first), so it stays hand-written -- see
+// `crate::error_support`'s module docs, "What is deliberately NOT covered".
 impl From<NumSysError> for SplitError {
     fn from(e: NumSysError) -> Self {
         SplitError::Core(e.to_string())

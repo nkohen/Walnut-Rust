@@ -71,31 +71,14 @@ impl std::fmt::Display for ProverHelperError {
     }
 }
 
-impl std::error::Error for ProverHelperError {}
-
-impl From<BaWriteError> for ProverHelperError {
-    fn from(e: BaWriteError) -> Self {
-        ProverHelperError::BaWrite(e)
-    }
-}
-
-impl From<io::Error> for ProverHelperError {
-    fn from(e: io::Error) -> Self {
-        ProverHelperError::Io(e)
-    }
-}
-
-impl From<PredicateEnvError> for ProverHelperError {
-    fn from(e: PredicateEnvError) -> Self {
-        ProverHelperError::Read(e)
-    }
-}
-
-impl From<RemoveLeadingZerosError> for ProverHelperError {
-    fn from(e: RemoveLeadingZerosError) -> Self {
-        ProverHelperError::RemoveLeadingZeros(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(
+    ProverHelperError,
+    BaWriteError => BaWrite,
+    io::Error => Io,
+    PredicateEnvError => Read,
+    RemoveLeadingZerosError => RemoveLeadingZeros,
+);
 
 /// `ProverHelper.exportAutomata(String s, String filename, String exportType, Automaton M,
 /// boolean isDFAO)` (`:17-33`), writing its one console line to the real process stdout.

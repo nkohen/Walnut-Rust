@@ -83,13 +83,8 @@ impl std::fmt::Display for MorphismCommandError {
     }
 }
 
-impl std::error::Error for MorphismCommandError {}
-
-impl From<io::Error> for MorphismCommandError {
-    fn from(e: io::Error) -> Self {
-        MorphismCommandError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(MorphismCommandError, io::Error => Io);
 
 /// `Morphism.morphismCommand(String morphismDefinition, String name)`
 /// (`Main/Commands/Morphism.java:9-17`), writing its console text to the real process

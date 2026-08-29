@@ -80,25 +80,13 @@ impl std::fmt::Display for OstError {
     }
 }
 
-impl std::error::Error for OstError {}
-
-impl From<ParseMethodsError> for OstError {
-    fn from(e: ParseMethodsError) -> Self {
-        OstError::Parse(e)
-    }
-}
-
-impl From<OstrowskiError> for OstError {
-    fn from(e: OstrowskiError) -> Self {
-        OstError::Ostrowski(e)
-    }
-}
-
-impl From<std::io::Error> for OstError {
-    fn from(e: std::io::Error) -> Self {
-        OstError::Io(e)
-    }
-}
+use crate::error_support::simple_error_froms;
+simple_error_froms!(
+    OstError,
+    ParseMethodsError => Parse,
+    OstrowskiError => Ostrowski,
+    std::io::Error => Io,
+);
 
 /// `Ost.ostCommand(String name, String preperiod, String period)` (`Ost.java:14-24`).
 ///
