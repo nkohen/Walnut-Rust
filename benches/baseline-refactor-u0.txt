@@ -1,0 +1,123 @@
+== U32: walnut-rs vs walnut-java, 11 workloads, 3 warm-up iterations each ==
+
+peak states = the largest automaton named in the JVM's COMPLETE `details` trace.
+rust trace  = the largest the port's PARTIAL trace names (a lower bound -- the port
+              does not yet thread `Logging` through wr-core; see benches/README.md).
+
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   376.571 µs   371.353 µs   679.942 µs   655.354 µs     1.81x            6           6
+207      50   301.982 µs   297.666 µs   470.109 µs   434.520 µs     1.56x            3           3
+293      20    32.171 ms    31.951 ms    82.411 ms    81.833 ms     2.56x        12334       12334
+521      20    20.532 ms    20.480 ms    50.006 ms    49.804 ms     2.44x            3           3
+179      20   112.957 ms   112.635 ms   323.134 ms   322.099 ms     2.86x        33000       33000
+266      20    37.089 ms    36.624 ms    89.977 ms    89.157 ms     2.43x         7657        7657
+230       5   554.911 ms   555.683 ms      1.871 s      1.874 s     3.37x       115802      115802
+295      20    68.876 ms    68.737 ms   150.441 ms   149.252 ms     2.18x        11589       11589
+261      20   109.162 ms   108.937 ms   249.417 ms   246.950 ms     2.28x        18674       18674
+286      20   177.201 ms   175.940 ms   416.821 ms   399.724 ms     2.35x        34988       34988
+637      20    24.864 ms    24.003 ms    62.506 ms    62.547 ms     2.51x         4965        4965
+
+-- per-workload detail --
+
+fixture 1 -- RUST FASTER (1.81x)
+  command : eval test1 "?lsd_2 (a = 4) & (b)=(5) & (6) = c & (17 = d)";
+  why     : floor: a tiny closed-form lsd_2 conjunction — measures per-command overhead (parse + dispatch + number-system construction), not algorithmic throughput
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 376.571 µs  median 371.353 µs  min 355.875 µs  max 410.750 µs  (n=50)
+  java    : mean 679.942 µs  median 655.354 µs  min 591.584 µs  max 948.041 µs  (n=50)
+  peak    : 6 states (both traces name the same largest automaton)
+
+fixture 207 -- RUST FASTER (1.56x)
+  command : eval test207 "?msd_17 a=37";
+  why     : a larger base (msd_17): NumberSystem::new eagerly builds adder/comparator automata over a k^3 alphabet, so this is dominated by number-system construction
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 301.982 µs  median 297.666 µs  min 287.041 µs  max 391.125 µs  (n=50)
+  java    : mean 470.109 µs  median 434.520 µs  min 406.166 µs  max 1.581 ms  (n=50)
+  peak    : 3 states (both traces name the same largest automaton)
+
+fixture 293 -- RUST FASTER (2.56x)
+  command : eval test293 "Ak (k<n) => P[i+k]=P[j+k]";
+  why     : the smallest genuine word-automaton factor-equality query (period-doubling `P`), one quantifier
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 32.171 ms  median 31.951 ms  min 31.503 ms  max 35.717 ms  (n=20)
+  java    : mean 82.411 ms  median 81.833 ms  min 80.040 ms  max 90.698 ms  (n=20)
+  peak    : 12334 states (both traces name the same largest automaton)
+
+fixture 521 -- RUST FASTER (2.44x)
+  command : eval test521 "?msd_10 Ix x + y = z & z <= 5";
+  why     : the `I` (infinitely-often) quantifier over msd_10 — a different elimination path (`wr_core::infinite`) from `E`/`A`
+  answer  : FALSE (engines agree)
+  corpus  : n/a (not an automaton result)
+  rust    : mean 20.532 ms  median 20.480 ms  min 20.313 ms  max 20.805 ms  (n=20)
+  java    : mean 50.006 ms  median 49.804 ms  min 48.737 ms  max 53.812 ms  (n=20)
+  peak    : 3 states (both traces name the same largest automaton)
+
+fixture 179 -- RUST FASTER (2.86x)
+  command : eval test179 "n > 0 & Ef,i i >= 1 & $startsWith2Zeros(i) & $startsWith2Zeros(n) & (Ak k < n => PFmsd[f][i+k] = PFmsd[f][i+k+n])";
+  why     : a MULTI-track word automaton (`PFmsd[f][i+k]`) under two quantifiers, with two `reg`-defined predicates from the prelude
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 112.957 ms  median 112.635 ms  min 111.331 ms  max 115.414 ms  (n=20)
+  java    : mean 323.134 ms  median 322.099 ms  min 316.771 ms  max 330.130 ms  (n=20)
+  peak    : 33000 states (both traces name the same largest automaton)
+
+fixture 266 -- RUST FASTER (2.43x)
+  command : eval test266 "Aj $rudin_in(j,1,n-m-1) => ~$rudin_factoreq(i+n-m,i+n-m-j,m)";
+  why     : nested `A`/macro-call structure over Rudin-Shapiro — mid-sized alternation
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 37.089 ms  median 36.624 ms  min 36.061 ms  max 41.661 ms  (n=20)
+  java    : mean 89.977 ms  median 89.157 ms  min 87.804 ms  max 97.159 ms  (n=20)
+  peak    : 7657 states (both traces name the same largest automaton)
+
+fixture 230 -- RUST FASTER (3.37x)
+  command : eval test230 "Ei At ((t<n) => ((T[i+t]=T[i+t+n]) & (T[i+t]=T[i+3*n-1-t])))";
+  why     : deep alternation (`Ei At …`) over Thue-Morse with a `3*n` coefficient — the first workload where the decision procedure, not the plumbing, dominates
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 554.911 ms  median 555.683 ms  min 547.432 ms  max 559.525 ms  (n=5)
+  java    : mean 1.871 s  median 1.874 s  min 1.833 s  max 1.907 s  (n=5)
+  peak    : 115802 states (both traces name the same largest automaton)
+
+fixture 295 -- RUST FASTER (2.18x)
+  command : eval test295 "(m<=n) & (Ek (k+m<=n) & $paperfolding_factoreq(i,j+k,m))";
+  why     : paperfolding factor-equality: a large cross product under one quantifier
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 68.876 ms  median 68.737 ms  min 66.702 ms  max 71.658 ms  (n=20)
+  java    : mean 150.441 ms  median 149.252 ms  min 144.350 ms  max 169.449 ms  (n=20)
+  peak    : 11589 states (both traces name the same largest automaton)
+
+fixture 261 -- RUST FASTER (2.28x)
+  command : eval test261 "(m<=n) & (Ek (k+m<=n) & $rudin_factoreq(i,j+k,m))";
+  why     : Rudin-Shapiro factor-equality — the same shape as 295 over a bigger word automaton
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 109.162 ms  median 108.937 ms  min 107.517 ms  max 113.475 ms  (n=20)
+  java    : mean 249.417 ms  median 246.950 ms  min 241.834 ms  max 267.640 ms  (n=20)
+  peak    : 18674 states (both traces name the same largest automaton)
+
+fixture 286 -- RUST FASTER (2.35x)
+  command : eval test286 "?lsd_2 (m<=n) & (Ek (k+m<=n) & $rudin_trapezoid_factoreq(i,j+k,m))";
+  why     : the SLOWEST fixture in the whole corpus (lsd_2 Rudin-Shapiro trapezoidal factor-equality) — the closest thing Walnut's own suite has to a research workload
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 177.201 ms  median 175.940 ms  min 173.531 ms  max 191.327 ms  (n=20)
+  java    : mean 416.821 ms  median 399.724 ms  min 389.422 ms  max 621.702 ms  (n=20)
+  peak    : 34988 states (both traces name the same largest automaton)
+
+fixture 637 -- RUST FASTER (2.51x)
+  command : [strategy 6 BRZ]eval test637 "E x,y,z (n=x+y+z)&(QQ[x]=@1)&(QQ[y]=@1)&(QQ[z]=@1)"::
+  why     : `[strategy 6 BRZ]`: the sixth determinization is a 1,790-state NFA that only Brzozowski makes tractable — the corpus's one strategy-sensitive fixture
+  answer  : automaton (engines agree)
+  corpus  : matches the recorded corpus automaton
+  rust    : mean 24.864 ms  median 24.003 ms  min 23.511 ms  max 39.679 ms  (n=20)
+  java    : mean 62.506 ms  median 62.547 ms  min 60.753 ms  max 66.122 ms  (n=20)
+  peak    : 4965 states (both traces name the same largest automaton)
+
+-- verdict --
+The Rust port is faster than (or comparable to) JVM Walnut on every workload.
