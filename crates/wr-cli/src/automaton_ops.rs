@@ -97,6 +97,7 @@ use wr_core::numsys::{is_ns_differing, TXT_EXTENSION};
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_output::write_automata;
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -319,7 +320,7 @@ pub fn combine_command(
         s,
         &session.paths().write_address_for_words_library(),
         combine_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }
@@ -415,7 +416,7 @@ pub fn union_command(
         s,
         &session.paths().write_address_for_automata_library(),
         union_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }
@@ -447,7 +448,7 @@ pub fn intersect_command(
         s,
         &session.paths().write_address_for_automata_library(),
         intersect_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }
@@ -550,7 +551,7 @@ pub fn concat_command(
         s,
         &session.paths().write_address_for_automata_library(),
         concat_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }
@@ -601,7 +602,7 @@ pub fn star_command(
         s,
         &session.paths().write_address_for_automata_library(),
         new_name,
-        false,
+        AutomatonKind::PlainAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }

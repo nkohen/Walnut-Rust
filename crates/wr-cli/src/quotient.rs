@@ -12,6 +12,7 @@ use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_ops::read_from_automata_library;
 use crate::automaton_output::write_automata;
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -153,7 +154,7 @@ pub fn right_quotient_command(
         s,
         &session.paths().write_address_for_automata_library(),
         new_name,
-        false,
+        AutomatonKind::PlainAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }
@@ -177,7 +178,7 @@ pub fn left_quotient_command(
         s,
         &session.paths().write_address_for_automata_library(),
         new_name,
-        false,
+        AutomatonKind::PlainAutomaton,
     )?;
     Ok(TestCase::from_automaton(c))
 }

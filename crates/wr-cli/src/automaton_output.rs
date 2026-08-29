@@ -32,6 +32,7 @@ use wr_core::automaton::Automaton;
 use wr_core::numsys::TXT_EXTENSION;
 use wr_io::writer::{write_automaton_gv, write_automaton_txt};
 
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 
 /// `Automaton.GV_EXTENSION` (also referenced directly as `Prover.GV_EXTENSION` at
@@ -41,22 +42,32 @@ use crate::session::Session;
 pub(crate) const GV_EXTENSION: &str = ".gv";
 
 /// `Automaton.writeAutomata(String predicate, String outLibrary, String name, boolean
-/// isDFAO)`. `is_dfao_for_gv` is Java's `isDFAO` parameter — note both real callers
-/// (`Reg.reg`, `Alphabet.alphabetCommand`) always pass `false` here regardless of the
-/// command's own `isDFAO` flag (ported verbatim; see `crate::alphabet`'s module docs for
-/// the resulting quirk on a genuine DFAO result).
+/// isDFAO)`. `is_dfao_for_gv` is Java's `isDFAO` parameter, passed independently by each
+/// caller — this crate now has ~18 call sites across most command modules (plus `join`/
+/// `split`, which pass a value computed from the operand actually read, not a hardcoded
+/// literal), not just the original two this doc used to name: `AutomatonKind::
+/// WordAutomaton` is hardcoded by `reverse`/`convert`/`transduce`/`promote`/`image`/
+/// `combine`/`union`/`intersect`/`concat`/`minimize` (10 sites); `AutomatonKind::
+/// PlainAutomaton` by `eval`/`def`/`star`/`rightquo`/`leftquo`/`fixleadzero`/
+/// `fixtrailzero`/`reg`/`alphabet` (8 sites). `Reg.reg`/`Alphabet.alphabetCommand`
+/// remain the two that always pass `PlainAutomaton` regardless of the command's own
+/// `isDFAO` flag (ported verbatim; see `crate::alphabet`'s module docs for the resulting
+/// quirk on a genuine DFAO result) — they are simply no longer the only callers.
 pub(crate) fn write_automata(
     session: &Session,
     automaton: &mut Automaton,
     predicate: &str,
     out_library_dir: &str,
     name: &str,
-    is_dfao_for_gv: bool,
+    is_dfao_for_gv: AutomatonKind,
 ) -> io::Result<()> {
     let result_dir = session.paths().address_for_result();
 
+    // `wr_io::writer::write_automaton_gv` is defined outside this crate, so it still
+    // takes Java's plain `boolean isDFAO` -- convert at the boundary.
+    let is_dfao_for_gv_bool = is_dfao_for_gv == AutomatonKind::WordAutomaton;
     let gv_path = format!("{result_dir}{name}{GV_EXTENSION}");
-    write_automaton_gv(automaton, &gv_path, predicate, is_dfao_for_gv)?;
+    write_automaton_gv(automaton, &gv_path, predicate, is_dfao_for_gv_bool)?;
 
     // `String firstAddress = Session.getAddressForResult() + name + TXT_EXTENSION;`
     let txt_path = format!("{result_dir}{name}{TXT_EXTENSION}");
@@ -113,7 +124,15 @@ mod tests {
         let mut a = small_automaton();
         let out_library = session.paths().write_address_for_automata_library();
 
-        write_automata(&session, &mut a, "x<y", &out_library, "myresult", false).unwrap();
+        write_automata(
+            &session,
+            &mut a,
+            "x<y",
+            &out_library,
+            "myresult",
+            AutomatonKind::PlainAutomaton,
+        )
+        .unwrap();
 
         let gv = fs::read_to_string(dir.join("Result").join("myresult.gv")).unwrap();
         assert!(
@@ -141,7 +160,14 @@ mod tests {
         // file there, and that failure must come back as an `Err`, not be swallowed.
         let missing_out_library = format!("{}/does-not-exist/", dir.to_str().unwrap());
 
-        let result = write_automata(&session, &mut a, "x<y", &missing_out_library, "r", false);
+        let result = write_automata(
+            &session,
+            &mut a,
+            "x<y",
+            &missing_out_library,
+            "r",
+            AutomatonKind::PlainAutomaton,
+        );
         assert!(result.is_err());
 
         fs::remove_dir_all(&dir).ok();

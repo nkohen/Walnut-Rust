@@ -29,7 +29,7 @@ use wr_core::word_automaton::reverse_with_output_with_ctx;
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_output::write_automata;
-use crate::prover_helper::{determine_in_library, determine_out_library};
+use crate::prover_helper::{determine_in_library, determine_out_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -65,7 +65,7 @@ pub fn reverse_command(
     logging: &mut Logging,
     s: &str,
     in_file_name: &str,
-    is_dfao: bool,
+    is_dfao: AutomatonKind,
     new_name: &str,
 ) -> Result<TestCase, ReverseError> {
     let in_address = determine_in_library(session.paths(), is_dfao, in_file_name);
@@ -74,16 +74,26 @@ pub fn reverse_command(
         .read_library_automaton(&in_address)
         .map_err(ReverseError::Read)?;
 
-    if is_dfao {
-        // `WordAutomaton.reverseWithOutput(M, true);` (`:13`).
-        reverse_with_output_with_ctx(&mut m, true, None, logging);
-    } else {
-        // `AutomatonLogicalOps.reverse(M, true);` (`:15`).
-        reverse_predicate_with_ctx(&mut m, true, None, logging);
+    match is_dfao {
+        AutomatonKind::WordAutomaton => {
+            // `WordAutomaton.reverseWithOutput(M, true);` (`:13`).
+            reverse_with_output_with_ctx(&mut m, true, None, logging);
+        }
+        AutomatonKind::PlainAutomaton => {
+            // `AutomatonLogicalOps.reverse(M, true);` (`:15`).
+            reverse_predicate_with_ctx(&mut m, true, None, logging);
+        }
     }
 
     let out_library = determine_out_library(session.paths(), is_dfao);
-    write_automata(session, &mut m, s, &out_library, new_name, true)?;
+    write_automata(
+        session,
+        &mut m,
+        s,
+        &out_library,
+        new_name,
+        AutomatonKind::WordAutomaton,
+    )?;
     Ok(TestCase::from_automaton(m))
 }
 
@@ -149,7 +159,7 @@ mod tests {
             &mut Logging::new(),
             "reverse c $A;",
             "A.txt",
-            false,
+            AutomatonKind::PlainAutomaton,
             "c",
         )
         .unwrap();
@@ -176,7 +186,7 @@ mod tests {
             &mut Logging::new(),
             "reverse c A;",
             "A.txt",
-            true,
+            AutomatonKind::WordAutomaton,
             "c",
         )
         .unwrap();
@@ -193,7 +203,7 @@ mod tests {
             &mut Logging::new(),
             "reverse c $A;",
             "A.txt",
-            false,
+            AutomatonKind::PlainAutomaton,
             "c",
         )
         .unwrap_err();

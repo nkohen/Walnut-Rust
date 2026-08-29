@@ -26,6 +26,7 @@ use wr_core::regex::{determine_encoded_regex, RegexError};
 
 use crate::alphabet::{all_reps_from_ns, determine_alphabets_and_ns, AlphabetError};
 use crate::automaton_output::write_automata;
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -119,7 +120,7 @@ pub fn reg(
         &predicate,
         &session.paths().write_address_for_automata_library(),
         reg_name,
-        false,
+        AutomatonKind::PlainAutomaton,
     )?;
 
     Ok(TestCase::from_automaton(automaton))

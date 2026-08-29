@@ -76,10 +76,21 @@ use wr_core::quantify::{quantify_with_ctx, QuantifyError};
 use wr_core::util::remove_duplicates;
 use wr_core::word_automaton::uncombine;
 
-use crate::prover_helper::determine_out_library;
+use crate::prover_helper::{determine_out_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 use wr_logic::predicate_env::{PredicateEnv, PredicateEnvError};
+
+/// Selects `split` (`Forward`) vs `rsplit` (`Reversed`) — Java's `isReverse`/`reverse`
+/// boolean, threaded unchanged through [`process_split_command`] into
+/// [`process_split`]'s three `reverse ?` ternaries (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitDirection {
+    /// `split` — Java's `isReverse == false`.
+    Forward,
+    /// `rsplit` — Java's `isReverse == true`.
+    Reversed,
+}
 
 /// Every failure `split`/`rsplit` can produce.
 #[derive(Debug)]
@@ -150,7 +161,7 @@ pub fn process_split_command(
     session: &Session,
     logging: &mut Logging,
     s: &str,
-    is_reverse: bool,
+    is_reverse: SplitDirection,
     automaton_name: &str,
     name: &str,
     input_group: &str,
@@ -162,13 +173,16 @@ pub fn process_split_command(
         .paths()
         .read_file_for_words_library(&format!("{automaton_name}{TXT_EXTENSION}"));
     let (m, is_dfao) = if Path::new(&words_address).is_file() {
-        (read(session, &words_address)?, true)
+        (read(session, &words_address)?, AutomatonKind::WordAutomaton)
     } else {
         let automata_address = session
             .paths()
             .read_file_for_automata_library(&format!("{automaton_name}{TXT_EXTENSION}"));
         if Path::new(&automata_address).is_file() {
-            (read(session, &automata_address)?, false)
+            (
+                read(session, &automata_address)?,
+                AutomatonKind::PlainAutomaton,
+            )
         } else {
             // `throw new WalnutException("Automaton " + automatonName + " does not
             // exist.")` (`:32`).
@@ -305,7 +319,7 @@ pub fn process_split(
     logging: &mut Logging,
     automaton: &Automaton,
     inputs: &[Option<ArithmeticOp>],
-    reverse: bool,
+    reverse: SplitDirection,
 ) -> Result<Automaton, SplitError> {
     // `if (automaton.getAlphabetSize() == 0)` (`:73-75`).
     if automaton.fa.alphabet_size == 0 {
@@ -363,7 +377,7 @@ pub fn process_split(
 
         if input == ArithmeticOp::Plus {
             // `baseChange.bind(reverse ? List.of(b, a) : List.of(a, b));` (`:104`).
-            base_change.bind(if reverse {
+            base_change.bind(if reverse == SplitDirection::Reversed {
                 vec![b.clone(), a.clone()]
             } else {
                 vec![a.clone(), b.clone()]
@@ -372,13 +386,24 @@ pub fn process_split(
             quantifiers.insert(b);
         } else {
             // `baseChange.bind(List.of(reverse ? b : a, c));` (`:108`).
-            base_change.bind(vec![if reverse { b.clone() } else { a.clone() }, c.clone()]);
+            base_change.bind(vec![
+                if reverse == SplitDirection::Reversed {
+                    b.clone()
+                } else {
+                    a.clone()
+                },
+                c.clone(),
+            ]);
             m = and(&m, &base_change, logging).into_automaton();
             // `negativeNumberSystem.arithmetic(reverse ? a : b, c, 0, PLUS)` (`:112`) --
             // the constant-RESULT overload, evaluated in the NEGATIVE number system.
             let negative_ns = resolve(session, logging, &negative_name)?;
             let sum_is_zero = negative_ns.arithmetic_const_c(
-                if reverse { &a } else { &b },
+                if reverse == SplitDirection::Reversed {
+                    &a
+                } else {
+                    &b
+                },
                 &c,
                 &num_bigint::BigInt::from(0),
                 ArithmeticOp::Plus,
@@ -533,7 +558,7 @@ mod tests {
             &session,
             &mut log(),
             "split out plain[+];",
-            false,
+            SplitDirection::Forward,
             "plain",
             "out",
             "[+]",
@@ -557,7 +582,7 @@ mod tests {
             &session,
             &mut log(),
             "split out w[+];",
-            false,
+            SplitDirection::Forward,
             "w",
             "out",
             "[+]",
@@ -576,7 +601,7 @@ mod tests {
             &session,
             &mut log(),
             "split out nope[+];",
-            false,
+            SplitDirection::Forward,
             "nope",
             "out",
             "[+]",
@@ -602,7 +627,7 @@ mod tests {
             &session,
             &mut log(),
             "split out plain[*];",
-            false,
+            SplitDirection::Forward,
             "plain",
             "out",
             "[*]",
@@ -627,7 +652,7 @@ mod tests {
                 &session,
                 &mut log(),
                 "split out plain;",
-                false,
+                SplitDirection::Forward,
                 "plain",
                 "out",
                 group,
@@ -667,7 +692,7 @@ mod tests {
             &mut log(),
             &empty,
             &[Some(ArithmeticOp::Plus)],
-            false,
+            SplitDirection::Forward,
         )
         .unwrap_err();
         assert_eq!(
@@ -693,7 +718,7 @@ mod tests {
             &mut log(),
             &one,
             &[Some(ArithmeticOp::Plus), Some(ArithmeticOp::Minus)],
-            false,
+            SplitDirection::Forward,
         )
         .unwrap_err();
         assert_eq!(
@@ -723,7 +748,7 @@ mod tests {
             &mut log(),
             &no_ns,
             &[Some(ArithmeticOp::Plus)],
-            false,
+            SplitDirection::Forward,
         )
         .unwrap_err();
         assert_eq!(
@@ -752,7 +777,7 @@ mod tests {
             &mut log(),
             &two,
             &[Some(ArithmeticOp::Plus), None],
-            false,
+            SplitDirection::Forward,
         )
         .unwrap();
         assert_eq!(out.alphabet.len(), 2);
@@ -778,7 +803,7 @@ mod tests {
             &session,
             &mut log(),
             "split out t[+];",
-            false,
+            SplitDirection::Forward,
             "t",
             "out",
             "[+]",
@@ -807,7 +832,7 @@ mod tests {
             &mut log(),
             &plain,
             &[Some(ArithmeticOp::Minus)],
-            false,
+            SplitDirection::Forward,
         )
         .unwrap();
         let rev = process_split(
@@ -815,7 +840,7 @@ mod tests {
             &mut log(),
             &plain,
             &[Some(ArithmeticOp::Minus)],
-            true,
+            SplitDirection::Reversed,
         )
         .unwrap();
         let mut a = fwd.clone();

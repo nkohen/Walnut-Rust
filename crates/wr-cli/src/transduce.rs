@@ -50,7 +50,7 @@ use wr_core::transducer::{TransduceError, Transducer};
 use wr_io::reader::{read_transducer_txt, ReadError, TransducerData};
 
 use crate::automaton_output::write_automata;
-use crate::prover_helper::determine_in_library;
+use crate::prover_helper::{determine_in_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 use wr_logic::predicate_env::PredicateEnvError;
@@ -154,7 +154,7 @@ pub fn transduce_command(
     s: &str,
     logging: &mut Logging,
     transducer_name: &str,
-    is_dfao: bool,
+    is_dfao: AutomatonKind,
     in_name: &str,
     new_name: &str,
 ) -> Result<TestCase, TransduceCommandError> {
@@ -193,7 +193,7 @@ pub fn transduce_command(
         s,
         &session.paths().write_address_for_words_library(),
         new_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
 
     // `return new TestCase(C);` (`:703`).
@@ -306,7 +306,7 @@ mod tests {
             "transduce test527 RUNSUM2 T",
             &mut Logging::new(),
             "RUNSUM2",
-            true,
+            AutomatonKind::WordAutomaton,
             "T",
             "test527",
         )
@@ -380,7 +380,7 @@ mod tests {
             "transduce test529 RUNSUM2 PR",
             &mut Logging::new(),
             "RUNSUM2",
-            true,
+            AutomatonKind::WordAutomaton,
             "PR",
             "test529",
         )
@@ -447,7 +447,7 @@ mod tests {
             "transduce outd RUNSUM2 $EVEN",
             &mut Logging::new(),
             "RUNSUM2",
-            false, // `is_dfao == false` <=> the `$` was present
+            AutomatonKind::PlainAutomaton, // `is_dfao == false` <=> the `$` was present
             "EVEN",
             "outd",
         )
@@ -508,7 +508,7 @@ mod tests {
             "transduce out PARTIAL T",
             &mut Logging::new(),
             "PARTIAL",
-            true,
+            AutomatonKind::WordAutomaton,
             "T",
             "out",
         )
@@ -564,7 +564,7 @@ mod tests {
             "transduce out RUNSUM2 TSET",
             &mut Logging::new(),
             "RUNSUM2",
-            true,
+            AutomatonKind::WordAutomaton,
             "TSET",
             "out",
         )
@@ -593,7 +593,7 @@ mod tests {
             "transduce out NOPE T",
             &mut Logging::new(),
             "NOPE",
-            true,
+            AutomatonKind::WordAutomaton,
             "T",
             "out",
         )
@@ -636,7 +636,7 @@ mod tests {
             "transduce out EMPTY T",
             &mut Logging::new(),
             "EMPTY",
-            true,
+            AutomatonKind::WordAutomaton,
             "T",
             "out",
         )

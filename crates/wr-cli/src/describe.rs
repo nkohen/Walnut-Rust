@@ -17,7 +17,7 @@ use wr_core::logging::Logging;
 use wr_io::reader::{read_comments, ReadError};
 use wr_logic::predicate_env::PredicateEnvError;
 
-use crate::prover_helper::determine_in_library;
+use crate::prover_helper::{determine_in_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::{AutomatonFilenamePair, TestCase, DEFAULT_TESTFILE};
 
@@ -59,7 +59,7 @@ fn ns_list_display(names: &[Option<String>]) -> String {
 pub fn describe(
     session: &Session,
     logging: &mut Logging,
-    is_dfao: bool,
+    is_dfao: AutomatonKind,
     in_file_name: &str,
 ) -> Result<TestCase, DescribeError> {
     let in_library = determine_in_library(session.paths(), is_dfao, in_file_name);
@@ -162,7 +162,13 @@ mod tests {
 
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
-        let tc = describe(&session, &mut logging, false, "A.txt").unwrap();
+        let tc = describe(
+            &session,
+            &mut logging,
+            AutomatonKind::PlainAutomaton,
+            "A.txt",
+        )
+        .unwrap();
 
         assert_eq!(tc.graph_viz().unwrap(), "", "describe writes no .gv file");
         assert_eq!(
@@ -216,7 +222,13 @@ mod tests {
 
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
-        let tc = describe(&session, &mut logging, false, "F.txt").unwrap();
+        let tc = describe(
+            &session,
+            &mut logging,
+            AutomatonKind::PlainAutomaton,
+            "F.txt",
+        )
+        .unwrap();
         assert!(
             tc.details().contains("Number systems:[msd_fib]"),
             "details were: {}",
@@ -230,7 +242,13 @@ mod tests {
         let (session, dir) = temp_session("missing");
         let mut logging =
             Logging::with_writers(Box::new(std::io::sink()), Box::new(std::io::sink()));
-        let err = describe(&session, &mut logging, false, "nope.txt").unwrap_err();
+        let err = describe(
+            &session,
+            &mut logging,
+            AutomatonKind::PlainAutomaton,
+            "nope.txt",
+        )
+        .unwrap_err();
         assert!(matches!(err, DescribeError::Read(_)));
         fs::remove_dir_all(&dir).ok();
     }

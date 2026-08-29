@@ -140,7 +140,7 @@ use crate::meta_commands::{MetaCommandError, MetaCommands};
 use crate::morphism::{morphism_command_to, promote_command, MorphismCommandError};
 use crate::ost::{ost_command, OstError};
 use crate::prover_helper::{
-    clear_screen_to, determine_in_library, export_automata_to, inf_from_address_to,
+    clear_screen_to, determine_in_library, export_automata_to, inf_from_address_to, AutomatonKind,
     ProverHelperError,
 };
 use crate::quotient::{left_quotient_command, right_quotient_command, QuotientError};
@@ -1421,7 +1421,11 @@ impl Prover {
             // `:498-500` -> `Describe.describe`
             DESCRIBE => {
                 let caps = match_or_fail(&patterns().describe, s, DESCRIBE)?;
-                let is_dfao = group(&caps, s, GROUP_DESCRIBE_DOLLAR_SIGN) != Some("$");
+                let is_dfao = if group(&caps, s, GROUP_DESCRIBE_DOLLAR_SIGN) != Some("$") {
+                    AutomatonKind::WordAutomaton
+                } else {
+                    AutomatonKind::PlainAutomaton
+                };
                 let in_file_name = format!(
                     "{}{TXT_EXTENSION}",
                     group(&caps, s, GROUP_DESCRIBE_NAME).unwrap_or("")
@@ -1579,7 +1583,11 @@ impl Prover {
             // `:550-552` -> `Reverse.reverseCommand`
             REVERSE => {
                 let caps = match_or_fail(&patterns().reverse, s, REVERSE)?;
-                let is_dfao = group(&caps, s, GROUP_REVERSE_DOLLAR_SIGN) != Some("$");
+                let is_dfao = if group(&caps, s, GROUP_REVERSE_DOLLAR_SIGN) != Some("$") {
+                    AutomatonKind::WordAutomaton
+                } else {
+                    AutomatonKind::PlainAutomaton
+                };
                 let in_file_name = format!(
                     "{}{TXT_EXTENSION}",
                     group(&caps, s, GROUP_REVERSE_OLD_NAME).unwrap_or("")
@@ -1617,7 +1625,7 @@ impl Prover {
                     &self.session,
                     &mut self.logging,
                     s,
-                    true,
+                    crate::split::SplitDirection::Reversed,
                     group(&caps, s, GROUP_RSPLIT_AUTOMATA).unwrap_or(""),
                     group(&caps, s, GROUP_RSPLIT_NAME).unwrap_or(""),
                     group(&caps, s, GROUP_RSPLIT_INPUT).unwrap_or(""),
@@ -1630,7 +1638,7 @@ impl Prover {
                     &self.session,
                     &mut self.logging,
                     s,
-                    false,
+                    crate::split::SplitDirection::Forward,
                     group(&caps, s, GROUP_SPLIT_AUTOMATA).unwrap_or(""),
                     group(&caps, s, GROUP_SPLIT_NAME).unwrap_or(""),
                     group(&caps, s, GROUP_SPLIT_INPUT).unwrap_or(""),
@@ -1812,7 +1820,11 @@ impl Prover {
             .unwrap_or("")
             .to_string();
         // `boolean isDFAO = !(m.group(GROUP_TRANSDUCE_DOLLAR_SIGN).equals("$"));` (`:698`).
-        let is_dfao = group(&caps, s, GROUP_TRANSDUCE_DOLLAR_SIGN) != Some("$");
+        let is_dfao = if group(&caps, s, GROUP_TRANSDUCE_DOLLAR_SIGN) != Some("$") {
+            AutomatonKind::WordAutomaton
+        } else {
+            AutomatonKind::PlainAutomaton
+        };
         let old_name = group(&caps, s, GROUP_TRANSDUCE_OLD_NAME)
             .unwrap_or("")
             .to_string();
@@ -1832,6 +1844,7 @@ impl Prover {
     fn alphabet_command(&mut self, s: &str) -> Result<TestCase, ProverError> {
         let caps = match_or_fail(&patterns().alphabet, s, ALPHABET)?;
         let list_of_alphabets = group(&caps, s, R_LIST_OF_ALPHABETS).map(|v| v.to_string());
+        // `alphabet_command`'s own `is_dfao` stays `bool` (see its doc comment).
         let is_dfao = group(&caps, s, GROUP_ALPHABET_DOLLAR_SIGN) != Some("$");
         let in_file_name = format!(
             "{}{TXT_EXTENSION}",
@@ -1948,7 +1961,14 @@ impl Prover {
         let filename = group(&caps, s, GROUP_EXPORT_NAME).unwrap_or("");
         let in_file_name = format!("{filename}{TXT_EXTENSION}");
         let export_type = group(&caps, s, GROUP_EXPORT_TYPE).unwrap_or("");
-        let is_dfao = group(&caps, s, GROUP_EXPORT_DOLLAR_SIGN) != Some("$");
+        // `export_automata_to`'s own `is_dfao` stays `bool` (see its doc comment);
+        // `determine_in_library`'s does not, so both are built from the same test here.
+        let is_dfao_bool = group(&caps, s, GROUP_EXPORT_DOLLAR_SIGN) != Some("$");
+        let is_dfao = if is_dfao_bool {
+            AutomatonKind::WordAutomaton
+        } else {
+            AutomatonKind::PlainAutomaton
+        };
 
         // `Automaton M = new Automaton(ProverHelper.determineInLibrary(isDFAO,
         //  inFileName));` (`:811`) -- `ProverHelperError::Read` is the same variant
@@ -1967,7 +1987,7 @@ impl Prover {
             filename,
             export_type,
             &m,
-            is_dfao,
+            is_dfao_bool,
             &mut self.out,
         )?;
 
@@ -1983,6 +2003,10 @@ impl Prover {
     /// Quirks preserved: lines are concatenated into the buffer with **no separator**
     /// (`:372`), a `#` line is echoed and skipped *before* buffering, and a
     /// `RuntimeException` out of `dispatch` is logged and the loop continues (`:390-392`).
+    ///
+    /// `console` stays `bool` rather than a flag enum (idiomatic-refactor U3): dozens of
+    /// call sites in `tests/differential` (outside `crates/wr-cli/`, off limits for this
+    /// unit) call this method directly with a literal `true`/`false`.
     pub fn read_buffer(&mut self, input: &mut dyn BufRead, console: bool) -> bool {
         let mut buffer = String::new();
         loop {
@@ -3730,6 +3754,57 @@ mod tests {
         assert_eq!(
             p.dispatch("rsplit S [+] T;").unwrap_err().to_string(),
             "Automaton T does not exist."
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// idiomatic-refactor U3, Opus review finding 1 (`SplitDirection`): the SPLIT/RSPLIT
+    /// dispatch arms (`:1620-1650` above) each build a `SplitDirection` from a plain
+    /// `true`/`false` literal at the call site (`RSPLIT => SplitDirection::Reversed`,
+    /// `SPLIT => SplitDirection::Forward`) rather than from parsed input, so a
+    /// transposition there would be a silent wrong answer for every `split`/`rsplit`
+    /// invocation — and, unlike every other conversion this unit made, is the ONE site
+    /// with zero fast-tier coverage: `split_and_rsplit_reach_a_real_handler_not_a_stub`
+    /// above only proves both dispatch to `crate::split`'s real handler with the right
+    /// operand-group indices, not that `SPLIT`/`RSPLIT` map to the right direction, and
+    /// the golden fixtures that WOULD catch a transposition (440-447's `rsplit(split(A))`
+    /// round trip) are `#[ignore]`d (gated-slow tier). `crate::split`'s own
+    /// `split_and_rsplit_are_different_computations` pins the same property one layer
+    /// down, against the `process_split`/`process_split_command` primitives directly —
+    /// this is the same T2-shaped fixture (`X_NOT_ZERO`, `msd_2`, "accepts iff x != 0"),
+    /// reused here to go through the real `Prover::dispatch` mapping that is actually
+    /// under guard (`SPLIT`/`RSPLIT` -> `SplitDirection`), not the primitive underneath.
+    #[test]
+    fn split_and_rsplit_through_real_dispatch_are_different_computations() {
+        let (mut p, dir, _) = prover("split-rsplit-polarity");
+        // `x != 0`, msd_2 -- `crate::split::tests::X_NOT_ZERO`, transcribed verbatim so
+        // this test does not need `crate::split`'s private test constant.
+        fs::write(
+            dir.join("Automata Library").join("plain.txt"),
+            "msd_2\n\n0 0\n0 -> 0\n1 -> 1\n\n1 1\n0 -> 1\n1 -> 1\n",
+        )
+        .unwrap();
+
+        assert!(p.dispatch("split fwd plain[-];").unwrap());
+        // Note the group order differs from `split`'s (`GROUP_RSPLIT_AUTOMATA == 4`,
+        // `GROUP_RSPLIT_INPUT == 2` -- see `RSPLIT`'s dispatch arm and
+        // `split_and_rsplit_reach_a_real_handler_not_a_stub`, above): `rsplit <name>
+        // [<op>] <automaton>;`, not `<name> <automaton>[<op>]`.
+        assert!(p.dispatch("rsplit rev [-] plain;").unwrap());
+
+        let mut fwd =
+            wr_io::reader::read_automaton_txt(dir.join("Automata Library").join("fwd.txt"))
+                .unwrap();
+        let mut rev =
+            wr_io::reader::read_automaton_txt(dir.join("Automata Library").join("rev.txt"))
+                .unwrap();
+        fwd.fa.totalize(0);
+        rev.fa.totalize(0);
+        assert!(
+            !wr_core::equiv::automaton_language_equivalent(&fwd, &rev).unwrap(),
+            "split and rsplit must not produce the same language on `x != 0` through real \
+             Prover::dispatch -- a SplitDirection transposition in the SPLIT/RSPLIT dispatch \
+             arms would make this pass"
         );
         fs::remove_dir_all(&dir).ok();
     }

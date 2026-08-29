@@ -147,6 +147,7 @@ use wr_logic::eval::{evaluate_with_logging_and_ctx, EvalError};
 use wr_logic::predicate_env::{FreshIdentifiers, PredicateEnv};
 
 use crate::automaton_output::{write_automata, GV_EXTENSION};
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::{AutomatonFilenamePair, TestCase, DEFAULT_TESTFILE};
 
@@ -386,7 +387,7 @@ pub fn eval_def_command_with_stdout_and_ctx(
             predicate_str,
             &session.paths().write_address_for_automata_library(),
             eval_name,
-            false,
+            AutomatonKind::PlainAutomaton,
         )?;
 
         // `if (M.fa.isTRUE_FALSE_AUTOMATON()) { System.out.println("____\n" +

@@ -81,6 +81,7 @@ use wr_logic::eval::{evaluate_with_logging, EvalError};
 use wr_logic::predicate_env::{FreshIdentifiers, PredicateEnvError};
 
 use crate::automaton_output::write_automata;
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::TestCase;
 use crate::walnut_exception as msg;
@@ -220,7 +221,7 @@ pub fn image(
         s,
         &session.paths().write_address_for_words_library(),
         image_new_name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
 
     Ok(TestCase::from_automaton(image))

@@ -40,7 +40,7 @@ use wr_core::numsys::{self, TXT_EXTENSION};
 use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_output::write_automata;
-use crate::prover_helper::{determine_in_library, determine_out_library};
+use crate::prover_helper::{determine_in_library, determine_out_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 use crate::walnut_exception as msg;
@@ -98,9 +98,17 @@ pub fn convert_command(
 ) -> Result<TestCase, ConvertError> {
     // `boolean newIsDFAO = !newDollarSign.equals("$");` / `boolean oldIsDFAO =
     //  !oldDollarSign.equals("$");` (`:727-730`).
-    let new_is_dfao = new_dollar_sign != "$";
-    let old_is_dfao = old_dollar_sign != "$";
-    if old_is_dfao && !new_is_dfao {
+    let new_is_dfao = if new_dollar_sign != "$" {
+        AutomatonKind::WordAutomaton
+    } else {
+        AutomatonKind::PlainAutomaton
+    };
+    let old_is_dfao = if old_dollar_sign != "$" {
+        AutomatonKind::WordAutomaton
+    } else {
+        AutomatonKind::PlainAutomaton
+    };
+    if old_is_dfao == AutomatonKind::WordAutomaton && new_is_dfao == AutomatonKind::PlainAutomaton {
         return Err(ConvertError::DfaoIntoFunction);
     }
 
@@ -132,7 +140,14 @@ pub fn convert_command(
     //  GROUP_CONVERT_NEW_NAME), true);` (`:743`) -- the trailing `true` is a hardcoded
     // GV-style quirk, see module docs.
     let out_library = determine_out_library(session.paths(), new_is_dfao);
-    write_automata(session, &mut m, s, &out_library, new_name, true)?;
+    write_automata(
+        session,
+        &mut m,
+        s,
+        &out_library,
+        new_name,
+        AutomatonKind::WordAutomaton,
+    )?;
 
     Ok(TestCase::from_automaton(m))
 }

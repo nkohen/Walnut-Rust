@@ -96,7 +96,7 @@ use wr_logic::predicate_env::PredicateEnvError;
 
 use crate::automaton_output::write_automata;
 use crate::prover::RE_WORD_OF_CMD_NO_SPC;
-use crate::prover_helper::determine_out_library;
+use crate::prover_helper::{determine_out_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 use crate::walnut_exception as msg;
@@ -193,7 +193,7 @@ pub fn join_command(
     join_name: &str,
 ) -> Result<TestCase, JoinError> {
     let mut subautomata: Vec<Automaton> = Vec::new();
-    let mut is_dfao = false;
+    let mut is_dfao = AutomatonKind::PlainAutomaton;
 
     let re1 = re_for_an_automaton_in_join_cmd();
     for caps in re1.captures_iter(Input::new(join_automata)) {
@@ -224,7 +224,7 @@ pub fn join_command(
             (m, false)
         };
         if from_word_library {
-            is_dfao = true;
+            is_dfao = AutomatonKind::WordAutomaton;
         }
         let mut m = m;
 

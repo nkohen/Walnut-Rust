@@ -47,6 +47,7 @@ use wr_core::util::validate_file;
 use wr_io::parse_methods::{parse_morphism, ParseMethodsError};
 
 use crate::automaton_output::write_automata;
+use crate::prover_helper::AutomatonKind;
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -204,7 +205,7 @@ pub fn promote_command(
         s,
         &session.paths().write_address_for_words_library(),
         name,
-        true,
+        AutomatonKind::WordAutomaton,
     )?;
 
     Ok(TestCase::from_automaton(p))

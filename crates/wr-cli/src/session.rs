@@ -217,6 +217,13 @@ impl SessionPaths {
     ///   append a trailing `/` here; `Prover.parseArgs` did it (`Prover.java:304-308`).
     ///
     /// One environment-forced divergence, in the timestamp only: see [`friendly_date_time`].
+    ///
+    /// `global_session` stays `bool` rather than a flag enum, unlike most other
+    /// two-behavior `bool` parameters in this crate (idiomatic-refactor U3): it is
+    /// threaded, unchanged, into `Session::new`, and from there is called directly (with
+    /// a literal `true`/`false`) from `tests/differential`, `tests/golden`, and
+    /// `benches/` — all outside `crates/wr-cli/`, off limits for this unit to edit. See
+    /// [`Session::new`]'s matching note.
     pub fn new(session_dir: Option<&str>, home_dir: Option<&str>, global_session: bool) -> Self {
         Self::with_console(
             session_dir,
@@ -822,8 +829,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// See [`SessionPaths::new`] for the argument semantics — this only adds the library
-    /// layer on top.
+    /// See [`SessionPaths::new`] for the argument semantics (including why
+    /// `global_session` stays `bool`) — this only adds the library layer on top.
     pub fn new(session_dir: Option<&str>, home_dir: Option<&str>, global_session: bool) -> Self {
         Session::from_paths(SessionPaths::new(session_dir, home_dir, global_session))
     }

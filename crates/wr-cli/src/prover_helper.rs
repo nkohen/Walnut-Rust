@@ -80,12 +80,53 @@ simple_error_froms!(
     RemoveLeadingZerosError => RemoveLeadingZeros,
 );
 
+/// Java's `boolean isDFAO`, wherever it selects which of Walnut's two file libraries an
+/// automaton belongs to: the plain "Automata Library" (a predicate automaton, no output)
+/// or the "Word Automata Library" (a DFAO — deterministic finite automaton with output,
+/// aka a "word automaton"). Threaded through most `isDFAO`-shaped call sites in this
+/// crate (`determine_in_library`/`determine_out_library`/`write_automata`'s
+/// `is_dfao_for_gv`, `set_alphabet`, and most of the commands that call them) — one
+/// shared type rather than a per-file bool, since it is the same concept everywhere.
+///
+/// **Exceptions, deliberate:** `export_automata_to`, `export_automata`, and
+/// `alphabet_command` keep a plain `bool` `is_dfao` parameter instead.
+/// `export_automata_to` is the one with the real external caller —
+/// `tests/differential` calls it directly with a literal `false` — and it does NOT
+/// convert to `AutomatonKind` at an internal boundary: its `is_dfao` threads straight
+/// into `wr_io`'s `export_automaton_to_ba`/`write_automaton_gv`, which already take a
+/// plain `bool`, so there is nothing to convert. `export_automata` merely forwards to
+/// `export_automata_to` (`As export_automata_to`, `wr-cli`'s own established
+/// `_to`-suffix seam convention) and keeps `bool` purely so the two signatures match —
+/// it has no external caller of its own. `alphabet_command` DOES convert at its own
+/// entry (see its doc comment) before calling the `AutomatonKind`-typed primitives
+/// below; its own `is_dfao` stays `bool` only because `tests/differential` calls it
+/// directly too, with a literal `false`, three times.
+///
+/// **The carve-out criterion, ratified by the coordinator:** a `bool` stays `bool`
+/// exactly when it has an in-repo external caller — a real call site in
+/// `tests/golden`, `tests/differential`, or `benches/` (outside `crates/wr-cli/`, off
+/// limits for this unit, idiomatic-refactor U3) — not merely because the parameter's
+/// owning function is `pub`. Plain `pub`-ness does not freeze a signature here: this
+/// refactor branch is declared source-breaking for embedders per its own plan, so a
+/// `pub` function with no real in-repo caller outside this crate is free to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomatonKind {
+    /// A word automaton (DFAO) — read/written via the Word Automata Library.
+    WordAutomaton,
+    /// A plain automaton (DFA/NFA, no output) — read/written via the Automata Library.
+    PlainAutomaton,
+}
+
 /// `ProverHelper.exportAutomata(String s, String filename, String exportType, Automaton M,
 /// boolean isDFAO)` (`:17-33`), writing its one console line to the real process stdout.
 ///
 /// `s` is `Option<&str>` for Java's nullable predicate argument (`String predicate = s ==
 /// null ? "" : s;`, `:19`) — the `[export …]` metacommand call site really does pass
 /// `Prover.currentEvalName`, which is `null` in headless mode.
+///
+/// `is_dfao` stays `bool` rather than [`AutomatonKind`] (idiomatic-refactor U3): this
+/// function only forwards it to [`export_automata_to`], whose own `bool` is fixed by a
+/// real external caller — see [`AutomatonKind`]'s doc comment for the full criterion.
 pub fn export_automata(
     paths: &SessionPaths,
     s: Option<&str>,
@@ -107,6 +148,14 @@ pub fn export_automata(
 
 /// As [`export_automata`], but with an injectable sink for the `Writing to …` line — the
 /// same seam `crate::eval_def`'s `_with_stdout` variant uses, for the same reason.
+///
+/// `is_dfao` stays `bool` rather than [`AutomatonKind`] (idiomatic-refactor U3):
+/// `tests/differential` (outside `crates/wr-cli/`, off limits for this unit) calls this
+/// function directly with a literal `false`. Unlike `alphabet_command`, there is no
+/// internal boundary conversion here either — `is_dfao` threads straight into
+/// `wr_io`'s `export_automaton_to_ba`/`write_automaton_gv` below, which already take a
+/// plain `bool`, so `bool` is this function's natural type end to end, not a carve-out
+/// forced against an otherwise-`AutomatonKind` body.
 pub fn export_automata_to(
     paths: &SessionPaths,
     s: Option<&str>,
@@ -239,20 +288,22 @@ pub fn inf_from_automaton_to(
 }
 
 /// `ProverHelper.determineInLibrary(boolean, String)` (`:64-67`).
-pub fn determine_in_library(paths: &SessionPaths, is_dfao: bool, in_file_name: &str) -> String {
-    if is_dfao {
-        paths.read_file_for_words_library(in_file_name)
-    } else {
-        paths.read_file_for_automata_library(in_file_name)
+pub fn determine_in_library(
+    paths: &SessionPaths,
+    is_dfao: AutomatonKind,
+    in_file_name: &str,
+) -> String {
+    match is_dfao {
+        AutomatonKind::WordAutomaton => paths.read_file_for_words_library(in_file_name),
+        AutomatonKind::PlainAutomaton => paths.read_file_for_automata_library(in_file_name),
     }
 }
 
 /// `ProverHelper.determineOutLibrary(boolean)` (`:69-72`).
-pub fn determine_out_library(paths: &SessionPaths, is_dfao: bool) -> String {
-    if is_dfao {
-        paths.write_address_for_words_library()
-    } else {
-        paths.write_address_for_automata_library()
+pub fn determine_out_library(paths: &SessionPaths, is_dfao: AutomatonKind) -> String {
+    match is_dfao {
+        AutomatonKind::WordAutomaton => paths.write_address_for_words_library(),
+        AutomatonKind::PlainAutomaton => paths.write_address_for_automata_library(),
     }
 }
 
@@ -368,10 +419,25 @@ mod tests {
     fn the_library_selectors_pick_the_right_directory() {
         let (session, dir) = temp_session("libs");
         let p = session.paths();
-        assert!(determine_in_library(p, true, "T.txt").contains("Word Automata Library"));
-        assert!(determine_in_library(p, false, "T.txt").contains("Automata Library/T.txt"));
-        assert!(determine_out_library(p, true).contains("Word Automata Library"));
-        assert!(determine_out_library(p, false).contains("Automata Library"));
+        assert!(
+            determine_in_library(p, AutomatonKind::WordAutomaton, "T.txt")
+                .contains("Word Automata Library")
+        );
+        // `"Word Automata Library/T.txt"` itself CONTAINS `"Automata Library/T.txt"` as a
+        // substring, so a plain `.contains` here would pass even if `PlainAutomaton`
+        // silently resolved to the WORD library -- the trailing `!....contains("Word ...")`
+        // is load-bearing, not decorative.
+        let plain_in = determine_in_library(p, AutomatonKind::PlainAutomaton, "T.txt");
+        assert!(
+            plain_in.contains("Automata Library/T.txt")
+                && !plain_in.contains("Word Automata Library")
+        );
+        assert!(determine_out_library(p, AutomatonKind::WordAutomaton)
+            .contains("Word Automata Library"));
+        let plain_out = determine_out_library(p, AutomatonKind::PlainAutomaton);
+        assert!(
+            plain_out.contains("Automata Library") && !plain_out.contains("Word Automata Library")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

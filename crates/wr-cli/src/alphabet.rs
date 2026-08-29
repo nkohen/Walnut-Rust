@@ -87,7 +87,7 @@ use wr_core::word_automaton::minimize_self_with_output_with_ctx;
 use wr_logic::predicate_env::{PredicateEnv, PredicateEnvError};
 
 use crate::automaton_output::write_automata;
-use crate::prover_helper::{determine_in_library, determine_out_library};
+use crate::prover_helper::{determine_in_library, determine_out_library, AutomatonKind};
 use crate::session::Session;
 use crate::test_case::TestCase;
 
@@ -393,7 +393,7 @@ pub(crate) fn all_reps_from_ns(
 pub fn set_alphabet(
     automaton: &mut Automaton,
     logging: &mut Logging,
-    is_dfao: bool,
+    is_dfao: AutomatonKind,
     number_systems: &[Option<Rc<NumberSystem>>],
     alphabet: Vec<Vec<i32>>,
 ) -> Result<(), AlphabetError> {
@@ -441,10 +441,13 @@ pub fn set_alphabet(
     m.fa.d = Automaton::rebuild_transitions_for_new_alphabet(automaton, &m.alphabet, m.encoder());
 
     // `:210-214`.
-    if is_dfao {
-        minimize_self_with_output_with_ctx(&mut m, None, logging);
-    } else {
-        m.determinize_and_minimize_with_ctx(None, logging);
+    match is_dfao {
+        AutomatonKind::WordAutomaton => {
+            minimize_self_with_output_with_ctx(&mut m, None, logging);
+        }
+        AutomatonKind::PlainAutomaton => {
+            m.determinize_and_minimize_with_ctx(None, logging);
+        }
     }
 
     // `M.forceCanonize();` (`:216`).
@@ -478,6 +481,11 @@ pub fn set_alphabet(
 /// `String` and the very first thing this method does is null-check it
 /// (`:19-21`) -- unlike `Reg::reg` (`crate::reg::reg`), whose own `Alphabet
 /// .determineAlphabetsAndNS` call has no such guard.
+///
+/// `is_dfao` stays `bool` rather than [`AutomatonKind`] (idiomatic-refactor U3):
+/// `tests/differential` (outside `crates/wr-cli/`, off limits for this unit) calls this
+/// function directly with a literal `false`. Converted to `AutomatonKind` at the
+/// boundary, immediately below, to feed the already-converted primitives it calls.
 pub fn alphabet_command(
     session: &Session,
     logging: &mut Logging,
@@ -487,6 +495,11 @@ pub fn alphabet_command(
     in_file_name: &str,
     new_name: &str,
 ) -> Result<TestCase, AlphabetError> {
+    let is_dfao = if is_dfao {
+        AutomatonKind::WordAutomaton
+    } else {
+        AutomatonKind::PlainAutomaton
+    };
     let list_of_alphabets = list_of_alphabets.ok_or_else(|| {
         AlphabetError::Walnut(
             "List of alphabets for alphabet command must not be empty.".to_string(),
@@ -510,7 +523,14 @@ pub fn alphabet_command(
     // `M.writeAutomata(s, ProverHelper.determineOutLibrary(isDFAO), newName, false);`
     // (`:25`) -- note the hardcoded `false`, see this module's docs.
     let out_library = determine_out_library(session.paths(), is_dfao);
-    write_automata(session, &mut automaton, s, &out_library, new_name, false)?;
+    write_automata(
+        session,
+        &mut automaton,
+        s,
+        &out_library,
+        new_name,
+        AutomatonKind::PlainAutomaton,
+    )?;
 
     Ok(TestCase::from_automaton(automaton))
 }
@@ -661,7 +681,7 @@ mod tests {
         let err = set_alphabet(
             &mut a,
             &mut Logging::new(),
-            false,
+            AutomatonKind::PlainAutomaton,
             &[None, None],
             vec![vec![0, 1], vec![0, 1]],
         )
@@ -675,7 +695,7 @@ mod tests {
         let err = set_alphabet(
             &mut a,
             &mut Logging::new(),
-            false,
+            AutomatonKind::PlainAutomaton,
             &[None, None],
             vec![vec![0, 1]],
         )
@@ -692,7 +712,7 @@ mod tests {
         set_alphabet(
             &mut a,
             &mut Logging::new(),
-            false,
+            AutomatonKind::PlainAutomaton,
             &[None],
             vec![vec![0, 1]],
         )
@@ -726,7 +746,7 @@ mod tests {
         set_alphabet(
             &mut a,
             &mut Logging::new(),
-            false,
+            AutomatonKind::PlainAutomaton,
             &[Some(Rc::clone(&ns2))],
             vec![vec![0, 1]],
         )
@@ -767,7 +787,14 @@ mod tests {
     #[test]
     fn set_alphabet_preserves_dfao_outputs_through_the_is_dfao_branch() {
         let mut a = one_track_word_automaton_over_four_digits();
-        set_alphabet(&mut a, &mut Logging::new(), true, &[None], vec![vec![0, 1]]).unwrap();
+        set_alphabet(
+            &mut a,
+            &mut Logging::new(),
+            AutomatonKind::WordAutomaton,
+            &[None],
+            vec![vec![0, 1]],
+        )
+        .unwrap();
 
         assert_eq!(a.alphabet, vec![vec![0, 1]]);
         let sym0 = a.encode(&[0]);
