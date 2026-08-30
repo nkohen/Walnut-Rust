@@ -518,7 +518,206 @@ pub struct Automaton {
     pub(crate) dfa_typed: bool,
 }
 
+/// One track's worth of `Automaton`'s per-track "`NumberSystem` stand-in" — exactly the
+/// four facets [`Automaton::debug_assert_track_invariant`] already certifies parallel
+/// today: [`Automaton::alphabet`], [`Automaton::msd`], [`Automaton::all_reps`], and
+/// [`Automaton::ns_name`]. Introduced in the idiomatic-refactor's U9 (Stage A): a plain
+/// data-carrier used by the read/write accessors below, which for now still delegate to
+/// those four separate `Vec`s (storage is unchanged in Stage A/B; Stage C replaces the
+/// four vectors with a single `tracks: Vec<Track>` and rewires the accessors to read
+/// from it instead).
+///
+/// # Why `label` is NOT a field here
+///
+/// `Automaton::label` is deliberately **not** parallel to the other four vectors, and
+/// folding it into `Track` would silently force it to be — `docs/
+/// IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`'s carve-out, restated in full because it is
+/// load-bearing: `label.len() != alphabet.len()` is this crate's encoding of Java's
+/// null-label "unbound" automaton state ([`Automaton::is_bound`] literally is
+/// `self.label.len() == self.alphabet.len()`). [`Automaton::unlabel`] sets `label` to an
+/// EMPTY vec while every track keeps its own alphabet/msd/all_reps/ns_name untouched —
+/// there is no meaningful "this track's label" once unbound, so `label` cannot be
+/// represented as a per-`Track` field without inventing a placeholder Java has no
+/// equivalent for. `product`'s unbound-panic tests and `quantify`'s `label.is_empty()`
+/// early return both depend on this exact length divergence surviving unchanged.
+#[derive(Debug, Clone)]
+pub struct Track {
+    /// This track's alphabet, e.g. `[0, 1, ..., base-1]` for an ordinary base-*k* track.
+    /// See [`Automaton::alphabet`].
+    pub alphabet: Vec<i32>,
+    /// This track's msd (`Some(true)`)/lsd (`Some(false)`)/non-arithmetic (`None`)
+    /// direction. See [`Automaton::msd`].
+    pub msd: Option<bool>,
+    /// This track's valid-representation restriction automaton, where its number
+    /// system has one. See [`Automaton::all_reps`].
+    pub all_reps: Option<Rc<Automaton>>,
+    /// This track's number-system name, where known. See [`Automaton::ns_name`].
+    pub ns_name: Option<String>,
+}
+
 impl Automaton {
+    /// One track's [`Track`] view, cloned out of the four parallel vectors (Stage A:
+    /// still four separate `Vec`s under the hood; Stage C: a direct `tracks[i].clone()`).
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`, exactly like indexing the underlying `Vec`s
+    /// directly did before this accessor existed.
+    pub fn track(&self, i: usize) -> Track {
+        Track {
+            alphabet: self.alphabet[i].clone(),
+            msd: self.msd[i],
+            all_reps: self.all_reps[i].clone(),
+            ns_name: self.ns_name[i].clone(),
+        }
+    }
+
+    /// The number of tracks — `Automaton::alphabet.len()` (equivalently `msd.len()` /
+    /// `all_reps.len()` / `ns_name.len()`, per the parallel-vector invariant).
+    pub fn track_count(&self) -> usize {
+        self.alphabet.len()
+    }
+
+    /// This track's alphabet — `&self.alphabet[i]`.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn track_alphabet(&self, i: usize) -> &[i32] {
+        &self.alphabet[i]
+    }
+
+    /// A mutable handle onto this track's alphabet `Vec` — e.g. for a caller appending a
+    /// single new digit onto one existing track (`RecursiveConstruction`-style callers in
+    /// `wr-core::transducer`). Does **not** refresh [`Automaton::encoder`] /
+    /// `fa.alphabet_size` — same contract as mutating `self.alphabet[i]` directly did
+    /// before this accessor existed; callers must still call
+    /// [`Automaton::determine_alphabet_size`] + [`Automaton::setup_encoder`] afterward if
+    /// those need to stay in sync.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn track_alphabet_mut(&mut self, i: usize) -> &mut Vec<i32> {
+        &mut self.alphabet[i]
+    }
+
+    /// This track's msd/lsd direction — `self.msd[i]`.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn track_msd(&self, i: usize) -> Option<bool> {
+        self.msd[i]
+    }
+
+    /// This track's all-representations automaton, if its number system has one —
+    /// `self.all_reps[i].as_ref()`.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn track_all_reps(&self, i: usize) -> Option<&Rc<Automaton>> {
+        self.all_reps[i].as_ref()
+    }
+
+    /// This track's RAW recorded number-system name — `self.ns_name[i].as_deref()`.
+    /// **Not** the same thing as [`Automaton::track_ns_names`] (plural, existing since
+    /// U5): that method reconstructs a `msd_<size>`/`lsd_<size>` fallback name when no
+    /// name was recorded; this accessor returns exactly what is stored, `None` included.
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn track_ns_name_raw(&self, i: usize) -> Option<&str> {
+        self.ns_name[i].as_deref()
+    }
+
+    /// Every track's alphabet, in track order — `&self.alphabet`. For iteration,
+    /// whole-vector comparison (`a.track_alphabets() == b.track_alphabets()`), and
+    /// cloning (`a.track_alphabets().to_vec()`).
+    pub fn track_alphabets(&self) -> &[Vec<i32>] {
+        &self.alphabet
+    }
+
+    /// Every track's msd/lsd direction, in track order — `&self.msd`.
+    pub fn track_msds(&self) -> &[Option<bool>] {
+        &self.msd
+    }
+
+    /// Every track's all-representations automaton, in track order — `&self.all_reps`.
+    pub fn track_all_reps_list(&self) -> &[Option<Rc<Automaton>>] {
+        &self.all_reps
+    }
+
+    /// Every track's RAW recorded number-system name, in track order —
+    /// `&self.ns_name`. Same "raw, not reconstructed" distinction as
+    /// [`Automaton::track_ns_name_raw`], plural form.
+    pub fn track_ns_names_raw(&self) -> &[Option<String>] {
+        &self.ns_name
+    }
+
+    /// A mutable iterator over every track's all-representations slot — e.g. for a
+    /// caller clearing every track's restriction in place
+    /// (`crate::logicalops`'s `a.all_reps.iter_mut()` shape).
+    pub fn track_all_reps_iter_mut(&mut self) -> impl Iterator<Item = &mut Option<Rc<Automaton>>> {
+        self.all_reps.iter_mut()
+    }
+
+    /// Appends one whole new [`Track`] (one alphabet + msd + all_reps + ns_name entry) —
+    /// the four-vector analogue of `axb.alphabet.push(...)` / `axb.msd.push(...)` /
+    /// `axb.all_reps.push(...)` / `axb.ns_name.push(...)` done together, in the same
+    /// step, so the parallel-vector invariant can never observably drift mid-push (the
+    /// four-separate-`push`-calls shape this replaces relied on every call site doing
+    /// all four in lockstep by convention, not by construction).
+    ///
+    /// Does **not** update `fa.alphabet_size`/`encoder`/`label` — same division of
+    /// responsibility the four separate `push` calls this replaces already had; callers
+    /// still own those separately (see [`Automaton::determine_alphabet_size`],
+    /// [`Automaton::setup_encoder`]).
+    pub fn push_track(&mut self, track: Track) {
+        self.alphabet.push(track.alphabet);
+        self.msd.push(track.msd);
+        self.all_reps.push(track.all_reps);
+        self.ns_name.push(track.ns_name);
+    }
+
+    /// Replaces every track's alphabet wholesale, keeping each track's other facets
+    /// (msd/all_reps/ns_name) untouched — the accessor form of `self.alphabet = new_alphabet`.
+    ///
+    /// # Panics
+    ///
+    /// If `alphabets.len() != self.track_count()` — a whole-vector alphabet replacement
+    /// that changes the number of tracks would desynchronize `msd`/`all_reps`/`ns_name`,
+    /// which no existing call site does (a track-count change goes through
+    /// [`Automaton::push_track`]/[`Automaton::clear`]/a fresh [`Automaton::new`], never a
+    /// same-length-assumed wholesale replace).
+    pub fn set_track_alphabets(&mut self, alphabets: Vec<Vec<i32>>) {
+        assert_eq!(
+            alphabets.len(),
+            self.alphabet.len(),
+            "set_track_alphabets: replacing the alphabet vector must not change the track count"
+        );
+        self.alphabet = alphabets;
+    }
+
+    /// Replaces every track's msd/lsd direction wholesale, keeping each track's other
+    /// facets (alphabet/all_reps/ns_name) untouched — the accessor form of
+    /// `self.msd = new_msd`.
+    ///
+    /// # Panics
+    ///
+    /// If `msds.len() != self.track_count()` — same reasoning as
+    /// [`Automaton::set_track_alphabets`].
+    pub fn set_track_msds(&mut self, msds: Vec<Option<bool>>) {
+        assert_eq!(
+            msds.len(),
+            self.alphabet.len(),
+            "set_track_msds: replacing the msd vector must not change the track count"
+        );
+        self.msd = msds;
+    }
+
     /// Builds an `Automaton` from an already-constructed [`Fa`] and track metadata.
     /// `alphabet`, `label`, and `msd` must have the same length as each other and match
     /// `fa.alphabet_size` (`Π alphabet[i].len() == fa.alphabet_size`) — not asserted here
@@ -3530,5 +3729,195 @@ mod tests {
         // `new NumberSystem(determineBaseNameUnderscore() + (max + 1))` (`:169`): the
         // track is no longer on the custom base, and says so.
         assert_eq!(switched.track_ns_names(), vec![Some("msd_2".to_string())]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Idiomatic-refactor U9 (Stage A): the new `Track` type + accessor surface.
+    // Storage is unchanged (the four `Vec`s below are still the real fields);
+    // these tests pin that every accessor is a faithful delegate onto them, so
+    // Stage C's storage flip has an exact contract to preserve.
+    // -----------------------------------------------------------------------
+
+    fn three_track_fixture() -> Automaton {
+        let mut a = Automaton::new(
+            trivial_fa(8),
+            vec![vec![0, 1], vec![0, 1, 2], vec![0, 1]],
+            vec!["x".into(), "y".into(), "z".into()],
+            vec![Some(true), Some(false), None],
+        );
+        // track 0 has a real all-reps automaton + recorded name; track 1 has a name but
+        // no all-reps automaton; track 2 (msd == None) has neither, per the invariant.
+        a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored"))), None, None]);
+        a.set_ns_names(vec![
+            Some("msd_fib".to_string()),
+            Some("lsd_3".to_string()),
+            None,
+        ]);
+        a
+    }
+
+    #[test]
+    fn track_count_matches_the_alphabet_vectors_length() {
+        let a = three_track_fixture();
+        assert_eq!(a.track_count(), 3);
+        assert_eq!(a.track_count(), a.alphabet.len());
+    }
+
+    #[test]
+    fn track_alphabet_matches_the_indexed_alphabet_field() {
+        let a = three_track_fixture();
+        assert_eq!(a.track_alphabet(0), &a.alphabet[0][..]);
+        assert_eq!(a.track_alphabet(1), &a.alphabet[1][..]);
+        assert_eq!(a.track_alphabet(2), &[0, 1]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn track_alphabet_panics_out_of_range_like_direct_indexing_did() {
+        let a = three_track_fixture();
+        let _ = a.track_alphabet(3);
+    }
+
+    #[test]
+    fn track_alphabet_mut_can_append_a_new_digit_to_one_track() {
+        let mut a = three_track_fixture();
+        a.track_alphabet_mut(1).push(3);
+        assert_eq!(a.alphabet[1], vec![0, 1, 2, 3]);
+        // The other tracks are untouched.
+        assert_eq!(a.alphabet[0], vec![0, 1]);
+        assert_eq!(a.alphabet[2], vec![0, 1]);
+    }
+
+    #[test]
+    fn track_msd_matches_the_indexed_msd_field() {
+        let a = three_track_fixture();
+        assert_eq!(a.track_msd(0), Some(true));
+        assert_eq!(a.track_msd(1), Some(false));
+        assert_eq!(a.track_msd(2), None);
+    }
+
+    #[test]
+    fn track_all_reps_matches_the_indexed_all_reps_field() {
+        let a = three_track_fixture();
+        assert!(a.track_all_reps(0).is_some());
+        assert!(a.track_all_reps(1).is_none());
+        assert!(a.track_all_reps(2).is_none());
+        assert!(std::ptr::eq(
+            a.track_all_reps(0).unwrap().as_ref() as *const Automaton,
+            a.all_reps[0].as_ref().unwrap().as_ref() as *const Automaton
+        ));
+    }
+
+    #[test]
+    fn track_ns_name_raw_matches_the_indexed_ns_name_field_unreconstructed() {
+        let a = three_track_fixture();
+        assert_eq!(a.track_ns_name_raw(0), Some("msd_fib"));
+        assert_eq!(a.track_ns_name_raw(1), Some("lsd_3"));
+        // Track 2 has no recorded name -- unlike `track_ns_names()` (plural), this raw
+        // accessor does NOT fall back to a `msd_<size>`/`lsd_<size>` reconstruction.
+        assert_eq!(a.track_ns_name_raw(2), None);
+    }
+
+    #[test]
+    fn track_returns_the_whole_per_track_bundle() {
+        let a = three_track_fixture();
+        let t0 = a.track(0);
+        assert_eq!(t0.alphabet, vec![0, 1]);
+        assert_eq!(t0.msd, Some(true));
+        assert!(t0.all_reps.is_some());
+        assert_eq!(t0.ns_name.as_deref(), Some("msd_fib"));
+
+        let t2 = a.track(2);
+        assert_eq!(t2.alphabet, vec![0, 1]);
+        assert_eq!(t2.msd, None);
+        assert!(t2.all_reps.is_none());
+        assert_eq!(t2.ns_name, None);
+    }
+
+    #[test]
+    fn whole_vector_accessors_match_the_underlying_fields_exactly() {
+        let a = three_track_fixture();
+        assert_eq!(a.track_alphabets(), a.alphabet.as_slice());
+        assert_eq!(a.track_msds(), a.msd.as_slice());
+        assert_eq!(a.track_all_reps_list().len(), a.all_reps.len());
+        for (accessor_entry, field_entry) in a.track_all_reps_list().iter().zip(a.all_reps.iter()) {
+            assert_eq!(accessor_entry.is_some(), field_entry.is_some());
+        }
+        assert_eq!(a.track_ns_names_raw(), a.ns_name.as_slice());
+    }
+
+    #[test]
+    fn track_all_reps_iter_mut_can_clear_every_slot_in_place() {
+        let mut a = three_track_fixture();
+        assert!(a.all_reps[0].is_some(), "sanity: track 0 starts populated");
+        for slot in a.track_all_reps_iter_mut() {
+            *slot = None;
+        }
+        assert!(a.all_reps.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn push_track_appends_all_four_facets_together() {
+        let mut a = three_track_fixture();
+        a.push_track(Track {
+            alphabet: vec![0, 1, 2, 3],
+            msd: Some(true),
+            all_reps: None,
+            ns_name: Some("msd_4".to_string()),
+        });
+        assert_eq!(a.track_count(), 4);
+        assert_eq!(a.alphabet[3], vec![0, 1, 2, 3]);
+        assert_eq!(a.msd[3], Some(true));
+        assert!(a.all_reps[3].is_none());
+        assert_eq!(a.ns_name[3].as_deref(), Some("msd_4"));
+        // The first three tracks are untouched.
+        assert_eq!(a.alphabet[0], vec![0, 1]);
+        assert_eq!(a.msd[1], Some(false));
+        assert!(a.all_reps[0].is_some());
+    }
+
+    #[test]
+    fn set_track_alphabets_replaces_every_alphabet_and_leaves_other_facets_alone() {
+        let mut a = three_track_fixture();
+        a.set_track_alphabets(vec![vec![0, 1, 2], vec![0, 1], vec![0]]);
+        assert_eq!(
+            a.alphabet,
+            vec![vec![0, 1, 2], vec![0, 1], vec![0]],
+            "alphabet is replaced wholesale"
+        );
+        // msd/all_reps/ns_name are untouched by this call.
+        assert_eq!(a.msd, vec![Some(true), Some(false), None]);
+        assert!(a.all_reps[0].is_some());
+        assert_eq!(a.ns_name[1].as_deref(), Some("lsd_3"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must not change the track count")]
+    fn set_track_alphabets_rejects_a_track_count_change() {
+        let mut a = three_track_fixture();
+        a.set_track_alphabets(vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn set_track_msds_replaces_every_direction_and_leaves_other_facets_alone() {
+        let mut a = three_track_fixture();
+        a.set_track_msds(vec![None, Some(true), Some(false)]);
+        assert_eq!(a.msd, vec![None, Some(true), Some(false)]);
+        // alphabet/all_reps/ns_name are untouched -- including track 0's, whose
+        // `all_reps`/`ns_name` now sit on a `None`-msd track, exactly the shape
+        // `debug_assert_track_invariant` would reject if this setter tried to enforce
+        // the cross-vector invariant itself (it deliberately does not: only
+        // `set_all_reps`/`set_ns_names` check it, matching the existing division of
+        // responsibility between `alphabet`/`msd`'s free-form field and the two
+        // invariant-checked setters).
+        assert_eq!(a.alphabet[0], vec![0, 1]);
+        assert!(a.all_reps[0].is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "must not change the track count")]
+    fn set_track_msds_rejects_a_track_count_change() {
+        let mut a = three_track_fixture();
+        a.set_track_msds(vec![Some(true)]);
     }
 }

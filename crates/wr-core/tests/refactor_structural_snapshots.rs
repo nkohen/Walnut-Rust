@@ -34,7 +34,7 @@ use std::rc::Rc;
 use wr_core::automaton::Automaton;
 use wr_core::fa::Fa;
 use wr_core::logging::Logging;
-use wr_core::numsys::NumberSystem;
+use wr_core::numsys::{CustomBaseCandidates, CustomBaseFiles, NumberSystem};
 use wr_core::trim::trim;
 
 fn map(entries: &[(i32, &[usize])]) -> BTreeMap<i32, Vec<usize>> {
@@ -731,4 +731,205 @@ fn apply_all_representations_with_output_single_restricted_track_has_this_exact_
     assert_eq!(b.label, vec!["x", "y"]);
     assert_eq!(b.alphabet, vec![vec![0, 1], vec![0, 1]]);
     assert_eq!(b.msd, vec![Some(true), Some(true)]);
+}
+
+// ---------------------------------------------------------------------------
+// U9 (idiomatic-refactor), Stage A: track-structure snapshots.
+//
+// `Automaton` today carries four parallel `Vec`s (`alphabet`/`msd`/`all_reps`/
+// `ns_name`) plus the deliberately-NOT-parallel `label`. U9 introduces a `Track`
+// type + a delegating accessor surface in Stage A (storage unchanged), migrates
+// every direct four-vector access workspace-wide onto that surface in Stage B,
+// then flips storage to `tracks: Vec<Track>` in Stage C. These tests capture the
+// exact CURRENT per-track structure of four representative automata -- built
+// from real `NumberSystem` construction paths, not hand-rolled `Fa` tables, so
+// they exercise the real code that populates `ns_name`/`all_reps`/`msd` rather
+// than a value this file just asserts back at itself -- so Stage B/C's storage
+// change has a byte-exact contract to preserve. Both the OLD raw fields (the
+// storage pinned) AND the NEW Stage-A accessors (the delegation pinned) are
+// checked against the same expected values, so a Stage B/C regression in either
+// direction shows up here.
+// ---------------------------------------------------------------------------
+
+/// Asserts one automaton's full track structure -- `alphabet`/`msd`/`ns_name`
+/// (per `Automaton::track_ns_name_raw`'s "raw, not the `track_ns_names()`
+/// reconstructed fallback" distinction) against `expected_ns_name`, and `label`
+/// checked SEPARATELY (per its own documented carve-out: `label.len()` need not
+/// equal `alphabet.len()`) -- through both the raw `pub` fields and the new
+/// Stage-A `Track` accessors, which must agree exactly since both read the same
+/// unchanged storage today.
+fn assert_track_structure(
+    a: &Automaton,
+    expected_alphabet: &[Vec<i32>],
+    expected_msd: &[Option<bool>],
+    expected_ns_name: &[Option<&str>],
+    expected_label: &[&str],
+) {
+    // The raw parallel-vector fields -- today's actual storage.
+    assert_eq!(a.alphabet, expected_alphabet, "alphabet field");
+    assert_eq!(a.msd, expected_msd, "msd field");
+    assert_eq!(
+        a.ns_name.iter().map(|n| n.as_deref()).collect::<Vec<_>>(),
+        expected_ns_name,
+        "ns_name field"
+    );
+    assert_eq!(
+        a.label, expected_label,
+        "label field (NOT parallel to the rest)"
+    );
+
+    // The new Stage-A accessor surface -- must delegate onto the exact same values.
+    assert_eq!(a.track_count(), expected_alphabet.len(), "track_count()");
+    assert_eq!(a.track_alphabets(), expected_alphabet, "track_alphabets()");
+    assert_eq!(a.track_msds(), expected_msd, "track_msds()");
+    assert_eq!(
+        a.track_ns_names_raw()
+            .iter()
+            .map(|n| n.as_deref())
+            .collect::<Vec<_>>(),
+        expected_ns_name,
+        "track_ns_names_raw()"
+    );
+    for i in 0..expected_alphabet.len() {
+        assert_eq!(
+            a.track_alphabet(i),
+            &expected_alphabet[i][..],
+            "track_alphabet({i})"
+        );
+        assert_eq!(a.track_msd(i), expected_msd[i], "track_msd({i})");
+        assert_eq!(
+            a.track_ns_name_raw(i),
+            expected_ns_name[i],
+            "track_ns_name_raw({i})"
+        );
+        let t = a.track(i);
+        assert_eq!(t.alphabet, expected_alphabet[i], "track({i}).alphabet");
+        assert_eq!(t.msd, expected_msd[i], "track({i}).msd");
+        assert_eq!(
+            t.ns_name.as_deref(),
+            expected_ns_name[i],
+            "track({i}).ns_name"
+        );
+    }
+}
+
+/// A plain ordinary base, two tracks, both arithmetic (msd), no custom-base
+/// restriction. `NumberSystem::with_custom_base_files` sets `ns_name` on EVERY
+/// track for EVERY number system it constructs -- including an ordinary base
+/// with no custom file at all -- so `less_than()` already carries
+/// `Some("msd_2")` on both tracks before this test does anything (confirmed by
+/// reading `with_custom_base_files`'s own doc comment: "For a plain `msd_k`
+/// this is exactly what `track_ns_names` would reconstruct anyway"). `bind`
+/// installs the two distinct variable names an `eval`-style query would use.
+#[test]
+fn track_structure_of_a_plain_msd_2_bound_automaton() {
+    let ns = NumberSystem::new("msd_2").expect("msd_2 is a valid ordinary base");
+    let mut a = ns.less_than().clone();
+    a.bind(vec!["x".to_string(), "y".to_string()]);
+
+    assert_track_structure(
+        &a,
+        &[vec![0, 1], vec![0, 1]],
+        &[Some(true), Some(true)],
+        &[Some("msd_2"), Some("msd_2")],
+        &["x", "y"],
+    );
+    assert!(
+        a.all_reps.iter().all(Option::is_none),
+        "an ordinary base has no all-reps restriction on any track"
+    );
+}
+
+/// A genuine custom base (hand-built rather than file-loaded, so this test has
+/// no dependency on `walnut-java/Custom Bases/` -- exactly the pattern
+/// `numsys.rs`'s own `#[cfg(test)]` module uses for `msd_fib`, e.g.
+/// `with_custom_base_files`'s test call sites): a resolved addition file (3
+/// tracks) AND a resolved all-representations file, so every track ends up
+/// with BOTH a real recorded `ns_name` (`"msd_myfib"`, not the `msd_2`
+/// reconstruction its alphabet cardinality alone would suggest) AND a real
+/// `all_reps` restriction -- the two facts an ordinary base's tracks never
+/// carry, which is exactly what distinguishes a `Track`'s four fields from
+/// each other. `ns.addition()`'s own construction (not this test) applies the
+/// all-representations restriction and, per `Automaton::apply_all_representations`'s
+/// documented label bookkeeping, leaves it bound to `randomLabel`'s numeric
+/// names before `bind()` below overwrites them -- included here as further
+/// proof `bind()` does not care about an automaton's PRIOR binding state.
+#[test]
+fn track_structure_of_a_custom_base_bound_automaton() {
+    let mut logging = Logging::new();
+    let files = CustomBaseFiles {
+        addition: CustomBaseCandidates {
+            main: Some(universal_tracks(&["_0", "_1", "_2"], 1)),
+            complement: None,
+        },
+        less_than: CustomBaseCandidates::default(),
+        all_representations: CustomBaseCandidates {
+            main: Some(no_adjacent_ones("ignored")),
+            complement: None,
+        },
+    };
+    let ns = NumberSystem::with_custom_base_files("msd_myfib", files, &mut logging)
+        .expect("a hand-built custom base with a resolved addition file must construct");
+    let mut a = ns.addition().clone();
+    a.bind(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+
+    assert_track_structure(
+        &a,
+        &[vec![0, 1], vec![0, 1], vec![0, 1]],
+        &[Some(true), Some(true), Some(true)],
+        &[Some("msd_myfib"), Some("msd_myfib"), Some("msd_myfib")],
+        &["a", "b", "c"],
+    );
+    assert!(
+        a.all_reps.iter().all(Option::is_some),
+        "a custom base with a resolved all-representations file restricts every track"
+    );
+}
+
+/// A multi-track (3-track) automaton on an ORDINARY base -- `NumberSystem`'s
+/// addition automaton is always 3-track (two addends + a sum), which
+/// distinguishes this case's track COUNT from the plain 2-track comparison
+/// case above without introducing a custom base's extra facets, isolating the
+/// "more than two tracks" dimension on its own.
+#[test]
+fn track_structure_of_a_multi_track_msd_2_bound_automaton() {
+    let ns = NumberSystem::new("msd_2").expect("msd_2 is a valid ordinary base");
+    let mut a = ns.addition().clone();
+    a.bind(vec!["x".to_string(), "y".to_string(), "z".to_string()]);
+
+    assert_track_structure(
+        &a,
+        &[vec![0, 1], vec![0, 1], vec![0, 1]],
+        &[Some(true), Some(true), Some(true)],
+        &[Some("msd_2"), Some("msd_2"), Some("msd_2")],
+        &["x", "y", "z"],
+    );
+    assert!(a.all_reps.iter().all(Option::is_none));
+}
+
+/// The unbound case: `NumberSystem`'s own cached `lessThan`/`addition`/`equality`
+/// automata start life UNBOUND (`init_basic_automaton`'s own doc comment: "these
+/// automata are bound later, by `comparison`/`arithmetic`") for any ordinary
+/// base, so simply never calling `bind` on a freshly constructed one is enough
+/// to exercise `label.len() != alphabet.len()` through a REAL construction path
+/// rather than a hand-built one -- this is the one case where `label` is
+/// intentionally NOT the same length as every other vector, the exact
+/// carve-out `Track` deliberately excludes `label` to preserve.
+#[test]
+fn track_structure_of_an_unbound_msd_2_automaton() {
+    let ns = NumberSystem::new("msd_2").expect("msd_2 is a valid ordinary base");
+    let a = ns.less_than();
+
+    assert!(
+        !a.is_bound(),
+        "sanity: NumberSystem's own automata start unbound"
+    );
+    assert_eq!(a.label.len(), 0, "label is empty, not merely mismatched");
+    assert_track_structure(
+        a,
+        &[vec![0, 1], vec![0, 1]],
+        &[Some(true), Some(true)],
+        &[Some("msd_2"), Some("msd_2")],
+        &[], // label deliberately NOT parallel -- 0 entries against 2 tracks.
+    );
 }
