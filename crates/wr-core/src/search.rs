@@ -326,6 +326,10 @@ pub fn shortest_witness_word_product(
     symbol_maps: &[Vec<i32>],
     want_accept: &[bool],
 ) -> Result<Option<Vec<i32>>, SearchError> {
+    // Java's `-1` "dead local state" sentinel — see this function's own doc comment
+    // ("Dead local state (`< 0`) is handled the same way Java's `-1` sentinel is").
+    const DEAD_LOCAL_STATE: i32 = -1;
+
     let component_count = dfas.len();
 
     // --- preconditions (all checked before any indexing) ---
@@ -397,14 +401,14 @@ pub fn shortest_witness_word_product(
                 let current_local_state = product_state[component_index];
                 let projected_local_sym = projected_syms_for_global_sym[component_index];
                 let next_local_state = if current_local_state < 0 {
-                    -1
+                    DEAD_LOCAL_STATE
                 } else {
                     dfa_successor(
                         &dfas[component_index],
                         current_local_state as usize,
                         projected_local_sym,
                     )
-                    .map_or(-1, |s| s as i32)
+                    .map_or(DEAD_LOCAL_STATE, |s| s as i32)
                 };
 
                 succ_state[component_index] = next_local_state;

@@ -403,6 +403,8 @@ impl Morphism {
         // ever building the malformed `Fa`, whose `d.len() != q` would otherwise be a
         // live landmine for every other algorithm in this crate (all of which assume
         // that invariant).
+        // `max_entry >= 0`: `determine_max_entry` above already returned `Err` on any
+        // negative image value (see its own doc comment), matching Java's early throw.
         let q = max_entry as usize + 1;
         if new_d.len() < q {
             return Err(MorphismError::DomainDoesNotCoverImageRange {
@@ -556,10 +558,16 @@ fn determine_max_image_length(mapping: &BTreeMap<i32, Vec<i32>>) -> usize {
     mapping.values().map(Vec::len).max().unwrap_or(0)
 }
 
-/// `determineUniformLength(Map<Integer, IntList>)` (`:143-155`). `-1` if any two
-/// entries' images differ in length; the length shared by every entry otherwise
-/// (including `0` for an empty `mapping` — Java's `firstElement` flag never flips,
-/// so `imageLength` stays at its initial `0`).
+/// `Morphism.length`'s "not uniform" sentinel (`-1`, set by `determineUniformLength`
+/// when any two entries' images differ in length; read back by
+/// `requirePositiveUniformLength`'s `self.length < 0` check, and read unchecked by
+/// `make_inter_predicate` — see module docs).
+const NOT_UNIFORM: i32 = -1;
+
+/// `determineUniformLength(Map<Integer, IntList>)` (`:143-155`). `-1`
+/// ([`NOT_UNIFORM`]) if any two entries' images differ in length; the length shared by
+/// every entry otherwise (including `0` for an empty `mapping` — Java's `firstElement`
+/// flag never flips, so `imageLength` stays at its initial `0`).
 fn determine_uniform_length(mapping: &BTreeMap<i32, Vec<i32>>) -> i32 {
     let mut values = mapping.values();
     let Some(first) = values.next() else {
@@ -568,7 +576,7 @@ fn determine_uniform_length(mapping: &BTreeMap<i32, Vec<i32>>) -> i32 {
     let expected = first.len();
     for image in values {
         if image.len() != expected {
-            return -1;
+            return NOT_UNIFORM;
         }
     }
     // Java returns `entry.getValue().size()`, an `int`, so an image longer than

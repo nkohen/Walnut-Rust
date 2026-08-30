@@ -421,7 +421,11 @@ impl<'a> Parser<'a> {
                     )));
                 }
                 let n = parse_ascii_int(&self.b[start..self.pos]);
-                let mut m: i32 = -1;
+                // Brics' `RegExp.parseRepeatExp` sentinel for "no upper bound"
+                // (`{n,}`), i.e. dispatch to `RepeatMin` instead of `RepeatMinMax`
+                // below. Purely local to this parse.
+                const NO_MAX: i32 = -1;
+                let mut m: i32 = NO_MAX;
                 if self.eat(',') {
                     let start = self.pos;
                     while self.peek("0123456789") {
@@ -439,7 +443,7 @@ impl<'a> Parser<'a> {
                         self.pos
                     )));
                 }
-                if m == -1 {
+                if m == NO_MAX {
                     e = RegexNode::RepeatMin(Box::new(e), n);
                 } else {
                     e = RegexNode::RepeatMinMax(Box::new(e), n, m);
@@ -1351,12 +1355,17 @@ fn determine_encoder(alphabet: &[Vec<i32>]) -> Vec<i32> {
 /// only Rust call site (the guard runs first), but is kept exactly as Java kept
 /// `RichAlphabet.encode` itself: unchanged, because it is not where the bug lived.
 fn encode_with_index_of(digits: &[i32], alphabet: &[Vec<i32>], encoder: &[i32]) -> i32 {
+    // Java's `List.indexOf` "not found" sentinel — see this function's own doc
+    // comment (WB-024) for why it is faithfully reproduced here, unreachable through
+    // its only call site but otherwise unchanged.
+    const INDEX_NOT_FOUND: i32 = -1;
+
     let mut encoding: i32 = 0;
     for (i, &d) in digits.iter().enumerate() {
         let index = alphabet[i]
             .iter()
             .position(|&v| v == d)
-            .map_or(-1, |p| p as i32);
+            .map_or(INDEX_NOT_FOUND, |p| p as i32);
         let term = encoder[i]
             .checked_mul(index)
             .expect("encode overflow (Math.multiplyExact equivalent)");

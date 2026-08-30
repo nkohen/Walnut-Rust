@@ -805,12 +805,17 @@ impl Automaton {
     /// callers must keep using; a panic is a better error than a corrupt encoding when
     /// the input really is an internal invariant.
     pub fn encode_index_of(&self, digits: &[i32]) -> i32 {
+        // Java's `List.indexOf` "not found" sentinel — see this function's own doc
+        // comment (and WB-038) for why that sentinel is faithfully reproduced here
+        // rather than rejected.
+        const INDEX_NOT_FOUND: i32 = -1;
+
         let mut encoding: i32 = 0;
         for (i, &d) in digits.iter().enumerate() {
             let index = self.alphabet[i]
                 .iter()
                 .position(|&v| v == d)
-                .map_or(-1, |p| p as i32);
+                .map_or(INDEX_NOT_FOUND, |p| p as i32);
             // Same checked arithmetic as `encode_with`, for the same reason (Java's
             // `Math.multiplyExact`/`addExact`).
             let encoder_i =
