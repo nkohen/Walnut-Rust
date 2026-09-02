@@ -236,3 +236,20 @@ fix   iters    rust mean  rust median    java mean  java median   speedup  peak 
 #   - Lever 3 (Valmari Partition locality) is second: 12-21% on 286/261, minor on 230/179.
 #   - Lever 4 (allocation reuse): allocator bucket is 5-9% post-mimalloc — modest ceiling.
 # Raw sample files: session scratchpad profiles/sample_{286,230,179,261}.txt (not committed).
+
+############################################################################
+# POST-P1(a) PROFILE (2026-09-02, HEAD 2c102ef, same methodology)
+############################################################################
+#   bucket                          fix286   fix230   fix179   fix261
+#   sc: body (incl. fill+drain)      46.0%    56.7%    74.4%    53.0%
+#   sc: scratch sort (usize)          n/a*    20.8%     4.1%     n/a*
+#   sc: metastate HashMap/SipHash     3.2%    10.3%     4.5%     3.4%
+#   SUBSET_CONSTRUCTION TOTAL        49.4%    87.8%    82.9%    56.3%
+#   minimize (Valmari)               25.7%     3.2%     6.8%    16.3%
+#   allocator+memops                 11.2%     5.9%     5.3%    11.7%
+#   (* below the report cutoff on those fixtures)
+# Intra-minimize (P2's Gate 0): mark+split = 53% of the bucket on 286, 29% on 261,
+# 20% on 179, 11% on 230 — the >=50% gate passes on 286 ONLY, marginally.
+# The sc-body bucket is one fully-inlined symbol under lto=fat; splitting it further
+# requires prototype A/Bs, not sampling. Remaining ranked candidates (P2 layout, C3
+# local-FxHasher on 230's 10.3%, C4 row-build) each project ~1-2.5% geomean.
