@@ -92,3 +92,17 @@ regex-automata = { version = "0.4", default-features = false, features = [
 # it, so no library in this workspace forces an allocator on its consumers -- `ct-research`
 # keeps its own choice.
 mimalloc = { version = "0.1", default-features = false }
+# `agent/par-max` EXPERIMENT ONLY -- the data-parallel work-stealing pool behind
+# `wr_core::par`. Replaces no Java dependency (Walnut is single-threaded), so
+# `docs/DESIGN.md` §6's dependency-replacement table does not apply; it is added here on the
+# same footing as `mimalloc`, i.e. an implementation substrate underneath unchanged algorithms.
+#
+# WHY RAYON RATHER THAN `std::thread::scope`. The parallel site is `subset_construction`'s
+# per-BFS-level frontier, and a query runs that loop for MANY separate automata (measured on
+# the benchmark corpus: ~190 `subset_construction` calls per fixture dispatch once the prelude
+# is warm, and 25-30 BFS levels inside the big ones). A `thread::scope` design pays an OS
+# thread spawn+join per level -- ~240 spawns on fixture 230's dominant call alone, tens of
+# thousands across a whole dispatch -- which on this machine is the same order as the work
+# being parallelized. A persistent work-stealing pool pays that once per process. The
+# threshold in `wr_core::par` is what keeps the small calls off the pool entirely.
+rayon = "1.10"

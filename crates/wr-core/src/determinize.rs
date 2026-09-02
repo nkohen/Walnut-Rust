@@ -64,6 +64,7 @@
 use crate::automaton::Automaton;
 use crate::fa::Fa;
 use crate::minimize::MinimizeError;
+use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// `DeterminizationStrategies.Strategy` (`:34-81`), restricted to its two in-scope
@@ -308,6 +309,32 @@ pub fn determinize(
 /// worklist that grows by appending newly-discovered metastates — the same
 /// array-append-as-worklist shape as the Java `metastateList`, not a separate queue.
 pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
+    subset_construction_scheduled(fa, initial, Schedule::Auto)
+}
+
+/// Which BFS schedule [`subset_construction_scheduled`] uses.
+///
+/// `agent/par-max` EXPERIMENT ONLY. Production callers always get [`Schedule::Auto`]; the two
+/// forcing variants exist so tests can compare the two schedules' output directly, on inputs
+/// far too small to trip `Auto`'s size thresholds. Without them the parallel path would be
+/// unreachable from any unit test, and its equivalence claim would rest entirely on the
+/// gated-slow tiers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// `Sequential`/`Parallel` are constructed only by this module's tests -- deliberately, see the
+// doc above. Keeping them in the non-test build (rather than `#[cfg(test)]`-gating the enum)
+// means the release build type-checks and optimizes the exact `match` the tests exercise.
+#[cfg_attr(not(test), allow(dead_code))]
+enum Schedule {
+    /// Per-level: parallel when the frontier clears [`should_parallelize`], else sequential.
+    Auto,
+    /// Always sequential — the exact loop shape that existed before this branch.
+    Sequential,
+    /// Always parallel, thresholds ignored. Slower than `Sequential` on small inputs by
+    /// construction; it is a correctness probe, not a performance mode.
+    Parallel,
+}
+
+fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: Schedule) -> Fa {
     // U34-P1 (`~/.claude/plans/glossy-compacting-lantern.md` §3) replaced the
     // per-(metastate, symbol) `BTreeSet<usize>` union — heap-allocated per iteration and
     // cloned just to probe `metastate_to_id` — with the reusable `scratch: Vec<usize>` +
@@ -365,139 +392,97 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
     // `subset_construction_reference` below is a verbatim copy of the pre-P1(a) body,
     // and `new_matches_the_pre_p1a_reference_implementation` compares the two outputs
     // field-for-field over 20,000 generated automata.
+    // ------------------------------------------------------------------
+    // `agent/par-max` EXPERIMENT — the per-BFS-level parallel schedule.
+    //
+    // P1(a)'s union/canonicalization logic above is NOT changed by this branch. It was
+    // lifted verbatim out of this loop body into `expand_metastate` below, and this
+    // function now only decides HOW the calls to it are SCHEDULED. Two schedules exist:
+    //
+    //   * sequential — one metastate at a time, expand-then-merge, exactly the old
+    //     interleaving;
+    //   * level-parallel — snapshot the current BFS frontier `[cursor, end)`, expand
+    //     every metastate in it concurrently (a pure read-only function of `fa` and the
+    //     metastate's own member list), then merge the results back **in frontier
+    //     order**, single-threaded.
+    //
+    // **The two schedules produce the same `Fa`, bit for bit**, which is why the
+    // structural snapshot tests and `new_matches_the_pre_p1a_reference_implementation`
+    // still pass unmodified. The argument, in the three places it could break:
+    //
+    //   1. *Discovery order.* The worklist IS a queue: expanding metastate `i` appends
+    //      new metastates at the end, and `i` is only ever expanded after every `j < i`.
+    //      Snapshotting `end = metastate_list.len()` and expanding `[cursor, end)` before
+    //      merging changes WHEN a metastate is expanded relative to others' merges, but
+    //      not the ORDER in which merges happen — the merge loop below walks the frontier
+    //      in ascending index and, within one metastate, ascending symbol, which is the
+    //      identical sequence of `metastate_to_id` probes the sequential loop performs.
+    //      So ids are minted in the same order and `metastate_list` grows identically.
+    //   2. *Key computation.* `expand_metastate` reads only `fa` (shared, immutable) and
+    //      one metastate's member list; it writes only into scratch buffers it owns. It
+    //      never observes `metastate_to_id`, `metastate_list` or any id, so it cannot see
+    //      the difference between the two schedules.
+    //   3. *Frontier membership.* A metastate discovered *during* the parallel level is
+    //      appended by the merge, i.e. at an index `>= end`, so it is expanded in the NEXT
+    //      level. The sequential schedule would have expanded it later too (its index is
+    //      larger). Neither schedule can expand a metastate before it exists.
+    //
+    // **What this branch does NOT preserve** (stated, not hidden): on a MALFORMED `Fa`
+    // whose transition table names a state outside `0..fa.q`, the resulting `fa.d[garbage]`
+    // panic is raised by whichever worker reaches it first rather than by a
+    // deterministically-ordered sequential scan. The panic still happens, with the same
+    // message, and rayon propagates it to this thread — only *which* offending metastate
+    // is blamed can differ. Well-formed automata are unaffected. `PAR_MIN_*` below keeps
+    // every small automaton (including every test in this file) on the sequential path.
     let mut metastate_list: Vec<Vec<usize>> = vec![initial.iter().copied().collect()];
     let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
     metastate_to_id.insert(metastate_list[0].clone(), 0);
 
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
-    let mut scratch: Vec<usize> = Vec::new();
-    // C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the
-    // metastate currently being processed, and is emptied again before the next one.
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); fa.alphabet_size];
-    // The symbols this metastate actually touched, so the clear-down is proportional to
-    // what was filled rather than to `alphabet_size`. No duplicates: a symbol is
-    // recorded only on the fill that takes its bucket from empty to non-empty.
-    let mut touched: Vec<usize> = Vec::new();
-    // C2's dedup marker. `seen[dest] == epoch` means `dest` is already in `scratch` for
-    // the (metastate, symbol) currently being drained. A `u64` epoch cannot wrap in
-    // practice and so needs no reset/wraparound branch: 2^64 bumps at an implausible
-    // 10^8 drains/second is ~5,800 years of continuous running.
-    let mut seen: Vec<u64> = vec![0; fa.q];
-    let mut epoch: u64 = 0;
+    let mut seq_scratch = ExpandScratch::new(fa);
+    let mut seq_out = ExpandOut::default();
     let mut cursor = 0;
     while cursor < metastate_list.len() {
-        let current = metastate_list[cursor].clone();
-        let mut row = BTreeMap::new();
-        // `alphabet_size == 0` is the one shape where the old code never read `fa.d[q]`
-        // at all (its `for sym in 0..0` body never ran), so neither may this one: on a
-        // malformed `Fa` whose `d` is shorter than `initial`'s members, the old code
-        // reached the `o`-build and panicked there, and moving that panic earlier —
-        // into a member walk that today does not happen — would be a behavior change.
-        // With `alphabet_size >= 1` both shapes index `fa.d[q]` for the same first
-        // offending member, so the panic site and message already coincide.
-        if fa.alphabet_size > 0 {
-            for &q in &current {
-                for (&sym, dests) in &fa.d[q] {
-                    // The mechanical equivalent of the old `for sym in
-                    // 0..fa.alphabet_size as i32` probe range, which never LOOKED UP a
-                    // key outside it: a negative or `>= alphabet_size` key contributes
-                    // nothing and is silently dropped with no diagnostic, matching Java
-                    // (WB-038 outcome (b)). This is that load-bearing drop, not a
-                    // defensive bounds check — `Fa` has no invariant excluding such
-                    // keys and this function is `pub`.
-                    if sym < 0 || sym as usize >= fa.alphabet_size {
-                        continue;
+        let end = metastate_list.len();
+        let level = &metastate_list[cursor..end];
+        let parallel = match schedule {
+            Schedule::Auto => should_parallelize(level),
+            Schedule::Sequential => false,
+            Schedule::Parallel => true,
+        };
+        if parallel {
+            // -- level-parallel ------------------------------------------------
+            // One `ExpandOut` per chunk, not per metastate: the frontier is routinely
+            // tens of thousands of metastates wide (measured: 31,034 at fixture 230's
+            // widest level), and three heap allocations per metastate would hand back at
+            // the allocator what U33 spent a whole unit reclaiming.
+            let chunk = crate::par::chunk_size(level.len(), PAR_MIN_CHUNK);
+            let chunk_outs: Vec<ExpandOut> = level
+                .par_chunks(chunk)
+                .map(|members| {
+                    let mut scratch = ExpandScratch::new(fa);
+                    let mut out = ExpandOut::default();
+                    for current in members {
+                        expand_metastate(fa, current, &mut scratch, &mut out);
                     }
-                    if dests.is_empty() {
-                        continue;
-                    }
-                    let bucket = &mut buckets[sym as usize];
-                    if bucket.is_empty() {
-                        touched.push(sym as usize);
-                    }
-                    bucket.extend(dests.iter().copied());
-                }
+                    out
+                })
+                .collect();
+            for out in &chunk_outs {
+                merge_expansion(out, &mut metastate_list, &mut metastate_to_id, &mut d);
+            }
+        } else {
+            // -- sequential (the pre-branch schedule) ---------------------------
+            for i in cursor..end {
+                // `metastate_list` is mutated by the merge below, so the member list has
+                // to be copied out first — the same clone the pre-branch loop did.
+                let current = metastate_list[i].clone();
+                seq_out.clear();
+                expand_metastate(fa, &current, &mut seq_scratch, &mut seq_out);
+                merge_expansion(&seq_out, &mut metastate_list, &mut metastate_to_id, &mut d);
             }
         }
-        for sym in 0..fa.alphabet_size as i32 {
-            let bucket = &buckets[sym as usize];
-            if bucket.is_empty() {
-                // SC does not totalize: no transition is recorded here at all.
-                continue;
-            }
-            // Exactly one bump per drained (metastate, symbol) pair, so the marker
-            // never carries a destination's membership across symbols.
-            epoch += 1;
-            scratch.clear();
-            for &dest in bucket {
-                if dest < fa.q {
-                    if seen[dest] == epoch {
-                        continue;
-                    }
-                    seen[dest] = epoch;
-                } else {
-                    // A destination id outside `0..fa.q` has no marker slot. Push it
-                    // unmarked rather than growing/bounds-checking `seen`: the
-                    // `sort_unstable()`/`dedup()` below canonicalizes such ids exactly
-                    // as the old code did, giving the identical key, and — load-bearing
-                    // — leaving the resulting `fa.d[garbage]` panic at the same later
-                    // BFS iteration, with the same message, that
-                    // `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`
-                    // pins. Indexing `seen` here instead would move that panic earlier.
-                }
-                scratch.push(dest);
-            }
-            scratch.sort_unstable();
-            // A provable no-op on the marker-deduped run above, except for the
-            // `>= fa.q` ids it deliberately does not mark. Kept because it is what
-            // canonicalizes those, and because it is cheap on an already-deduped slice.
-            scratch.dedup();
-            // Adversarial review found breaking this invariant (e.g. dropping the sort
-            // or the dedup) has NO clean test tripwire: a non-canonical key makes every
-            // metastate look "new" to `metastate_to_id`, so `while cursor <
-            // metastate_list.len()` never terminates and the test process is killed by
-            // its resource cap rather than failing an assertion -- exactly what
-            // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists
-            // to prevent. This turns that failure mode into an immediate, located panic.
-            debug_assert!(
-                scratch.windows(2).all(|w| w[0] < w[1]),
-                "subset_construction: metastate key must be sorted with no duplicates"
-            );
-            // ... but that invariant is blind to OVER-dedup: dropping a destination
-            // that belongs in the union leaves a shorter key that is still sorted and
-            // still duplicate-free, so it passes the check above and silently builds a
-            // different automaton. This is the tripwire for that class (the cross-symbol
-            // suppression of C2's marker being the concrete way to cause it): the
-            // canonicalized RAW bucket must equal what the epoch-dedup produced.
-            #[cfg(debug_assertions)]
-            {
-                let mut canonical_raw = bucket.clone();
-                canonical_raw.sort_unstable();
-                canonical_raw.dedup();
-                assert!(
-                    canonical_raw == scratch,
-                    "subset_construction: the epoch-deduped union for symbol {sym} \
-                     differs from the canonicalized raw union ({scratch:?} vs \
-                     {canonical_raw:?}) -- the dedup marker dropped or kept the wrong \
-                     destinations"
-                );
-            }
-            let id = if let Some(&id) = metastate_to_id.get(scratch.as_slice()) {
-                id
-            } else {
-                let next_id = metastate_list.len();
-                metastate_to_id.insert(scratch.clone(), next_id);
-                metastate_list.push(scratch.clone());
-                next_id
-            };
-            row.insert(sym, vec![id]);
-        }
-        for &sym in &touched {
-            buckets[sym].clear();
-        }
-        touched.clear();
-        d.push(row);
-        cursor += 1;
+        cursor = end;
     }
 
     let o = metastate_list
@@ -506,6 +491,254 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
         .collect();
 
     Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
+}
+
+/// The smallest BFS frontier worth handing to the worker pool.
+///
+/// Below this the split/join bookkeeping dominates. Deliberately generous: the engine runs
+/// ~190 `subset_construction` calls per benchmark-fixture dispatch, almost all of them small,
+/// and a threshold that lets those onto the pool makes the *whole dispatch* slower even though
+/// the one big call gets faster.
+const PAR_MIN_LEVEL: usize = 256;
+
+/// …and the smallest total member count in that frontier. A frontier of 1,000 singleton
+/// metastates over a 2-symbol alphabet is 2,000 destination-list appends in total — real work,
+/// but not enough of it to pay for a parallel round trip.
+const PAR_MIN_MEMBERS: usize = 4_096;
+
+/// The floor on a chunk's size, so a frontier barely over [`PAR_MIN_LEVEL`] does not fragment
+/// into per-metastate jobs (each of which would allocate its own scratch).
+const PAR_MIN_CHUNK: usize = 32;
+
+/// Whether this BFS frontier is big enough to be worth expanding in parallel.
+fn should_parallelize(level: &[Vec<usize>]) -> bool {
+    if !crate::par::enabled() || level.len() < PAR_MIN_LEVEL {
+        return false;
+    }
+    // O(level.len()) and branch-free — cheap next to the expansion it gates. `.len()` is a
+    // field read; nothing is dereferenced past the `Vec` headers.
+    let members: usize = level.iter().map(Vec::len).sum();
+    members >= PAR_MIN_MEMBERS
+}
+
+/// The per-worker reusable buffers behind [`expand_metastate`] — P1(a)'s `buckets`/`touched`/
+/// `seen`/`epoch`, unchanged, moved into a struct so each parallel worker can own a set.
+struct ExpandScratch {
+    /// C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the metastate
+    /// currently being expanded, and is emptied again before the next one.
+    buckets: Vec<Vec<usize>>,
+    /// The symbols this metastate actually touched, so the clear-down is proportional to what
+    /// was filled rather than to `alphabet_size`. No duplicates: a symbol is recorded only on
+    /// the fill that takes its bucket from empty to non-empty.
+    touched: Vec<usize>,
+    /// C2's dedup marker. `seen[dest] == epoch` means `dest` is already in the key being built
+    /// for the (metastate, symbol) currently being drained. A `u64` epoch cannot wrap in
+    /// practice and so needs no reset/wraparound branch: 2^64 bumps at an implausible 10^8
+    /// drains/second is ~5,800 years of continuous running.
+    seen: Vec<u64>,
+    epoch: u64,
+}
+
+impl ExpandScratch {
+    fn new(fa: &Fa) -> ExpandScratch {
+        ExpandScratch {
+            buckets: vec![Vec::new(); fa.alphabet_size],
+            touched: Vec::new(),
+            seen: vec![0; fa.q],
+            epoch: 0,
+        }
+    }
+}
+
+/// The output of expanding one or more metastates: their canonical destination-set keys,
+/// concatenated, plus the index needed to walk back over them.
+///
+/// Flat rather than `Vec<(i32, Vec<usize>)>` on purpose — see the allocation note at the
+/// parallel call site.
+#[derive(Default)]
+struct ExpandOut {
+    /// Every key's members, concatenated in emission order.
+    flat: Vec<usize>,
+    /// `(symbol, key length)` for each key in `flat`, in emission order. Reconstructing a key
+    /// means walking `spans` with a running offset into `flat`.
+    spans: Vec<(i32, u32)>,
+    /// How many `spans` entries belong to each expanded metastate, in expansion order. A
+    /// metastate with no outgoing transitions at all contributes a `0`, so this vector's
+    /// length is always the number of metastates expanded — that is what keeps the merge's
+    /// `d.push(row)` in step with `metastate_list`.
+    per_metastate: Vec<u32>,
+}
+
+impl ExpandOut {
+    fn clear(&mut self) {
+        self.flat.clear();
+        self.spans.clear();
+        self.per_metastate.clear();
+    }
+}
+
+/// Expands ONE metastate: computes, for every symbol with a non-empty destination union, the
+/// canonical (sorted, deduplicated) union, and appends it to `out`.
+///
+/// This is P1(a)'s loop body, verbatim apart from writing into `out.flat` instead of a local
+/// `scratch` vector. It is a **pure function of `fa` and `current`** — it reads no id, no
+/// worklist and no map — which is the whole reason the caller is free to run many copies of it
+/// concurrently.
+fn expand_metastate(fa: &Fa, current: &[usize], sc: &mut ExpandScratch, out: &mut ExpandOut) {
+    // `alphabet_size == 0` is the one shape where the pre-P1(a) code never read `fa.d[q]` at
+    // all (its `for sym in 0..0` body never ran), so neither may this one: on a malformed `Fa`
+    // whose `d` is shorter than `initial`'s members, that code reached the `o`-build and
+    // panicked there, and moving the panic earlier — into a member walk that today does not
+    // happen — would be a behavior change. With `alphabet_size >= 1` both shapes index
+    // `fa.d[q]` for the same first offending member, so the panic site and message coincide.
+    if fa.alphabet_size > 0 {
+        for &q in current {
+            for (&sym, dests) in &fa.d[q] {
+                // The mechanical equivalent of the pre-P1(a) `for sym in
+                // 0..fa.alphabet_size as i32` probe range, which never LOOKED UP a key
+                // outside it: a negative or `>= alphabet_size` key contributes nothing and is
+                // silently dropped with no diagnostic, matching Java (WB-038 outcome (b)).
+                // This is that load-bearing drop, not a defensive bounds check — `Fa` has no
+                // invariant excluding such keys and `subset_construction` is `pub`.
+                if sym < 0 || sym as usize >= fa.alphabet_size {
+                    continue;
+                }
+                if dests.is_empty() {
+                    continue;
+                }
+                let bucket = &mut sc.buckets[sym as usize];
+                if bucket.is_empty() {
+                    sc.touched.push(sym as usize);
+                }
+                bucket.extend(dests.iter().copied());
+            }
+        }
+    }
+    let mut spans_here: u32 = 0;
+    for sym in 0..fa.alphabet_size as i32 {
+        let bucket = &sc.buckets[sym as usize];
+        if bucket.is_empty() {
+            // SC does not totalize: no transition is recorded here at all.
+            continue;
+        }
+        // Exactly one bump per drained (metastate, symbol) pair, so the marker never carries a
+        // destination's membership across symbols.
+        sc.epoch += 1;
+        let start = out.flat.len();
+        for &dest in bucket {
+            if dest < fa.q {
+                if sc.seen[dest] == sc.epoch {
+                    continue;
+                }
+                sc.seen[dest] = sc.epoch;
+            } else {
+                // A destination id outside `0..fa.q` has no marker slot. Push it unmarked
+                // rather than growing/bounds-checking `seen`: the sort/dedup below
+                // canonicalizes such ids exactly as the pre-P1(a) code did, giving the
+                // identical key, and leaving the resulting `fa.d[garbage]` panic to the later
+                // BFS iteration that `subset_construction_panics_on_a_destination_id_out_of_\
+                // range_of_fa_q` pins. Indexing `seen` here instead would move that panic
+                // earlier.
+            }
+            out.flat.push(dest);
+        }
+        let key = &mut out.flat[start..];
+        key.sort_unstable();
+        // Deduplicate in place. A provable no-op on the marker-deduped run above, except for
+        // the `>= fa.q` ids it deliberately does not mark. Kept because it is what
+        // canonicalizes those, and because it is cheap on an already-sorted slice.
+        let mut write = 1;
+        for read in 1..key.len() {
+            if key[read] != key[write - 1] {
+                key[write] = key[read];
+                write += 1;
+            }
+        }
+        out.flat.truncate(start + write);
+        // Adversarial review found breaking this invariant (e.g. dropping the sort or the
+        // dedup) has NO clean test tripwire: a non-canonical key makes every metastate look
+        // "new" to `metastate_to_id`, so the BFS never terminates and the test process is
+        // killed by its resource cap rather than failing an assertion -- exactly what
+        // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists to prevent.
+        // This turns that failure mode into an immediate, located panic.
+        debug_assert!(
+            out.flat[start..].windows(2).all(|w| w[0] < w[1]),
+            "subset_construction: metastate key must be sorted with no duplicates"
+        );
+        // ... but that invariant is blind to OVER-dedup: dropping a destination that belongs
+        // in the union leaves a shorter key that is still sorted and still duplicate-free, so
+        // it passes the check above and silently builds a different automaton. This is the
+        // tripwire for that class (the cross-symbol suppression of C2's marker being the
+        // concrete way to cause it): the canonicalized RAW bucket must equal what the
+        // epoch-dedup produced.
+        #[cfg(debug_assertions)]
+        {
+            let mut canonical_raw = bucket.clone();
+            canonical_raw.sort_unstable();
+            canonical_raw.dedup();
+            assert!(
+                canonical_raw.as_slice() == &out.flat[start..],
+                "subset_construction: the epoch-deduped union for symbol {sym} differs from \
+                 the canonicalized raw union ({:?} vs {canonical_raw:?}) -- the dedup marker \
+                 dropped or kept the wrong destinations",
+                &out.flat[start..]
+            );
+        }
+        let len = out.flat.len() - start;
+        out.spans.push((sym, len as u32));
+        spans_here += 1;
+    }
+    for &sym in &sc.touched {
+        sc.buckets[sym].clear();
+    }
+    sc.touched.clear();
+    out.per_metastate.push(spans_here);
+}
+
+/// Turns [`ExpandOut`]'s keys into ids and rows — the single-threaded half.
+///
+/// This is where every observable ordering decision is made: it walks `out`'s metastates in
+/// expansion order and, within each, its symbols in ascending order, performing exactly the
+/// `metastate_to_id` probe/insert sequence the pre-branch loop performed inline. Running it
+/// after a parallel expansion rather than interleaved with a sequential one is what makes the
+/// two schedules agree bit for bit.
+fn merge_expansion(
+    out: &ExpandOut,
+    metastate_list: &mut Vec<Vec<usize>>,
+    metastate_to_id: &mut HashMap<Vec<usize>, usize>,
+    d: &mut Vec<BTreeMap<i32, Vec<usize>>>,
+) {
+    let mut span_at = 0usize;
+    let mut flat_at = 0usize;
+    for &n_spans in &out.per_metastate {
+        let mut row = BTreeMap::new();
+        for _ in 0..n_spans {
+            let (sym, len) = out.spans[span_at];
+            span_at += 1;
+            let key = &out.flat[flat_at..flat_at + len as usize];
+            flat_at += len as usize;
+            let id = if let Some(&id) = metastate_to_id.get(key) {
+                id
+            } else {
+                let next_id = metastate_list.len();
+                metastate_to_id.insert(key.to_vec(), next_id);
+                metastate_list.push(key.to_vec());
+                next_id
+            };
+            row.insert(sym, vec![id]);
+        }
+        d.push(row);
+    }
+    debug_assert_eq!(
+        span_at,
+        out.spans.len(),
+        "merge_expansion: per_metastate does not account for every span"
+    );
+    debug_assert_eq!(
+        flat_at,
+        out.flat.len(),
+        "merge_expansion: spans do not account for every key element"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1258,117 @@ mod tests {
                  (expected at least {min})"
             );
         }
+    }
+
+    /// **`agent/par-max`: the branch's primary unit gate.** The level-parallel schedule must
+    /// produce a field-for-field identical `Fa` to the frozen pre-P1(a) implementation on
+    /// exactly the same 20,000 generated inputs the sequential schedule is checked against
+    /// above — not merely an equivalent language.
+    ///
+    /// It runs under [`Schedule::Parallel`], which ignores `should_parallelize`'s size
+    /// thresholds, because the generator's automata (`q <= 6`) are three orders of magnitude
+    /// too small to trip them. Without that forcing this test would silently re-run the
+    /// sequential path and assert nothing new — which is exactly the vacuous-test failure
+    /// mode this project's review history keeps finding, so it is worth being explicit that
+    /// the forcing is what makes the test load-bearing.
+    ///
+    /// The generator's coverage assertions are not repeated here; they are properties of
+    /// `random_case`, already asserted above over the identical seed sequence.
+    #[test]
+    fn the_parallel_schedule_matches_the_pre_p1a_reference_implementation() {
+        const CASES: usize = 20_000;
+        let mut cov = GeneratorCoverage::default();
+        for case in 0..CASES {
+            let seed = 0x5C_01A0_5EED_0001_u64 ^ case as u64;
+            let mut rng = Rng(seed);
+            let (fa, initial) = random_case(&mut rng, &mut cov);
+            let expected = subset_construction_reference(&fa, &initial);
+            let actual = subset_construction_scheduled(&fa, &initial, Schedule::Parallel);
+            let context =
+                format!("case {case} (seed {seed:#x}): fa = {fa:?}, initial = {initial:?}");
+            assert_eq!(actual.q, expected.q, "q -- {context}");
+            assert_eq!(actual.q0, expected.q0, "q0 -- {context}");
+            assert_eq!(
+                actual.alphabet_size, expected.alphabet_size,
+                "alphabet_size -- {context}"
+            );
+            assert_eq!(actual.o, expected.o, "o -- {context}");
+            assert_eq!(actual.d, expected.d, "d -- {context}");
+            assert_eq!(
+                actual.true_false, expected.true_false,
+                "true_false -- {context}"
+            );
+        }
+    }
+
+    /// The test above forces the parallel schedule on inputs that would never select it. This
+    /// one is the complement: an input big enough that `Schedule::Auto` picks the parallel
+    /// path **on its own thresholds**, checked against `Schedule::Sequential` on the same
+    /// input. Between them, both halves of the `Auto` decision are exercised.
+    ///
+    /// The automaton is a classic "subset construction blows up" shape: `q` states in a ring,
+    /// where symbol 0 is deterministic (`i -> i+1 mod q`) and symbol 1 is nondeterministic
+    /// from a fixed anchor. Determinizing it produces thousands of metastates whose member
+    /// lists are large — which is what clears `PAR_MIN_MEMBERS`, not just `PAR_MIN_LEVEL`.
+    ///
+    /// The assertion is deliberately field-for-field, and it additionally asserts the input
+    /// really did reach the thresholds, so a future retune of `PAR_MIN_*` that quietly puts
+    /// this case back on the sequential path turns the test red instead of vacuous.
+    #[test]
+    fn auto_selects_the_parallel_schedule_on_a_large_input_and_agrees_with_sequential() {
+        const Q: usize = 17;
+        let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::with_capacity(Q);
+        for i in 0..Q {
+            let mut row = BTreeMap::new();
+            row.insert(0, vec![(i + 1) % Q]);
+            // Symbol 1 branches from every state to two others, which is what makes the
+            // reachable metastate set exponential rather than linear.
+            row.insert(1, vec![(i + 1) % Q, (2 * i + 3) % Q]);
+            d.push(row);
+        }
+        let o: Vec<i32> = (0..Q).map(|i| i32::from(i % 5 == 0)).collect();
+        let fa = Fa::with_states(0, Q, 2, o, d);
+        let initial: BTreeSet<usize> = [0usize].into_iter().collect();
+
+        let sequential = subset_construction_scheduled(&fa, &initial, Schedule::Sequential);
+        let auto = subset_construction_scheduled(&fa, &initial, Schedule::Auto);
+
+        // Anti-vacuity: prove `Auto` had something to decide. `PAR_MIN_LEVEL` is a per-level
+        // bound and this only checks the total, which is necessary rather than sufficient --
+        // the level histogram is checked by the `should_parallelize` unit test below.
+        assert!(
+            sequential.q > PAR_MIN_LEVEL,
+            "the blow-up input produced only {} metastates -- too few for Auto to have \
+             taken the parallel branch on any level, so this test proves nothing",
+            sequential.q
+        );
+
+        assert_eq!(auto.q, sequential.q);
+        assert_eq!(auto.q0, sequential.q0);
+        assert_eq!(auto.alphabet_size, sequential.alphabet_size);
+        assert_eq!(auto.o, sequential.o);
+        assert_eq!(auto.d, sequential.d);
+        assert_eq!(auto.true_false, sequential.true_false);
+    }
+
+    /// `should_parallelize` is the whole `Auto` policy, so its two independent conditions get
+    /// a direct test rather than only being covered through the schedule comparison above.
+    #[test]
+    fn should_parallelize_requires_both_a_wide_level_and_real_work_in_it() {
+        // Wide enough, but every metastate is a singleton: `PAR_MIN_LEVEL` passes,
+        // `PAR_MIN_MEMBERS` does not.
+        let thin: Vec<Vec<usize>> = (0..PAR_MIN_LEVEL + 10).map(|i| vec![i]).collect();
+        assert!(!should_parallelize(&thin));
+
+        // Heavy, but only a handful of metastates: the other way round.
+        let narrow: Vec<Vec<usize>> = (0..4).map(|_| (0..4_000).collect()).collect();
+        assert!(!should_parallelize(&narrow));
+
+        // Both conditions met. Only asserted when the process actually has a pool to submit
+        // to -- under `WR_PAR=0` or a single-worker machine `enabled()` is false and the
+        // sequential path is the only correct answer.
+        let big: Vec<Vec<usize>> = (0..PAR_MIN_LEVEL + 10).map(|_| (0..64).collect()).collect();
+        assert_eq!(should_parallelize(&big), crate::par::enabled());
     }
 
     /// The one `dest >= fa.q` shape the randomized comparison above deliberately cannot

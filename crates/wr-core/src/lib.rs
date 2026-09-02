@@ -44,6 +44,8 @@ pub mod minimize;
 pub mod morphism;
 pub mod numsys;
 pub mod ostrowski;
+/// `agent/par-max` EXPERIMENT ONLY — the parallel-execution policy (see the module docs).
+pub mod par;
 pub mod product;
 pub mod quantify;
 pub mod regex;
