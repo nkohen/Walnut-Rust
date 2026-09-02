@@ -27,7 +27,7 @@ THIS campaign, gated on a fresh profile.
 
 | Unit | Scope | Status |
 |---|---|---|
-| U0 | Branch, dispatch committed, ledger reconciliation, campaign re-baseline | **partial — BLOCKED on machine conditions.** Branch cut; docs landed. Baseline attempt 1 (3 full compare runs) completed harness-green (33/33 answer checks, 9/9 corpus matches) but is **discarded as a baseline**: two foreign ~99%-CPU processes (load avg 10–17) and battery at 16% discharging during the runs; fixture 230's Java median spanned 3.9–14.8 s, Rust's own 0.70–2.07 s. Raw tables + evidence in `benches/baseline-perf-campaign.txt`, which says so in its header. **Next session: verify quiet machine + AC power (`uptime`, `ps -Ao pcpu,comm -r | head`, `pmset -g batt`) BEFORE re-running the 3× sweep; then replace that file's header with real medians-of-medians, profile 286/230/179/261, and report at the dispatch's re-baselining boundary.** |
+| U0 | Branch, dispatch committed, ledger reconciliation, campaign re-baseline | **done.** Branch cut at `cc64579`; docs landed. Baseline took THREE attempts: 1 (battery 16% + two 99%-CPU processes, load 10–17) and 2 (AC but concurrent Claude/Lean sessions, load 7→34) both harness-green yet **discarded** — swings up to 19× on identical code; attempt 3 (load 2.5–5.8, one pinned python core, otherwise quiet) **blessed**: Rust medians tight to ~2% (worst 7%), reproduces the historical quiet-machine tables. Campaign baseline table in `benches/baseline-perf-campaign.txt`: engine-bound fixtures **2.18×–3.45×** vs Java (230: 3.45×, 286: 2.29×, 295: 2.18×). >10× aspiration ⇒ ~3–4× more off the port's own times. Check machine fitness before EVERY bench/profile run (attempts 1–2 are the cautionary appendix). |
 
 ### Findings so far (campaign)
 
