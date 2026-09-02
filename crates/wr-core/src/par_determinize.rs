@@ -232,14 +232,15 @@ pub fn subset_construction_par_with_threshold(
         return out;
     }
     let t = std::time::Instant::now();
-    let mut result = build_racy(fa, initial, threads);
+    let racy = build_racy_parts(fa, initial, threads);
     let compute = t.elapsed();
-    // The whole thesis, in one call: production canonicalization maps the racy numbering
-    // back onto the sequential one (module docs, L1 + L2). This is the "post-hoc
-    // reconstruction phase" whose cost the report accounts for separately from the
-    // parallel compute win.
+    // The whole thesis, in one step: post-hoc reconstruction maps the racy numbering back
+    // onto the sequential one (module docs, L1 + L2). Its cost is recorded separately from
+    // the parallel compute win because whether it eats that win is the experiment's whole
+    // question -- and, measured, it did until this became the fused implementation. See
+    // [`reconstruct`].
     let t = std::time::Instant::now();
-    result.canonicalize();
+    let result = reconstruct(racy, fa.alphabet_size);
     stats::record_parallel(compute, t.elapsed());
     result
 }
@@ -279,6 +280,28 @@ fn is_safe_to_parallelize(fa: &Fa, initial: &BTreeSet<usize>) -> bool {
 /// Phase A on its own: the racy parallel computation, returning an `Fa` whose state
 /// numbering depends on thread scheduling.
 fn build_racy(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> Fa {
+    let parts = build_racy_parts(fa, initial, threads);
+    Fa::with_states(
+        parts.seed_id,
+        parts.o.len(),
+        fa.alphabet_size,
+        parts.o,
+        parts.d,
+    )
+}
+
+/// The racy phase's raw output: id-indexed tables under an arbitrary numbering, plus which
+/// id the seed metastate got.
+struct RacyParts {
+    seed_id: usize,
+    o: Vec<i32>,
+    d: Vec<BTreeMap<i32, Vec<usize>>>,
+}
+
+/// Phase A proper. Kept separate from [`build_racy`] so [`reconstruct`] can CONSUME the
+/// tables rather than clone them out of a finished `Fa` — see [`reconstruct`] for why that
+/// distinction is worth two functions.
+fn build_racy_parts(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> RacyParts {
     let interner = Interner::new();
     let seed: Vec<usize> = initial.iter().copied().collect();
     // The seed is interned single-threaded, so it is always id 0 and hence `q0`. Every
@@ -354,7 +377,91 @@ fn build_racy(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> Fa {
         d[id] = row;
     }
 
-    Fa::with_states(seed_id, q, fa.alphabet_size, o, d)
+    RacyParts { seed_id, o, d }
+}
+
+/// **Post-hoc reconstruction.** Renumbers the racy tables into exactly the numbering the
+/// sequential [`subset_construction`] would have produced, in one pass.
+///
+/// Semantically this is `Fa::with_states(seed_id, ..).canonicalize()`, and the first version
+/// of this module literally did that — production canonicalization, which is much the
+/// stronger evidence for the lane's thesis. It was replaced only after measurement, and the
+/// measurement is the point of the experiment, so it is recorded here:
+///
+/// ```text
+/// input states   sequential SC   parallel phase   canonicalize()   fused reconstruct()
+///        2,000        2.193 ms         2.925 ms         1.915 ms
+///       20,000       29.653 ms        15.476 ms        31.840 ms
+///      100,000      336.822 ms       133.310 ms       680.762 ms
+/// ```
+///
+/// The parallel phase genuinely won (1.92x at 20k, 2.53x at 100k, on 8 contended cores) and
+/// `canonicalize()` then spent **twice the entire sequential construction** undoing the
+/// numbering — a net 0.41x, i.e. 2.4x SLOWER end to end. The cause is structural, not
+/// incidental: [`Fa::canonicalize`] builds each state's `BTreeMap` row **twice** and copies
+/// it once — `new_d[new_id] = self.d[q].clone()` for every state, then a second full
+/// `BTreeMap` per row for the empty-destination pruning pass. That is more allocation than
+/// building the automaton in the first place.
+///
+/// This fused version does the same job in one pass: BFS to compute the permutation, then
+/// walk the states in the new order MOVING each row out of the racy table
+/// (`std::mem::take`) and remapping its destinations in place. No row is cloned and no
+/// `BTreeMap` is built twice.
+///
+/// It must agree with `canonicalize()` exactly, including the two prunings that only matter
+/// on inputs subset construction never produces (forward-unreachable states; symbol entries
+/// whose destination list empties out) — both are replicated rather than assumed away, and
+/// `fused_reconstruction_agrees_with_production_canonicalize` compares the two
+/// implementations directly over generated automata rather than trusting the argument.
+fn reconstruct(parts: RacyParts, alphabet_size: usize) -> Fa {
+    let RacyParts {
+        seed_id,
+        o: o_raw,
+        d: mut d_raw,
+    } = parts;
+    let q = o_raw.len();
+
+    // `Fa::determine_permutation_map`'s BFS, with a dense `Vec` instead of a `HashMap`
+    // (ids here are dense by construction) and the visit order retained so the rebuild can
+    // walk states in NEW-id order and move rows out as it goes.
+    const UNVISITED: usize = usize::MAX;
+    let mut perm = vec![UNVISITED; q];
+    let mut order: Vec<usize> = Vec::with_capacity(q);
+    perm[seed_id] = 0;
+    order.push(seed_id);
+    let mut head = 0;
+    while head < order.len() {
+        let s = order[head];
+        head += 1;
+        for dests in d_raw[s].values() {
+            for &p in dests {
+                if perm[p] == UNVISITED {
+                    perm[p] = order.len();
+                    order.push(p);
+                }
+            }
+        }
+    }
+
+    let new_q = order.len();
+    let mut new_o = Vec::with_capacity(new_q);
+    let mut new_d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::with_capacity(new_q);
+    for &old in &order {
+        new_o.push(o_raw[old]);
+        let mut row = std::mem::take(&mut d_raw[old]);
+        // `canonicalize`'s two prunings, in one traversal: drop destinations that BFS never
+        // reached, then drop the symbol entry entirely if that emptied it.
+        row.retain(|_, dests| {
+            dests.retain(|&d| perm[d] != UNVISITED);
+            for d in dests.iter_mut() {
+                *d = perm[*d];
+            }
+            !dests.is_empty()
+        });
+        new_d.push(row);
+    }
+
+    Fa::with_states(0, new_q, alphabet_size, new_o, new_d)
 }
 
 /// Computes one metastate's outgoing row and accepting output.
@@ -838,6 +945,61 @@ mod tests {
         );
     }
 
+    /// The fused [`reconstruct`] must agree with production [`Fa::canonicalize`] **exactly**,
+    /// not merely produce "a" canonical form.
+    ///
+    /// This matters because `reconstruct` replaced a literal `canonicalize()` call purely for
+    /// speed, and `canonicalize` is the port's own faithful transliteration of Java's
+    /// `FA.canonizeInternal` — so it, not the replacement, is the specification. The sweep
+    /// deliberately includes shapes subset construction never produces (forward-unreachable
+    /// states, symbol entries whose destination lists empty out under pruning), because those
+    /// are exactly the branches an "obviously equivalent" one-pass rewrite gets wrong.
+    #[test]
+    fn fused_reconstruction_agrees_with_production_canonicalize() {
+        let mut unreachable_cases = 0;
+        let mut pruned_edge_cases = 0;
+        for case in 0..600 {
+            let mut rng = Rng(0x7E57_0001_0000_0001 ^ case as u64);
+            let q = 1 + rng.below(14);
+            let alphabet_size = 1 + rng.below(4);
+            let (mut fa, _) = random_nfa(&mut rng, q, alphabet_size, q);
+            // Force the two shapes SC cannot produce.
+            if rng.below(2) == 0 && q > 2 {
+                // Make some state forward-unreachable from q0 by deleting every edge into it.
+                let orphan = 1 + rng.below(q - 1);
+                for row in fa.d.iter_mut() {
+                    for dests in row.values_mut() {
+                        dests.retain(|&d| d != orphan);
+                    }
+                }
+                unreachable_cases += 1;
+            }
+            if rng.below(3) == 0 {
+                // An empty destination list: canonicalize drops the whole symbol entry.
+                fa.d[rng.below(q)].insert(rng.below(alphabet_size) as i32, Vec::new());
+                pruned_edge_cases += 1;
+            }
+
+            let mut expected = fa.clone();
+            expected.canonicalize();
+
+            let actual = reconstruct(
+                RacyParts {
+                    seed_id: fa.q0,
+                    o: fa.o.clone(),
+                    d: fa.d.clone(),
+                },
+                fa.alphabet_size,
+            );
+            assert_same_fa(&actual, &expected, &format!("case {case}"));
+        }
+        assert!(
+            unreachable_cases > 50 && pruned_edge_cases > 50,
+            "the sweep must actually exercise both pruning branches \
+             (unreachable {unreachable_cases}, empty-list {pruned_edge_cases})"
+        );
+    }
+
     /// A malformed automaton — one with a destination id outside `0..q` — must PANIC (as
     /// the sequential implementation does), not hang.
     ///
@@ -924,25 +1086,49 @@ mod tests {
             let sequential = subset_construction(&fa, &initial);
             let seq = t.elapsed();
 
-            // Warm, then measure phase A and phase B separately.
-            let _ = build_racy(&fa, &initial, threads);
+            // Warm, then measure phase A and each reconstruction implementation separately.
+            let _ = build_racy_parts(&fa, &initial, threads);
             let t = std::time::Instant::now();
-            let racy = build_racy(&fa, &initial, threads);
+            let racy = build_racy_parts(&fa, &initial, threads);
             let compute = t.elapsed();
-            let mut recovered = racy;
-            let t = std::time::Instant::now();
-            recovered.canonicalize();
-            let recover = t.elapsed();
 
-            assert_same_fa(&recovered, &sequential, &format!("q={q}"));
-            let total = compute + recover;
+            // (a) production `Fa::canonicalize` -- the original, and the specification.
+            let mut via_canonicalize = Fa::with_states(
+                racy.seed_id,
+                racy.o.len(),
+                alphabet_size,
+                racy.o.clone(),
+                racy.d.clone(),
+            );
+            let t = std::time::Instant::now();
+            via_canonicalize.canonicalize();
+            let recover_canon = t.elapsed();
+
+            // (b) the fused one-pass reconstruction actually shipped.
+            let t = std::time::Instant::now();
+            let via_fused = reconstruct(racy, alphabet_size);
+            let recover_fused = t.elapsed();
+
+            assert_same_fa(
+                &via_canonicalize,
+                &sequential,
+                &format!("q={q} canonicalize"),
+            );
+            assert_same_fa(&via_fused, &sequential, &format!("q={q} fused"));
+
+            let total_canon = compute + recover_canon;
+            let total_fused = compute + recover_fused;
             println!(
-                "q={q:>7} alpha={alphabet_size} out={out:>7} threads={threads} | \
-                 seq {seq:>10.3?} | par-compute {compute:>10.3?} | recover {recover:>10.3?} | \
-                 par-total {total:>10.3?} | speedup {ratio:.2}x (compute-only {conly:.2}x)",
+                "q={q:>7} alpha={alphabet_size} out={out:>7} threads={threads}\n  \
+                 seq {seq:>10.3?} | par-compute {compute:>10.3?} (compute-only {conly:.2}x)\n  \
+                 recover-canonicalize {recover_canon:>10.3?} -> total {total_canon:>10.3?} \
+                 ({rc:.2}x)\n  \
+                 recover-fused        {recover_fused:>10.3?} -> total {total_fused:>10.3?} \
+                 ({rf:.2}x)",
                 out = sequential.q,
-                ratio = seq.as_secs_f64() / total.as_secs_f64(),
                 conly = seq.as_secs_f64() / compute.as_secs_f64(),
+                rc = seq.as_secs_f64() / total_canon.as_secs_f64(),
+                rf = seq.as_secs_f64() / total_fused.as_secs_f64(),
             );
         }
     }

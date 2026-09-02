@@ -61,13 +61,26 @@ fn mode_label() -> &'static str {
 }
 
 fn main() {
-    let corpus_root = wr_bench::walnut_java_dir();
+    // `corpus_root()`, NOT `walnut_java_dir()`: the recorded corpus lives at
+    // `src/test/resources/integrationTests` inside the checkout, and that is the directory
+    // holding the `Global` tree `build_session_tree` copies. (A first draft passed the
+    // checkout root and every run failed with a bare `No such file or directory` -- which,
+    // with stderr suppressed by the driver script, silently produced ZERO result lines and a
+    // determinism check that compared two empty files and called them identical.)
+    let Some(corpus_root) = wr_bench::golden::corpus_root() else {
+        eprintln!(
+            "the recorded corpus is missing: expected {}/src/test/resources/integrationTests \
+             with a Global/ tree and automaton0.txt",
+            wr_bench::walnut_java_dir().display()
+        );
+        eprintln!("(set WALNUT_JAVA_DIR to the walnut-java checkout)");
+        std::process::exit(1);
+    };
     let dest = std::env::temp_dir().join(format!("wr-par-compare-{}", std::process::id()));
     let engine = match RustEngine::prepare(&corpus_root, &dest) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("could not prepare the Rust engine: {e}");
-            eprintln!("(set WALNUT_JAVA_DIR to the walnut-java checkout)");
             std::process::exit(1);
         }
     };
@@ -114,7 +127,10 @@ fn main() {
         // stable across repeated racy runs, and timing 11 workloads five times over would
         // cost minutes for numbers the check never looks at.
         if std::env::var("WR_PAR_HASH_ONLY").is_ok_and(|v| v == "1") {
-            println!("RESULT {:<6} {:>12} {:>12} {:>12} {:>12} {:>8}  {hash:016x}", w.id, 0, 0, 0, 0, 0);
+            println!(
+                "RESULT {:<6} {:>12} {:>12} {:>12} {:>12} {:>8}  {hash:016x}",
+                w.id, 0, 0, 0, 0, 0
+            );
             continue;
         }
 
