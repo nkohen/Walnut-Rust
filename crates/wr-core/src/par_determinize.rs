@@ -799,6 +799,50 @@ mod tests {
         );
     }
 
+    /// Isolated micro-measurement of the primitive: sequential vs racy-parallel vs the
+    /// post-hoc recovery phase, on one large synthetic determinization.
+    ///
+    /// `#[ignore]`d — it is a measurement, not an assertion, and the machine it runs on is
+    /// shared. Run with
+    /// `cargo test -p wr-core --release par_determinize::tests::micro -- --ignored --nocapture`.
+    ///
+    /// It exists because the end-to-end `benches` numbers cannot separate "the parallel
+    /// phase is slow" from "the corpus never reaches the parallel path"; this can.
+    #[test]
+    #[ignore = "measurement, not an assertion; machine-shared timings"]
+    fn micro_sequential_vs_parallel() {
+        let threads = default_threads().max(2);
+        for (q, alphabet_size) in [(2_000usize, 4usize), (20_000, 4), (100_000, 8)] {
+            let mut rng = Rng(0xABCD_0000_0000_0001 ^ q as u64);
+            let (fa, initial) = random_nfa(&mut rng, q, alphabet_size, 0);
+
+            let t = std::time::Instant::now();
+            let sequential = subset_construction(&fa, &initial);
+            let seq = t.elapsed();
+
+            // Warm, then measure phase A and phase B separately.
+            let _ = build_racy(&fa, &initial, threads);
+            let t = std::time::Instant::now();
+            let racy = build_racy(&fa, &initial, threads);
+            let compute = t.elapsed();
+            let mut recovered = racy;
+            let t = std::time::Instant::now();
+            recovered.canonicalize();
+            let recover = t.elapsed();
+
+            assert_same_fa(&recovered, &sequential, &format!("q={q}"));
+            let total = compute + recover;
+            println!(
+                "q={q:>7} alpha={alphabet_size} out={out:>7} threads={threads} | \
+                 seq {seq:>10.3?} | par-compute {compute:>10.3?} | recover {recover:>10.3?} | \
+                 par-total {total:>10.3?} | speedup {ratio:.2}x (compute-only {conly:.2}x)",
+                out = sequential.q,
+                ratio = seq.as_secs_f64() / total.as_secs_f64(),
+                conly = seq.as_secs_f64() / compute.as_secs_f64(),
+            );
+        }
+    }
+
     /// The threshold delegation is real, not decorative: a tiny input must go down the
     /// sequential path (which is what keeps the malformed-input panic sites identical).
     #[test]
