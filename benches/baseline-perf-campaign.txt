@@ -62,3 +62,58 @@ fix   iters    rust mean  rust median    java mean  java median   speedup  peak 
 286      20   220.307 ms   216.300 ms   652.845 ms   658.649 ms     2.96x        34988       34988
 637      20    43.309 ms    41.657 ms    81.793 ms    73.866 ms     1.89x         4965        4965
 
+
+## attempt 2 (2026-09-02, ~10:09-10:31): ALSO DISCARDED — machine contention, not power
+# AC power restored (battery charging), but the machine (8 cores: 4P+4E) ran at load
+# average 7 -> 24 -> 34 during the three runs: multiple concurrent Claude Code sessions
+# (10-50% CPU each), Lean loogle/lake builds, and a VM. Fixture 261's Rust median swung
+# 115 ms / 2.21 s / 161 ms across identical code; two rows flipped to Java-faster on
+# noise alone. All answer checks green again (66/66 cumulative). No medians blessed.
+
+## attempt-2 run 1 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   718.959 µs   438.104 µs     1.212 ms   829.875 µs     1.69x            6           6
+207      50     2.535 ms     1.408 ms     2.099 ms     1.749 ms     0.83x            3           3
+293      20    44.240 ms    41.049 ms   190.392 ms   167.164 ms     4.30x        12334       12334
+521      20    30.139 ms    28.154 ms   139.709 ms   134.799 ms     4.64x            3           3
+179      20   116.026 ms   113.724 ms   466.110 ms   444.557 ms     4.02x        33000       33000
+266      20    45.858 ms    38.837 ms   185.239 ms   144.470 ms     4.04x         7657        7657
+230       5   987.908 ms   972.785 ms      8.328 s      6.397 s     8.43x       115802      115802
+295      20   203.173 ms   185.059 ms   569.586 ms   552.137 ms     2.80x        11589       11589
+261      20   117.057 ms   114.810 ms   509.252 ms   519.742 ms     4.35x        18674       18674
+286      20   218.694 ms   218.509 ms   460.082 ms   453.816 ms     2.10x        34988       34988
+637      20    24.538 ms    24.344 ms   150.987 ms   137.849 ms     6.15x         4965        4965
+
+
+## attempt-2 run 2 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   704.419 µs   410.896 µs     1.042 ms   810.333 µs     1.48x            6           6
+207      50     1.036 ms     1.040 ms     2.385 ms     2.191 ms     2.30x            3           3
+293      20   193.572 ms   109.634 ms   326.015 ms   328.963 ms     1.68x        12334       12334
+521      20    33.795 ms    33.549 ms   166.091 ms   133.447 ms     4.91x            3           3
+179      20   200.378 ms   188.814 ms      1.563 s      1.188 s     7.80x        33000       33000
+266      20    59.039 ms    54.129 ms   387.711 ms   344.322 ms     6.57x         7657        7657
+230       5      2.640 s      1.993 s      6.770 s      6.851 s     2.56x       115802      115802
+295      20   299.864 ms   181.926 ms      1.363 s      1.264 s     4.55x        11589       11589
+261      20      2.370 s      2.208 s      1.918 s      1.624 s     0.81x        18674       18674
+286      20   182.891 ms   184.312 ms   396.843 ms   396.105 ms     2.17x        34988       34988
+637      20    23.703 ms    23.622 ms    61.599 ms    60.716 ms     2.60x         4965        4965
+
+
+## attempt-2 run 3 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   955.648 µs   442.624 µs   694.817 µs   630.104 µs     0.73x            6           6
+207      50   338.740 µs   341.437 µs   417.186 µs   411.396 µs     1.23x            3           3
+293      20    31.767 ms    31.704 ms   100.153 ms    89.432 ms     3.15x        12334       12334
+521      20    20.420 ms    20.253 ms    63.722 ms    56.927 ms     3.12x            3           3
+179      20   120.148 ms   116.837 ms   816.823 ms   503.960 ms     6.80x        33000       33000
+266      20    93.100 ms    77.630 ms   602.567 ms   522.450 ms     6.47x         7657        7657
+230       5      1.431 s      1.333 s      9.352 s      8.198 s     6.54x       115802      115802
+295      20   197.917 ms   139.908 ms   234.554 ms   215.656 ms     1.19x        11589       11589
+261      20   162.251 ms   161.319 ms   742.124 ms   536.546 ms     4.57x        18674       18674
+286      20   264.126 ms   252.307 ms      1.685 s      1.537 s     6.38x        34988       34988
+637      20    40.774 ms    37.570 ms   155.823 ms   146.298 ms     3.82x         4965        4965
+
