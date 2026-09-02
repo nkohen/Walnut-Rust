@@ -101,9 +101,9 @@ impl Strategy {
     }
 
     /// `Strategy.outputName(int currentIdx)` (`:69-71`) — the `[#3, strategy: SC]`
-    /// fragment of Java's `Determinizing …` log line. Nothing emits it yet (see this
-    /// module's docs); it is ported and pinned now because the `details*` golden
-    /// fixtures compare that line verbatim.
+    /// fragment of Java's `Determinizing …` log line, emitted by [`determinize`]'s
+    /// `Some(ctx)` arm below; it is ported and pinned here because the `details*`
+    /// golden fixtures compare that line verbatim.
     pub fn output_name(self, automaton_index: usize) -> String {
         format!("[#{}, strategy: {}]", automaton_index, self.name())
     }

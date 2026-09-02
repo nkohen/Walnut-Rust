@@ -29,9 +29,10 @@
 //! PERMANENT (not deleted after the refactor lands): they are the regression gate
 //! that proves the loop-shape change in each function did not alter its output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use wr_core::automaton::Automaton;
+use wr_core::determinize::subset_construction;
 use wr_core::fa::Fa;
 use wr_core::logging::Logging;
 use wr_core::numsys::{CustomBaseCandidates, CustomBaseFiles, NumberSystem};
@@ -867,4 +868,338 @@ fn track_structure_of_an_unbound_msd_2_automaton() {
         &[Some("msd_2"), Some("msd_2")],
         &[], // label deliberately NOT parallel -- 0 entries against 2 tracks.
     );
+}
+
+// ---------------------------------------------------------------------------
+// wr_core::determinize::subset_construction (perf/beyond P1(a) preparatory
+// commit).
+//
+// `~/.claude/plans/perf-beyond-p1a-subset-construction.md`'s "Preparatory
+// commit" section: `subset_construction` has NO exact-structure snapshot
+// coverage today (the single-symbol U34 regression test in `determinize.rs`
+// pins one shape; these extend it to the shapes the planned C1/C2 rewrite
+// must preserve bit-for-bit). Captured from the UNCHANGED implementation --
+// every literal below was produced by running the test, not hand-derived in
+// isolation, though each is ALSO hand-traced in this file's own comments so a
+// reader can verify the trace independently of trusting the captured run.
+//
+// `subset_construction`'s contract (module docs, `determinize.rs`): BFS over
+// `metastate_list` in index order, symbols ascending `0..alphabet_size`,
+// first-seen assigns the next id, per-symbol union canonicalized via
+// sort+dedup, no totalization (an empty union means no output entry for that
+// symbol), out-of-`0..alphabet_size` symbol keys never probed.
+// ---------------------------------------------------------------------------
+
+/// (a) The cross-symbol-suppression tripwire: state 0 has NFA-state `1` as a
+/// destination under BOTH symbol 0 (`{1}`) and symbol 1 (`{1,2}`). Each
+/// symbol's union is built and canonicalized independently today (a fresh
+/// `scratch` per symbol) -- a future implementation that suppresses a
+/// destination id after its first appearance ACROSS symbols (rather than
+/// per-symbol) would incorrectly drop `1` from symbol 1's union, turning
+/// `{1,2}` into `{2}` and changing which metastate gets discovered as
+/// symbol 1's target. 3 symbols, 5 discovered metastates
+/// (`{0}`,`{1}`,`{1,2}`,`{2}`,`{3}`), both required minimums cleared.
+///
+/// NFA: state 0 (q0, non-accepting) --0--> {1}, --1--> {1,2}, --2--> {2};
+/// state 1 (accepting) --0--> {1} (self), --1--> {3}; state 2
+/// (non-accepting) --0--> {2} (self), --1--> {3}; state 3 (accepting sink)
+/// --0,1,2--> {3} (self on everything).
+#[test]
+fn subset_construction_does_not_suppress_a_destination_across_symbols() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![1]);
+    d0.insert(1, vec![1, 2]);
+    d0.insert(2, vec![2]);
+    let mut d1 = BTreeMap::new();
+    d1.insert(0, vec![1]);
+    d1.insert(1, vec![3]);
+    let mut d2 = BTreeMap::new();
+    d2.insert(0, vec![2]);
+    d2.insert(1, vec![3]);
+    let mut d3 = BTreeMap::new();
+    d3.insert(0, vec![3]);
+    d3.insert(1, vec![3]);
+    d3.insert(2, vec![3]);
+    let fa = Fa::with_states(0, 4, 3, vec![0, 1, 0, 1], vec![d0, d1, d2, d3]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    // Discovery order (BFS over metastate_list, symbols ascending 0..3):
+    // id0={0} (initial); processing id0: sym0 discovers id1={1}, sym1
+    // discovers id2={1,2}, sym2 discovers id3={2}; processing id1={1}: sym0
+    // revisits id1 (self), sym1 discovers id4={3}; processing id2={1,2}:
+    // sym0 revisits id2 (self, union {1,2}), sym1 revisits id4 (union
+    // {3,3}->{3}); processing id3={2}: sym0 revisits id3 (self), sym1
+    // revisits id4; processing id4={3}: every symbol self-loops to id4.
+    assert_eq!(dfa.q, 5);
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(
+        dfa.o,
+        vec![0, 1, 1, 0, 1],
+        "id0={{0}} non-acc, id1={{1}} acc, id2={{1,2}} acc (via state 1), \
+         id3={{2}} non-acc, id4={{3}} acc"
+    );
+    assert_eq!(dfa.d[0], map(&[(0, &[1]), (1, &[2]), (2, &[3])]));
+    assert_eq!(
+        dfa.d[1],
+        map(&[(0, &[1]), (1, &[4])]),
+        "{{1}} --1--> {{3}}=id4, not the id2={{1,2}} a cross-symbol-suppressed \
+         run of {{1}} could be confused with"
+    );
+    assert_eq!(dfa.d[2], map(&[(0, &[2]), (1, &[4])]));
+    assert_eq!(dfa.d[3], map(&[(0, &[3]), (1, &[4])]));
+    assert_eq!(dfa.d[4], map(&[(0, &[4]), (1, &[4]), (2, &[4])]));
+}
+
+/// (b) A metastate rediscovered from two DIFFERENT predecessors at two
+/// different BFS points must keep the id assigned at its FIRST discovery,
+/// never mint a second one. State 1 discovers `{3}` first (as id 3, while
+/// processing cursor 1); state 2 -- a different predecessor, processed one
+/// BFS step later -- also transitions to `{3}` and must reuse id 3, not
+/// allocate id 4.
+///
+/// NFA: state 0 (q0, non-accepting) --0--> {1}, --1--> {2}; state 1
+/// (accepting) --0--> {3}; state 2 (non-accepting) --0--> {3} (same target
+/// as state 1, discovered later); state 3 (accepting sink) --0--> {3}.
+#[test]
+fn subset_construction_reuses_the_first_discovery_id_when_a_later_predecessor_rediscovers_it() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![1]);
+    d0.insert(1, vec![2]);
+    let mut d1 = BTreeMap::new();
+    d1.insert(0, vec![3]);
+    let mut d2 = BTreeMap::new();
+    d2.insert(0, vec![3]);
+    let mut d3 = BTreeMap::new();
+    d3.insert(0, vec![3]);
+    let fa = Fa::with_states(0, 4, 2, vec![0, 1, 0, 1], vec![d0, d1, d2, d3]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    // Discovery order: id0={0}; processing id0: sym0 -> id1={1}, sym1 ->
+    // id2={2}; processing id1={1}: sym0 -> id3={3} (FIRST discovery);
+    // processing id2={2}: sym0 -> canonical {3} already maps to id3 --
+    // REUSED, not a new id4; processing id3={3}: sym0 self-loops to id3.
+    assert_eq!(
+        dfa.q, 4,
+        "exactly 4 metastates -- {{3}} discovered once, not twice"
+    );
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(dfa.o, vec![0, 1, 0, 1]);
+    assert_eq!(dfa.d[0], map(&[(0, &[1]), (1, &[2])]));
+    assert_eq!(
+        dfa.d[1],
+        map(&[(0, &[3])]),
+        "{{1}} first discovers {{3}} as id 3"
+    );
+    assert_eq!(
+        dfa.d[2],
+        map(&[(0, &[3])]),
+        "{{2}}, a DIFFERENT predecessor, rediscovers {{3}} and reuses id 3 \
+         (not a fresh id 4)"
+    );
+    assert_eq!(dfa.d[3], map(&[(0, &[3])]));
+}
+
+/// (c) Unsorted AND duplicated destination lists across MULTIPLE symbols
+/// (extends `determinize.rs`'s
+/// `subset_construction_canonicalizes_an_unsorted_duplicated_destination_list`,
+/// which covers exactly one symbol -- that test is untouched, this is a new,
+/// separate fixture). Symbol 0's raw union is `[2,0,0,2]` (unsorted,
+/// duplicated, canonicalizes to `{0,2}`); symbol 1's raw union is `[1,1]`
+/// (duplicated only, canonicalizes to `{1}`) -- two DIFFERENT canonical
+/// results from two DIFFERENT malformed lists on the same state, plus a
+/// later rediscovery of `{1}` from a different predecessor (state 1).
+///
+/// NFA: state 0 (q0, non-accepting) --0--> raw `[2,0,0,2]`, --1--> raw
+/// `[1,1]`; state 1 (accepting) --0--> {1} (self, sorted/no-dup already);
+/// state 2 (non-accepting) --0--> {2} (self).
+#[test]
+fn subset_construction_canonicalizes_unsorted_duplicated_lists_on_two_different_symbols() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![2, 0, 0, 2]);
+    d0.insert(1, vec![1, 1]);
+    let mut d1 = BTreeMap::new();
+    d1.insert(0, vec![1]);
+    let mut d2 = BTreeMap::new();
+    d2.insert(0, vec![2]);
+    let fa = Fa::with_states(0, 3, 2, vec![0, 1, 0], vec![d0, d1, d2]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    // Discovery order: id0={0}; processing id0: sym0 raw [2,0,0,2] ->
+    // canonical {0,2} -> id1; sym1 raw [1,1] -> canonical {1} -> id2;
+    // processing id1={0,2}: sym0 union of state0's raw [2,0,0,2] and
+    // state2's [2] -> canonical {0,2}, self-loop id1; sym1 union of
+    // state0's raw [1,1] and state2's absent-key -> canonical {1}, matches
+    // id2; processing id2={1}: sym0 -> state1's [1] -> canonical {1} ->
+    // matches id2 (REDISCOVERED from a different predecessor, state 1).
+    assert_eq!(dfa.q, 3);
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(
+        dfa.o,
+        vec![0, 0, 1],
+        "id0={{0}} non-acc, id1={{0,2}} non-acc (neither member accepts), \
+         id2={{1}} acc"
+    );
+    assert_eq!(dfa.d[0], map(&[(0, &[1]), (1, &[2])]));
+    assert_eq!(dfa.d[1], map(&[(0, &[1]), (1, &[2])]));
+    assert_eq!(dfa.d[2], map(&[(0, &[2])]));
+}
+
+/// (d) The no-totalize rule: an absent symbol key means NO entry in the
+/// output row for it, not an empty `Vec`. State 0 has ONLY symbol 0; state 1
+/// has ONLY symbol 1 -- so both discovered metastates' output rows are
+/// missing a different key each.
+#[test]
+fn subset_construction_omits_absent_symbols_from_the_output_row() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![1]);
+    let mut d1 = BTreeMap::new();
+    d1.insert(1, vec![1]);
+    let fa = Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    assert_eq!(dfa.q, 2);
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(dfa.o, vec![0, 1]);
+    assert_eq!(
+        dfa.d[0],
+        map(&[(0, &[1])]),
+        "{{0}} has no symbol-1 entry at all (state 0 has none)"
+    );
+    assert_eq!(
+        dfa.d[1],
+        map(&[(1, &[1])]),
+        "{{1}} has no symbol-0 entry at all (state 1 has none)"
+    );
+}
+
+/// (e) A row containing a symbol key `>= alphabet_size` AND a negative
+/// symbol key: today's `for sym in 0..alphabet_size` probe range means
+/// NEITHER is ever looked up -- their destinations contribute nothing, not
+/// even to widen the discovered state set (mirrors Java's `SC`; WB-038
+/// outcome (b), a silent drop with no diagnostic). `alphabet_size == 1`, so
+/// only key `0` is ever probed; state 0 ALSO carries key `5` (out-of-range)
+/// pointing at state 2 and key `-1` (negative) pointing at state 3 -- if
+/// either were mistakenly probed, states 2/3 would be discovered and `dfa.q`
+/// would exceed 2. It doesn't: `metastate_list` never grows past `{0}`,`{1}`.
+#[test]
+fn subset_construction_silently_drops_out_of_range_and_negative_symbol_keys() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![1]);
+    d0.insert(5, vec![2]);
+    d0.insert(-1, vec![3]);
+    let d1 = BTreeMap::new();
+    let d2 = BTreeMap::new();
+    let d3 = BTreeMap::new();
+    let fa = Fa::with_states(0, 4, 1, vec![0, 1, 0, 0], vec![d0, d1, d2, d3]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    assert_eq!(
+        dfa.q, 2,
+        "states 2 and 3 (reachable ONLY via the out-of-range/negative keys) \
+         are never discovered"
+    );
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(dfa.o, vec![0, 1]);
+    assert_eq!(dfa.d[0], map(&[(0, &[1])]), "keys 5 and -1 leave no trace");
+    assert_eq!(dfa.d[1], map(&[]));
+}
+
+/// (f)-1: `alphabet_size == 0` with a WELL-FORMED non-empty `initial`. The
+/// symbol loop is `0..0` (never runs), so the output row is empty and the
+/// only discovered metastate is `initial` itself -- but the output's `o` is
+/// still genuinely computed from that member's real acceptance (`state 0`,
+/// non-accepting here), not a hardcoded value: contrast with `f-3` below,
+/// where the same shape with a DIFFERENT initial member yields a different
+/// `o`.
+#[test]
+fn subset_construction_with_zero_alphabet_size_and_a_well_formed_initial_produces_one_metastate() {
+    let fa = Fa::with_states(0, 2, 0, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]);
+    let initial: BTreeSet<usize> = [0].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    assert_eq!(dfa.q, 1);
+    assert_eq!(dfa.q0, 0);
+    assert_eq!(dfa.alphabet_size, 0);
+    assert_eq!(dfa.o, vec![0], "state 0 is non-accepting");
+    assert_eq!(dfa.d, vec![BTreeMap::new()], "the symbol loop never runs");
+}
+
+/// (f)-2: the same `alphabet_size == 0` shape, but `initial`'s member is the
+/// ACCEPTING state instead -- proves `o`'s single entry really does track
+/// `fa.is_accepting` on whichever state was seeded, not a constant.
+#[test]
+fn subset_construction_with_zero_alphabet_size_and_an_accepting_initial_member() {
+    let fa = Fa::with_states(0, 2, 0, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]);
+    let initial: BTreeSet<usize> = [1].into_iter().collect();
+
+    let dfa = subset_construction(&fa, &initial);
+
+    assert_eq!(dfa.q, 1);
+    assert_eq!(dfa.o, vec![1], "state 1 is accepting");
+    assert_eq!(dfa.d, vec![BTreeMap::new()]);
+}
+
+/// (f)-3: `alphabet_size == 0` with a MALFORMED shape -- `initial` names a
+/// member state whose index is out of bounds of `fa.o` (built via the raw
+/// struct literal, bypassing `Fa::with_states`'s `debug_assert`, exactly the
+/// way `Fa`'s own docs describe test fixtures deliberately doing to exercise
+/// a validation/guard path). The symbol loop still never runs (alphabet size
+/// 0), so nothing panics until the `o`-build's `fa.is_accepting(0)` call --
+/// pinning that subset_construction has NO bounds-check of its own on
+/// `initial`'s members before reading `fa.o`, matching Java's equivalent
+/// unguarded array read.
+#[test]
+#[should_panic(expected = "index out of bounds: the len is 0 but the index is 0")]
+fn subset_construction_with_zero_alphabet_size_and_an_out_of_bounds_initial_member_panics() {
+    let fa = Fa {
+        q0: 0,
+        q: 1,
+        alphabet_size: 0,
+        o: vec![],
+        d: vec![BTreeMap::new()],
+        true_false: None,
+    };
+    let initial: BTreeSet<usize> = [0].into_iter().collect();
+
+    let _ = subset_construction(&fa, &initial);
+}
+
+/// (g) A destination id `>= fa.q` (here, `5` on a 1-state automaton): **this
+/// panics today, contradicting the plan's own pre-registered prediction**
+/// ("sorted into the canonical key like any other id, garbage-in-garbage-out,
+/// no panic in subset_construction itself"). The out-of-range id `5` IS
+/// accepted into the canonical key on its first (only) appearance -- no
+/// bounds check runs at that point -- and a genuinely NEW metastate `{5}` is
+/// pushed onto the worklist. But `subset_construction`'s BFS unconditionally
+/// dequeues and processes EVERY metastate it ever pushes (the `while cursor
+/// < metastate_list.len()` loop has no "was this ever going to be reachable
+/// through valid data" escape hatch), so on the very next iteration
+/// `fa.d[5]` is indexed against a 1-element `Vec` and panics. This is only
+/// avoidable if `fa.d`/`fa.o` happen to be oversized relative to the
+/// declared `q` (a DIFFERENT malformed shape from this one, not attempted
+/// here) -- for the natural "one dangling out-of-range destination on an
+/// otherwise well-formed automaton" shape, the plan's "no panic" claim does
+/// not hold, and this test pins the panic instead, per the plan's own
+/// contingency ("if the CURRENT code panics somewhere on this shape, pin
+/// that panic instead").
+#[test]
+#[should_panic(expected = "index out of bounds: the len is 1 but the index is 5")]
+fn subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q() {
+    let mut d0 = BTreeMap::new();
+    d0.insert(0, vec![5]);
+    let fa = Fa::with_states(0, 1, 1, vec![0], vec![d0]);
+    let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
+
+    let _ = subset_construction(&fa, &initial);
 }

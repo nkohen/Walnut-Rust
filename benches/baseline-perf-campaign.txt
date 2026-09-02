@@ -9,8 +9,9 @@
 # Environment, stated honestly: 1-min load 2.5-5.8 during the runs, including ONE
 # unrelated single-threaded python3 process pinned at ~100% of one core throughout.
 # Cross-run tightness is the evidence the baseline is credible anyway: Rust medians agree
-# to ~2% on 10 of 11 fixtures (worst: 179 at ~7%), Java medians to ~7%, and the values
-# reproduce the historical quiet-machine U34/refactor-U0 tables. Attempts 1-2 (appendix
+# to ~2% on 9 of 11 fixtures, with fixture 1 ~12% and 179 ~7% as the two outliers, Java
+# medians to ~7%, and the values reproduce the historical quiet-machine U34/refactor-U0
+# tables. Attempts 1-2 (appendix
 # below) show what an UNFIT machine does to the same code: load 10-34, swings up to 19x.
 #
 # THE CAMPAIGN BASELINE (median-of-3-run-medians; speedup = java/rust):

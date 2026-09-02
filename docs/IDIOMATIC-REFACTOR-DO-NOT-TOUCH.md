@@ -25,6 +25,12 @@ for most entries, not at all in this refactor.
 
 ## Order-load-bearing sites (symbol order / insertion order / numbering)
 
+- `wr_core::determinize` — `subset_construction`'s metastate discovery order (BFS over
+  `metastate_list` in index order × symbols ascending `0..alphabet_size`; first-seen assigns the
+  next id) IS the output automaton's state numbering, observable in every `.txt`/`.gv` byte and
+  `::`-details state count. The `0..alphabet_size` probe range is itself load-bearing: a
+  transition-table key outside that range (negative, or `>= alphabet_size`) is silently dropped,
+  matching Java (WB-038 outcome (b)) — not a bounds check to "fix."
 - `wr_core::fa` — `determine_permutation_map` → `canonicalize`: consumes `d`'s ascending
   `BTreeMap` symbol order AND each destination list's insertion order; feeds state numbering for
   every `.txt`/`.gv` write.
