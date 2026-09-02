@@ -365,137 +365,352 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
     // `subset_construction_reference` below is a verbatim copy of the pre-P1(a) body,
     // and `new_matches_the_pre_p1a_reference_implementation` compares the two outputs
     // field-for-field over 20,000 generated automata.
-    let mut metastate_list: Vec<Vec<usize>> = vec![initial.iter().copied().collect()];
+    subset_construction_with_policy(fa, initial, Pipeline::default())
+}
+
+/// The pipeline's tuning, as a value so tests can force it on (or off) on inputs far
+/// smaller than the production thresholds — the only way to run the existing
+/// [`subset_construction_reference`] cross-check *through* the parallel path.
+#[derive(Debug, Clone, Copy)]
+struct Pipeline {
+    /// Helper threads. `0` is the plain sequential engine.
+    workers: usize,
+    /// Discovered metastates below which the pipeline never starts.
+    min_states: usize,
+    /// Frontier width below which it is not worth starting (or continuing).
+    min_lookahead: usize,
+    /// How far ahead of the cursor keys may be computed.
+    window: usize,
+}
+
+impl Default for Pipeline {
+    fn default() -> Pipeline {
+        Pipeline {
+            workers: default_workers(),
+            min_states: PIPELINE_MIN_STATES,
+            min_lookahead: PIPELINE_MIN_LOOKAHEAD,
+            window: PIPELINE_WINDOW,
+        }
+    }
+}
+
+/// How many helper threads [`subset_construction`] may use for its speculative
+/// key-computation pipeline. `0` disables the pipeline entirely, leaving the exact
+/// pre-parallel code path.
+///
+/// `WR_SC_THREADS` overrides it — read once per process, both so the benchmark harness can
+/// pin a thread count and so a `0` there restores the sequential engine for A/B
+/// verification. One less than the machine's parallelism, capped at 7, because the calling
+/// thread is itself a full participant (it does all the minting and, whenever a key is not
+/// yet ready, computes one itself).
+fn default_workers() -> usize {
+    use std::sync::OnceLock;
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        if let Ok(v) = std::env::var("WR_SC_THREADS") {
+            return v.trim().parse().unwrap_or(0);
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).min(7))
+            .unwrap_or(0)
+    })
+}
+
+/// Below this many discovered metastates the pipeline is never started: thread spin-up
+/// costs tens of microseconds and the corpus is dominated by determinizations of a few
+/// dozen states, which must not pay for it. The whole run below the threshold is the
+/// untouched sequential loop, so small determinizations are bit-identical *and*
+/// unmeasurably affected.
+const PIPELINE_MIN_STATES: usize = 4_096;
+
+/// … and the pipeline is only worth starting if this much work is still queued behind the
+/// cursor when the threshold trips.
+const PIPELINE_MIN_LOOKAHEAD: usize = 256;
+
+/// How far ahead of the cursor keys may be computed. Bounds the memory the speculation
+/// holds (one [`KeyRows`] per in-flight metastate) without ever bounding *throughput*: the
+/// measured lookahead available on the heavy corpus workloads is 25,000-61,000 metastates,
+/// two orders of magnitude more than this window needs to keep every worker busy.
+const PIPELINE_WINDOW: usize = 1_024;
+
+/// The reusable per-thread scratch of [`key_rows`] — exactly the buffers the sequential
+/// loop used to hold as locals, lifted into a struct so a worker thread can own its own set.
+struct ScBuffers {
+    /// C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the
+    /// metastate currently being processed, and is emptied again before the next one.
+    buckets: Vec<Vec<usize>>,
+    /// The symbols this metastate actually touched, so the clear-down is proportional to
+    /// what was filled rather than to `alphabet_size`. No duplicates: a symbol is
+    /// recorded only on the fill that takes its bucket from empty to non-empty.
+    touched: Vec<usize>,
+    /// C2's dedup marker. `seen[dest] == epoch` means `dest` is already in the key being
+    /// drained. A `u64` epoch cannot wrap in practice and so needs no reset/wraparound
+    /// branch: 2^64 bumps at an implausible 10^8 drains/second is ~5,800 years of
+    /// continuous running.
+    seen: Vec<u64>,
+    epoch: u64,
+}
+
+impl ScBuffers {
+    fn new(fa: &Fa) -> ScBuffers {
+        ScBuffers {
+            buckets: vec![Vec::new(); fa.alphabet_size],
+            touched: Vec::new(),
+            seen: vec![0; fa.q],
+            epoch: 0,
+        }
+    }
+}
+
+/// One metastate's canonical successor keys, flattened.
+///
+/// `spans` is in ascending symbol order and `flat[start..end]` is that symbol's sorted,
+/// deduplicated destination union — the exact byte sequence the pre-parallel loop held in
+/// its reused `scratch` at the moment it probed `metastate_to_id`. Flat rather than a
+/// `Vec<Vec<usize>>` so one metastate's whole result is two allocations, not one per
+/// symbol: the old code probed the map straight out of `scratch` and allocated nothing at
+/// all on the (overwhelmingly common) already-known-metastate path, and handing keys
+/// across a thread boundary must not turn that into an allocation per transition.
+#[derive(Default)]
+struct KeyRows {
+    flat: Vec<usize>,
+    spans: Vec<(i32, u32, u32)>,
+}
+
+impl KeyRows {
+    fn clear(&mut self) {
+        self.flat.clear();
+        self.spans.clear();
+    }
+}
+
+/// The pure half of subset construction: everything one metastate contributes that depends
+/// **only** on `fa` and `members`, and nothing on how many metastates have been minted so
+/// far. This is what makes the pipeline below sound — see [`subset_construction_with_workers`].
+///
+/// The body is the pre-parallel loop's, unchanged in every order-bearing respect; the only
+/// edit is that where it used to probe/mint an id it now appends the key to `out`.
+///
+/// # Panics
+///
+/// Indexes `fa.d[q]` for each member, so a member `>= fa.d.len()` panics here exactly as
+/// the pre-parallel loop panicked at its own `fa.d[q]`. Callers that must not panic
+/// (the worker threads, which would move that panic to a different, earlier metastate)
+/// screen their input with [`members_are_in_range`] first.
+fn key_rows(fa: &Fa, members: &[usize], b: &mut ScBuffers, out: &mut KeyRows) {
+    out.clear();
+    // `alphabet_size == 0` is the one shape where the old code never read `fa.d[q]`
+    // at all (its `for sym in 0..0` body never ran), so neither may this one: on a
+    // malformed `Fa` whose `d` is shorter than `initial`'s members, the old code
+    // reached the `o`-build and panicked there, and moving that panic earlier —
+    // into a member walk that today does not happen — would be a behavior change.
+    // With `alphabet_size >= 1` both shapes index `fa.d[q]` for the same first
+    // offending member, so the panic site and message already coincide.
+    if fa.alphabet_size > 0 {
+        for &q in members {
+            for (&sym, dests) in &fa.d[q] {
+                // The mechanical equivalent of the old `for sym in
+                // 0..fa.alphabet_size as i32` probe range, which never LOOKED UP a
+                // key outside it: a negative or `>= alphabet_size` key contributes
+                // nothing and is silently dropped with no diagnostic, matching Java
+                // (WB-038 outcome (b)). This is that load-bearing drop, not a
+                // defensive bounds check — `Fa` has no invariant excluding such
+                // keys and this function is reachable from a `pub` one.
+                if sym < 0 || sym as usize >= fa.alphabet_size {
+                    continue;
+                }
+                if dests.is_empty() {
+                    continue;
+                }
+                let bucket = &mut b.buckets[sym as usize];
+                if bucket.is_empty() {
+                    b.touched.push(sym as usize);
+                }
+                bucket.extend(dests.iter().copied());
+            }
+        }
+    }
+    for sym in 0..fa.alphabet_size as i32 {
+        let bucket = &b.buckets[sym as usize];
+        if bucket.is_empty() {
+            // SC does not totalize: no transition is recorded here at all.
+            continue;
+        }
+        // Exactly one bump per drained (metastate, symbol) pair, so the marker
+        // never carries a destination's membership across symbols.
+        b.epoch += 1;
+        let start = out.flat.len();
+        for &dest in bucket {
+            if dest < fa.q {
+                if b.seen[dest] == b.epoch {
+                    continue;
+                }
+                b.seen[dest] = b.epoch;
+            } else {
+                // A destination id outside `0..fa.q` has no marker slot. Push it
+                // unmarked rather than growing/bounds-checking `seen`: the
+                // `sort_unstable()`/`dedup()` below canonicalizes such ids exactly
+                // as the old code did, giving the identical key, and — load-bearing
+                // — leaving the resulting `fa.d[garbage]` panic at the same later
+                // BFS iteration, with the same message, that
+                // `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`
+                // pins. Indexing `seen` here instead would move that panic earlier.
+            }
+            out.flat.push(dest);
+        }
+        out.flat[start..].sort_unstable();
+        // A provable no-op on the marker-deduped run above, except for the
+        // `>= fa.q` ids it deliberately does not mark. Kept because it is what
+        // canonicalizes those, and because it is cheap on an already-deduped slice.
+        let mut len = start;
+        for i in start..out.flat.len() {
+            if len == start || out.flat[len - 1] != out.flat[i] {
+                out.flat[len] = out.flat[i];
+                len += 1;
+            }
+        }
+        out.flat.truncate(len);
+        // Adversarial review found breaking this invariant (e.g. dropping the sort
+        // or the dedup) has NO clean test tripwire: a non-canonical key makes every
+        // metastate look "new" to `metastate_to_id`, so `while cursor <
+        // metastate_list.len()` never terminates and the test process is killed by
+        // its resource cap rather than failing an assertion -- exactly what
+        // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists
+        // to prevent. This turns that failure mode into an immediate, located panic.
+        debug_assert!(
+            out.flat[start..].windows(2).all(|w| w[0] < w[1]),
+            "subset_construction: metastate key must be sorted with no duplicates"
+        );
+        // ... but that invariant is blind to OVER-dedup: dropping a destination
+        // that belongs in the union leaves a shorter key that is still sorted and
+        // still duplicate-free, so it passes the check above and silently builds a
+        // different automaton. This is the tripwire for that class (the cross-symbol
+        // suppression of C2's marker being the concrete way to cause it): the
+        // canonicalized RAW bucket must equal what the epoch-dedup produced.
+        #[cfg(debug_assertions)]
+        {
+            let mut canonical_raw = bucket.clone();
+            canonical_raw.sort_unstable();
+            canonical_raw.dedup();
+            assert!(
+                canonical_raw == out.flat[start..],
+                "subset_construction: the epoch-deduped union for symbol {sym} \
+                 differs from the canonicalized raw union ({:?} vs \
+                 {canonical_raw:?}) -- the dedup marker dropped or kept the wrong \
+                 destinations",
+                &out.flat[start..]
+            );
+        }
+        out.spans.push((sym, start as u32, out.flat.len() as u32));
+    }
+    for &sym in &b.touched {
+        b.buckets[sym].clear();
+    }
+    b.touched.clear();
+}
+
+/// Whether every member indexes `fa.d` — the screen a worker applies before calling
+/// [`key_rows`], so that a malformed `Fa`'s panic still fires on the main thread at the
+/// same metastate the sequential engine reached, not early on a speculative one.
+fn members_are_in_range(fa: &Fa, members: &[usize]) -> bool {
+    fa.alphabet_size == 0 || members.iter().all(|&q| q < fa.d.len())
+}
+
+/// The sequential half: turn one metastate's keys into its transition row, minting ids for
+/// keys not seen before. **This is the only place a state id is ever assigned**, it runs
+/// only on the calling thread, and it consumes `spans` in ascending symbol order — which
+/// together are exactly why the pipeline cannot change the output's state numbering.
+fn mint_row(
+    keys: &KeyRows,
+    metastate_to_id: &mut HashMap<Vec<usize>, usize>,
+    metastate_list: &mut Vec<std::sync::Arc<Vec<usize>>>,
+) -> BTreeMap<i32, Vec<usize>> {
+    let mut row = BTreeMap::new();
+    for &(sym, start, end) in &keys.spans {
+        let key = &keys.flat[start as usize..end as usize];
+        let id = if let Some(&id) = metastate_to_id.get(key) {
+            id
+        } else {
+            let next_id = metastate_list.len();
+            metastate_to_id.insert(key.to_vec(), next_id);
+            metastate_list.push(std::sync::Arc::new(key.to_vec()));
+            next_id
+        };
+        row.insert(sym, vec![id]);
+    }
+    row
+}
+
+/// [`subset_construction`] with an explicit worker count; `workers == 0` is the plain
+/// sequential engine. Split out so tests can force the pipeline on (and off) rather than
+/// depending on the host's core count.
+///
+/// # Why the pipeline cannot change the output
+///
+/// The loop has exactly two halves, and only one of them depends on history:
+///
+/// * [`key_rows`] is a **pure function of `fa` and the metastate's members**. It reads no
+///   id, no counter, and nothing another metastate produced. Computing it early, late, or
+///   on another thread cannot change its result.
+/// * [`mint_row`] is where every id is assigned, and it stays on the calling thread,
+///   driven by the same `cursor`-ascending × symbol-ascending sequence over the same keys.
+///
+/// So the sequence of `metastate_to_id` probes — hence the id minted for each new
+/// metastate, hence `metastate_list`, hence `d` and `o` — is identical to the sequential
+/// engine's for any scheduling of the workers. The pipeline is a *scheduling* change over
+/// a pure function, not a change to the construction.
+///
+/// Two behaviors are preserved deliberately rather than incidentally:
+///
+/// * **Panic site.** A member outside `0..fa.d.len()` panics inside `fa.d[q]`. Workers
+///   screen for it ([`members_are_in_range`]) and hand such a metastate back unevaluated,
+///   so the panic still fires on the calling thread, at the same cursor, as it did before.
+/// * **Small inputs pay nothing.** Nothing spins up below [`PIPELINE_MIN_STATES`], so the
+///   corpus's thousands of small determinizations run the identical sequential code.
+fn subset_construction_with_policy(fa: &Fa, initial: &BTreeSet<usize>, policy: Pipeline) -> Fa {
+    use std::sync::Arc;
+
+    let mut metastate_list: Vec<Arc<Vec<usize>>> =
+        vec![Arc::new(initial.iter().copied().collect())];
     let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
-    metastate_to_id.insert(metastate_list[0].clone(), 0);
+    metastate_to_id.insert((*metastate_list[0]).clone(), 0);
 
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
-    let mut scratch: Vec<usize> = Vec::new();
-    // C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the
-    // metastate currently being processed, and is emptied again before the next one.
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); fa.alphabet_size];
-    // The symbols this metastate actually touched, so the clear-down is proportional to
-    // what was filled rather than to `alphabet_size`. No duplicates: a symbol is
-    // recorded only on the fill that takes its bucket from empty to non-empty.
-    let mut touched: Vec<usize> = Vec::new();
-    // C2's dedup marker. `seen[dest] == epoch` means `dest` is already in `scratch` for
-    // the (metastate, symbol) currently being drained. A `u64` epoch cannot wrap in
-    // practice and so needs no reset/wraparound branch: 2^64 bumps at an implausible
-    // 10^8 drains/second is ~5,800 years of continuous running.
-    let mut seen: Vec<u64> = vec![0; fa.q];
-    let mut epoch: u64 = 0;
+    let mut bufs = ScBuffers::new(fa);
+    let mut keys = KeyRows::default();
     let mut cursor = 0;
+
+    // Phase 1 — the untouched sequential engine, which is also the whole run for every
+    // input below the pipeline threshold.
+    while cursor < metastate_list.len() && metastate_list.len() < policy.min_states {
+        let members = metastate_list[cursor].clone();
+        key_rows(fa, &members, &mut bufs, &mut keys);
+        let row = mint_row(&keys, &mut metastate_to_id, &mut metastate_list);
+        d.push(row);
+        cursor += 1;
+    }
+
+    // Phase 2 — the same loop, with keys for metastates ahead of the cursor computed on
+    // worker threads. Entered only when there is enough left to pay for the threads.
+    if policy.workers > 0 && metastate_list.len() - cursor >= policy.min_lookahead {
+        pipelined_tail(
+            fa,
+            policy,
+            &mut cursor,
+            &mut metastate_list,
+            &mut metastate_to_id,
+            &mut d,
+            &mut bufs,
+            &mut keys,
+        );
+    }
+
+    // Phase 3 — whatever the pipeline left (it stops as soon as the frontier is small),
+    // again on the plain sequential engine.
     while cursor < metastate_list.len() {
-        let current = metastate_list[cursor].clone();
-        let mut row = BTreeMap::new();
-        // `alphabet_size == 0` is the one shape where the old code never read `fa.d[q]`
-        // at all (its `for sym in 0..0` body never ran), so neither may this one: on a
-        // malformed `Fa` whose `d` is shorter than `initial`'s members, the old code
-        // reached the `o`-build and panicked there, and moving that panic earlier —
-        // into a member walk that today does not happen — would be a behavior change.
-        // With `alphabet_size >= 1` both shapes index `fa.d[q]` for the same first
-        // offending member, so the panic site and message already coincide.
-        if fa.alphabet_size > 0 {
-            for &q in &current {
-                for (&sym, dests) in &fa.d[q] {
-                    // The mechanical equivalent of the old `for sym in
-                    // 0..fa.alphabet_size as i32` probe range, which never LOOKED UP a
-                    // key outside it: a negative or `>= alphabet_size` key contributes
-                    // nothing and is silently dropped with no diagnostic, matching Java
-                    // (WB-038 outcome (b)). This is that load-bearing drop, not a
-                    // defensive bounds check — `Fa` has no invariant excluding such
-                    // keys and this function is `pub`.
-                    if sym < 0 || sym as usize >= fa.alphabet_size {
-                        continue;
-                    }
-                    if dests.is_empty() {
-                        continue;
-                    }
-                    let bucket = &mut buckets[sym as usize];
-                    if bucket.is_empty() {
-                        touched.push(sym as usize);
-                    }
-                    bucket.extend(dests.iter().copied());
-                }
-            }
-        }
-        for sym in 0..fa.alphabet_size as i32 {
-            let bucket = &buckets[sym as usize];
-            if bucket.is_empty() {
-                // SC does not totalize: no transition is recorded here at all.
-                continue;
-            }
-            // Exactly one bump per drained (metastate, symbol) pair, so the marker
-            // never carries a destination's membership across symbols.
-            epoch += 1;
-            scratch.clear();
-            for &dest in bucket {
-                if dest < fa.q {
-                    if seen[dest] == epoch {
-                        continue;
-                    }
-                    seen[dest] = epoch;
-                } else {
-                    // A destination id outside `0..fa.q` has no marker slot. Push it
-                    // unmarked rather than growing/bounds-checking `seen`: the
-                    // `sort_unstable()`/`dedup()` below canonicalizes such ids exactly
-                    // as the old code did, giving the identical key, and — load-bearing
-                    // — leaving the resulting `fa.d[garbage]` panic at the same later
-                    // BFS iteration, with the same message, that
-                    // `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`
-                    // pins. Indexing `seen` here instead would move that panic earlier.
-                }
-                scratch.push(dest);
-            }
-            scratch.sort_unstable();
-            // A provable no-op on the marker-deduped run above, except for the
-            // `>= fa.q` ids it deliberately does not mark. Kept because it is what
-            // canonicalizes those, and because it is cheap on an already-deduped slice.
-            scratch.dedup();
-            // Adversarial review found breaking this invariant (e.g. dropping the sort
-            // or the dedup) has NO clean test tripwire: a non-canonical key makes every
-            // metastate look "new" to `metastate_to_id`, so `while cursor <
-            // metastate_list.len()` never terminates and the test process is killed by
-            // its resource cap rather than failing an assertion -- exactly what
-            // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists
-            // to prevent. This turns that failure mode into an immediate, located panic.
-            debug_assert!(
-                scratch.windows(2).all(|w| w[0] < w[1]),
-                "subset_construction: metastate key must be sorted with no duplicates"
-            );
-            // ... but that invariant is blind to OVER-dedup: dropping a destination
-            // that belongs in the union leaves a shorter key that is still sorted and
-            // still duplicate-free, so it passes the check above and silently builds a
-            // different automaton. This is the tripwire for that class (the cross-symbol
-            // suppression of C2's marker being the concrete way to cause it): the
-            // canonicalized RAW bucket must equal what the epoch-dedup produced.
-            #[cfg(debug_assertions)]
-            {
-                let mut canonical_raw = bucket.clone();
-                canonical_raw.sort_unstable();
-                canonical_raw.dedup();
-                assert!(
-                    canonical_raw == scratch,
-                    "subset_construction: the epoch-deduped union for symbol {sym} \
-                     differs from the canonicalized raw union ({scratch:?} vs \
-                     {canonical_raw:?}) -- the dedup marker dropped or kept the wrong \
-                     destinations"
-                );
-            }
-            let id = if let Some(&id) = metastate_to_id.get(scratch.as_slice()) {
-                id
-            } else {
-                let next_id = metastate_list.len();
-                metastate_to_id.insert(scratch.clone(), next_id);
-                metastate_list.push(scratch.clone());
-                next_id
-            };
-            row.insert(sym, vec![id]);
-        }
-        for &sym in &touched {
-            buckets[sym].clear();
-        }
-        touched.clear();
+        let members = metastate_list[cursor].clone();
+        key_rows(fa, &members, &mut bufs, &mut keys);
+        let row = mint_row(&keys, &mut metastate_to_id, &mut metastate_list);
         d.push(row);
         cursor += 1;
     }
@@ -506,6 +721,205 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
         .collect();
 
     Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
+}
+
+/// One metastate handed to a worker.
+type Task = (usize, std::sync::Arc<Vec<usize>>);
+
+/// What a worker hands back for one metastate.
+enum Reply {
+    /// The computed keys.
+    Keys(KeyRows),
+    /// Screened out before evaluation ([`members_are_in_range`]) — the mint loop must
+    /// evaluate this one itself so the malformed-`Fa` panic fires on the calling thread at
+    /// the right cursor.
+    Defer,
+    /// `key_rows` panicked on the worker. The payload is carried back and re-raised on the
+    /// calling thread rather than left to kill the worker: a dead worker never answers,
+    /// and the mint loop would block on that answer forever — turning a diagnosable
+    /// assertion into a hang, which `CLAUDE.md`'s "never hangs, always a diagnosable
+    /// verdict" guardrail exists to prevent. Reachable in practice only through
+    /// `key_rows`' own `cfg(debug_assertions)` over-dedup tripwire, since
+    /// [`members_are_in_range`] already screens the one panic an ordinary malformed `Fa`
+    /// can cause; it is a safety net for the assertions, not a second screen.
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
+}
+
+type Done = (usize, Reply);
+
+/// How many times a worker has had to carry a panic back (test builds only). The screen
+/// [`members_are_in_range`] is supposed to keep this at zero even on a malformed `Fa`;
+/// without it the default panic hook prints a `thread '<unnamed>' panicked` line for every
+/// speculatively-evaluated bad metastate, including ones the sequential engine never
+/// reaches. That stderr noise is the observable difference the screen exists to prevent,
+/// and it is what `the_screen_keeps_speculation_from_panicking_on_a_worker` measures.
+#[cfg(test)]
+static WORKER_PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The scheduling core of phase 2. Runs the mint loop on the calling thread while
+/// `workers` threads compute keys for metastates already discovered but not yet reached.
+#[allow(clippy::too_many_arguments)]
+fn pipelined_tail(
+    fa: &Fa,
+    policy: Pipeline,
+    cursor: &mut usize,
+    metastate_list: &mut Vec<std::sync::Arc<Vec<usize>>>,
+    metastate_to_id: &mut HashMap<Vec<usize>, usize>,
+    d: &mut Vec<BTreeMap<i32, Vec<usize>>>,
+    bufs: &mut ScBuffers,
+    keys: &mut KeyRows,
+) {
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
+
+    struct Queue {
+        items: VecDeque<Task>,
+        closed: bool,
+    }
+    let queue = Mutex::new(Queue {
+        items: VecDeque::new(),
+        closed: false,
+    });
+    let wake = Condvar::new();
+    let (done_tx, done_rx) = mpsc::channel::<Done>();
+
+    /// Closes the queue however the scope is left — including by an unwind out of the
+    /// mint loop (a malformed `Fa`'s `fa.d[q]` panic). Without this, `thread::scope`'s
+    /// implicit join would deadlock against workers still parked on the condvar, turning
+    /// a clean panic into a hang.
+    struct CloseOnDrop<'a>(&'a Mutex<Queue>, &'a Condvar);
+    impl Drop for CloseOnDrop<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut q) = self.0.lock() {
+                q.closed = true;
+            }
+            self.1.notify_all();
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let _closer = CloseOnDrop(&queue, &wake);
+        for _ in 0..policy.workers {
+            let tx = done_tx.clone();
+            let queue = &queue;
+            let wake = &wake;
+            scope.spawn(move || {
+                let mut bufs = ScBuffers::new(fa);
+                loop {
+                    let task = {
+                        let mut guard = queue.lock().unwrap();
+                        loop {
+                            if let Some(task) = guard.items.pop_front() {
+                                break task;
+                            }
+                            if guard.closed {
+                                return;
+                            }
+                            guard = wake.wait(guard).unwrap();
+                        }
+                    };
+                    let (index, members) = task;
+                    let reply = if members_are_in_range(fa, &members) {
+                        let mut out = KeyRows::default();
+                        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            key_rows(fa, &members, &mut bufs, &mut out)
+                        }));
+                        match caught {
+                            Ok(()) => Reply::Keys(out),
+                            Err(payload) => {
+                                #[cfg(test)]
+                                WORKER_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                Reply::Panicked(payload)
+                            }
+                        }
+                    } else {
+                        Reply::Defer
+                    };
+                    if tx.send((index, reply)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+
+        let mut ready: HashMap<usize, Reply> = HashMap::new();
+        // Indices in `*cursor..dispatched` are in the workers' hands; the rest of
+        // `metastate_list` has not been offered yet. Bounding this to
+        // `PIPELINE_WINDOW` past the cursor is what bounds the memory the speculation
+        // holds, and costs no throughput (see the constant's docs).
+        let mut dispatched = *cursor;
+        loop {
+            let mut pushed = false;
+            {
+                let mut guard = queue.lock().unwrap();
+                while dispatched < metastate_list.len() && dispatched < *cursor + policy.window {
+                    guard
+                        .items
+                        .push_back((dispatched, metastate_list[dispatched].clone()));
+                    dispatched += 1;
+                    pushed = true;
+                }
+            }
+            if pushed {
+                wake.notify_all();
+            }
+            if *cursor >= metastate_list.len() {
+                break;
+            }
+            // Hand back to the plain sequential engine once the frontier no longer
+            // covers the coordination cost, rather than paying a channel round trip
+            // per metastate down to the last one.
+            if metastate_list.len() - *cursor < policy.min_lookahead && ready.is_empty() {
+                break;
+            }
+
+            let reply = match ready.remove(cursor) {
+                Some(reply) => reply,
+                None => {
+                    let mut found = None;
+                    while found.is_none() {
+                        match done_rx.recv() {
+                            Ok((index, reply)) => {
+                                if index == *cursor {
+                                    found = Some(reply);
+                                } else {
+                                    ready.insert(index, reply);
+                                }
+                            }
+                            // Unreachable while any worker lives, and `_closer` has not
+                            // run yet: `*cursor` was dispatched above and every
+                            // dispatched index is answered exactly once (a worker that
+                            // panics inside `key_rows` still answers, with
+                            // `Reply::Panicked`). Falling back to computing it here keeps
+                            // that reasoning off the critical path of correctness.
+                            Err(_) => found = Some(Reply::Defer),
+                        }
+                    }
+                    found.unwrap()
+                }
+            };
+
+            let row = match reply {
+                Reply::Keys(computed) => mint_row(&computed, metastate_to_id, metastate_list),
+                // Screened out by the worker (or the channel closed): evaluate on this
+                // thread, so a malformed `Fa` panics here, at this cursor, exactly as the
+                // sequential engine did.
+                Reply::Defer => {
+                    let members = metastate_list[*cursor].clone();
+                    key_rows(fa, &members, bufs, keys);
+                    mint_row(keys, metastate_to_id, metastate_list)
+                }
+                // Re-raised on this thread, so it reaches the caller's
+                // `catch_walnut_panic` boundary with its payload intact instead of
+                // stranding the mint loop on an answer that will never come.
+                Reply::Panicked(payload) => std::panic::resume_unwind(payload),
+            };
+            d.push(row);
+            *cursor += 1;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,6 +1439,195 @@ mod tests {
                  (expected at least {min})"
             );
         }
+    }
+
+    /// The parallel pipeline, run over the SAME generator and the SAME pre-parallel
+    /// reference implementation as `new_matches_the_pre_p1a_reference_implementation`
+    /// above — the byte-identity proof for the speculation.
+    ///
+    /// The production thresholds (4,096 metastates) would never trip on a generated case
+    /// this small, so the policy is forced: `min_states: 0`/`min_lookahead: 1` puts every
+    /// single case through the dispatch/recv machinery from its very first metastate, and
+    /// `window: 3` keeps the in-flight window narrow enough that the top-up path, the
+    /// out-of-order `ready` path and the window-full path are all exercised rather than
+    /// every task being dispatched in one burst.
+    ///
+    /// Four workers against a one-metastate frontier is deliberately the *worst* case for
+    /// the scheduler — maximum contention, maximum chance that a result arrives for an
+    /// index the mint loop has not reached — which is exactly the shape a reordering bug
+    /// would need.
+    #[test]
+    fn the_parallel_pipeline_matches_the_pre_p1a_reference_implementation() {
+        const CASES: usize = 20_000;
+        let policy = Pipeline {
+            workers: 4,
+            min_states: 0,
+            min_lookahead: 1,
+            window: 3,
+        };
+        let mut cov = GeneratorCoverage::default();
+        let mut through_pipeline = 0;
+        for case in 0..CASES {
+            let seed = 0x5C_01A0_5EED_0001_u64 ^ case as u64;
+            let mut rng = Rng(seed);
+            let (fa, initial) = random_case(&mut rng, &mut cov);
+            let expected = subset_construction_reference(&fa, &initial);
+            let actual = subset_construction_with_policy(&fa, &initial, policy);
+            if !initial.is_empty() {
+                through_pipeline += 1;
+            }
+            let context =
+                format!("case {case} (seed {seed:#x}): fa = {fa:?}, initial = {initial:?}");
+            assert_eq!(actual.q, expected.q, "q -- {context}");
+            assert_eq!(actual.q0, expected.q0, "q0 -- {context}");
+            assert_eq!(
+                actual.alphabet_size, expected.alphabet_size,
+                "alphabet_size -- {context}"
+            );
+            assert_eq!(actual.o, expected.o, "o -- {context}");
+            assert_eq!(actual.d, expected.d, "d -- {context}");
+            assert_eq!(
+                actual.true_false, expected.true_false,
+                "true_false -- {context}"
+            );
+        }
+        // Anti-vacuity: a policy that silently failed to engage would make this test a
+        // second copy of the sequential one. `min_lookahead: 1` engages whenever there is
+        // at least one metastate to process, which is every case with a non-empty seed.
+        assert!(
+            through_pipeline > 10_000,
+            "only {through_pipeline} of {CASES} cases could have entered the pipeline"
+        );
+    }
+
+    /// Determinism across repeated parallel runs of one input, which the reference
+    /// comparison above does not by itself establish: that test runs each case once, so a
+    /// scheduling-dependent result could in principle agree with the reference on the
+    /// scheduling it happened to get. This re-runs the same input many times and requires
+    /// every run to be byte-identical.
+    #[test]
+    fn the_parallel_pipeline_is_deterministic_across_repeated_runs() {
+        let policy = Pipeline {
+            workers: 4,
+            min_states: 0,
+            min_lookahead: 1,
+            window: 2,
+        };
+        let mut cov = GeneratorCoverage::default();
+        for case in 0..400 {
+            let seed = 0x5C_01A0_D37E_0001_u64 ^ case as u64;
+            let mut rng = Rng(seed);
+            let (fa, initial) = random_case(&mut rng, &mut cov);
+            let first = subset_construction_with_policy(&fa, &initial, policy);
+            for repeat in 1..8 {
+                let again = subset_construction_with_policy(&fa, &initial, policy);
+                assert_eq!(
+                    again.d, first.d,
+                    "case {case} repeat {repeat}: transition table differs between runs"
+                );
+                assert_eq!(
+                    again.o, first.o,
+                    "case {case} repeat {repeat}: outputs differ"
+                );
+                assert_eq!(
+                    again.q, first.q,
+                    "case {case} repeat {repeat}: state count differs"
+                );
+            }
+        }
+    }
+
+    /// The malformed-`Fa` panic must still reach the caller, with its message intact, from
+    /// the calling thread — that is what `wr_core::walnut_panic`/`Prover::caught` catch.
+    ///
+    /// Note what this does and does not pin. Two independent mechanisms keep it true: the
+    /// `members_are_in_range` screen (the metastate is never evaluated on a worker at all)
+    /// and `Reply::Panicked` (a worker panic is carried back and re-raised here). Because
+    /// the second alone suffices for *this* assertion, deleting the screen does NOT make
+    /// this test fail — an earlier draft claimed it did, and the mutation showed otherwise.
+    /// The screen's own effect is the absence of speculative panic-hook output, which
+    /// `the_screen_keeps_speculation_from_panicking_on_a_worker` pins instead.
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn the_parallel_pipeline_keeps_an_out_of_range_member_panicking_on_the_caller() {
+        // One state, one symbol, pointing at a destination `fa.d` has no row for.
+        let mut row = BTreeMap::new();
+        row.insert(0, vec![7]);
+        let fa = Fa::with_states(0, 1, 1, vec![0], vec![row]);
+        let policy = Pipeline {
+            workers: 4,
+            min_states: 0,
+            min_lookahead: 1,
+            window: 4,
+        };
+        subset_construction_with_policy(&fa, &[0usize].into_iter().collect(), policy);
+    }
+
+    /// The screen's own job, which the `should_panic` test above cannot see: a metastate
+    /// that would panic must never be *speculatively* evaluated on a worker.
+    ///
+    /// Without `members_are_in_range`, index 2 (`{7}`, a destination `fa.d` has no row
+    /// for) is dispatched to a worker while the mint loop is still on index 1, and the
+    /// default panic hook prints a `thread '<unnamed>' panicked` line for it — stderr the
+    /// sequential engine never produces. `WORKER_PANICS` counts exactly those carried-back
+    /// panics; deleting the screen makes this assertion fail.
+    ///
+    /// Measured as a delta rather than an absolute so a concurrently running test in the
+    /// same binary cannot make it spuriously fail; no other test is expected to move it.
+    #[test]
+    fn the_screen_keeps_speculation_from_panicking_on_a_worker() {
+        use std::sync::atomic::Ordering;
+
+        let mut row0 = BTreeMap::new();
+        row0.insert(0, vec![1]);
+        row0.insert(1, vec![7]);
+        let mut row1 = BTreeMap::new();
+        row1.insert(0, vec![1]);
+        // States 0 and 1 are well formed; symbol 1 out of state 0 mints the bad metastate
+        // `{7}` as index 2, which the window dispatches while the cursor is still at 1.
+        let fa = Fa::with_states(0, 2, 2, vec![0, 1], vec![row0, row1]);
+        let policy = Pipeline {
+            workers: 4,
+            min_states: 0,
+            min_lookahead: 1,
+            window: 8,
+        };
+
+        let before = WORKER_PANICS.load(Ordering::Relaxed);
+        let outcome = std::panic::catch_unwind(|| {
+            subset_construction_with_policy(&fa, &[0usize].into_iter().collect(), policy)
+        });
+        let after = WORKER_PANICS.load(Ordering::Relaxed);
+
+        assert!(
+            outcome.is_err(),
+            "the malformed automaton should still panic on the calling thread"
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "a worker evaluated a metastate the screen should have held back \
+             ({} carried-back panic(s)), which prints panic-hook output the sequential \
+             engine never produces",
+            after - before
+        );
+    }
+
+    /// The screen itself, directly.
+    #[test]
+    fn members_are_in_range_screens_exactly_the_rows_that_exist() {
+        let mut row = BTreeMap::new();
+        row.insert(0, vec![0]);
+        let fa = Fa::with_states(0, 2, 1, vec![0, 0], vec![row.clone(), row]);
+        assert!(members_are_in_range(&fa, &[0, 1]));
+        assert!(!members_are_in_range(&fa, &[0, 2]));
+        assert!(!members_are_in_range(&fa, &[9]));
+        assert!(members_are_in_range(&fa, &[]));
+
+        // `alphabet_size == 0` never reads `fa.d` at all, so nothing needs screening --
+        // the load-bearing early-out `key_rows` documents.
+        let empty_alphabet = Fa::with_states(0, 1, 0, vec![0], vec![BTreeMap::new()]);
+        assert!(members_are_in_range(&empty_alphabet, &[5]));
     }
 
     /// The one `dest >= fa.q` shape the randomized comparison above deliberately cannot

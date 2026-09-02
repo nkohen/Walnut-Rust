@@ -13,6 +13,12 @@
 //!   infinitely-wide machine would still have to pay),
 //! * the resulting Amdahl ceiling `total / critical`,
 //! * the maximum number of tokens simultaneously ready (the raw "width").
+//!
+//! **The `WR_DAG_TRACE` writer is not in the tree.** It is a five-line, env-gated patch to
+//! `compute_with_ctx`, deliberately reverted after the study so `wr-logic` carries no
+//! measurement code; recover it with
+//! `git show 71f1bd0 -- crates/wr-logic/src/eval.rs`. This binary is kept because the
+//! measurement is worth being able to repeat, not because it runs as-is.
 
 use std::path::Path;
 
@@ -90,7 +96,10 @@ fn corpus_sweep(root: &Path) {
         let before = std::fs::metadata(&trace).map(|m| m.len()).unwrap_or(0);
         let _ = engine.dispatch(&f.command_script);
         let text = std::fs::read_to_string(&trace).unwrap_or_default();
-        for line in text[before as usize..].lines().filter(|l| !l.trim().is_empty()) {
+        for line in text[before as usize..]
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+        {
             let toks: Vec<(usize, u128)> = line
                 .split(',')
                 .filter_map(|t| {
@@ -128,7 +137,9 @@ fn corpus_sweep(root: &Path) {
             println!("work >= {floor_ms:>6.0} ms:  (none)");
             continue;
         }
-        let best = sel.iter().fold(sel[0], |a, b| if b.5 > a.5 { b } else { a });
+        let best = sel
+            .iter()
+            .fold(sel[0], |a, b| if b.5 > a.5 { b } else { a });
         let over_11 = sel.iter().filter(|r| r.5 >= 1.1).count();
         let work: f64 = sel.iter().map(|r| ms(r.2)).sum();
         let crit: f64 = sel.iter().map(|r| ms(r.3)).sum();
@@ -141,7 +152,7 @@ fn corpus_sweep(root: &Path) {
         );
     }
 
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
     println!(
         "\nthe 15 costliest compute() calls in the corpus:\n{:>8}  {:>6}  {:>10}  {:>10}  {:>8}  {:>5}",
         "fixture", "tokens", "work(ms)", "crit(ms)", "ceiling", "width"
@@ -212,7 +223,7 @@ fn main() {
                 })
                 .collect();
             let total: u128 = toks.iter().map(|t| t.1).sum();
-            if best.as_ref().is_none_or(|(_, b)| total > *b) {
+            if best.as_ref().map_or(true, |(_, b)| total > *b) {
                 best = Some((toks, total));
             }
         }

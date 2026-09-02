@@ -600,8 +600,6 @@ pub fn compute_with_ctx(
 ) -> Result<Expression, EvalError> {
     let mut stack: Vec<Expression> = Vec::new();
     let time_beginning = Instant::now();
-    // TEMPORARY MEASUREMENT SCAFFOLD (agent/par-det DAG-width study). Removed before merge.
-    let mut dag_trace: Vec<(usize, u128)> = Vec::new();
 
     for t in post_order {
         let time_before = Instant::now();
@@ -628,7 +626,6 @@ pub fn compute_with_ctx(
             });
         }
         let elapsed_ms = time_before.elapsed().as_millis();
-        dag_trace.push((t.arity(), time_before.elapsed().as_nanos()));
 
         // `if (t.isOperator() && nextExpression instanceof AutomatonExpression)`
         // (`:117`). `stack.last()` is `expressions.peek()`; `act()` above always
@@ -644,18 +641,6 @@ pub fn compute_with_ctx(
                 logging.log_evaluation_step(&step, false);
                 logging.indent();
             }
-        }
-    }
-
-    // TEMPORARY MEASUREMENT SCAFFOLD (agent/par-det DAG-width study). Removed before merge.
-    if let Ok(path) = std::env::var("WR_DAG_TRACE") {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let line: Vec<String> = dag_trace
-                .iter()
-                .map(|(a, n)| format!("{a}:{n}"))
-                .collect();
-            let _ = writeln!(f, "{}", line.join(","));
         }
     }
 
