@@ -257,7 +257,7 @@ mod tests {
         )
         .unwrap();
         let converted = tc.automaton_pairs()[0].automaton().unwrap();
-        assert_eq!(converted.alphabet, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(converted.track_alphabets(), vec![vec![0, 1, 2, 3]]);
         assert!(dir.join("Result").join("lt4.txt").is_file());
         assert!(dir.join("Automata Library").join("lt4.txt").is_file());
 

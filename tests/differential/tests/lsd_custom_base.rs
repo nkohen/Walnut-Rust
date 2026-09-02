@@ -268,15 +268,15 @@ fn compare_to_fixture(
     ground_truth.fa.totalize(0);
 
     let tracks = expected_alphabet.len();
-    assert_eq!(ground_truth.alphabet, expected_alphabet);
-    assert_eq!(ours.alphabet, expected_alphabet);
+    assert_eq!(ground_truth.track_alphabets(), expected_alphabet);
+    assert_eq!(ours.track_alphabets(), expected_alphabet);
     assert_eq!(
-        ground_truth.msd,
+        ground_truth.track_msds(),
         vec![Some(false); tracks],
         "the fixture's header must actually say lsd on every track"
     );
     assert_eq!(
-        ours.msd,
+        ours.track_msds(),
         vec![Some(false); tracks],
         "the port must keep every surviving track marked lsd"
     );

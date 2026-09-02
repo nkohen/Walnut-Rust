@@ -230,22 +230,22 @@ fn check_conversion(input: &str, to_msd: bool, to_base: i32, expected: &str, exp
     // 1. the declared number system.
     let expected_alphabet: Vec<i32> = (0..expected_base).collect();
     assert_eq!(
-        theirs.alphabet,
+        theirs.track_alphabets(),
         vec![expected_alphabet.clone()],
         "{what}: the fixture's own alphabet must be 0..{expected_base}"
     );
     assert_eq!(
-        theirs.msd,
+        theirs.track_msds(),
         vec![Some(to_msd)],
         "{what}: the fixture's own header must declare the requested direction"
     );
     assert_eq!(
-        ours.alphabet,
+        ours.track_alphabets(),
         vec![expected_alphabet],
         "{what}: the port must install the new base's alphabet"
     );
     assert_eq!(
-        ours.msd,
+        ours.track_msds(),
         vec![Some(to_msd)],
         "{what}: the port must install the new direction"
     );

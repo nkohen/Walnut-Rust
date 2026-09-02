@@ -1541,7 +1541,7 @@ impl NumberSystem {
 
         let mut addition =
             Self::set_addition_automaton(name, base, direction, files.addition.resolve())?;
-        let alphabet = &addition.alphabet[0];
+        let alphabet = addition.track_alphabet(0);
         let mut less_than = Self::set_less_than_automaton(
             name,
             base,
@@ -1561,7 +1561,7 @@ impl NumberSystem {
         // for a custom base it is the only way `msd_fib` survives into everything these
         // three automata are later combined into.
         for a in [&mut addition, &mut less_than, &mut equality] {
-            a.set_ns_names(vec![Some(name.to_string()); a.alphabet.len()]);
+            a.set_ns_names(vec![Some(name.to_string()); a.track_count()]);
         }
 
         // `allRepresentations = loadAutomatonOrNull(name, TXT_EXTENSION, base)` (`:147`).
@@ -1571,7 +1571,7 @@ impl NumberSystem {
             Some(mut n) => {
                 // `Collections.fill(allRepresentations.getNS(), this)` (`:151`) -- see this
                 // method's doc comment for the `all_reps` half, deliberately left empty.
-                n.msd = vec![Some(is_msd); n.alphabet.len()];
+                n.set_track_msds(vec![Some(is_msd); n.track_count()]);
                 let n = Rc::new(n);
                 // `Logging.disablePrint()` (`:151`) -- redundant with the one above (no
                 // intervening `enablePrint()`), ported as the same no-op re-assignment.
@@ -1581,7 +1581,7 @@ impl NumberSystem {
                 // installed by the two setters above and by `initBasicAutomaton`); here the
                 // per-track handle is installed explicitly.
                 for a in [&mut addition, &mut less_than, &mut equality] {
-                    a.set_all_reps(vec![Some(Rc::clone(&n)); a.alphabet.len()]);
+                    a.set_all_reps(vec![Some(Rc::clone(&n)); a.track_count()]);
                     a.apply_all_representations(logging);
                 }
                 Some(n)
@@ -1685,17 +1685,17 @@ impl NumberSystem {
             }
         };
 
-        if addition.alphabet.len() != 3 {
+        if addition.track_count() != 3 {
             return Err(NumSysError::AdditionInputCount(name.to_string()));
         }
-        let alphabet = &addition.alphabet[0];
+        let alphabet = addition.track_alphabet(0);
         if !alphabet.contains(&0) {
             return Err(NumSysError::AdditionAlphabetMissingZero(name.to_string()));
         }
         if !alphabet.contains(&1) {
             return Err(NumSysError::AdditionAlphabetMissingOne(name.to_string()));
         }
-        for track in &addition.alphabet[1..] {
+        for track in &addition.track_alphabets()[1..] {
             // `UtilityMethods.areEqual` is SET equality (see `Automaton::remove_same_inputs`).
             let lhs: BTreeSet<i32> = track.iter().copied().collect();
             let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
@@ -1704,7 +1704,10 @@ impl NumberSystem {
             }
         }
         // `for (i) addition.getNS().set(i, this)` (`:364-366`).
-        addition.msd = vec![Some(direction == Direction::Msd); addition.alphabet.len()];
+        addition.set_track_msds(vec![
+            Some(direction == Direction::Msd);
+            addition.track_count()
+        ]);
         Ok(addition)
     }
 
@@ -1751,12 +1754,18 @@ impl NumberSystem {
                 less_than
             }
         };
-        if less_than.alphabet.len() != 2 {
+        if less_than.track_count() != 2 {
             return Err(NumSysError::LessThanInputCount(name.to_string()));
         }
         let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
-        for (i, track) in less_than.alphabet.iter().enumerate() {
-            let lhs: BTreeSet<i32> = track.iter().copied().collect();
+        // U9 (idiomatic-refactor) Stage B: an index-range loop, not `.alphabet.iter()
+        // .enumerate()` -- `track_alphabet(i)` borrows `&less_than` per iteration and the
+        // borrow ends at `.collect()`, before `less_than.msd[i] = …` needs `&mut
+        // less_than` below; holding a live `track_alphabets().iter()` for the whole loop
+        // would conflict with that write (a real "simultaneous borrow of two facets"
+        // shape -- see U9's checkpoint report).
+        for i in 0..less_than.track_count() {
+            let lhs: BTreeSet<i32> = less_than.track_alphabet(i).iter().copied().collect();
             if lhs != rhs {
                 return Err(NumSysError::LessThanAlphabetMismatch(name.to_string()));
             }
@@ -1870,7 +1879,7 @@ impl NumberSystem {
 
     /// `NumberSystem.getAlphabet()` (`:257-259`) — `addition.richAlphabet.getA().get(0)`.
     pub fn get_alphabet(&self) -> &[i32] {
-        &self.addition.alphabet[0]
+        self.addition.track_alphabet(0)
     }
 
     /// `NumberSystem.determineBaseNameUnderscore()` (`:603-605`).
@@ -2935,7 +2944,7 @@ mod tests {
         let one = ns
             .get_constant(&big(1), &mut crate::logging::Logging::new())
             .unwrap();
-        assert_eq!(one.alphabet[0].len(), 5);
+        assert_eq!(one.track_alphabet(0).len(), 5);
         assert_eq!(one.get_arity(), 1);
 
         // lsd: the value 1 is "1" followed by any number of TRAILING zeros.
@@ -2962,7 +2971,7 @@ mod tests {
                 .unwrap();
             assert_eq!(zero.get_arity(), 1, "{name}");
             // the track alphabet was widened from the regex's {0,1} to the full base
-            assert_eq!(zero.alphabet[0], vec![0, 1, 2], "{name}");
+            assert_eq!(zero.track_alphabet(0), vec![0, 1, 2], "{name}");
             assert!(accepts_tuples(&zero, &single_track("0")), "{name}");
             assert!(accepts_tuples(&zero, &single_track("000")), "{name}");
             assert!(!accepts_tuples(&zero, &single_track("1")), "{name}");
@@ -3738,7 +3747,7 @@ mod tests {
         let a = ns
             .get_constant(&big(-5), &mut crate::logging::Logging::new())
             .unwrap();
-        assert_eq!(a.alphabet[0].len(), 10);
+        assert_eq!(a.track_alphabet(0).len(), 10);
         // Base -10, place values 1, -10, 100: "15" = -10 + 5 = -5, "05" = 5.
         // `getConstant` hands back an UNBOUND automaton (Java binds at the call site), and
         // `accepts_digits` matches by label, so the bind has to come first.
@@ -4087,7 +4096,7 @@ mod tests {
         let scrambled = [7, -2, 0];
         let a = lexicographic_less_than(&scrambled, Direction::Msd);
         // The track alphabets come out sorted, not in the caller's order.
-        assert_eq!(a.alphabet[0], vec![-2, 0, 7]);
+        assert_eq!(a.track_alphabet(0), vec![-2, 0, 7]);
         // -2 < 0 < 7 decided on the first digit pair, in VALUE order.
         assert!(accepts(&a, &[(-2, 0), (7, -2)]));
         assert!(accepts(&a, &[(0, 7), (7, -2)]));
@@ -4104,7 +4113,11 @@ mod tests {
     fn equality_automaton_is_the_diagonal_regardless_of_alphabet_order() {
         let scrambled = [7, -2, 0];
         let a = equality_automaton(&scrambled, Direction::Msd);
-        assert_eq!(a.alphabet[0], vec![7, -2, 0], "the alphabet is NOT sorted");
+        assert_eq!(
+            a.track_alphabet(0),
+            vec![7, -2, 0],
+            "the alphabet is NOT sorted"
+        );
         assert!(accepts(&a, &[(7, 7), (-2, -2), (0, 0)]));
         assert!(!accepts(&a, &[(7, 7), (-2, 0)]));
         assert!(!accepts(&a, &[(0, 7)]));
@@ -5212,7 +5225,11 @@ mod tests {
             )
             .unwrap();
             let bc = ns.base_change().unwrap();
-            assert_eq!(bc.alphabet, vec![vec![0, 1, 2], vec![0, 1, 2]], "{name}");
+            assert_eq!(
+                bc.track_alphabets(),
+                vec![vec![0, 1, 2], vec![0, 1, 2]],
+                "{name}"
+            );
             let prefix = if is_msd { "msd" } else { "lsd" };
             assert_eq!(
                 bc.track_ns_names(),
@@ -5547,7 +5564,7 @@ mod tests {
 
     /// Runs a single-track word (msd-first) through `a`, NFA-style.
     fn accepts_single_track_word(a: &Automaton, digits: &[i32]) -> bool {
-        assert_eq!(a.alphabet.len(), 1, "single-track helper");
+        assert_eq!(a.track_count(), 1, "single-track helper");
         let word: Vec<i32> = digits.iter().map(|&d| a.encode(&[d])).collect();
         let mut current: BTreeSet<usize> = [a.fa.q0].into_iter().collect();
         for sym in word {
@@ -5745,7 +5762,7 @@ mod tests {
             RelationalOp::Equal,
             &mut crate::logging::Logging::new(),
         );
-        assert_eq!(x_equals_x.alphabet.len(), 1, "the two tracks merged");
+        assert_eq!(x_equals_x.track_count(), 1, "the two tracks merged");
         for word in [
             vec![],
             vec![0],
@@ -5805,19 +5822,19 @@ mod tests {
         )
         .unwrap();
         for a in [ns.addition(), ns.less_than(), &ns.equality] {
-            assert_eq!(a.all_reps.len(), a.alphabet.len());
+            assert_eq!(a.track_all_reps_list().len(), a.track_count());
             assert!(
-                a.all_reps.iter().all(|r| r.is_some()),
+                a.track_all_reps_list().iter().all(|r| r.is_some()),
                 "every track carries the valid-representation automaton"
             );
             assert!(
-                a.msd.iter().all(|m| m == &Some(true)),
+                a.track_msds().iter().all(|m| m == &Some(true)),
                 "`getNS().set(i, this)` overwrote the file's null number systems"
             );
         }
         // Propagation through `arithmetic` (a clone + bind) and then `and`/`quantify`.
         let sum = ns.arithmetic("p", "q", "r", ArithmeticOp::Plus).unwrap();
-        assert!(sum.all_reps.iter().all(|r| r.is_some()));
+        assert!(sum.track_all_reps_list().iter().all(|r| r.is_some()));
     }
 
     /// `applyAllRepresentations`'s label quirk, observed at the one place in the port that
@@ -5851,7 +5868,10 @@ mod tests {
             &mut crate::logging::Logging::new(),
         )
         .unwrap();
-        assert_eq!(ns.less_than().alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(
+            ns.less_than().track_alphabets(),
+            vec![vec![0, 1], vec![0, 1]]
+        );
         // 01 < 10 lexicographically; both are valid representations.
         let lt = ns.comparison(
             "x",
@@ -6072,7 +6092,7 @@ mod tests {
     #[test]
     fn a_file_loaded_adder_missing_digit_one_is_a_clean_error() {
         let mut adder = msd_fib_addition();
-        adder.alphabet = vec![vec![0, 2], vec![0, 2], vec![0, 2]];
+        adder.set_track_alphabets(vec![vec![0, 2], vec![0, 2], vec![0, 2]]);
         adder.setup_encoder();
         let files = CustomBaseFiles {
             addition: CustomBaseCandidates {
@@ -6095,7 +6115,7 @@ mod tests {
     #[test]
     fn a_file_loaded_adder_with_mismatched_track_alphabets_is_a_clean_error() {
         let mut adder = msd_fib_addition();
-        adder.alphabet = vec![vec![0, 1], vec![0, 1], vec![0, 1, 2]];
+        adder.set_track_alphabets(vec![vec![0, 1], vec![0, 1], vec![0, 1, 2]]);
         adder.setup_encoder();
         let files = CustomBaseFiles {
             addition: CustomBaseCandidates {
@@ -6143,7 +6163,7 @@ mod tests {
     #[test]
     fn a_file_loaded_comparator_over_a_different_alphabet_is_a_clean_error() {
         let mut comparator = lexicographic_less_than(&[0, 1, 2], Direction::Msd);
-        comparator.msd = vec![None, None];
+        comparator.set_track_msds(vec![None, None]);
         let files = CustomBaseFiles {
             addition: CustomBaseCandidates {
                 main: Some(msd_fib_addition()),
@@ -6189,11 +6209,11 @@ mod tests {
             // Three tracks over `{0..n-1}` -- the negative-base adder, not the positive one.
             let n = crate::util::parse_neg_number(determine_base(name));
             assert_eq!(
-                ns.addition().alphabet,
+                ns.addition().track_alphabets(),
                 vec![(0..n).collect::<Vec<i32>>(); 3]
             );
             assert_eq!(
-                ns.less_than().alphabet,
+                ns.less_than().track_alphabets(),
                 vec![(0..n).collect::<Vec<i32>>(); 2]
             );
         }

@@ -600,13 +600,13 @@ pub fn write_matrix(
     // `:62-71`: per-free-variable domains, from the automaton's own alphabet.
     let mut domains: Vec<Vec<i32>> = Vec::with_capacity(indices.len());
     for (i, &idx) in indices.iter().enumerate() {
-        let dom = &automaton.alphabet[idx];
+        let dom = automaton.track_alphabet(idx);
         if dom.is_empty() {
             return Err(MatrixWriteError::EmptyValueDomain {
                 name: free_variables[i].clone(),
             });
         }
-        domains.push(dom.clone());
+        domains.push(dom.to_vec());
     }
 
     // `:73-79`: representative for the fix-up line -- prefer 0, else the domain's first

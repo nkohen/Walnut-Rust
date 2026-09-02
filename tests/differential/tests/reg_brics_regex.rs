@@ -174,7 +174,8 @@ fn reg_matches_real_walnut_output() {
             .unwrap_or_else(|e| panic!("{name}'s fixture must parse cleanly, got {e:?}"));
 
         assert_eq!(
-            ours.alphabet, alphabet_snapshot,
+            ours.track_alphabets(),
+            alphabet_snapshot,
             "{name} (`{baseexp}`): the built automaton must carry the declared tracks"
         );
         assert_eq!(

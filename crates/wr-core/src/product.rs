@@ -432,10 +432,10 @@ fn compute_same_inputs(a: &Automaton, b: &Automaton) -> Vec<i32> {
     for ((slot, b_label_i), b_alphabet_i) in same_inputs_in_a_and_b
         .iter_mut()
         .zip(b.label.iter())
-        .zip(b.alphabet.iter())
+        .zip(b.track_alphabets().iter())
     {
         if let Some(j) = a.label.iter().position(|l| l == b_label_i) {
-            let set_a: HashSet<i32> = a.alphabet[j].iter().copied().collect();
+            let set_a: HashSet<i32> = a.track_alphabet(j).iter().copied().collect();
             let set_b: HashSet<i32> = b_alphabet_i.iter().copied().collect();
             if set_a != set_b {
                 panic!("in computing cross product of two automaton, variables with the same label must have the same alphabet");
@@ -463,19 +463,16 @@ fn update_axb_fields(
     same_inputs_in_a_and_b: &[i32],
 ) {
     for i in 0..a.label.len() {
-        axb.alphabet.push(a.alphabet[i].clone());
+        // U9 (idiomatic-refactor) Stage B: `push_track` builds the alphabet/msd/all_reps/
+        // ns_name entries together, in one step -- `label` stays a separate push (its own
+        // documented carve-out, not one of `Track`'s four facets).
+        axb.push_track(a.track(i));
         axb.label.push(a.label[i].clone());
-        axb.msd.push(a.msd[i]);
-        axb.all_reps.push(a.all_reps[i].clone());
-        axb.ns_name.push(a.ns_name.get(i).cloned().flatten());
     }
     for (i, &j) in same_inputs_in_a_and_b.iter().enumerate() {
         if j == NOT_SAME_INPUT_IN_BOTH {
-            axb.alphabet.push(b.alphabet[i].clone());
+            axb.push_track(b.track(i));
             axb.label.push(b.label[i].clone());
-            axb.msd.push(b.msd[i]);
-            axb.all_reps.push(b.all_reps[i].clone());
-            axb.ns_name.push(b.ns_name.get(i).cloned().flatten());
         } else {
             let j = j as usize;
             // Java's `AxB.getNS().set(j, bNS.get(i))` replaces the whole `NumberSystem`
@@ -484,11 +481,21 @@ fn update_axb_fields(
             // verbatim (`msd[..].is_none()` IS "this track has no number system"), and
             // `all_reps` must move in lockstep or the two halves would describe different
             // number systems (see `Automaton::all_reps`'s invariant).
-            if b.msd[i].is_some() && axb.msd[j].is_none() {
-                axb.msd[j] = b.msd[i];
-                axb.all_reps[j] = b.all_reps[i].clone();
-                if j < axb.ns_name.len() {
-                    axb.ns_name[j] = b.ns_name.get(i).cloned().flatten();
+            //
+            // U9 Stage B: reads converted to the new accessors; the three writes below
+            // stay on the raw fields -- there is no single-index setter for
+            // "overwrite track j's msd/all_reps/ns_name in place, leaving alphabet[j]
+            // alone" (this crate's `Track` bundles all four facets together, but Java's
+            // own object model keeps `RichAlphabet`'s alphabet list and `NumberSystem`'s
+            // msd/all_reps/name triple as two SEPARATE lists, and `getNS().set(j, ns)`
+            // only ever touches the second one -- exactly this shape). Recorded as a Stage
+            // B checkpoint gap rather than improvised; see `flip_ns` in `logicalops.rs`
+            // for the same pattern (msd + ns_name, no all_reps there).
+            if b.track_msd(i).is_some() && axb.track_msd(j).is_none() {
+                axb.msd[j] = b.track_msd(i);
+                axb.all_reps[j] = b.track_all_reps(i).cloned();
+                if j < axb.track_ns_names_raw().len() {
+                    axb.ns_name[j] = b.track_ns_name_raw(i).map(String::from);
                 }
             }
         }
@@ -588,12 +595,18 @@ fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>)
     // common case.
     debug_assert_eq!(
         a.fa.alphabet_size,
-        a.alphabet.iter().map(|t| t.len()).product::<usize>(),
+        a.track_alphabets()
+            .iter()
+            .map(|t| t.len())
+            .product::<usize>(),
         "malformed `a`: fa.alphabet_size doesn't match the product of its track sizes"
     );
     debug_assert_eq!(
         b.fa.alphabet_size,
-        b.alphabet.iter().map(|t| t.len()).product::<usize>(),
+        b.track_alphabets()
+            .iter()
+            .map(|t| t.len())
+            .product::<usize>(),
         "malformed `b`: fa.alphabet_size doesn't match the product of its track sizes"
     );
 
@@ -1197,7 +1210,7 @@ mod tests {
             |x, y| BooleanOp::And.combine(x, y),
             &mut crate::logging::Logging::new(),
         );
-        assert_eq!(axb.msd, vec![Some(true)]);
+        assert_eq!(axb.track_msds(), vec![Some(true)]);
     }
 
     #[test]
@@ -1213,7 +1226,7 @@ mod tests {
             |x, y| BooleanOp::And.combine(x, y),
             &mut crate::logging::Logging::new(),
         );
-        assert_eq!(axb.msd, vec![Some(false)]);
+        assert_eq!(axb.track_msds(), vec![Some(false)]);
     }
 
     // --- Shared-variable semantics: AxB collapses a shared label to one track and
@@ -1283,7 +1296,7 @@ mod tests {
             vec!["x".to_string()],
             "a shared label collapses to ONE track, not two"
         );
-        assert_eq!(axb.automaton().alphabet, vec![vec![0, 1]]);
+        assert_eq!(axb.automaton().track_alphabets(), vec![vec![0, 1]]);
 
         let expected =
             equiv::product_dfa(&even_ones_dfa(), &ends_with_one_dfa(), |p, q| p && q).unwrap();
@@ -1314,7 +1327,7 @@ mod tests {
             let axb = cross_product(&a, &b, |p, q| BooleanOp::And.combine(p, q), &mut crate::logging::Logging::new());
 
             prop_assert_eq!(&axb.label, &vec!["x".to_string(), "y".to_string()]);
-            prop_assert_eq!(&axb.alphabet, &vec![vec![0, 1], vec![0, 1]]);
+            prop_assert_eq!(axb.track_alphabets(), &vec![vec![0, 1], vec![0, 1]]);
 
             let combined_word: Vec<i32> = (0..len).map(|i| axb.encode(&[x_word[i], y_word[i]])).collect();
 
@@ -1525,7 +1538,7 @@ mod tests {
              tracks are appended in B's own order"
         );
         assert_eq!(
-            axb.alphabet,
+            axb.track_alphabets(),
             vec![vec![0, 1], vec![0, 1, 2], vec![0, 1, 2, 3, 4], vec![0, 1]]
         );
 
@@ -1714,7 +1727,7 @@ mod tests {
         // the product symbol for (a_sym, b_sym) is `a_sym + 2*b_sym`. Asserting the full
         // transition table pins the numbering a second, independent way (every
         // destination id below is a discovery-order index).
-        assert_eq!(axb.alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(axb.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
         assert_eq!(axb.label, vec!["x".to_string(), "y".to_string()]);
         assert_eq!(axb.fa.alphabet_size, 4);
         let z = |a_sym: i32, b_sym: i32| a_sym + 2 * b_sym;

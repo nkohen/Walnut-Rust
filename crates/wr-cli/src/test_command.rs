@@ -353,7 +353,7 @@ fn is_after_previous(previous: Option<&[i32]>, length: i32, comparison: i32) -> 
 /// same user-facing formatting as `Automaton.findAcceptedHelper`: single-arity digits
 /// 0..9 are printed without brackets, while vector symbols remain bracketed."
 fn format_accepted_word(m: &Automaton, word: &[i32]) -> String {
-    let single_arity = m.alphabet.len() == 1;
+    let single_arity = m.track_count() == 1;
     let mut path = String::new();
 
     for &sym in word {
@@ -631,7 +631,7 @@ mod tests {
         // turns this back into `accept_everything_automaton`'s `0, 1, 00, ...` list,
         // which is what makes this the regression test for it.
         let mut a = accept_everything_automaton();
-        a.msd = vec![Some(true)];
+        a.set_track_msds(vec![Some(true)]);
         let expected: Vec<&str> = vec!["1", "10", "11", "100", "101", "110", "111", "1000"];
         assert_eq!(
             find_accepted(&mut a, &mut Logging::new(), 8).unwrap(),

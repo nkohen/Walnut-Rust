@@ -791,7 +791,7 @@ mod tests {
     /// `wr-core`-test-private — so this is a small, deliberate duplicate, not a new
     /// shared abstraction).
     fn accepts_single_track_msd(a: &Automaton, digits: &[i32]) -> bool {
-        assert_eq!(a.alphabet.len(), 1, "single-track helper");
+        assert_eq!(a.track_count(), 1, "single-track helper");
         let mut current = std::collections::BTreeSet::from([a.fa.q0]);
         for &d in digits {
             let sym = a.encode(&[d]);
@@ -1050,7 +1050,7 @@ mod tests {
     /// taken in `a.label` order, so a caller passes digits in whatever order the result's
     /// own labels say — which is exactly what makes argument-order bugs visible.
     fn accepts_two_track_msd(a: &Automaton, w0: &[i32], w1: &[i32]) -> bool {
-        assert_eq!(a.alphabet.len(), 2, "two-track helper");
+        assert_eq!(a.track_count(), 2, "two-track helper");
         assert_eq!(
             w0.len(),
             w1.len(),

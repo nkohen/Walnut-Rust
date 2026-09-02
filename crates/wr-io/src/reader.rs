@@ -1849,8 +1849,8 @@ mod tests {
     fn reads_automaton572_explicit_set_alphabet() {
         // {0, 1}; state 0 (q0, accepting) self-loops on both symbols to state 0.
         let a = read_automaton_txt(fixture("automaton572.txt")).unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![None]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![None]);
         assert_eq!(a.fa.q, 1);
         assert!(a.fa.is_accepting(a.fa.q0));
         assert!(a
@@ -1861,8 +1861,8 @@ mod tests {
     #[test]
     fn reads_automaton2_msd3_four_track() {
         let a = read_automaton_txt(fixture("automaton2.txt")).unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1, 2]; 4]);
-        assert_eq!(a.msd, vec![Some(true); 4]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1, 2]; 4]);
+        assert_eq!(a.track_msds(), vec![Some(true); 4]);
         assert_eq!(a.fa.q, 4);
         assert!(a.fa.is_deterministic());
         // Accepts exactly the one 3-transition path the file spells out:
@@ -2468,18 +2468,18 @@ mod tests {
     #[test]
     fn a_duplicated_alphabet_symbol_is_removed_before_the_alphabet_is_sized() {
         let dup = read_automaton_from_str("{0,0,1}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
-        assert_eq!(dup.alphabet, vec![vec![0, 1]]);
+        assert_eq!(dup.track_alphabets(), vec![vec![0, 1]]);
         assert_eq!(dup.fa.alphabet_size, 2);
         // ...and it is now structurally identical to the un-duplicated spelling, which is
         // exactly the comparison `isNSDiffering` performs.
         let plain = read_automaton_from_str("{0,1}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
-        assert_eq!(dup.alphabet, plain.alphabet);
+        assert_eq!(dup.track_alphabets(), plain.track_alphabets());
         assert_eq!(dup.fa.alphabet_size, plain.fa.alphabet_size);
 
         // Order is first-occurrence, not sorted (`LinkedHashSet`), and duplicates are
         // removed per track, not globally.
         let d = read_automaton_from_str("{3,1,3} {1,1}\n0 0\n3 1 -> 0\n1 1 -> 0\n").unwrap();
-        assert_eq!(d.alphabet, vec![vec![3, 1], vec![1]]);
+        assert_eq!(d.track_alphabets(), vec![vec![3, 1], vec![1]]);
         assert_eq!(d.fa.alphabet_size, 2);
 
         // `readTransducer` shares `firstParse`, so it dedups too
@@ -2498,9 +2498,9 @@ mod tests {
     #[test]
     fn an_explicit_set_may_space_a_sign_away_from_its_digits() {
         let a = read_automaton_from_str("{ - 3 , 0 }\n0 0\n-3 -> 0\n0 -> 0\n").unwrap();
-        assert_eq!(a.alphabet, vec![vec![-3, 0]]);
+        assert_eq!(a.track_alphabets(), vec![vec![-3, 0]]);
         let b = read_automaton_from_str("{+ 1,2}\n0 0\n1 -> 0\n2 -> 0\n").unwrap();
-        assert_eq!(b.alphabet, vec![vec![1, 2]]);
+        assert_eq!(b.track_alphabets(), vec![vec![1, 2]]);
         // A dangling comma is still a hard failure: the repeated group backtracks to zero
         // extra repetitions without consuming it, so the `\s*\}` requirement fails on the
         // leftover `,}` and `parseAlphabetDeclaration` returns false. Real jar:
@@ -2567,7 +2567,7 @@ mod tests {
         // the last token is consumed by the pattern's own `\s*` (real Walnut's writer emits
         // exactly such a trailing space).
         let a = read_automaton_from_str("\u{b}\t msd_2 \u{c}\n0 0\n0 -> 0\n1 -> 0\n").unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
     }
 
     // --- trivial (TRUE/FALSE) automaton files (U0) ---
@@ -2586,9 +2586,9 @@ mod tests {
         assert!(a.is_true_automaton());
         assert!(!a.is_empty(), "the TRUE automaton's language is not empty");
         assert_eq!(a.get_arity(), 0);
-        assert!(a.alphabet.is_empty());
+        assert!(a.track_alphabets().is_empty());
         assert!(a.label.is_empty());
-        assert!(a.msd.is_empty());
+        assert!(a.track_msds().is_empty());
     }
 
     #[test]
@@ -2769,8 +2769,8 @@ mod tests {
         std::fs::write(&path, "msd_fib\n\n0 1\n0 -> 0\n1 -> 0\n").unwrap();
 
         let a = read_automaton_txt_with_custom_bases(&path, &cb_dir).unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![Some(true)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![Some(true)]);
         assert!(a.fa.is_accepting(a.fa.q0));
 
         // Same file through the plain (no-directory) entry point is unaffected --
@@ -2811,9 +2811,9 @@ mod tests {
         )
         .unwrap();
         let a = read_automaton_txt_with_custom_bases(&path, &cb_dir).unwrap();
-        assert_eq!(a.all_reps.len(), 2, "one entry per track");
+        assert_eq!(a.track_all_reps_list().len(), 2, "one entry per track");
         assert!(
-            a.all_reps.iter().all(|r| r.is_some()),
+            a.track_all_reps_list().iter().all(|r| r.is_some()),
             "every msd_fib track must carry the base's all-representations automaton"
         );
 
@@ -2823,8 +2823,8 @@ mod tests {
         let plain = dir.join("plain.txt");
         std::fs::write(&plain, "msd_2 {0,1}\n\n0 1\n0 0 -> 0\n").unwrap();
         let p = read_automaton_txt_with_custom_bases(&plain, &cb_dir).unwrap();
-        assert_eq!(p.all_reps.len(), 2);
-        assert!(p.all_reps.iter().all(|r| r.is_none()));
+        assert_eq!(p.track_all_reps_list().len(), 2);
+        assert!(p.track_all_reps_list().iter().all(|r| r.is_none()));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2856,8 +2856,8 @@ mod tests {
         let two = read_automaton_txt_with_custom_bases(&two_path, &cb_dir).unwrap();
 
         // Identical by every fact the pre-fix `Automaton` carried...
-        assert_eq!(fib.alphabet, two.alphabet);
-        assert_eq!(fib.msd, two.msd);
+        assert_eq!(fib.track_alphabets(), two.track_alphabets());
+        assert_eq!(fib.track_msds(), two.track_msds());
         // ...and distinguishable only by the name, which is now kept.
         assert_eq!(fib.track_ns_names(), vec![Some("msd_fib".to_string())]);
         assert_eq!(two.track_ns_names(), vec![Some("msd_2".to_string())]);
@@ -2932,8 +2932,8 @@ mod tests {
             fallback: global.clone(),
         };
         let a = read_automaton_txt_with_custom_base_resolver(&path, &resolver).unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![Some(true)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![Some(true)]);
 
         // Neither directory alone is sufficient: the adder is mandatory, so the
         // session-only view cannot resolve `msd_fib` at all.
@@ -2969,8 +2969,8 @@ mod tests {
         std::fs::write(&path, "msd_wide\n\n0 1\n0 -> 0\n1 -> 0\n2 -> 0\n").unwrap();
 
         let a = read_automaton_txt_with_custom_bases(&path, &dir).unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1, 2]]);
-        assert_eq!(a.msd, vec![Some(true)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1, 2]]);
+        assert_eq!(a.track_msds(), vec![Some(true)]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2995,7 +2995,7 @@ mod tests {
 
         let dfa = read_automaton_dfa_txt_with_custom_bases(&path, &cb_dir).unwrap();
         assert!(dfa.automaton().fa.is_deterministic());
-        assert_eq!(dfa.automaton().alphabet, vec![vec![0, 1]]);
+        assert_eq!(dfa.automaton().track_alphabets(), vec![vec![0, 1]]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3046,8 +3046,8 @@ mod tests {
         let path = dir.join("neg.txt");
         std::fs::write(&path, "msd_neg_2 lsd_neg_3\n\n0 1\n0 0 -> 0\n").unwrap();
         let a = read_automaton_txt(&path).expect("a negative base needs no Custom Bases file");
-        assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
-        assert_eq!(a.msd, vec![Some(true), Some(false)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1, 2]]);
+        assert_eq!(a.track_msds(), vec![Some(true), Some(false)]);
         assert_eq!(
             a.track_ns_names(),
             vec![Some("msd_neg_2".to_string()), Some("lsd_neg_3".to_string())]
@@ -3290,7 +3290,7 @@ mod tests {
     fn read_automaton_dfa_txt_on_an_already_deterministic_fixture() {
         let dfa = read_automaton_dfa_txt(fixture("automaton2.txt")).unwrap();
         assert!(dfa.automaton().fa.is_deterministic());
-        assert_eq!(dfa.automaton().alphabet, vec![vec![0, 1, 2]; 4]);
+        assert_eq!(dfa.automaton().track_alphabets(), vec![vec![0, 1, 2]; 4]);
     }
 
     #[test]
@@ -3555,7 +3555,7 @@ mod tests {
             );
             // Sanity: the same file with an ordinary comment line loads.
             let ok = read_automaton_from_str("#x\nmsd_2\n0 0\n0 -> 0\n").unwrap();
-            assert_eq!(ok.alphabet, vec![vec![0, 1]]);
+            assert_eq!(ok.track_alphabets(), vec![vec![0, 1]]);
         }
     }
 
@@ -3614,8 +3614,8 @@ mod tests {
         let cr = "{0, 1} \r\r0 1\r0 -> 0\r1 -> 0\r";
         let a_lf = read_automaton_from_str(lf).unwrap();
         let a_cr = read_automaton_from_str(cr).unwrap();
-        assert_eq!(a_lf.alphabet, a_cr.alphabet);
-        assert_eq!(a_lf.msd, a_cr.msd);
+        assert_eq!(a_lf.track_alphabets(), a_cr.track_alphabets());
+        assert_eq!(a_lf.track_msds(), a_cr.track_msds());
         assert_eq!(format!("{:?}", a_lf.fa), format!("{:?}", a_cr.fa));
     }
 

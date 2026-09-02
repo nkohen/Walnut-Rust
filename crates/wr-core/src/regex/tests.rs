@@ -656,9 +656,9 @@ fn reg_yields_a_one_state_accepting_automaton_for_the_empty_string_language() {
 fn reg_installs_the_declared_tracks_and_alphabet_size_on_the_result() {
     let m = reg(vec![vec![0, 1], vec![0, 1, 2]], "[1,2]*").expect("builds");
     let a = m.automaton();
-    assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
+    assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1, 2]]);
     assert_eq!(a.fa.alphabet_size, 6);
-    assert_eq!(a.msd, vec![None, None]);
+    assert_eq!(a.track_msds(), vec![None, None]);
 }
 
 #[test]

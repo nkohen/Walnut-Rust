@@ -328,7 +328,7 @@ pub fn process_split(
         ));
     }
     // `if (inputs.size() != automaton.richAlphabet.getA().size())` (`:76-78`).
-    if inputs.len() != automaton.alphabet.len() {
+    if inputs.len() != automaton.track_count() {
         return Err(SplitError::Walnut(
             "Split automaton has incorrect number of inputs.".to_string(),
         ));
@@ -340,7 +340,7 @@ pub fn process_split(
     // assignment in Java, not `bind()`: no `removeSameInputs`, no `labelSorted`/`canonized`
     // reset. The names are distinct by construction, so the only observable difference
     // would be those two flags; assigning directly keeps the port faithful anyway.
-    m.label = (0..automaton.alphabet.len())
+    m.label = (0..automaton.track_count())
         .map(|i| format!("b{i}"))
         .collect();
 
@@ -780,7 +780,7 @@ mod tests {
             SplitDirection::Forward,
         )
         .unwrap();
-        assert_eq!(out.alphabet.len(), 2);
+        assert_eq!(out.track_count(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 

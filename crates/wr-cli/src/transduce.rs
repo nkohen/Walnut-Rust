@@ -388,7 +388,7 @@ mod tests {
 
         let c = tc.automaton_pairs()[0].automaton().unwrap();
         // Still an lsd_2 result (the reversal is undone on the way out).
-        assert_eq!(c.msd, vec![Some(false)]);
+        assert_eq!(c.track_msds(), vec![Some(false)]);
 
         let mut running = 0i32;
         for n in 0u32..40 {

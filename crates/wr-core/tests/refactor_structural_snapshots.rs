@@ -446,7 +446,7 @@ fn number_system_new_msd_3_less_than_has_the_hand_derived_lexicographic_shape() 
     );
     // The converted loop's ONLY side effect: per-track `msd = Some(direction ==
     // Msd)`. Two tracks, direction msd -> both `Some(true)` (confirmed live).
-    assert_eq!(less_than.msd, vec![Some(true), Some(true)]);
+    assert_eq!(less_than.track_msds(), vec![Some(true), Some(true)]);
 }
 
 /// `NumberSystem::new("lsd_3")` takes the SAME `lexicographic_less_than` shape as
@@ -505,7 +505,7 @@ fn number_system_new_lsd_3_less_than_is_the_msd_shape_reversed() {
     );
     // Same converted loop, direction lsd this time -> both tracks `Some(false)`
     // (confirmed live, not assumed from the msd_3 case above).
-    assert_eq!(less_than.msd, vec![Some(false), Some(false)]);
+    assert_eq!(less_than.track_msds(), vec![Some(false), Some(false)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,7 +576,10 @@ fn number_system_set_addition_automaton_msd_2_has_the_hand_derived_carry_shape()
             map(&[(1, &[1]), (2, &[1]), (3, &[0]), (7, &[1])]),
         ]
     );
-    assert_eq!(addition.msd, vec![Some(true), Some(true), Some(true)]);
+    assert_eq!(
+        addition.track_msds(),
+        vec![Some(true), Some(true), Some(true)]
+    );
 }
 
 /// Covers [`NumberSystem::with_custom_base_files`]'s `alphabet` local (the
@@ -597,7 +600,7 @@ fn number_system_with_custom_base_files_msd_3_equality_has_the_hand_derived_diag
     assert_eq!(eq.fa.alphabet_size, 9);
     assert_eq!(eq.fa.o, vec![1]);
     assert_eq!(eq.fa.d, vec![map(&[(0, &[0]), (4, &[0]), (8, &[0])])]);
-    assert_eq!(eq.msd, vec![Some(true), Some(true)]);
+    assert_eq!(eq.track_msds(), vec![Some(true), Some(true)]);
 }
 
 /// The `lsd_3` twin of the test above: `equality_automaton` "is never reversed
@@ -617,7 +620,7 @@ fn number_system_with_custom_base_files_lsd_3_equality_is_the_same_shape_directi
     assert_eq!(eq.fa.alphabet_size, 9);
     assert_eq!(eq.fa.o, vec![1]);
     assert_eq!(eq.fa.d, vec![map(&[(0, &[0]), (4, &[0]), (8, &[0])])]);
-    assert_eq!(eq.msd, vec![Some(false), Some(false)]);
+    assert_eq!(eq.track_msds(), vec![Some(false), Some(false)]);
 }
 
 /// A one-track automaton over `{0,1}` accepting the words with no `11`
@@ -700,8 +703,8 @@ fn apply_all_representations_single_restricted_track_has_this_exact_shape() {
         ]
     );
     assert_eq!(a.label, vec!["x", "y"]);
-    assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1]]);
-    assert_eq!(a.msd, vec![Some(true), Some(true)]);
+    assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
+    assert_eq!(a.track_msds(), vec![Some(true), Some(true)]);
 }
 
 /// The `apply_all_representations_with_output` twin of the test above (covers
@@ -729,8 +732,8 @@ fn apply_all_representations_with_output_single_restricted_track_has_this_exact_
         ]
     );
     assert_eq!(b.label, vec!["x", "y"]);
-    assert_eq!(b.alphabet, vec![vec![0, 1], vec![0, 1]]);
-    assert_eq!(b.msd, vec![Some(true), Some(true)]);
+    assert_eq!(b.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
+    assert_eq!(b.track_msds(), vec![Some(true), Some(true)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +838,7 @@ fn track_structure_of_a_plain_msd_2_bound_automaton() {
         &["x", "y"],
     );
     assert!(
-        a.all_reps.iter().all(Option::is_none),
+        a.track_all_reps_list().iter().all(Option::is_none),
         "an ordinary base has no all-reps restriction on any track"
     );
 }
@@ -881,7 +884,7 @@ fn track_structure_of_a_custom_base_bound_automaton() {
         &["a", "b", "c"],
     );
     assert!(
-        a.all_reps.iter().all(Option::is_some),
+        a.track_all_reps_list().iter().all(Option::is_some),
         "a custom base with a resolved all-representations file restricts every track"
     );
 }
@@ -904,7 +907,7 @@ fn track_structure_of_a_multi_track_msd_2_bound_automaton() {
         &[Some("msd_2"), Some("msd_2"), Some("msd_2")],
         &["x", "y", "z"],
     );
-    assert!(a.all_reps.iter().all(Option::is_none));
+    assert!(a.track_all_reps_list().iter().all(Option::is_none));
 }
 
 /// The unbound case: `NumberSystem`'s own cached `lessThan`/`addition`/`equality`

@@ -99,8 +99,8 @@ fn compare_to_fixture(predicate: &str, fixture: &str, expected_alphabet: &[Vec<i
     ours.fa.totalize(0);
     ground_truth.fa.totalize(0);
 
-    assert_eq!(ground_truth.alphabet, expected_alphabet);
-    assert_eq!(ours.alphabet, expected_alphabet);
+    assert_eq!(ground_truth.track_alphabets(), expected_alphabet);
+    assert_eq!(ours.track_alphabets(), expected_alphabet);
     assert_eq!(
         automaton_language_equivalent(&ours, &ground_truth),
         Ok(true),

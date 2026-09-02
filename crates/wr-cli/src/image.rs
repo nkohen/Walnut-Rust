@@ -238,24 +238,28 @@ fn determine_image_number_system_prefix(
     word: &Automaton,
     word_name: &str,
 ) -> Result<String, ImageError> {
-    if word.arity() != 1 || word.msd.len() != 1 {
+    if word.arity() != 1 || word.track_msds().len() != 1 {
         return Err(ImageError::NotUnaryWordAutomaton {
             name: word_name.to_string(),
         });
     }
-    match word.msd[0] {
+    match word.track_msd(0) {
         // `ns == null` -- this crate's `None` stand-in.
         None => Ok(String::new()),
         Some(is_msd) => {
             // A custom base (`msd_fib`, ...) is exactly `all_reps[0].is_some()`. Its real
             // `NumberSystem` name is not recoverable here, and the `msd_<alphabet.len()>`
             // reconstruction below would be actively WRONG for it -- see module docs.
-            if word.all_reps.first().is_some_and(Option::is_some) {
+            if word
+                .track_all_reps_list()
+                .first()
+                .is_some_and(Option::is_some)
+            {
                 return Err(ImageError::CustomBaseNotSupported {
                     name: word_name.to_string(),
                 });
             }
-            let base = word.alphabet[0].len();
+            let base = word.track_alphabet(0).len();
             Ok(format!("?{}_{base}", if is_msd { "msd" } else { "lsd" }))
         }
     }
@@ -444,7 +448,7 @@ mod tests {
         // ...and it is genuinely the 2-state Thue-Morse DFAO, not some larger automaton
         // that merely agrees on the sampled prefix.
         assert_eq!(result.fa.q, 2);
-        assert_eq!(result.alphabet, vec![vec![0, 1]]);
+        assert_eq!(result.track_alphabets(), vec![vec![0, 1]]);
 
         // The written file is the same automaton (the Result copy and the Word Automata
         // Library copy are byte-identical, per `write_automata`'s copy-based shape).

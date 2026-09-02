@@ -211,7 +211,7 @@ fn write_alphabet<W: Write>(automaton: &Automaton, out: &mut W) -> io::Result<()
                 write!(
                     out,
                     "{{{}}} ",
-                    generic_list_string(&automaton.alphabet[i], ", ")
+                    generic_list_string(automaton.track_alphabet(i), ", ")
                 )?;
             }
         }

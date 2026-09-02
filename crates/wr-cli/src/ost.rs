@@ -402,11 +402,11 @@ mod tests {
         // The returned pairs really are the two DISTINCT automata, not the same one
         // twice: the adder is 3-track, the representation automaton 1-track.
         assert_eq!(
-            tc.automaton_pairs()[0].automaton().unwrap().alphabet.len(),
+            tc.automaton_pairs()[0].automaton().unwrap().track_count(),
             3
         );
         assert_eq!(
-            tc.automaton_pairs()[1].automaton().unwrap().alphabet.len(),
+            tc.automaton_pairs()[1].automaton().unwrap().track_count(),
             1
         );
 

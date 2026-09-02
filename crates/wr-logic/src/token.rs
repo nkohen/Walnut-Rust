@@ -2286,11 +2286,17 @@ impl AlphabetLetter {
 /// classified deliberately rather than left to borrow WB-013's (then false) message. Kept
 /// for the same reason `wr_core::logicalops::ConvertNsError::BaseOverflowsInt` is.
 fn track_equality_automaton(automaton: &Automaton, i: usize) -> OwnedTrackNs {
-    let Some(is_msd) = automaton.msd.get(i).copied().flatten() else {
+    // U9 (idiomatic-refactor) Stage B: `track_msds()`/`track_alphabets()`/
+    // `track_all_reps_list()` are plain slices, so `.get(i)` on them is exactly as
+    // checked/non-panicking as `automaton.msd.get(i)` etc. was on the raw `Vec`s --
+    // this whole function exists to handle an `i` that may not be a valid track index
+    // (see its own doc comment), which is why the checked form is used throughout
+    // rather than the panicking `track_msd`/`track_alphabet`/`track_all_reps`.
+    let Some(is_msd) = automaton.track_msds().get(i).copied().flatten() else {
         // Java's own `null`: a `{...}`-declared track (WB-013).
         return OwnedTrackNs::DeclaredAlphabet;
     };
-    let Some(alphabet) = automaton.alphabet.get(i) else {
+    let Some(alphabet) = automaton.track_alphabets().get(i) else {
         // Unreachable from any caller -- see this function's last section.
         return OwnedTrackNs::NumberSystemUnrecoverable;
     };
@@ -2310,10 +2316,14 @@ fn track_equality_automaton(automaton: &Automaton, i: usize) -> OwnedTrackNs {
         .cloned()
         .flatten()
         .expect("msd[i] and alphabet[i] are both present, so track_ns_names()[i] is Some");
-    equality.set_ns_names(vec![Some(name); equality.alphabet.len()]);
+    equality.set_ns_names(vec![Some(name); equality.track_count()]);
     // `allRepresentations != null` -> `equality.applyAllRepresentations()` (`:151-155`).
-    if let Some(restriction) = automaton.all_reps.get(i).and_then(|r| r.as_ref()) {
-        equality.set_all_reps(vec![Some(Rc::clone(restriction)); equality.alphabet.len()]);
+    if let Some(restriction) = automaton
+        .track_all_reps_list()
+        .get(i)
+        .and_then(|r| r.as_ref())
+    {
+        equality.set_all_reps(vec![Some(Rc::clone(restriction)); equality.track_count()]);
         // Throwaway `Logging` on purpose -- Java logs nothing here; see the docs above.
         equality.apply_all_representations(&mut wr_core::logging::Logging::new());
     }
@@ -2341,8 +2351,8 @@ impl OwnedTrackNs {
         match self {
             OwnedTrackNs::Present(eq) => format!(
                 "Present(ns_name={:?}, alphabet={:?})",
-                eq.ns_name.first(),
-                eq.alphabet.first()
+                eq.track_ns_names_raw().first(),
+                eq.track_alphabets().first()
             ),
             OwnedTrackNs::DeclaredAlphabet => "DeclaredAlphabet".to_string(),
             OwnedTrackNs::NumberSystemUnrecoverable => "NumberSystemUnrecoverable".to_string(),
@@ -3842,12 +3852,18 @@ mod tests {
             let computed = track_equality_automaton(&a, 0);
             let computed = expect_equality(&computed);
             assert_eq!(
-                computed.alphabet, ns.equality.alphabet,
+                computed.track_alphabets(),
+                ns.equality.track_alphabets(),
                 "{name}: alphabet must match the real number system's equality automaton"
             );
-            assert_eq!(computed.msd, ns.equality.msd, "{name}: direction");
             assert_eq!(
-                computed.ns_name, ns.equality.ns_name,
+                computed.track_msds(),
+                ns.equality.track_msds(),
+                "{name}: direction"
+            );
+            assert_eq!(
+                computed.track_ns_names_raw(),
+                ns.equality.track_ns_names_raw(),
                 "{name}: the number system's NAME is installed on every track of `equality` \
                  (`NumberSystem.java:364-366`/`:392`) and survives into the result"
             );
@@ -3904,7 +3920,7 @@ mod tests {
         let custom = track_equality_automaton(&a, 2);
         let custom = expect_equality(&custom);
         assert_eq!(
-            custom.ns_name,
+            custom.track_ns_names_raw(),
             vec![Some("msd_fib".to_string()); 2],
             "a custom-base track computes its own equality automaton, under its own name -- \
              it is NOT Java's null case and must never report WB-013's message"
@@ -3931,17 +3947,20 @@ mod tests {
     fn a_custom_base_without_an_all_representations_file_computes_its_own_equality() {
         let a = track(vec![0, 1, 5], true, Some("msd_bar"));
         assert!(
-            a.all_reps.iter().all(Option::is_none),
+            a.track_all_reps_list().iter().all(Option::is_none),
             "the whole point of this test is that `all_reps` says nothing here"
         );
         let computed = track_equality_automaton(&a, 0);
         let computed = expect_equality(&computed);
         assert_eq!(
-            computed.alphabet,
+            computed.track_alphabets(),
             vec![vec![0, 1, 5]; 2],
             "the track's OWN alphabet, not a `msd_3` fabricated from its cardinality"
         );
-        assert_eq!(computed.ns_name, vec![Some("msd_bar".to_string()); 2]);
+        assert_eq!(
+            computed.track_ns_names_raw(),
+            vec![Some("msd_bar".to_string()); 2]
+        );
         // The diagonal over `{0, 1, 5}`, including the letter a fabricated `msd_3` would
         // not have had at all.
         assert!(accepts_pair(computed, &[(5, 5), (0, 0), (1, 1)]));
@@ -3973,11 +3992,14 @@ mod tests {
         let computed = track_equality_automaton(&a, 0);
         let computed = expect_equality(&computed);
         assert_eq!(
-            computed.alphabet,
+            computed.track_alphabets(),
             vec![vec![0, 1, 2, 3]; 2],
             "the shadowing base's alphabet, not the programmatic one's"
         );
-        assert_eq!(computed.ns_name, vec![Some("msd_neg_3".to_string()); 2]);
+        assert_eq!(
+            computed.track_ns_names_raw(),
+            vec![Some("msd_neg_3".to_string()); 2]
+        );
         assert!(accepts_pair(computed, &[(3, 3)]));
         assert!(!accepts_pair(computed, &[(3, 2)]));
         assert_eq!(
@@ -4000,9 +4022,9 @@ mod tests {
         let a = track(vec![0, 1, 2], true, Some("msd_baz"));
         let computed = track_equality_automaton(&a, 0);
         let computed = expect_equality(&computed);
-        assert_eq!(computed.alphabet, vec![vec![0, 1, 2]; 2]);
+        assert_eq!(computed.track_alphabets(), vec![vec![0, 1, 2]; 2]);
         assert_eq!(
-            computed.ns_name,
+            computed.track_ns_names_raw(),
             vec![Some("msd_baz".to_string()); 2],
             "the recorded name survives; it is not re-derived as `msd_3`"
         );
@@ -4022,12 +4044,12 @@ mod tests {
     fn a_track_with_no_recorded_name_falls_back_to_direction_plus_alphabet_size() {
         let computed = track_equality_automaton(&track(vec![0, 1, 2], true, None), 0);
         assert_eq!(
-            expect_equality(&computed).ns_name,
+            expect_equality(&computed).track_ns_names_raw(),
             vec![Some("msd_3".to_string()); 2]
         );
         let computed = track_equality_automaton(&track(vec![0, 1], false, None), 0);
         assert_eq!(
-            expect_equality(&computed).ns_name,
+            expect_equality(&computed).track_ns_names_raw(),
             vec![Some("lsd_2".to_string()); 2]
         );
     }
@@ -4140,7 +4162,7 @@ mod tests {
         match stack.as_slice() {
             [Expression::Word(w)] => {
                 assert_eq!(
-                    w.word_automaton.alphabet[0],
+                    w.word_automaton.track_alphabet(0),
                     vec![0, 1, 5],
                     "the custom base's own alphabet survives -- a fabricated `msd_3` would \
                      have made this `{{0, 1, 2}}` and failed the cross product outright"
@@ -5888,7 +5910,7 @@ mod tests {
         assert_eq!(result.to_string(), "`x<5");
         let m = as_automaton_expression(result).m;
         assert_eq!(
-            m.msd,
+            m.track_msds(),
             vec![Some(false)],
             "reverse(_, true) must flip msd to lsd"
         );

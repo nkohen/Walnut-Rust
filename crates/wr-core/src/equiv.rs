@@ -261,7 +261,7 @@ pub fn automaton_language_equivalent(a: &Automaton, b: &Automaton) -> Result<boo
     if a.fa.is_true_false_automaton() || b.fa.is_true_false_automaton() {
         return language_equivalent(&a.fa, &b.fa);
     }
-    if a.alphabet != b.alphabet {
+    if a.track_alphabets() != b.track_alphabets() {
         return Err(EquivError::MismatchedTrackStructure);
     }
     language_equivalent(&a.fa, &b.fa)

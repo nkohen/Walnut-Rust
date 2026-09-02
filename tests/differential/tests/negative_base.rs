@@ -223,15 +223,19 @@ fn compare_to_fixture(
 
     let tracks = expected_alphabet.len();
     let is_msd = expected_ns_name.starts_with("msd");
-    assert_eq!(ground_truth.alphabet, expected_alphabet, "{what}: fixture");
-    assert_eq!(ours.alphabet, expected_alphabet, "{what}: ours");
     assert_eq!(
-        ground_truth.msd,
+        ground_truth.track_alphabets(),
+        expected_alphabet,
+        "{what}: fixture"
+    );
+    assert_eq!(ours.track_alphabets(), expected_alphabet, "{what}: ours");
+    assert_eq!(
+        ground_truth.track_msds(),
         vec![Some(is_msd); tracks],
         "{what}: the fixture's header must actually say {expected_ns_name}"
     );
     assert_eq!(
-        ours.msd,
+        ours.track_msds(),
         vec![Some(is_msd); tracks],
         "{what}: the port must keep every surviving track's direction"
     );

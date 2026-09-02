@@ -592,7 +592,8 @@ impl Transducer {
     /// If the transducer declares no tracks at all, matching Java's `A.get(0)`
     /// `IndexOutOfBoundsException`.
     fn encode_input(&self, value: i32) -> i32 {
-        self.automaton.alphabet[0]
+        self.automaton
+            .track_alphabet(0)
             .iter()
             .position(|&v| v == value)
             .map_or(-1, |i| i as i32)
@@ -789,7 +790,12 @@ impl Transducer {
         } else {
             Vec::new()
         };
-        let mut n = Automaton::new(n_fa, m.alphabet.clone(), n_label, m.msd.clone());
+        let mut n = Automaton::new(
+            n_fa,
+            m.track_alphabets().to_vec(),
+            n_label,
+            m.track_msds().to_vec(),
+        );
         // The other half of this crate's per-track `NumberSystem` stand-in
         // (`PORTING.md`'s parallel-vector ruling): Java's single `getNS().add(...)`
         // moves the msd/lsd direction and the all-representations automaton together,
@@ -799,10 +805,12 @@ impl Transducer {
         // .size()` and indexes `getNS().get(i)` unconditionally, so a shorter `NS` list
         // throws `IndexOutOfBoundsException` there. On the well-formed input every
         // real caller produces, the two behave identically.
-        if m.all_reps.len() == m.alphabet.len() && m.msd.len() == m.alphabet.len() {
-            n.set_all_reps(m.all_reps.clone());
-            if m.ns_name.len() == m.alphabet.len() {
-                n.set_ns_names(m.ns_name.clone());
+        if m.track_all_reps_list().len() == m.track_alphabets().len()
+            && m.track_msds().len() == m.track_alphabets().len()
+        {
+            n.set_all_reps(m.track_all_reps_list().to_vec());
+            if m.track_ns_names_raw().len() == m.track_alphabets().len() {
+                n.set_ns_names(m.track_ns_names_raw().to_vec());
             }
         }
 
@@ -1031,7 +1039,14 @@ impl Transducer {
         budget: TransduceBudget,
     ) -> Result<Automaton, TransduceError> {
         // check that the input automaton only has one input!
-        if m.msd.len() != 1 {
+        // U9 (idiomatic-refactor) Stage B: deliberately `track_msds().len()`, NOT
+        // `track_count()` (== `alphabet.len()`) -- the two are supposed to stay parallel,
+        // but `wb034_a_track_with_no_number_system_is_rejected`'s sibling tests
+        // (`a_two_track_automaton_is_rejected` et al.) deliberately desync `m.msd` alone
+        // (via `set_track_msds`, alphabet untouched) to exercise exactly this arity guard
+        // on `msd`'s own length -- collapsing to `track_count()` would silently stop
+        // catching that malformed shape.
+        if m.track_msds().len() != 1 {
             return Err(TransduceError::NotSingleInput);
         }
 
@@ -1054,7 +1069,7 @@ impl Transducer {
         // null check, and an explicit-alphabet track's `NumberSystem` *is* null. Ported
         // verbatim as a rejection at exactly Java's position — after the arity and
         // alphabet-compatibility guards, before the reversal.
-        let Some(is_msd) = m.msd[0] else {
+        let Some(is_msd) = m.track_msd(0) else {
             return Err(TransduceError::NoNumberSystem);
         };
 
@@ -1148,7 +1163,7 @@ impl Transducer {
     /// [`Transducer::encode_input`] documents.
     fn dead_letter_outside_input_alphabet(t: &Transducer, dead_state_output: i32) -> i32 {
         let mut min = dead_state_output;
-        for &letter in &t.automaton.alphabet[0] {
+        for &letter in t.automaton.track_alphabet(0) {
             min = min.min(letter);
         }
         min - 1
@@ -1209,7 +1224,7 @@ impl Transducer {
     /// `determine_alphabet_size`'s own doc warns about, so both are refreshed here as
     /// Java does.
     fn append_input_letter(t: &mut Transducer, letter: i32) -> i32 {
-        t.automaton.alphabet[0].push(letter);
+        t.automaton.track_alphabet_mut(0).push(letter);
         t.automaton.setup_encoder();
         t.automaton.determine_alphabet_size();
         t.encode_input(letter)
@@ -1309,7 +1324,7 @@ mod tests {
                 &[(0, 3), (1, 3)],
             ],
         );
-        a.msd = vec![Some(false)];
+        a.set_track_msds(vec![Some(false)]);
         a
     }
 
@@ -1582,6 +1597,11 @@ mod tests {
     fn a_two_track_automaton_is_rejected() {
         let mut logging = Logging::new();
         let mut m = thue_morse();
+        // Deliberately desynced: `thue_morse()` is 1-track, and this grows only `msd` to
+        // simulate a 2-track automaton for the arity guard above -- `set_track_msds`
+        // would panic on the length mismatch, so this stays a raw field write (U9 Stage B
+        // gap: no supported way to desync `msd` from `alphabet` through the accessors,
+        // which is the point of this test).
         m.msd = vec![Some(true), Some(true)];
         assert_eq!(
             runsum2()
@@ -1618,7 +1638,7 @@ mod tests {
         let mut logging = Logging::new();
         let mut m = thue_morse();
         // What `wr_io::reader`'s `HeaderToken::Set(..)` branch produces for `{0,1}`.
-        m.msd = vec![None];
+        m.set_track_msds(vec![None]);
         assert_eq!(
             runsum2()
                 .transduce_non_deterministic(&mut m, &mut logging)
@@ -1635,6 +1655,9 @@ mod tests {
         // after the alphabet-compatibility loop (`:276-281`) — so both still win when
         // they also apply.
         let mut two_track = thue_morse();
+        // Deliberately desynced (same reasoning as `a_two_track_automaton_is_rejected`
+        // above): `thue_morse()` is 1-track, `msd` alone is grown to 2 -- `set_track_msds`
+        // would panic here, so this stays a raw field write.
         two_track.msd = vec![None, None];
         assert_eq!(
             runsum2()
@@ -1643,7 +1666,7 @@ mod tests {
             TransduceError::NotSingleInput
         );
         let mut bad_alphabet = word_automaton(&[0, 7], &[&[(0, 0), (1, 1)], &[(0, 1), (1, 0)]]);
-        bad_alphabet.msd = vec![None];
+        bad_alphabet.set_track_msds(vec![None]);
         assert_eq!(
             runsum2()
                 .transduce_non_deterministic(&mut bad_alphabet, &mut logging)
@@ -1938,7 +1961,7 @@ mod tests {
         let c = t.transduce_non_deterministic(&mut m, &mut logging).unwrap();
 
         assert_eq!(
-            t.automaton.alphabet,
+            t.automaton.track_alphabets(),
             vec![vec![0, 1]],
             "T's alphabet is intact"
         );
@@ -1948,7 +1971,11 @@ mod tests {
             [0, 1]
         );
         assert_eq!(t.sigma[0].keys().copied().collect::<Vec<_>>(), [0, 1]);
-        assert_eq!(c.alphabet, vec![vec![0, 1]], "the RESULT's alphabet is M's");
+        assert_eq!(
+            c.track_alphabets(),
+            vec![vec![0, 1]],
+            "the RESULT's alphabet is M's"
+        );
         assert_eq!(c.fa.alphabet_size, 2);
         // Every output of the result is one the transducer actually declares.
         assert_eq!(c.fa.o, vec![-1, 1]);
@@ -1996,9 +2023,9 @@ mod tests {
             for dead_state_output in [-5, -1, 0, 1, 40] {
                 let letter = Transducer::dead_letter_outside_input_alphabet(t, dead_state_output);
                 assert!(
-                    !t.automaton.alphabet[0].contains(&letter),
+                    !t.automaton.track_alphabet(0).contains(&letter),
                     "dead letter {letter} is already in {:?}",
-                    t.automaton.alphabet[0]
+                    t.automaton.track_alphabet(0)
                 );
                 assert!(letter < dead_state_output);
             }
@@ -2287,7 +2314,7 @@ mod tests {
             assert_eq!(row[&1], vec![row_expected[1]], "state {q} on symbol 1");
         }
         assert_eq!(
-            c.msd,
+            c.track_msds(),
             vec![Some(false)],
             "the result is reversed back to lsd on the way out"
         );
@@ -2321,7 +2348,7 @@ mod tests {
         let mut logging = Logging::new();
         let relabel = transducer(&[0, 1], &[&[(0, 0, 9), (1, 0, 4)]]);
         let mut m = thue_morse();
-        m.msd = vec![Some(false)];
+        m.set_track_msds(vec![Some(false)]);
 
         let c = relabel
             .transduce_non_deterministic(&mut m, &mut logging)
@@ -2348,7 +2375,7 @@ mod tests {
         // Java mutates its argument and never restores it, and `Prover.
         // transduceCommand`, its only caller, never looks at `M` again.
         assert_eq!(
-            m.msd,
+            m.track_msds(),
             vec![Some(true)],
             "M is left REVERSED in place; Java never reverses it back"
         );
@@ -2393,7 +2420,7 @@ mod tests {
         let mut logging = Logging::new();
         logging.configure_for_command(false, true);
         let mut m = thue_morse();
-        m.msd = vec![Some(false)];
+        m.set_track_msds(vec![Some(false)]);
         transducer(&[0, 1], &[&[(0, 0, 0), (1, 0, 1)]])
             .transduce_non_deterministic(&mut m, &mut logging)
             .unwrap();
@@ -2545,8 +2572,8 @@ mod tests {
             .transduce_non_deterministic(&mut m, &mut logging)
             .unwrap();
         assert_eq!(c.label, vec!["n".to_string()]);
-        assert_eq!(c.alphabet, vec![vec![0, 1]]);
-        assert_eq!(c.msd, vec![Some(true)]);
+        assert_eq!(c.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(c.track_msds(), vec![Some(true)]);
     }
     // ---------------------------------------------------- Tier-4 property (Phase 4, U31)
 

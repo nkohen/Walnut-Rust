@@ -398,7 +398,7 @@ pub fn set_alphabet(
     alphabet: Vec<Vec<i32>>,
 ) -> Result<(), AlphabetError> {
     // `:185-190`.
-    if alphabet.len() != automaton.alphabet.len() {
+    if alphabet.len() != automaton.track_count() {
         return Err(AlphabetError::Walnut(
             "The number of alphabets must match the number of alphabets in the input automaton."
                 .to_string(),
@@ -413,11 +413,13 @@ pub fn set_alphabet(
     // `Automaton M = clone();` (`:202`) plus `M.richAlphabet.setA(alphabet)` /
     // `M.setNS(numberSystems)` (`:203-204`).
     let mut m = automaton.clone();
-    m.alphabet = alphabet;
-    m.msd = number_systems
-        .iter()
-        .map(|o| o.as_ref().map(|ns| ns.is_msd()))
-        .collect();
+    m.set_track_alphabets(alphabet);
+    m.set_track_msds(
+        number_systems
+            .iter()
+            .map(|o| o.as_ref().map(|ns| ns.is_msd()))
+            .collect(),
+    );
     // `set_all_reps`/`set_ns_names` require `msd` already parallel to `alphabet` -- just
     // established above. The third part of the per-track `NumberSystem` stand-in is the
     // NAME (`wr_core::automaton::Automaton::ns_name`): a track switched to a literal
@@ -438,7 +440,11 @@ pub fn set_alphabet(
 
     // `rebuildTransitions(this.getFa(), this.richAlphabet, M);` (`:208`) -- reads from
     // the STILL-UNCHANGED `automaton` (Java's `this`), writes into `m` (`M`).
-    m.fa.d = Automaton::rebuild_transitions_for_new_alphabet(automaton, &m.alphabet, m.encoder());
+    m.fa.d = Automaton::rebuild_transitions_for_new_alphabet(
+        automaton,
+        m.track_alphabets(),
+        m.encoder(),
+    );
 
     // `:210-214`.
     match is_dfao {
@@ -718,7 +724,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
         // Only digits 0 and 1 can reach acceptance now; the automaton must still accept
         // exactly the one-symbol words drawn from {0,1} and reject everything else
         // (in particular, it must NOT still recognize a stray digit 2/3 as one-symbol
@@ -751,7 +757,7 @@ mod tests {
             vec![vec![0, 1]],
         )
         .unwrap();
-        assert_eq!(a.msd, vec![Some(false)]);
+        assert_eq!(a.track_msds(), vec![Some(false)]);
     }
 
     /// A one-track word (DFAO) automaton over `{0,1,2,3}` with genuine non-boolean
@@ -796,7 +802,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
         let sym0 = a.encode(&[0]);
         let next = a.fa.d[a.fa.q0]
             .get(&sym0)

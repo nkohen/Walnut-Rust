@@ -168,12 +168,12 @@ fn check(
     ground_truth.fa.totalize(0);
 
     assert_eq!(
-        ground_truth.alphabet,
+        ground_truth.track_alphabets(),
         vec![expected_alphabet.to_vec()],
         "{tag}: precondition -- the captured fixture's own alphabet"
     );
     assert_eq!(
-        ours.alphabet,
+        ours.track_alphabets(),
         vec![expected_alphabet.to_vec()],
         "{tag}: the result must be over the TRACK's alphabet, not one fabricated from its \
          cardinality or from an unshadowed programmatic base of the same name"
@@ -184,7 +184,7 @@ fn check(
         "{tag}: the custom base's own NAME must survive into the written header"
     );
     assert_eq!(
-        ours.msd,
+        ours.track_msds(),
         vec![Some(true)],
         "{tag}: every base here is msd_*"
     );

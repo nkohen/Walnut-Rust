@@ -142,7 +142,11 @@ fn assert_result_matches_capture(prover: &Prover, dir: &Path, name: &str) {
         return;
     }
 
-    assert_eq!(theirs.alphabet, ours.alphabet, "{name}: alphabet");
+    assert_eq!(
+        theirs.track_alphabets(),
+        ours.track_alphabets(),
+        "{name}: alphabet"
+    );
     assert_eq!(
         theirs.track_ns_names(),
         ours.track_ns_names(),

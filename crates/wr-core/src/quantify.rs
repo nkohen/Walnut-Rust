@@ -235,7 +235,7 @@ pub fn quantify_with_ctx(
     // `quantify`'s tail: consult the surviving tracks' numeration direction. Note this
     // runs even when `quantify_helper` short-circuited — a faithfully-ported quirk, see
     // the module docs.
-    match determine_msd(&a.msd) {
+    match determine_msd(a.track_msds()) {
         None => Ok(()),
         Some(true) => {
             // `AutomatonLogicalOps.fixLeadingZerosProblem(A)` (`:44`). Its closing
@@ -360,7 +360,7 @@ fn quantify_helper(
     // with a repeated label (`f(a,a)`-shaped, two tracks both named "a") takes the
     // ordinary projection path here, not this one. `BTreeSet<String>` reproduces the
     // same deduplication.
-    if labels.len() == a.alphabet.len() {
+    if labels.len() == a.track_count() {
         let truth = !a.is_empty();
         a.fa.true_false = Some(truth);
         a.clear();
@@ -387,7 +387,7 @@ fn quantify_helper(
                 .expect("label presence was just validated")
         })
         .collect();
-    let kept: Vec<usize> = (0..a.alphabet.len())
+    let kept: Vec<usize> = (0..a.track_count())
         .filter(|i| !dropped.contains(i))
         .collect();
 
@@ -396,17 +396,17 @@ fn quantify_helper(
     let all_inputs: Vec<Vec<i32>> = (0..old_alphabet_size as i32).map(|s| a.decode(s)).collect();
 
     // `removeIndices` on A / NS / label (`:75-81`) — order of the survivors is preserved.
-    let new_alphabet: Vec<Vec<i32>> = kept.iter().map(|&i| a.alphabet[i].clone()).collect();
+    let new_alphabet: Vec<Vec<i32>> = kept.iter().map(|&i| a.track_alphabet(i).to_vec()).collect();
     let new_label: Vec<String> = kept.iter().map(|&i| a.label[i].clone()).collect();
-    let new_msd: Vec<Option<bool>> = kept.iter().map(|&i| a.msd[i]).collect();
+    let new_msd: Vec<Option<bool>> = kept.iter().map(|&i| a.track_msd(i)).collect();
     // `removeIndices(A.getNS(), I)` removes the whole per-track `NumberSystem`, i.e. all
     // three parts of this crate's stand-in (`Automaton::all_reps`'s invariant, U5, plus
     // `Automaton::ns_name`).
     let new_all_reps: Vec<Option<std::rc::Rc<Automaton>>> =
-        kept.iter().map(|&i| a.all_reps[i].clone()).collect();
+        kept.iter().map(|&i| a.track_all_reps(i).cloned()).collect();
     let new_ns_names: Vec<Option<String>> = kept
         .iter()
-        .map(|&i| a.ns_name.get(i).cloned().flatten())
+        .map(|&i| a.track_ns_name_raw(i).map(String::from))
         .collect();
     let new_alphabet_size: usize = new_alphabet.iter().map(|t| t.len()).product();
 
@@ -660,7 +660,7 @@ mod tests {
         assert!(!a.is_empty(), "sanity");
         quantify(&mut a, &labels(&["y", "x"])).unwrap();
         assert!(a.is_true_false_automaton() && a.is_true_automaton());
-        assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+        assert!(a.track_alphabets().is_empty() && a.label.is_empty() && a.track_msds().is_empty());
         assert_eq!(
             a.fa.q, 2,
             "`Automaton.clear()` leaves `q` stale -- FA.clear() never resets it"

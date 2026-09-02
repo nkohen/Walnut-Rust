@@ -33,7 +33,7 @@ fn ei_i_lt_x_matches_real_walnut_output() {
     // Sanity on the reduced automaton's shape before the language check, so a
     // failure here doesn't get misdiagnosed as an oracle bug.
     assert_eq!(ours.label, vec!["x".to_string()]);
-    assert_eq!(ground_truth.alphabet, vec![vec![0, 1]]);
+    assert_eq!(ground_truth.track_alphabets(), vec![vec![0, 1]]);
 
     // `wr_core::equiv::automaton_language_equivalent` (U8) checks `Automaton::alphabet`
     // for exact positional equality itself before ever touching the underlying `Fa`s —

@@ -169,8 +169,8 @@ mod tests {
 
         assert_eq!(tc.automaton_pairs().len(), 1);
         let a = tc.automaton_pairs()[0].automaton().unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![None]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![None]);
 
         // The library copy must exist (`writeAutomata`'s `Files.copy`).
         assert!(dir.join("Automata Library").join("r.txt").is_file());
@@ -191,8 +191,8 @@ mod tests {
         )
         .unwrap();
         let a = tc.automaton_pairs()[0].automaton().unwrap();
-        assert_eq!(a.alphabet, vec![vec![0, 1, 2]]);
-        assert_eq!(a.msd, vec![Some(false)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1, 2]]);
+        assert_eq!(a.track_msds(), vec![Some(false)]);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -208,7 +208,7 @@ mod tests {
         )
         .unwrap();
         let a = tc.automaton_pairs()[0].automaton().unwrap();
-        assert_eq!(a.alphabet.len(), 2);
+        assert_eq!(a.track_count(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 

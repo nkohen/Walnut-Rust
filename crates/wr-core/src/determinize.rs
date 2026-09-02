@@ -1032,7 +1032,7 @@ mod tests {
         // The sink gets the whole `Automaton` (Java passes `A`, not `A.getFa()`) --
         // the writers it feeds need the track alphabets/labels.
         assert_eq!(offered.label, vec!["x".to_string()]);
-        assert_eq!(offered.alphabet, vec![vec![0, 1]]);
+        assert_eq!(offered.track_alphabets(), vec![vec![0, 1]]);
     }
 
     #[test]

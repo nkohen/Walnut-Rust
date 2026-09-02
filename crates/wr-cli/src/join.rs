@@ -236,7 +236,7 @@ pub fn join_command(
                 label.push(t.to_string());
             }
         }
-        if label.len() != m.alphabet.len() {
+        if label.len() != m.track_count() {
             return Err(JoinError::LabelMismatch { automaton_name });
         }
         m.label = label;
@@ -323,7 +323,7 @@ pub fn join(
 fn check_shared_labels_agree(first: &Automaton, rest: &[Automaton]) -> Result<(), JoinError> {
     let mut seen: HashMap<&str, HashSet<i32>> = HashMap::new();
     for a in std::iter::once(first).chain(rest.iter()) {
-        for (label, alphabet) in a.label.iter().zip(a.alphabet.iter()) {
+        for (label, alphabet) in a.label.iter().zip(a.track_alphabets().iter()) {
             let letters: HashSet<i32> = alphabet.iter().copied().collect();
             match seen.entry(label.as_str()) {
                 Entry::Vacant(slot) => {
@@ -449,7 +449,7 @@ mod tests {
         let joined = join(&t, vec![s], &mut sink_logging()).unwrap();
 
         assert_eq!(joined.label, vec!["x".to_string(), "y".to_string()]);
-        assert_eq!(joined.alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(joined.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
         assert_eq!(joined.fa.alphabet_size, 4);
 
         // Run a two-track word through the joined automaton and read its output.
@@ -480,7 +480,7 @@ mod tests {
         // would otherwise hit `wr_core::product`'s `assert_eq!`, killing the process.
         let a = word_automaton_labeled(1, 1, "x");
         let mut b = word_automaton_labeled(1, 1, "x");
-        b.alphabet = vec![vec![0, 1, 2]];
+        b.set_track_alphabets(vec![vec![0, 1, 2]]);
 
         let err = join(&a, vec![b], &mut sink_logging()).unwrap_err();
         assert!(matches!(err, JoinError::AlphabetMismatch { ref label } if label == "x"));
@@ -497,13 +497,13 @@ mod tests {
         // legitimately be over different bases.
         let a = word_automaton_labeled(1, 1, "x");
         let mut b = word_automaton_labeled(1, 1, "y");
-        b.alphabet = vec![vec![0, 1, 2]];
+        b.set_track_alphabets(vec![vec![0, 1, 2]]);
         b.fa.alphabet_size = 3;
         b.fa.d[0].insert(2, vec![1]);
         b.fa.d[1].insert(2, vec![1]);
 
         let joined = join(&a, vec![b], &mut sink_logging()).unwrap();
-        assert_eq!(joined.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
+        assert_eq!(joined.track_alphabets(), vec![vec![0, 1], vec![0, 1, 2]]);
     }
 
     // -- join_command (end-to-end) ---------------------------------------------------

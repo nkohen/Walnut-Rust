@@ -632,8 +632,8 @@ mod tests {
 
         assert_eq!(p.fa.q, 4);
         assert_eq!(p.fa.alphabet_size, 2);
-        assert_eq!(p.alphabet, vec![vec![0, 1]]);
-        assert_eq!(p.msd, vec![Some(true)]);
+        assert_eq!(p.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(p.track_msds(), vec![Some(true)]);
         assert!(p.is_canonized());
         // State q's output IS q.
         assert_eq!(p.fa.o, vec![0, 1, 2, 3]);
@@ -1237,8 +1237,8 @@ mod tests {
             n_raw in 0usize..27,
         ) {
             let p = h.to_word_automaton().expect("the generator excludes all three guards");
-            prop_assert_eq!(p.alphabet.len(), 1);
-            prop_assert_eq!(&p.alphabet[0], &(0..l as i32).collect::<Vec<i32>>());
+            prop_assert_eq!(p.track_count(), 1);
+            prop_assert_eq!(p.track_alphabet(0), &(0..l as i32).collect::<Vec<i32>>());
 
             let word = iterate_from_zero(&h.mapping, m);
             prop_assert_eq!(word.len(), l.pow(m as u32));
@@ -1300,8 +1300,8 @@ mod tests {
                 prop_assert_eq!(p.fa.d.len(), p.fa.q);
                 prop_assert_eq!(p.fa.o.len(), p.fa.q);
                 prop_assert_eq!(&p.fa.o, &(0..=max_entry).collect::<Vec<i32>>());
-                prop_assert_eq!(&p.alphabet[0], &(0..max_image_length as i32).collect::<Vec<i32>>());
-                prop_assert_eq!(&p.msd, &vec![Some(true)]);
+                prop_assert_eq!(p.track_alphabet(0), &(0..max_image_length as i32).collect::<Vec<i32>>());
+                prop_assert_eq!(p.track_msds(), &vec![Some(true)]);
                 prop_assert!(p.is_canonized());
             }
         }

@@ -1120,7 +1120,7 @@ mod tests {
         // `and(TRUE, constant)` short-circuits to the constant automaton itself, bound to
         // the fresh name -- so the result is a one-track automaton over that name.
         assert_eq!(m.label, identifiers);
-        assert_eq!(m.alphabet, vec![vec![0, 1]]);
+        assert_eq!(m.track_alphabets(), vec![vec![0, 1]]);
     }
 
     /// The number system is consulted through a SHARED handle, so two literals over the same

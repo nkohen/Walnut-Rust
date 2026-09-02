@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(p.fa.q, 2);
         assert_eq!(p.fa.q0, 0);
         assert_eq!(p.fa.o, vec![0, 1]);
-        assert_eq!(p.alphabet, vec![vec![0, 1]]);
-        assert_eq!(p.msd, vec![Some(true)]);
+        assert_eq!(p.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(p.track_msds(), vec![Some(true)]);
         assert_eq!(
             p.fa.d[0],
             std::collections::BTreeMap::from([(0, vec![0]), (1, vec![1])])

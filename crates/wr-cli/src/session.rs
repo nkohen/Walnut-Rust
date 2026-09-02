@@ -968,7 +968,11 @@ mod tests {
     /// cross-check uses. The track-structure guard is kept explicitly, since totalizing at
     /// the `Fa` level bypasses the `Automaton`-level check.
     fn same_language(a: &Automaton, b: &Automaton) -> bool {
-        assert_eq!(a.alphabet, b.alphabet, "track structure must match");
+        assert_eq!(
+            a.track_alphabets(),
+            b.track_alphabets(),
+            "track structure must match"
+        );
         let (mut x, mut y) = (a.fa.clone(), b.fa.clone());
         x.totalize(0);
         y.totalize(0);
@@ -1406,8 +1410,8 @@ mod tests {
             .unwrap();
         assert!(same_language(ns.addition(), &base3));
         assert_ne!(
-            ns.addition().alphabet,
-            base2.alphabet,
+            ns.addition().track_alphabets(),
+            base2.track_alphabets(),
             "the global base-2 adder must NOT be the one that got loaded"
         );
         assert!(out
@@ -1453,11 +1457,11 @@ mod tests {
         let (s, out) = session_with_capture(&global, &session, false);
         let t = s.libraries().word("T").unwrap();
         assert_eq!(
-            t.alphabet,
+            t.track_alphabets(),
             vec![vec![0, 1, 2]],
             "the SESSION copy of msd_kk (base 3) must be the one the header resolved to"
         );
-        assert_eq!(t.msd, vec![Some(true)]);
+        assert_eq!(t.track_msds(), vec![Some(true)]);
         assert!(
             out.text()
                 .contains("Overriding global file with session file:"),
@@ -1477,7 +1481,10 @@ mod tests {
         write(&global2, "Word Automata Library/T.txt", WILDCARD_LOOP);
 
         let (s2, _out2) = session_with_capture(&global2, &session2, false);
-        assert_eq!(s2.libraries().word("T").unwrap().alphabet, vec![vec![0, 1]]);
+        assert_eq!(
+            s2.libraries().word("T").unwrap().track_alphabets(),
+            vec![vec![0, 1]]
+        );
     }
 
     /// `getComputeIfAbsent` hands the same instance to every token in a formula — which is

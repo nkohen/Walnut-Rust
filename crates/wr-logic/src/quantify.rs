@@ -111,8 +111,8 @@ mod tests {
         exists(&mut a, &labels(&["i"])).unwrap();
 
         assert_eq!(a.label, vec!["x".to_string()]);
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![Some(true)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![Some(true)]);
         assert_eq!(a.fa.alphabet_size, 2);
         assert_eq!(a.fa.q, 2, "expected the minimal 'contains a 1' DFA");
         assert!(a.fa.is_deterministic());
@@ -162,9 +162,9 @@ mod tests {
         assert!(a.is_true_false_automaton());
         assert!(a.is_true_automaton(), "∃i ∃x (i < x) is TRUE");
         // `Automaton.clear()` wiped the track metadata (`AutomatonQuantification:63`).
-        assert!(a.alphabet.is_empty());
+        assert!(a.track_alphabets().is_empty());
         assert!(a.label.is_empty());
-        assert!(a.msd.is_empty());
+        assert!(a.track_msds().is_empty());
         assert_eq!(a.get_arity(), 0);
         assert!(!a.is_empty(), "the TRUE automaton's language is not empty");
     }
@@ -226,12 +226,12 @@ mod tests {
     fn lsd_tracks_are_quantified_rather_than_rejected() {
         let mut a = less_than_msd(2);
         a.label = vec!["i".to_string(), "x".to_string()];
-        a.msd = vec![Some(false), Some(false)];
+        a.set_track_msds(vec![Some(false), Some(false)]);
 
         exists(&mut a, &labels(&["i"])).unwrap();
 
         assert_eq!(a.label, vec!["x".to_string()]);
-        assert_eq!(a.msd, vec![Some(false)], "the track stays lsd");
+        assert_eq!(a.track_msds(), vec![Some(false)], "the track stays lsd");
         // Same language as the msd run of this fixture ("contains a 1"), because the
         // trailing-zero fixup is a no-op here -- it only ever widens the accepting set,
         // and nothing reaches acceptance by reading zeros that is not accepting already.
@@ -348,7 +348,7 @@ mod tests {
         exists(&mut a, &labels(&["b"])).unwrap();
 
         assert_eq!(a.label, vec!["a".to_string(), "c".to_string()]);
-        assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
 
         // Only (a=1, c=0) is accepted. (a=0, c=1) is the swapped pair — accepting it
         // instead is exactly the symptom a [c, a] order bug would produce.
@@ -646,7 +646,7 @@ mod tests {
         ) {
             let mut a = original.clone();
             exists(&mut a, &labels(&["y"])).unwrap();
-            prop_assert_eq!(&a.msd, &vec![Some(false)], "the surviving track stays lsd");
+            prop_assert_eq!(a.track_msds(), &vec![Some(false)], "the surviving track stays lsd");
 
             // The pure ∃y-projection, as a subset of the ORIGINAL automaton's states.
             let mut subset: BTreeSet<usize> = BTreeSet::from([original.fa.q0]);
@@ -696,8 +696,8 @@ mod tests {
 
             prop_assert_eq!(a.label.len(), 1);
             prop_assert_eq!(a.label[0].as_str(), "x");
-            prop_assert_eq!(a.alphabet.len(), 1);
-            prop_assert_eq!(a.msd, vec![Some(true)]);
+            prop_assert_eq!(a.track_count(), 1);
+            prop_assert_eq!(a.track_msds(), vec![Some(true)]);
             prop_assert_eq!(a.fa.alphabet_size, 2);
             prop_assert_eq!(a.fa.d.len(), a.fa.q);
             prop_assert!(a.fa.is_deterministic());

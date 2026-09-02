@@ -250,7 +250,7 @@ fn ns_differs(a: &Automaton, b: &Automaton) -> bool {
     let b_names = b.track_ns_names();
     let a_ref: Vec<Option<&str>> = a_names.iter().map(|o| o.as_deref()).collect();
     let b_ref: Vec<Option<&str>> = b_names.iter().map(|o| o.as_deref()).collect();
-    is_ns_differing(&a_ref, &b_ref, &a.alphabet, &b.alphabet)
+    is_ns_differing(&a_ref, &b_ref, a.track_alphabets(), b.track_alphabets())
 }
 
 // ---------------------------------------------------------------------------
@@ -855,9 +855,9 @@ mod tests {
         // Same alphabet size but a different base direction (msd vs lsd) -- `is_ns_differing`
         // must catch this even though the raw alphabet lists are identical.
         let mut msd_a = single_symbol_automaton(1);
-        msd_a.msd = vec![Some(true)];
+        msd_a.set_track_msds(vec![Some(true)]);
         let mut lsd_b = single_symbol_automaton(1);
-        lsd_b.msd = vec![Some(false)];
+        lsd_b.set_track_msds(vec![Some(false)]);
         write_library_automaton(&dir, "A", msd_a);
         write_library_automaton(&dir, "B", lsd_b);
 

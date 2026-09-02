@@ -221,17 +221,17 @@ fn wb032_convert_regroups_msd10_to_msd1000_not_msd100() {
     let ours = wr_io::reader::read_automaton_txt(&ours_path).expect("b10msd1000.txt");
 
     assert_eq!(
-        ours.alphabet,
+        ours.track_alphabets(),
         vec![(0..1000).collect::<Vec<i32>>()],
         "WB-032: must regroup 3 base-10 digits per base-1000 digit (alphabet 0..1000), \
          not 2 (0..100, the old bug's answer)"
     );
-    assert_eq!(ours.msd, vec![Some(true)]);
+    assert_eq!(ours.track_msds(), vec![Some(true)]);
 
     let theirs = wr_io::reader::read_automaton_txt(convert_ns_fixture("b10msd1000.txt"))
         .expect("real walnut-java's fixed b10msd1000.txt fixture must parse cleanly");
     assert_eq!(
-        theirs.alphabet,
+        theirs.track_alphabets(),
         vec![(0..1000).collect::<Vec<i32>>()],
         "sanity: the captured fixture itself must be base 1000, not the old bug's 100"
     );
@@ -280,8 +280,8 @@ fn wb032_convert_ungroups_msd1000_to_msd10_without_a_spurious_base_mismatch() {
     // digit-group -- can correspond to the empty base-1000 word, and every digit must be
     // rejected.
     let ours = wr_io::reader::read_automaton_txt(&ours_path).expect("must parse cleanly");
-    assert_eq!(ours.alphabet, vec![(0..10).collect::<Vec<i32>>()]);
-    assert_eq!(ours.msd, vec![Some(true)]);
+    assert_eq!(ours.track_alphabets(), vec![(0..10).collect::<Vec<i32>>()]);
+    assert_eq!(ours.track_msds(), vec![Some(true)]);
     assert!(ours.fa.accepts_word(&[]), "empty string must be accepted");
     for d in 0..10 {
         assert!(

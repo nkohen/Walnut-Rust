@@ -196,9 +196,13 @@ fn compare(dir: &Path, name: &str, expected_tracks: usize) {
         "the walnut-java fixture",
     );
 
-    assert_eq!(theirs.alphabet.len(), expected_tracks, "{name}: fixture");
-    assert_eq!(ours.alphabet.len(), expected_tracks, "{name}: ours");
-    assert_eq!(ours.alphabet, theirs.alphabet, "{name}: alphabets");
+    assert_eq!(theirs.track_count(), expected_tracks, "{name}: fixture");
+    assert_eq!(ours.track_count(), expected_tracks, "{name}: ours");
+    assert_eq!(
+        ours.track_alphabets(),
+        theirs.track_alphabets(),
+        "{name}: alphabets"
+    );
     assert_eq!(
         ours.track_ns_names(),
         theirs.track_ns_names(),
@@ -276,7 +280,7 @@ fn split_over_a_custom_base_loads_its_shipped_base_change_file() {
     );
     // …and that really is the CUSTOM base's restriction, not `msd_2`'s absence of one:
     // `msd_fib.txt` is the Zeckendorf "no two adjacent 1s" automaton.
-    assert!(out.all_reps.iter().all(Option::is_some));
+    assert!(out.track_all_reps_list().iter().all(Option::is_some));
     fs::remove_dir_all(&dir).ok();
 }
 

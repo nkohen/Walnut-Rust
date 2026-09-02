@@ -425,24 +425,30 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 /// see [`crate::numsys::NumberSystem::flip_with_custom_base_files`], which is the API a
 /// caller that *does* have the files should use instead of relying on this.
 pub(crate) fn flip_ns(a: &mut Automaton) {
-    for i in 0..a.msd.len() {
+    for i in 0..a.track_count() {
         // `if (NS == null) continue;` — a `{0,1}`-style explicit-set track has no
         // number system at all, so neither its flag nor its (necessarily absent) name
         // is touched.
-        if a.msd[i].is_none() {
+        if a.track_msd(i).is_none() {
             continue;
         }
-        match a.ns_name.get(i).and_then(|n| n.as_deref()) {
+        // U9 (idiomatic-refactor) Stage B: `track_ns_name_raw` reads the same field this
+        // used to reach via `a.ns_name.get(i)` -- safe because the loop bound above is
+        // `track_count()`, i.e. the parallel-vector invariant already guarantees `i` is
+        // in range for every one of the four vectors.
+        match a.track_ns_name_raw(i) {
             Some(name) => {
                 let new_name = flipped_ns_name(name);
                 // `NumberSystem`'s constructor: `isMsd = determineMsdOrLsd(name).equals(MSD)`.
+                // No single-index setter exists for `msd`/`ns_name` yet (Stage B gap --
+                // see U9's checkpoint report), so these two writes stay on the raw fields.
                 a.msd[i] = Some(new_name.starts_with(crate::numsys::MSD_UNDERSCORE));
                 a.ns_name[i] = Some(new_name);
             }
-            None => a.msd[i] = Some(!a.msd[i].unwrap()),
+            None => a.msd[i] = Some(!a.track_msd(i).unwrap()),
         }
     }
-    for slot in a.all_reps.iter_mut() {
+    for slot in a.track_all_reps_iter_mut() {
         if let Some(all_reps) = slot.as_mut() {
             let mut flipped = (**all_reps).clone();
             reverse(&mut flipped, MsdFlip::Keep);
@@ -841,7 +847,7 @@ pub fn right_quotient(
     ));
     if subset_check == SubsetCheck::Check {
         assert!(
-            is_subset_alphabet(&b.alphabet, &a.alphabet),
+            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
             "Second A's alphabet must be a subset of the first A's alphabet for right quotient."
         );
     }
@@ -862,13 +868,20 @@ pub fn right_quotient(
         })
         .collect();
     other_clone.fa.d = re_encoded;
-    other_clone.alphabet = a.alphabet.clone();
+    // U9 (idiomatic-refactor) Stage B: this reassigns `other_clone`'s WHOLE track set to
+    // `a`'s, which can change the track COUNT (`a`/`b` need not be same-arity when
+    // `subset_check != Check` skips the guard above) -- `set_track_alphabets`/
+    // `set_track_msds` deliberately panic on a track-count change (Stage A's documented
+    // assumption "no existing call site does this"), so this specific write stays on the
+    // raw field; see U9's checkpoint report ("gap: whole-vector replace with a
+    // possibly-different track count"). The READ side is still converted.
+    other_clone.alphabet = a.track_alphabets().to_vec();
     other_clone.setup_encoder();
     other_clone.fa.alphabet_size = a.fa.alphabet_size;
     // `otherClone.setNS(A.getNS())` (`:206`) — all three parts of the per-track stand-in.
-    other_clone.msd = a.msd.clone();
-    other_clone.set_all_reps(a.all_reps.clone());
-    other_clone.set_ns_names(a.ns_name.clone());
+    other_clone.msd = a.track_msds().to_vec();
+    other_clone.set_all_reps(a.track_all_reps_list().to_vec());
+    other_clone.set_ns_names(a.track_ns_names_raw().to_vec());
 
     for i in 0..a.fa.q {
         // A temporary automaton identical to `a` except that it starts from state `i`.
@@ -953,7 +966,7 @@ pub fn left_quotient(
         a.fa.q, b.fa.q
     ));
     assert!(
-        is_subset_alphabet(&b.alphabet, &a.alphabet),
+        is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
         "Second A's alphabet must be a subset of the first A's alphabet for left quotient."
     );
 
@@ -1340,14 +1353,14 @@ fn remove_leading_zeros_helper(
 ) -> Result<Automaton, RemoveLeadingZerosError> {
     // `if (n >= A.richAlphabet.getA().size() || n < 0)` (`:376`). The `n < 0` half is
     // unrepresentable for a `usize`.
-    if n >= a.alphabet.len() {
+    if n >= a.track_count() {
         return Err(RemoveLeadingZerosError::InputIndexOutOfRange {
             n,
-            inputs: a.alphabet.len(),
+            inputs: a.track_count(),
         });
     }
 
-    let msd = match a.msd[n] {
+    let msd = match a.track_msd(n) {
         Some(msd) => msd,
         None => {
             // `new AutomatonDFA(true)` (`AutomatonLogicalOps.java:381-383`) — DFA-typed
@@ -1380,16 +1393,16 @@ fn remove_leading_zeros_helper(
             o: vec![1, 1],
             d,
         },
-        a.alphabet.clone(),
+        a.track_alphabets().to_vec(),
         a.label.clone(),
-        a.msd.clone(),
+        a.track_msds().to_vec(),
     );
     // `M.setNS(A.getNS())` (`:387`) shares the whole `NumberSystem` list, i.e. both halves
     // of this crate's NS stand-in — the msd flags handed to `Automaton::new` above AND the
     // all-representations restriction, which `or`/`xor`/`imply`/`iff` re-apply after
     // totalizing (`and` never totalizes, so it never needs to).
-    m.set_all_reps(a.all_reps.clone());
-    m.set_ns_names(a.ns_name.clone());
+    m.set_all_reps(a.track_all_reps_list().to_vec());
+    m.set_ns_names(a.track_ns_names_raw().to_vec());
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
@@ -1982,14 +1995,14 @@ fn set_number_system_and_alphabet(
     direction: crate::numsys::Direction,
     new_base: i32,
 ) {
-    a.msd = vec![Some(direction == crate::numsys::Direction::Msd)];
-    a.all_reps = vec![None];
+    a.set_track_msds(vec![Some(direction == crate::numsys::Direction::Msd)]);
+    a.set_all_reps(vec![None]);
     // Java installs `new NumberSystem(<msd|lsd>_ + newBase)`, whose name is exactly what
     // `Automaton::track_ns_names` reconstructs from the `0..new_base` alphabet installed
     // on the next line — so `None` ("no recorded name, reconstruct it") is the right
     // entry here, not a stale carry-over of the pre-conversion base's name.
-    a.ns_name = vec![None];
-    a.alphabet = vec![util::int_range_list(new_base)];
+    a.set_ns_names(vec![None]);
+    a.set_track_alphabets(vec![util::int_range_list(new_base)]);
     a.fa.alphabet_size = new_base as usize;
     a.setup_encoder();
     a.debug_assert_track_invariant();
@@ -2375,12 +2388,12 @@ pub fn convert_ns(
     // because this crate reads the source base off the alphabet (see the doc comment
     // above) and Java's `NS`/`richAlphabet` lists are always the same length, so no
     // Java-reachable input can take one arm without the other.
-    if a.msd.len() != 1 || a.alphabet.len() != 1 {
+    if a.track_msds().len() != 1 || a.track_alphabets().len() != 1 {
         return Err(ConvertNsError::NotSingleInput);
     }
     // `NumberSystem ns = A.getNS().get(0); int fromBase = ns.parseBase();` (`:460-462`) —
     // the `null` case is WB-033, see `ConvertNsError::NoNumberSystem`.
-    let Some(from_msd) = a.msd[0] else {
+    let Some(from_msd) = a.track_msd(0) else {
         return Err(ConvertNsError::NoNumberSystem);
     };
     // `ns.parseBase()` (`NumberSystem.java:237-243`) parses the base out of the number
@@ -2627,7 +2640,7 @@ mod tests {
             vec![Some(true), None, Some(false)],
         );
         flip_ns(&mut a);
-        assert_eq!(a.msd, vec![Some(false), None, Some(true)]);
+        assert_eq!(a.track_msds(), vec![Some(false), None, Some(true)]);
     }
 
     /// The RECORDED NAME must flip too, not just the direction flag — see [`flip_ns`]'s
@@ -2666,7 +2679,7 @@ mod tests {
             // The direction flag is taken from the NEW name, exactly as
             // `NumberSystem`'s constructor derives `isMsd` from it.
             assert_eq!(
-                a.msd,
+                a.track_msds(),
                 vec![Some(after.starts_with("msd_"))],
                 "direction flag of {before}"
             );
@@ -2684,7 +2697,7 @@ mod tests {
             flip_ns(&mut a);
             flip_ns(&mut a);
             assert_eq!(a.track_ns_names(), vec![Some(name.to_string())]);
-            assert_eq!(a.msd, vec![Some(name.starts_with("msd_"))]);
+            assert_eq!(a.track_msds(), vec![Some(name.starts_with("msd_"))]);
         }
     }
 
@@ -2758,8 +2771,8 @@ mod tests {
 
         flip_ns(&mut a);
 
-        assert_eq!(a.msd, vec![Some(false)], "direction still flips");
-        let flipped = a.all_reps[0].as_ref().expect("still present");
+        assert_eq!(a.track_msds(), vec![Some(false)], "direction still flips");
+        let flipped = a.track_all_reps(0).expect("still present");
         let mut expected = ends_in_one;
         reverse(&mut expected, MsdFlip::Keep);
         let mut got = flipped.fa.clone();
@@ -2943,8 +2956,8 @@ mod tests {
             SubsetCheck::Check,
             &mut crate::logging::Logging::new(),
         );
-        assert_eq!(quotient.msd, vec![Some(true)]);
-        assert!(quotient.all_reps.iter().all(|r| r.is_some()));
+        assert_eq!(quotient.track_msds(), vec![Some(true)]);
+        assert!(quotient.track_all_reps_list().iter().all(|r| r.is_some()));
     }
 
     /// `0*1` totalized — the "before" language for the test above.
@@ -3470,7 +3483,7 @@ mod tests {
             assert!(!m.fa.accepts_word(word), "must reject {word:?}");
         }
         assert_eq!(
-            m.msd,
+            m.track_msds(),
             vec![Some(false)],
             "reverse(_, false) must not flip NS"
         );
@@ -3605,9 +3618,9 @@ mod tests {
     fn remove_leading_zeros_preserves_the_valid_representation_restriction_metadata() {
         let a = restricted(universal());
         let m = remove_leading_zeros(&a, &labels(&["x"])).unwrap();
-        assert_eq!(m.msd, vec![Some(true)]);
+        assert_eq!(m.track_msds(), vec![Some(true)]);
         assert!(
-            m.all_reps.iter().all(|r| r.is_some()),
+            m.track_all_reps_list().iter().all(|r| r.is_some()),
             "the no_adjacent_ones restriction must still be attached to the x track"
         );
 
@@ -3646,7 +3659,7 @@ mod tests {
         assert!(!a.fa.accepts_word(&[]));
         assert!(!a.fa.accepts_word(&[0]));
         assert_eq!(
-            a.msd,
+            a.track_msds(),
             vec![Some(true)],
             "reverse_msd = false must NOT flip the number system"
         );
@@ -3682,7 +3695,7 @@ mod tests {
         reverse(&mut a, MsdFlip::Flip);
 
         assert_eq!(
-            a.msd,
+            a.track_msds(),
             vec![Some(false), None],
             "only the arithmetic track flips; the null-NumberSystem track is skipped"
         );
@@ -4399,7 +4412,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(&a.alphabet, &b.alphabet),
+            is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
             "the OPPOSITE containment does hold, so a swapped guard would pass"
         );
         let _ = right_quotient(
@@ -4434,7 +4447,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            !is_subset_alphabet(&b.alphabet, &a.alphabet),
+            !is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
             "precondition: the guard WOULD reject this pair if it ran"
         );
 
@@ -4610,11 +4623,11 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(&b.alphabet, &a.alphabet),
+            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
             "sanity: the real precondition (B subset A) genuinely holds here"
         );
         assert!(
-            !is_subset_alphabet(&a.alphabet, &b.alphabet),
+            !is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
             "sanity: but the alphabets are NOT equal as sets -- the old (backwards) \
              guard would have wrongly rejected this pair"
         );
@@ -4682,7 +4695,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(&b.alphabet, &a.alphabet),
+            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
             "sanity: B's alphabet {{1,2}} is a genuine (non-prefix) subset of A's {{0,1,2}}"
         );
 
@@ -4723,7 +4736,7 @@ mod tests {
         assert!(!m.fa.accepts_word(&[0, 1]));
         assert!(!m.fa.accepts_word(&[1, 1]));
         assert_eq!(
-            m.msd,
+            m.track_msds(),
             vec![Some(true)],
             "of the three internal `reverse(_, true)` calls, only two apply to the \
              SAME automaton (`reverse_and_canonize(a)`, then the final \
@@ -4793,11 +4806,11 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(&a.alphabet, &b.alphabet),
+            is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
             "sanity: the OLD (backwards) guard (A subset B) would have wrongly passed"
         );
         assert!(
-            !is_subset_alphabet(&b.alphabet, &a.alphabet),
+            !is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
             "sanity: the containment the FIXED guard (and rightQuotient's re-encode) \
              actually needs (B subset A) does NOT hold -- so the fixed guard rejects"
         );
@@ -4881,7 +4894,10 @@ mod tests {
     /// no use to an oracle that has to reason ABOUT that shape; WB-010's generator below
     /// feeds digits one operand does not have.)
     fn symbol_for_digit(a: &Automaton, d: i32) -> Option<i32> {
-        a.alphabet[0].iter().position(|&x| x == d).map(|i| i as i32)
+        a.track_alphabet(0)
+            .iter()
+            .position(|&x| x == d)
+            .map(|i| i as i32)
     }
 
     /// The set of states `a` can be in after reading the digit word `w` from `start`
@@ -5069,9 +5085,9 @@ mod tests {
             let mut b = b;
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
-            prop_assert!(is_subset_alphabet(&b.alphabet, &a.alphabet));
+            prop_assert!(is_subset_alphabet(b.track_alphabets(), a.track_alphabets()));
             prop_assert!(
-                !is_subset_alphabet(&a.alphabet, &b.alphabet),
+                !is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
                 "keep this shape genuinely non-equal-alphabet, or it collapses into \
                  the sibling equal-alphabet property above"
             );
@@ -5119,7 +5135,7 @@ mod tests {
             let mut b = b;
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
-            prop_assert!(!is_subset_alphabet(&b.alphabet, &a.alphabet));
+            prop_assert!(!is_subset_alphabet(b.track_alphabets(), a.track_alphabets()));
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 left_quotient(&a, &b, &mut crate::logging::Logging::new())
@@ -5478,7 +5494,7 @@ mod tests {
             reverse(&mut a, MsdFlip::Flip);
             assert!(a.is_true_false_automaton());
             assert_eq!(a.is_true_automaton(), t);
-            assert!(a.msd.is_empty(), "nothing to flip");
+            assert!(a.track_msds().is_empty(), "nothing to flip");
         }
     }
 
@@ -5639,7 +5655,11 @@ mod tests {
         convert_ns(&mut a, false, 2, &mut crate::logging::Logging::new())
             .expect("the flip must succeed");
 
-        assert_eq!(a.msd, vec![Some(false)], "number system must now be lsd_2");
+        assert_eq!(
+            a.track_msds(),
+            vec![Some(false)],
+            "number system must now be lsd_2"
+        );
         assert_eq!(
             simulate(&a.fa, &[]),
             1,
@@ -5659,8 +5679,12 @@ mod tests {
         convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new())
             .expect("the conversion must succeed");
 
-        assert_eq!(a.msd, vec![Some(true)], "number system must now be msd_2");
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(
+            a.track_msds(),
+            vec![Some(true)],
+            "number system must now be msd_2"
+        );
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
         assert_eq!(a.fa.alphabet_size, 2);
         assert_eq!(
             simulate(&a.fa, &[]),
@@ -5722,7 +5746,7 @@ mod tests {
     #[test]
     fn convert_ns_rejects_a_track_with_no_number_system_wb033() {
         let mut a = epsilon_only(2, crate::numsys::Direction::Msd);
-        a.msd = vec![None];
+        a.set_track_msds(vec![None]);
         let err = convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new())
             .expect_err("must reject a track with no attached number system");
         assert_eq!(err, ConvertNsError::NoNumberSystem);
@@ -5947,7 +5971,7 @@ mod tests {
             vec![Some("msd_1000".to_string())],
             "WB-032: must regroup 3 base-10 digits per base-1000 digit, not 2"
         );
-        assert_eq!(a.alphabet, vec![util::int_range_list(1000)]);
+        assert_eq!(a.track_alphabets(), vec![util::int_range_list(1000)]);
         assert!(
             a.fa.accepts_word(&[]),
             "empty string still accepted after regrouping"
@@ -5984,7 +6008,7 @@ mod tests {
             .expect("msd_1000 -> msd_10 must succeed, not hit a spurious base-mismatch error");
 
         assert_eq!(a.track_ns_names(), vec![Some("msd_10".to_string())]);
-        assert_eq!(a.alphabet, vec![util::int_range_list(10)]);
+        assert_eq!(a.track_alphabets(), vec![util::int_range_list(10)]);
         assert!(a.fa.accepts_word(&[]));
     }
 
@@ -6088,11 +6112,11 @@ mod tests {
 
         set_number_system_and_alphabet(&mut a, crate::numsys::Direction::Lsd, 5);
 
-        assert_eq!(a.alphabet, vec![vec![0, 1, 2, 3, 4]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1, 2, 3, 4]]);
         assert_eq!(a.fa.alphabet_size, 5);
-        assert_eq!(a.msd, vec![Some(false)]);
-        assert_eq!(a.all_reps.len(), 1);
-        assert!(a.all_reps[0].is_none());
+        assert_eq!(a.track_msds(), vec![Some(false)]);
+        assert_eq!(a.track_all_reps_list().len(), 1);
+        assert!(a.track_all_reps(0).is_none());
         assert_eq!(
             a.encoder(),
             &[1],
@@ -6172,8 +6196,8 @@ mod tests {
         let mut even = parity(1, 0);
         convert_ns(&mut even, true, 4, &mut crate::logging::Logging::new())
             .expect("the conversion must succeed");
-        assert_eq!(even.msd, vec![Some(true)]);
-        assert_eq!(even.alphabet, vec![vec![0, 1, 2, 3]]);
+        assert_eq!(even.track_msds(), vec![Some(true)]);
+        assert_eq!(even.track_alphabets(), vec![vec![0, 1, 2, 3]]);
         assert_eq!(
             even.fa.o[even.fa.q0], 1,
             "every base-4 word has even binary length, so the answer is constant-1; \
@@ -6249,7 +6273,7 @@ mod tests {
         convert_ns(&mut a, true, 4, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_4");
         convert_ns(&mut a, true, 2, &mut crate::logging::Logging::new()).expect("msd_4 -> msd_2");
 
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
         assert!(a.fa.accepts_word(&[0, 1]), "even length still accepted");
         assert!(
             a.fa.accepts_word(&[1]),
@@ -6316,14 +6340,17 @@ mod tests {
                 &mut crate::logging::Logging::new(),
             )
             .expect("forward conversion");
-            assert_eq!(there.msd, vec![Some(msd_mid)]);
-            assert_eq!(there.alphabet, vec![util::int_range_list(base_mid)]);
+            assert_eq!(there.track_msds(), vec![Some(msd_mid)]);
+            assert_eq!(
+                there.track_alphabets(),
+                vec![util::int_range_list(base_mid)]
+            );
 
             let mut back = there.clone();
             convert_ns(&mut back, true, 2, &mut crate::logging::Logging::new())
                 .expect("reverse conversion");
-            assert_eq!(back.msd, vec![Some(true)]);
-            assert_eq!(back.alphabet, vec![vec![0, 1]]);
+            assert_eq!(back.track_msds(), vec![Some(true)]);
+            assert_eq!(back.track_alphabets(), vec![vec![0, 1]]);
 
             let mut lhs = back.clone();
             let mut rhs = original.clone();
@@ -6578,8 +6605,8 @@ mod tests {
             let to_base = 2i32.pow(j as u32);
             let mut converted = a.clone();
             convert_ns(&mut converted, true, to_base, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_2^j must succeed");
-            prop_assert_eq!(&converted.alphabet, &vec![util::int_range_list(to_base)]);
-            prop_assert_eq!(&converted.msd, &vec![Some(true)]);
+            prop_assert_eq!(converted.track_alphabets(), &vec![util::int_range_list(to_base)]);
+            prop_assert_eq!(converted.track_msds(), &vec![Some(true)]);
 
             for w in all_words_over(to_base, 3) {
                 let expanded: Vec<i32> =
