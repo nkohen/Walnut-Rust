@@ -35,7 +35,7 @@
 //! own docs) needed a real `Automaton` wired in as of this unit — done via
 //! [`wr_core::automaton::Automaton::track_ns_names`]. That method reports each track's
 //! REAL `NumberSystem.getName()`, threaded through from `wr-io`'s reader
-//! ([`wr_core::automaton::Automaton::ns_name`]); an earlier draft of this unit
+//! ([`wr_core::automaton::Track::ns_name`]); an earlier draft of this unit
 //! reconstructed the name from `(msd, alphabet.len())` instead, which made the guard
 //! **fail open** on custom bases — `union u fib1 two1;` with an `msd_fib` operand and an
 //! `msd_2` one silently produced a mixed-numeration result where real Walnut refuses with
@@ -250,7 +250,7 @@ fn ns_differs(a: &Automaton, b: &Automaton) -> bool {
     let b_names = b.track_ns_names();
     let a_ref: Vec<Option<&str>> = a_names.iter().map(|o| o.as_deref()).collect();
     let b_ref: Vec<Option<&str>> = b_names.iter().map(|o| o.as_deref()).collect();
-    is_ns_differing(&a_ref, &b_ref, a.track_alphabets(), b.track_alphabets())
+    is_ns_differing(&a_ref, &b_ref, &a.track_alphabets(), &b.track_alphabets())
 }
 
 // ---------------------------------------------------------------------------

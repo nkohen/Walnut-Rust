@@ -369,8 +369,9 @@ fn is_subset_alphabet(r1: &[Vec<i32>], r2: &[Vec<i32>]) -> bool {
 ///
 /// Java replaces the whole object with `new NumberSystem(newName)`, so
 /// `NumberSystem.getName()` afterwards is the FLIPPED name. This port splits Java's one
-/// object into the parallel [`Automaton::msd`] flag and [`Automaton::ns_name`] string,
-/// and until this fix only the flag was flipped. That was a live, silent
+/// object into the parallel [`crate::automaton::Track::msd`] flag and
+/// [`crate::automaton::Track::ns_name`] string, and until this fix only the flag was
+/// flipped. That was a live, silent
 /// wrong-output bug, because [`Automaton::track_ns_names`] deliberately *prefers* the
 /// recorded name over reconstructing one from the flag (it has to — a custom base's name
 /// is not derivable from its alphabet):
@@ -440,12 +441,12 @@ pub(crate) fn flip_ns(a: &mut Automaton) {
             Some(name) => {
                 let new_name = flipped_ns_name(name);
                 // `NumberSystem`'s constructor: `isMsd = determineMsdOrLsd(name).equals(MSD)`.
-                // No single-index setter exists for `msd`/`ns_name` yet (Stage B gap --
-                // see U9's checkpoint report), so these two writes stay on the raw fields.
-                a.msd[i] = Some(new_name.starts_with(crate::numsys::MSD_UNDERSCORE));
-                a.ns_name[i] = Some(new_name);
+                // U9 Stage C: `set_track_msd`/`set_track_ns_name` -- the single-index
+                // setters Stage B's checkpoint flagged as missing -- close this gap.
+                a.set_track_msd(i, Some(new_name.starts_with(crate::numsys::MSD_UNDERSCORE)));
+                a.set_track_ns_name(i, Some(new_name));
             }
-            None => a.msd[i] = Some(!a.track_msd(i).unwrap()),
+            None => a.set_track_msd(i, Some(!a.track_msd(i).unwrap())),
         }
     }
     for slot in a.track_all_reps_iter_mut() {
@@ -465,7 +466,7 @@ pub(crate) fn flip_ns(a: &mut Automaton) {
 /// `determineMsdOrLsd` is `name.substring(0, name.indexOf("_"))`, so a name with no `_`
 /// at all makes Java evaluate `substring(0, -1)` and throw
 /// `StringIndexOutOfBoundsException`. That is unreachable through every real path into
-/// [`Automaton::ns_name`] — every writer of it (`wr-io`'s reader, `wr-cli`'s
+/// [`crate::automaton::Track::ns_name`] — every writer of it (`wr-io`'s reader, `wr-cli`'s
 /// `alphabet`/`reg`, `crate::numsys`) sources the string from
 /// `normalize_number_system_token` or a [`crate::numsys::NumberSystem`]'s own name, and
 /// every branch of the former yields an `msd_`/`lsd_`-prefixed string — but
@@ -847,7 +848,7 @@ pub fn right_quotient(
     ));
     if subset_check == SubsetCheck::Check {
         assert!(
-            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+            is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
             "Second A's alphabet must be a subset of the first A's alphabet for right quotient."
         );
     }
@@ -868,20 +869,16 @@ pub fn right_quotient(
         })
         .collect();
     other_clone.fa.d = re_encoded;
-    // U9 (idiomatic-refactor) Stage B: this reassigns `other_clone`'s WHOLE track set to
-    // `a`'s, which can change the track COUNT (`a`/`b` need not be same-arity when
-    // `subset_check != Check` skips the guard above) -- `set_track_alphabets`/
-    // `set_track_msds` deliberately panic on a track-count change (Stage A's documented
-    // assumption "no existing call site does this"), so this specific write stays on the
-    // raw field; see U9's checkpoint report ("gap: whole-vector replace with a
-    // possibly-different track count"). The READ side is still converted.
-    other_clone.alphabet = a.track_alphabets().to_vec();
+    // `otherClone.setNS(A.getNS())` (`:206`) -- installs `a`'s WHOLE per-track state
+    // (alphabet + all three NS-stand-in parts) onto `other_clone`. U9 Stage C:
+    // `replace_all_tracks`, the loudly-named exception to `set_track_alphabets`/
+    // `set_track_msds`'s track-count-preserving guard -- `a`/`b` need not be the same
+    // arity here (`subset_check != Check` skips the earlier alphabet-subset guard), so
+    // this is exactly the one call site that accessor was added for; see its own doc
+    // comment.
+    other_clone.replace_all_tracks((0..a.track_count()).map(|i| a.track(i)).collect());
     other_clone.setup_encoder();
     other_clone.fa.alphabet_size = a.fa.alphabet_size;
-    // `otherClone.setNS(A.getNS())` (`:206`) — all three parts of the per-track stand-in.
-    other_clone.msd = a.track_msds().to_vec();
-    other_clone.set_all_reps(a.track_all_reps_list().to_vec());
-    other_clone.set_ns_names(a.track_ns_names_raw().to_vec());
 
     for i in 0..a.fa.q {
         // A temporary automaton identical to `a` except that it starts from state `i`.
@@ -966,7 +963,7 @@ pub fn left_quotient(
         a.fa.q, b.fa.q
     ));
     assert!(
-        is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+        is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
         "Second A's alphabet must be a subset of the first A's alphabet for left quotient."
     );
 
@@ -1393,16 +1390,16 @@ fn remove_leading_zeros_helper(
             o: vec![1, 1],
             d,
         },
-        a.track_alphabets().to_vec(),
+        a.track_alphabets(),
         a.label.clone(),
-        a.track_msds().to_vec(),
+        a.track_msds(),
     );
     // `M.setNS(A.getNS())` (`:387`) shares the whole `NumberSystem` list, i.e. both halves
     // of this crate's NS stand-in — the msd flags handed to `Automaton::new` above AND the
     // all-representations restriction, which `or`/`xor`/`imply`/`iff` re-apply after
     // totalizing (`and` never totalizes, so it never needs to).
-    m.set_all_reps(a.track_all_reps_list().to_vec());
-    m.set_ns_names(a.track_ns_names_raw().to_vec());
+    m.set_all_reps(a.track_all_reps_list());
+    m.set_ns_names(a.track_ns_names_raw());
 
     // `if (!A.getNS().get(n).isMsd()) reverse(M, false);` (`:402-404`).
     if !msd {
@@ -3554,12 +3551,16 @@ mod tests {
     }
 
     /// `removeLeadingZerosHelper`'s own guard (`:376-379`), reachable only for a
-    /// malformed automaton whose `label` is longer than its `alphabet`.
+    /// malformed automaton whose `label` is longer than its `alphabet`. Only `label`
+    /// needs to desync (still freely mutable post-U9 Stage C — `label` was never one of
+    /// `Track`'s bundled facets): `remove_leading_zeros_helper`'s `n >= a.track_count()`
+    /// guard fires from `label`'s extra entry alone, before ever touching `msd`, so a
+    /// `msd.push(...)` alongside it (present here through Stage B) was never
+    /// load-bearing — confirmed by removing it and re-running this test unchanged.
     #[test]
     fn remove_leading_zeros_reports_an_out_of_range_input_index() {
         let mut a = single_track(universal(), Some(true));
         a.label.push("y".to_string());
-        a.msd.push(Some(true));
         let err = remove_leading_zeros(&a, &labels(&["y"])).unwrap_err();
         assert_eq!(
             err,
@@ -4412,7 +4413,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
+            is_subset_alphabet(&a.track_alphabets(), &b.track_alphabets()),
             "the OPPOSITE containment does hold, so a swapped guard would pass"
         );
         let _ = right_quotient(
@@ -4447,7 +4448,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            !is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+            !is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
             "precondition: the guard WOULD reject this pair if it ran"
         );
 
@@ -4623,11 +4624,11 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+            is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
             "sanity: the real precondition (B subset A) genuinely holds here"
         );
         assert!(
-            !is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
+            !is_subset_alphabet(&a.track_alphabets(), &b.track_alphabets()),
             "sanity: but the alphabets are NOT equal as sets -- the old (backwards) \
              guard would have wrongly rejected this pair"
         );
@@ -4695,7 +4696,7 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+            is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
             "sanity: B's alphabet {{1,2}} is a genuine (non-prefix) subset of A's {{0,1,2}}"
         );
 
@@ -4806,11 +4807,11 @@ mod tests {
             vec![Some(true)],
         );
         assert!(
-            is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
+            is_subset_alphabet(&a.track_alphabets(), &b.track_alphabets()),
             "sanity: the OLD (backwards) guard (A subset B) would have wrongly passed"
         );
         assert!(
-            !is_subset_alphabet(b.track_alphabets(), a.track_alphabets()),
+            !is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()),
             "sanity: the containment the FIXED guard (and rightQuotient's re-encode) \
              actually needs (B subset A) does NOT hold -- so the fixed guard rejects"
         );
@@ -5085,9 +5086,9 @@ mod tests {
             let mut b = b;
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
-            prop_assert!(is_subset_alphabet(b.track_alphabets(), a.track_alphabets()));
+            prop_assert!(is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()));
             prop_assert!(
-                !is_subset_alphabet(a.track_alphabets(), b.track_alphabets()),
+                !is_subset_alphabet(&a.track_alphabets(), &b.track_alphabets()),
                 "keep this shape genuinely non-equal-alphabet, or it collapses into \
                  the sibling equal-alphabet property above"
             );
@@ -5135,7 +5136,7 @@ mod tests {
             let mut b = b;
             a.fa = crate::trim::trim(&a.fa);
             b.fa = crate::trim::trim(&b.fa);
-            prop_assert!(!is_subset_alphabet(b.track_alphabets(), a.track_alphabets()));
+            prop_assert!(!is_subset_alphabet(&b.track_alphabets(), &a.track_alphabets()));
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 left_quotient(&a, &b, &mut crate::logging::Logging::new())
@@ -6605,8 +6606,8 @@ mod tests {
             let to_base = 2i32.pow(j as u32);
             let mut converted = a.clone();
             convert_ns(&mut converted, true, to_base, &mut crate::logging::Logging::new()).expect("msd_2 -> msd_2^j must succeed");
-            prop_assert_eq!(converted.track_alphabets(), &vec![util::int_range_list(to_base)]);
-            prop_assert_eq!(converted.track_msds(), &vec![Some(true)]);
+            prop_assert_eq!(converted.track_alphabets(), vec![util::int_range_list(to_base)]);
+            prop_assert_eq!(converted.track_msds(), vec![Some(true)]);
 
             for w in all_words_over(to_base, 3) {
                 let expanded: Vec<i32> =

@@ -442,7 +442,7 @@ pub fn set_alphabet(
     // the STILL-UNCHANGED `automaton` (Java's `this`), writes into `m` (`M`).
     m.fa.d = Automaton::rebuild_transitions_for_new_alphabet(
         automaton,
-        m.track_alphabets(),
+        &m.track_alphabets(),
         m.encoder(),
     );
 

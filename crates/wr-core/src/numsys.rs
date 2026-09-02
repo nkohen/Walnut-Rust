@@ -889,7 +889,7 @@ pub fn base_change_candidate_names(name: &str) -> Result<(String, String), NumSy
 ///
 /// **Wired as of U23** (`wr-cli`'s `union`/`intersect`/`concat` commands): each call site
 /// passes [`crate::automaton::Automaton::track_ns_names`], which reports the track's real
-/// `NumberSystem.getName()` where one was recorded ([`crate::automaton::Automaton::ns_name`])
+/// `NumberSystem.getName()` where one was recorded ([`crate::automaton::Track::ns_name`])
 /// and reconstructs `msd_k`/`lsd_k` from the alphabet otherwise. Recording the real name is
 /// load-bearing, not cosmetic: without it a custom base (`msd_fib`) is indistinguishable
 /// from the plain base with the same alphabet cardinality (`msd_2`), and this guard fails
@@ -1502,7 +1502,7 @@ impl NumberSystem {
     /// `Collections.fill(allRepresentations.getNS(), this)` (`:151`) makes the
     /// all-representations automaton point at the very number system that owns it —
     /// a reference cycle Java's GC shrugs off but `Rc` would leak. This port fills the
-    /// direction half (`msd`) and leaves the [`crate::automaton::Automaton::all_reps`] half
+    /// direction half (`msd`) and leaves the [`crate::automaton::Track::all_reps`] half
     /// empty. Provably unread: `all_reps[i]` is only consulted by
     /// `apply_all_representations`, and the only reader of *this* automaton's copy would be
     /// `product::update_axb_fields`'s `bNS.get(i) != null && AxB.getNS().get(j) == null`
@@ -1556,7 +1556,7 @@ impl NumberSystem {
         // number system on every track — carrying its NAME, which
         // `NumberSystem.isNSDiffering` compares by and which
         // `AutomatonWriter.writeAlphabet` emits. The msd/lsd half is already installed by
-        // the two setters above; this is the name half (see `Automaton::ns_name`). For a
+        // the two setters above; this is the name half (see `Track::ns_name`). For a
         // plain `msd_k` this is exactly what `track_ns_names` would reconstruct anyway;
         // for a custom base it is the only way `msd_fib` survives into everything these
         // three automata are later combined into.
@@ -1758,18 +1758,18 @@ impl NumberSystem {
             return Err(NumSysError::LessThanInputCount(name.to_string()));
         }
         let rhs: BTreeSet<i32> = alphabet.iter().copied().collect();
-        // U9 (idiomatic-refactor) Stage B: an index-range loop, not `.alphabet.iter()
-        // .enumerate()` -- `track_alphabet(i)` borrows `&less_than` per iteration and the
-        // borrow ends at `.collect()`, before `less_than.msd[i] = …` needs `&mut
-        // less_than` below; holding a live `track_alphabets().iter()` for the whole loop
-        // would conflict with that write (a real "simultaneous borrow of two facets"
-        // shape -- see U9's checkpoint report).
+        // An index-range loop, not `.track_alphabets().iter().enumerate()` -- reading
+        // `track_alphabet(i)` per iteration borrows `less_than` only long enough to
+        // `.collect()` into an owned `BTreeSet`, ending that borrow before
+        // `set_track_msd` below needs `&mut less_than`; holding one live borrow across
+        // the whole loop (e.g. `for (i, track) in less_than.track_alphabets().iter()
+        // .enumerate()`) would conflict with that write.
         for i in 0..less_than.track_count() {
             let lhs: BTreeSet<i32> = less_than.track_alphabet(i).iter().copied().collect();
             if lhs != rhs {
                 return Err(NumSysError::LessThanAlphabetMismatch(name.to_string()));
             }
-            less_than.msd[i] = Some(direction == Direction::Msd);
+            less_than.set_track_msd(i, Some(direction == Direction::Msd));
         }
         Ok(less_than)
     }

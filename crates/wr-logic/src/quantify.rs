@@ -646,7 +646,7 @@ mod tests {
         ) {
             let mut a = original.clone();
             exists(&mut a, &labels(&["y"])).unwrap();
-            prop_assert_eq!(a.track_msds(), &vec![Some(false)], "the surviving track stays lsd");
+            prop_assert_eq!(a.track_msds(), vec![Some(false)], "the surviving track stays lsd");
 
             // The pure ∃y-projection, as a subset of the ORIGINAL automaton's states.
             let mut subset: BTreeSet<usize> = BTreeSet::from([original.fa.q0]);

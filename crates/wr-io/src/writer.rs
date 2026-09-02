@@ -32,7 +32,7 @@
 //!
 //! **Number-system names**: Java writes `numberSystem.toString()` (`AutomatonWriter.java:72`),
 //! i.e. `NumberSystem.getName()`. Since U23's review fixes, `wr_core::Automaton` carries
-//! that name per track ([`wr_core::automaton::Automaton::ns_name`], surfaced through
+//! that name per track ([`wr_core::automaton::Track::ns_name`], surfaced through
 //! `track_ns_names()`), so this writer emits it verbatim — a custom base (`msd_fib`, ...)
 //! now round-trips through write→read instead of being flattened to the `msd_2` its
 //! alphabet cardinality alone suggests. Where no name was recorded (an automaton this

@@ -758,9 +758,19 @@ fn apply_all_representations_with_output_single_restricted_track_has_this_exact_
 /// (per `Automaton::track_ns_name_raw`'s "raw, not the `track_ns_names()`
 /// reconstructed fallback" distinction) against `expected_ns_name`, and `label`
 /// checked SEPARATELY (per its own documented carve-out: `label.len()` need not
-/// equal `alphabet.len()`) -- through both the raw `pub` fields and the new
-/// Stage-A `Track` accessors, which must agree exactly since both read the same
-/// unchanged storage today.
+/// equal `alphabet.len()`).
+///
+/// U9 (idiomatic-refactor) Stage C conversion, recorded explicitly: through Stage
+/// A/B this asserted the SAME expected values twice -- once against the raw
+/// `pub` parallel-vector fields (`Automaton::alphabet`/`msd`/`ns_name`, then the
+/// actual storage), once again through the `Track` accessor surface -- to prove
+/// the accessors delegated correctly onto that storage. Stage C's storage flip
+/// (`tracks: Vec<Track>`) removed those fields entirely, so the raw-field half is
+/// gone; this now checks only the accessor surface, still against the real
+/// literal `expected_*` values every call site supplies (not a self-comparison,
+/// so still fully non-vacuous coverage) -- just no longer ALSO proving
+/// "delegates correctly onto a separate field," since there is no longer a
+/// separate field to delegate onto.
 fn assert_track_structure(
     a: &Automaton,
     expected_alphabet: &[Vec<i32>],
@@ -768,20 +778,11 @@ fn assert_track_structure(
     expected_ns_name: &[Option<&str>],
     expected_label: &[&str],
 ) {
-    // The raw parallel-vector fields -- today's actual storage.
-    assert_eq!(a.alphabet, expected_alphabet, "alphabet field");
-    assert_eq!(a.msd, expected_msd, "msd field");
-    assert_eq!(
-        a.ns_name.iter().map(|n| n.as_deref()).collect::<Vec<_>>(),
-        expected_ns_name,
-        "ns_name field"
-    );
     assert_eq!(
         a.label, expected_label,
         "label field (NOT parallel to the rest)"
     );
 
-    // The new Stage-A accessor surface -- must delegate onto the exact same values.
     assert_eq!(a.track_count(), expected_alphabet.len(), "track_count()");
     assert_eq!(a.track_alphabets(), expected_alphabet, "track_alphabets()");
     assert_eq!(a.track_msds(), expected_msd, "track_msds()");

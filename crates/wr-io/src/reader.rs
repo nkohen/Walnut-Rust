@@ -1545,10 +1545,10 @@ fn expand_wildcards(input: &[Option<i32>], alphabet: &[Vec<i32>]) -> Vec<Vec<i32
 /// belongs here", per the Phase 3a plan's U13 row).
 #[derive(Debug, Clone)]
 pub struct TransducerData {
-    /// Per-track alphabet (same shape as [`Automaton::alphabet`]).
+    /// Per-track alphabet (same shape as [`Automaton::track_alphabets`]).
     pub alphabet: Vec<Vec<i32>>,
     /// Per-track msd/lsd (`None` for an explicit-set track) — same shape as
-    /// [`Automaton::msd`].
+    /// [`Automaton::track_msds`].
     pub msd: Vec<Option<bool>>,
     /// The declared alphabet's total encoded size (product of per-track sizes).
     pub alphabet_size: usize,

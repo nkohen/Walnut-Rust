@@ -1301,7 +1301,7 @@ mod tests {
                 prop_assert_eq!(p.fa.o.len(), p.fa.q);
                 prop_assert_eq!(&p.fa.o, &(0..=max_entry).collect::<Vec<i32>>());
                 prop_assert_eq!(p.track_alphabet(0), &(0..max_image_length as i32).collect::<Vec<i32>>());
-                prop_assert_eq!(p.track_msds(), &vec![Some(true)]);
+                prop_assert_eq!(p.track_msds(), vec![Some(true)]);
                 prop_assert!(p.is_canonized());
             }
         }

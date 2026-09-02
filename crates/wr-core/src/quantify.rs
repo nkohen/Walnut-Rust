@@ -195,7 +195,8 @@ impl From<MinimizeError> for QuantifyError {
 /// Naming *every* track is legal and turns `a` into a TRUE/FALSE automaton — see this
 /// module's "U0 behavior change" section.
 ///
-/// On success `a.alphabet` / `a.label` / `a.msd` have had the quantified tracks removed,
+/// On success `a`'s tracks (alphabet/msd/all_reps/ns_name) / `a.label` have had the
+/// quantified tracks removed,
 /// `a.fa` is a minimal (generally *partial* — `minimize` drops non-co-reachable states)
 /// DFA over the reduced alphabet, and state numbering bears no relation to Walnut's.
 pub fn quantify(a: &mut Automaton, labels: &BTreeSet<String>) -> Result<(), QuantifyError> {
@@ -235,7 +236,7 @@ pub fn quantify_with_ctx(
     // `quantify`'s tail: consult the surviving tracks' numeration direction. Note this
     // runs even when `quantify_helper` short-circuited — a faithfully-ported quirk, see
     // the module docs.
-    match determine_msd(a.track_msds()) {
+    match determine_msd(&a.track_msds()) {
         None => Ok(()),
         Some(true) => {
             // `AutomatonLogicalOps.fixLeadingZerosProblem(A)` (`:44`). Its closing

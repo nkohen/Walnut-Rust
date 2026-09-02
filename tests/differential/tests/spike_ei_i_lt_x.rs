@@ -35,10 +35,12 @@ fn ei_i_lt_x_matches_real_walnut_output() {
     assert_eq!(ours.label, vec!["x".to_string()]);
     assert_eq!(ground_truth.track_alphabets(), vec![vec![0, 1]]);
 
-    // `wr_core::equiv::automaton_language_equivalent` (U8) checks `Automaton::alphabet`
-    // for exact positional equality itself before ever touching the underlying `Fa`s —
-    // this used to be a manual `assert_eq!(ours.alphabet, ground_truth.alphabet, ...)`
-    // work-around here (see git history), needed because the raw `Fa`-level oracle
+    // `wr_core::equiv::automaton_language_equivalent` (U8) checks each track's alphabet
+    // (`Automaton::track_alphabets`) for exact positional equality itself before ever
+    // touching the underlying `Fa`s — this used to be a manual
+    // `assert_eq!(ours.alphabet, ground_truth.alphabet, ...)` work-around here (see git
+    // history, predating U9's idiomatic-refactor removal of that field), needed because
+    // the raw `Fa`-level oracle
     // (`language_equivalent`) only ever checks `alphabet_size`, never track content or
     // order. That work-around is no longer needed: the oracle call below now enforces
     // the same guarantee (returning `Err(MismatchedTrackStructure)` instead of a

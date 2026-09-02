@@ -2223,14 +2223,16 @@ impl AlphabetLetter {
 /// [`Automaton`] already carries per track, with no name parsing, no `Custom Bases/` file
 /// access and no `NumberSystem` reconstruction anywhere in it:
 ///
-/// * [`Automaton::msd`] `[i]` is Java's `NS.get(i) == null` test. `None` is a
-///   `{...}`-declared track — no numeration in Java either, so
-///   [`TrackNs::DeclaredAlphabet`] and, on a repeated occurrence, WB-013's message.
+/// * [`Automaton::track_msds`] `(i)`, i.e. [`wr_core::automaton::Track::msd`], is Java's
+///   `NS.get(i) == null` test. `None` is a `{...}`-declared track — no numeration in Java
+///   either, so [`TrackNs::DeclaredAlphabet`] and, on a repeated occurrence, WB-013's
+///   message.
 /// * otherwise, `NumberSystem`'s constructor built `equality` as
 ///   `setEqualityAutomaton(getAlphabet())` (`NumberSystem.java:144`), where `getAlphabet()`
 ///   is the adder's track-0 alphabet — which is *exactly* what `wr-io`'s reader stored in
-///   [`Automaton::alphabet`] `[i]` (`reader.rs`: `alphabet: ns.get_alphabet().to_vec()`).
-///   So [`wr_core::numsys::equality_automaton`] `(&automaton.alphabet[i], is_msd)`
+///   [`Automaton::track_alphabet`] `(i)`, i.e. [`wr_core::automaton::Track::alphabet`]
+///   (`reader.rs`: `alphabet: ns.get_alphabet().to_vec()`). So
+///   [`wr_core::numsys::equality_automaton`] `(automaton.track_alphabet(i), is_msd)`
 ///   reproduces it verbatim.
 /// * the number system installs its own NAME on every track of `equality`
 ///   (`NumberSystem.java:364-366`/`:392`/`initBasicAutomaton`, ported in
@@ -2239,10 +2241,12 @@ impl AlphabetLetter {
 ///   programmatic bases where the two are identical by construction.
 /// * a custom base with a `Custom Bases/<name>.txt` all-representations file additionally
 ///   restricts `equality` to the valid representations (`:151-155`). That restriction
-///   automaton is [`Automaton::all_reps`] `[i]` — the reader stores the very `Rc` the
-///   number system holds (`reader.rs`: `all_reps: ns.all_representations().cloned()`) — so
-///   replaying [`Automaton::set_all_reps`] + [`Automaton::apply_all_representations`] here
-///   is the same sequence, on the same operand, as the constructor ran.
+///   automaton is [`Automaton::track_all_reps`] `(i)`, i.e.
+///   [`wr_core::automaton::Track::all_reps`] — the reader stores the very `Rc` the
+///   number system holds (`reader.rs`: `all_reps: ns.all_representations().cloned()`) —
+///   so replaying [`Automaton::set_all_reps`] + [`Automaton::apply_all_representations`]
+///   here is the
+///   same sequence, on the same operand, as the constructor ran.
 ///
 /// The replay is deliberately given a throwaway [`wr_core::logging::Logging`]: Java logs
 /// nothing at this point (it clones an automaton built once, at `NumberSystem`
@@ -2277,29 +2281,42 @@ impl AlphabetLetter {
 ///
 /// # The one remaining non-`Present` answer besides Java's own `null`
 ///
-/// [`TrackNs::NumberSystemUnrecoverable`] survives as a defensive arm for a state that is
-/// representable but violates [`Automaton`]'s parallel-track invariant: `msd[i]` says the
-/// track HAS a number system while `alphabet` has no track `i` at all. No caller can reach
-/// it — [`Word::act`] iterates `0..arity` and `Word::new` requires `arity ==
-/// word_automaton.arity()`, i.e. `alphabet.len()` — but `msd` and `alphabet` are `pub`
-/// fields with only a `debug_assert` between them, so the case is constructible and is
-/// classified deliberately rather than left to borrow WB-013's (then false) message. Kept
-/// for the same reason `wr_core::logicalops::ConvertNsError::BaseOverflowsInt` is.
+/// [`TrackNs::NumberSystemUnrecoverable`] survives as a defensive arm mirroring Java's own
+/// null-check shape (`getNS().get(i)` returning `null` for an out-of-range `i` there), even
+/// though the state it guards — `msd[i]` says the track HAS a number system while
+/// `alphabet` has no track `i` at all — is dead by construction post-U9 (idiomatic-refactor)
+/// Stage C: `tracks: Vec<Track>` bundles a track's alphabet and msd/lsd direction together,
+/// one per index, so `track_msds()` and `track_alphabets()` are always the same length and
+/// this disagreement cannot arise through any safe API in any crate (see
+/// `a_track_index_in_range_for_msd_is_always_in_range_for_alphabet_too` below, which pins
+/// exactly this). No caller can reach it either way — [`Word::act`] iterates `0..arity` and
+/// `Word::new` requires `arity == word_automaton.arity()`, i.e. `alphabet.len()`. Classified
+/// deliberately rather than left to borrow WB-013's (then false) message, and kept for the
+/// same mechanical-port-fidelity reason `wr_core::logicalops::ConvertNsError::BaseOverflowsInt`
+/// is.
 fn track_equality_automaton(automaton: &Automaton, i: usize) -> OwnedTrackNs {
-    // U9 (idiomatic-refactor) Stage B: `track_msds()`/`track_alphabets()`/
-    // `track_all_reps_list()` are plain slices, so `.get(i)` on them is exactly as
-    // checked/non-panicking as `automaton.msd.get(i)` etc. was on the raw `Vec`s --
-    // this whole function exists to handle an `i` that may not be a valid track index
-    // (see its own doc comment), which is why the checked form is used throughout
-    // rather than the panicking `track_msd`/`track_alphabet`/`track_all_reps`.
+    // This whole function exists to handle an `i` that may not be a valid track index
+    // (see its own doc comment), so every read below is checked/non-panicking, never the
+    // plain panicking `track_msd`/`track_alphabet`/`track_all_reps`. `track_msds()`
+    // returns an OWNED `Vec` since U9 Stage C's storage flip (`tracks: Vec<Track>` has
+    // no contiguous per-facet region left to borrow a slice from), but `.get(i)
+    // .copied()` immediately copies the `Option<bool>` out (it's `Copy`), so the
+    // temporary `Vec` this builds doesn't need to outlive this statement.
     let Some(is_msd) = automaton.track_msds().get(i).copied().flatten() else {
         // Java's own `null`: a `{...}`-declared track (WB-013).
         return OwnedTrackNs::DeclaredAlphabet;
     };
-    let Some(alphabet) = automaton.track_alphabets().get(i) else {
+    // U9 (idiomatic-refactor) Stage C: a bounds check plus the panicking
+    // `track_alphabet`, not `track_alphabets().get(i)` -- the plural accessor now
+    // returns an OWNED `Vec<Vec<i32>>` (`tracks: Vec<Track>` has no contiguous
+    // alphabet-only region left to borrow a slice from), so indexing into it here would
+    // clone every track's alphabet just to check one, and the borrowed result would
+    // dangle past this statement (the `Vec<Vec<i32>>` is a temporary) besides.
+    if i >= automaton.track_count() {
         // Unreachable from any caller -- see this function's last section.
         return OwnedTrackNs::NumberSystemUnrecoverable;
-    };
+    }
+    let alphabet = automaton.track_alphabet(i);
     // `setEqualityAutomaton(getAlphabet())` (`NumberSystem.java:144`).
     let direction = if is_msd {
         wr_core::numsys::Direction::Msd
@@ -3767,7 +3784,7 @@ mod tests {
 
     /// A one-track [`Automaton`] shaped exactly like what `wr-io`'s reader produces for a
     /// declared numeration system: the number system's own alphabet, its direction, and
-    /// its name recorded in [`Automaton::ns_name`].
+    /// its name recorded in [`wr_core::automaton::Track::ns_name`].
     fn track(alphabet: Vec<i32>, is_msd: bool, ns_name: Option<&str>) -> Automaton {
         let mut a = Automaton::new(
             wr_core::fa::Fa {
@@ -4091,27 +4108,100 @@ mod tests {
         ));
     }
 
-    /// The one non-`Present`, non-Java answer left: an [`Automaton`] whose parallel track
-    /// vectors disagree — `msd[1]` declares a number system while `alphabet` has no track
-    /// 1 at all.
+    /// U9 (idiomatic-refactor) Stage C conversion, recorded explicitly. Through Stage B
+    /// this test constructed the one non-`Present`, non-Java answer
+    /// [`OwnedTrackNs::NumberSystemUnrecoverable`] exists for — an [`Automaton`] whose
+    /// parallel track vectors disagree, `msd[1]` declaring a number system while
+    /// `alphabet` has no track 1 at all — by pushing directly onto the old `pub msd:
+    /// Vec<Option<bool>>` field (the original doc comment's own words: "constructible,
+    /// since `msd` is a `pub` field"). `Automaton::msd` no longer exists: U9 Stage C
+    /// replaced it and `alphabet` with `tracks: Vec<Track>`, which bundles a track's
+    /// alphabet and msd/lsd direction together, one per index -- so the disagreement
+    /// this test used to build is no longer constructible through ANY safe API, in ANY
+    /// crate, not merely "unreachable from every current caller" as the pre-Stage-C doc
+    /// comment already (correctly) suspected but could not prove.
     ///
-    /// Unreachable from any caller ([`Word::act`] iterates `0..arity` and [`Word::new`]
-    /// requires `arity == word_automaton.arity()`), but constructible, since `msd` is a
-    /// `pub` field. Classified deliberately rather than allowed to borrow WB-013's message,
-    /// which would be factually false about it.
+    /// Converted to pin that structural guarantee directly. The FIRST draft of this
+    /// conversion asserted `track_msds().get(i).is_some() == track_alphabets().get(i)
+    /// .is_some()` for every `i` — a tautology, since both `Vec`s are always
+    /// `track_count()`-long (they're built by mapping over `self.tracks`), so the two
+    /// `.get(i)` calls agree on "in range" for the trivial reason that they're indexing
+    /// same-length `Vec`s, not because of anything `Track` enforces; a reviewer caught
+    /// this. This version instead asserts a FALSIFIABLE invariant — `track_count()` and
+    /// all four plural-accessor lengths agree — immediately after every mutating
+    /// accessor that could plausibly desync them ([`Automaton::push_track`],
+    /// [`Automaton::replace_all_tracks`], [`Automaton::set_track_alphabets`],
+    /// [`Automaton::bind`], [`Automaton::sort_label`]): a real mutation bug in any of
+    /// those (e.g. a permute that drops one track's `Track` but not another's) CAN break
+    /// this assertion, unlike the tautological one it replaces.
     #[test]
-    fn a_track_that_declares_a_number_system_but_has_no_alphabet_is_classified_not_guessed() {
+    fn a_track_index_in_range_for_msd_is_always_in_range_for_alphabet_too() {
+        fn assert_track_vectors_length_consistent(a: &Automaton) {
+            let n = a.track_count();
+            assert_eq!(a.track_msds().len(), n, "track_msds() length");
+            assert_eq!(a.track_alphabets().len(), n, "track_alphabets() length");
+            assert_eq!(
+                a.track_all_reps_list().len(),
+                n,
+                "track_all_reps_list() length"
+            );
+            assert_eq!(
+                a.track_ns_names_raw().len(),
+                n,
+                "track_ns_names_raw() length"
+            );
+        }
+
         let mut a = track(vec![0, 1], true, Some("msd_2"));
-        a.msd.push(Some(true)); // a second track's DIRECTION, with no second alphabet
-        assert!(a.alphabet.get(1).is_none());
-        assert!(
-            matches!(
-                track_equality_automaton(&a, 1),
-                OwnedTrackNs::NumberSystemUnrecoverable
-            ),
-            "must not be reported as Java's null (WB-013), which would claim the alphabet \
-             was declared explicitly"
-        );
+        assert_track_vectors_length_consistent(&a);
+
+        // `push_track`: grows the track count by one.
+        a.push_track(wr_core::automaton::Track {
+            alphabet: vec![0, 1, 2],
+            msd: Some(false),
+            all_reps: None,
+            ns_name: None,
+        });
+        assert_track_vectors_length_consistent(&a);
+
+        // `bind` (unsorted labels, so the later `sort_label` call actually permutes).
+        a.bind(vec!["z".to_string(), "a".to_string()]);
+        assert_track_vectors_length_consistent(&a);
+
+        // `sort_label`: permutes `tracks` in step with `label`.
+        a.sort_label();
+        assert_track_vectors_length_consistent(&a);
+        assert_eq!(a.label, vec!["a".to_string(), "z".to_string()]);
+
+        // `replace_all_tracks`: allowed to change the track count (down to 1 here).
+        a.replace_all_tracks(vec![wr_core::automaton::Track {
+            alphabet: vec![0, 1],
+            msd: Some(true),
+            all_reps: None,
+            ns_name: None,
+        }]);
+        assert_track_vectors_length_consistent(&a);
+
+        // `set_track_alphabets`: same track count, different alphabet.
+        a.set_track_alphabets(vec![vec![0, 1, 2, 3]]);
+        assert_track_vectors_length_consistent(&a);
+
+        for i in 0..=a.track_count() {
+            assert_eq!(
+                a.track_msds().get(i).is_some(),
+                a.track_alphabets().get(i).is_some(),
+                "index {i}: msd and alphabet must agree on whether it's in range"
+            );
+        }
+        // The two real, still-reachable `TrackNs` classifications are unaffected by this
+        // structural guarantee -- both are decided by `msd[i]` alone (`Some`/`None`), and
+        // still exercised end to end by this module's other tests
+        // (`track_equality_automaton_reports_javas_null_only_for_a_declared_alphabet_track`
+        // and friends).
+        assert!(matches!(
+            track_equality_automaton(&a, 0),
+            OwnedTrackNs::Present(_)
+        ));
     }
 
     // --------------------------------------------------- `Word::act`, end to end

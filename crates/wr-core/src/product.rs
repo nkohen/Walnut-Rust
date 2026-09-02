@@ -480,22 +480,26 @@ fn update_axb_fields(
             // `msd` guard is the `bNS.get(i) != null && AxB.getNS().get(j) == null` test
             // verbatim (`msd[..].is_none()` IS "this track has no number system"), and
             // `all_reps` must move in lockstep or the two halves would describe different
-            // number systems (see `Automaton::all_reps`'s invariant).
+            // number systems (see `Track::all_reps`'s invariant).
             //
-            // U9 Stage B: reads converted to the new accessors; the three writes below
-            // stay on the raw fields -- there is no single-index setter for
-            // "overwrite track j's msd/all_reps/ns_name in place, leaving alphabet[j]
-            // alone" (this crate's `Track` bundles all four facets together, but Java's
-            // own object model keeps `RichAlphabet`'s alphabet list and `NumberSystem`'s
-            // msd/all_reps/name triple as two SEPARATE lists, and `getNS().set(j, ns)`
-            // only ever touches the second one -- exactly this shape). Recorded as a Stage
-            // B checkpoint gap rather than improvised; see `flip_ns` in `logicalops.rs`
-            // for the same pattern (msd + ns_name, no all_reps there).
+            // U9 Stage C: `set_track_msd`/`set_track_all_reps`/`set_track_ns_name` --
+            // added specifically for this call site's Stage B checkpoint gap (no
+            // single-index setter for "overwrite track j's msd/all_reps/ns_name in
+            // place, leaving alphabet[j] alone", Java's `getNS().set(j, ns)` shape).
+            // `msd` is set FIRST: `set_track_all_reps`/`set_track_ns_name` both assert
+            // their track's `msd` is already `Some`, and the guard above only reaches
+            // here when `b.track_msd(i)` is `Some`.
             if b.track_msd(i).is_some() && axb.track_msd(j).is_none() {
-                axb.msd[j] = b.track_msd(i);
-                axb.all_reps[j] = b.track_all_reps(i).cloned();
-                if j < axb.track_ns_names_raw().len() {
-                    axb.ns_name[j] = b.track_ns_name_raw(i).map(String::from);
+                axb.set_track_msd(j, b.track_msd(i));
+                axb.set_track_all_reps(j, b.track_all_reps(i).cloned());
+                // `j < axb.track_count()` used to guard against `axb`'s recorded-name
+                // vector being genuinely SHORTER than its track count (a real,
+                // independently-desyncable `Vec` pre-U9); post-U9 (idiomatic-refactor)
+                // Stage C that case is structurally impossible (`track_ns_names_raw()
+                // .len() == track_count()` always), so this is now tautologically true,
+                // kept only for Java-shape fidelity.
+                if j < axb.track_count() {
+                    axb.set_track_ns_name(j, b.track_ns_name_raw(i).map(String::from));
                 }
             }
         }
@@ -1327,7 +1331,7 @@ mod tests {
             let axb = cross_product(&a, &b, |p, q| BooleanOp::And.combine(p, q), &mut crate::logging::Logging::new());
 
             prop_assert_eq!(&axb.label, &vec!["x".to_string(), "y".to_string()]);
-            prop_assert_eq!(axb.track_alphabets(), &vec![vec![0, 1], vec![0, 1]]);
+            prop_assert_eq!(axb.track_alphabets(), vec![vec![0, 1], vec![0, 1]]);
 
             let combined_word: Vec<i32> = (0..len).map(|i| axb.encode(&[x_word[i], y_word[i]])).collect();
 

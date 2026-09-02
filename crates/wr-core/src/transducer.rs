@@ -790,27 +790,29 @@ impl Transducer {
         } else {
             Vec::new()
         };
-        let mut n = Automaton::new(
-            n_fa,
-            m.track_alphabets().to_vec(),
-            n_label,
-            m.track_msds().to_vec(),
-        );
+        let mut n = Automaton::new(n_fa, m.track_alphabets(), n_label, m.track_msds());
         // The other half of this crate's per-track `NumberSystem` stand-in
         // (`PORTING.md`'s parallel-vector ruling): Java's single `getNS().add(...)`
         // moves the msd/lsd direction and the all-representations automaton together,
-        // so this must too. Guarded rather than asserted only for the port's own
-        // convenience: hand-built automata in tests may carry short parallel vectors.
-        // Java is NOT this tolerant — `clonePartialFields` loops to `richAlphabet.getA()
-        // .size()` and indexes `getNS().get(i)` unconditionally, so a shorter `NS` list
-        // throws `IndexOutOfBoundsException` there. On the well-formed input every
-        // real caller produces, the two behave identically.
+        // so this must too. Guarded rather than asserted for historical reasons only —
+        // pre-U9 (idiomatic-refactor) the four per-track vectors were independent `Vec`s
+        // that hand-built test automata could genuinely desync (see this guard's
+        // original doc, which warned exactly that). Post-U9 Stage C's storage flip
+        // (`tracks: Vec<Track>` bundles all four facets per index) makes
+        // `track_all_reps_list().len()`/`track_msds().len()`/`track_ns_names_raw().len()`
+        // and `track_alphabets().len()` the SAME number by construction for any
+        // `Automaton` value that exists at all — this guard is therefore now always
+        // true, structurally impossible to fail, and kept only for its Java-source
+        // diffability against `clonePartialFields`'s own length reads (which Java is not
+        // this tolerant about: it indexes `getNS().get(i)` unconditionally and throws
+        // `IndexOutOfBoundsException` on a genuinely shorter list, a shape this crate's
+        // type no longer admits).
         if m.track_all_reps_list().len() == m.track_alphabets().len()
             && m.track_msds().len() == m.track_alphabets().len()
         {
-            n.set_all_reps(m.track_all_reps_list().to_vec());
+            n.set_all_reps(m.track_all_reps_list());
             if m.track_ns_names_raw().len() == m.track_alphabets().len() {
-                n.set_ns_names(m.track_ns_names_raw().to_vec());
+                n.set_ns_names(m.track_ns_names_raw());
             }
         }
 
@@ -1039,13 +1041,15 @@ impl Transducer {
         budget: TransduceBudget,
     ) -> Result<Automaton, TransduceError> {
         // check that the input automaton only has one input!
-        // U9 (idiomatic-refactor) Stage B: deliberately `track_msds().len()`, NOT
-        // `track_count()` (== `alphabet.len()`) -- the two are supposed to stay parallel,
-        // but `wb034_a_track_with_no_number_system_is_rejected`'s sibling tests
-        // (`a_two_track_automaton_is_rejected` et al.) deliberately desync `m.msd` alone
-        // (via `set_track_msds`, alphabet untouched) to exercise exactly this arity guard
-        // on `msd`'s own length -- collapsing to `track_count()` would silently stop
-        // catching that malformed shape.
+        // `Transducer.java:271` -- `M.getNS().size() != 1`. Read as `track_msds().len()`
+        // rather than `track_count()` purely to stay textually close to Java's own
+        // `getNS()`-list read; post-U9 (idiomatic-refactor) Stage C the two are
+        // PROVABLY identical (`tracks: Vec<Track>` makes `track_msds().len()` and
+        // `track_count()` the same number by construction, not by convention -- there is
+        // no longer any way to desync them, see `a_two_track_automaton_is_rejected`'s own
+        // updated doc comment for the test-side account of this), so this is kept for
+        // Java-source diffability, not because it catches a shape `track_count()`
+        // wouldn't.
         if m.track_msds().len() != 1 {
             return Err(TransduceError::NotSingleInput);
         }
@@ -1593,16 +1597,40 @@ mod tests {
     // The other guards
     // -------------------------------------------------------------------
 
+    /// A genuine 2-track automaton (2 tracks of `{0,1}`, `alphabet_size == 4`) -- the
+    /// state itself is irrelevant to every caller (the arity guard fires before any
+    /// state is ever consulted), so a single self-looping state is enough.
+    fn two_track_automaton(msd: Vec<Option<bool>>) -> Automaton {
+        let fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 4,
+            o: vec![0],
+            d: vec![BTreeMap::new()],
+            true_false: None,
+        };
+        Automaton::new(
+            fa,
+            vec![vec![0, 1], vec![0, 1]],
+            vec!["x".to_string(), "y".to_string()],
+            msd,
+        )
+    }
+
     #[test]
     fn a_two_track_automaton_is_rejected() {
         let mut logging = Logging::new();
-        let mut m = thue_morse();
-        // Deliberately desynced: `thue_morse()` is 1-track, and this grows only `msd` to
-        // simulate a 2-track automaton for the arity guard above -- `set_track_msds`
-        // would panic on the length mismatch, so this stays a raw field write (U9 Stage B
-        // gap: no supported way to desync `msd` from `alphabet` through the accessors,
-        // which is the point of this test).
-        m.msd = vec![Some(true), Some(true)];
+        // A genuine 2-track automaton -- U9 Stage C replaced the old desync hack
+        // (`thue_morse()`, 1-track, with `msd` alone grown to length 2) with this, since
+        // `tracks: Vec<Track>` makes that specific desync unrepresentable: `msd`'s
+        // length and the track count are now the same number by construction, not by
+        // convention. This is a strictly more realistic exercise of the SAME guard
+        // (`transduce_non_deterministic`'s `NotSingleInput` arity check) than the old
+        // hack was, not a weaker one -- see U9's checkpoint report for the full account
+        // of why the two guard-length readings (`msd`'s vs. the track count's) this test
+        // used to also distinguish became provably identical, and so nothing about that
+        // distinction survives to test.
+        let mut m = two_track_automaton(vec![Some(true), Some(true)]);
         assert_eq!(
             runsum2()
                 .transduce_non_deterministic(&mut m, &mut logging)
@@ -1653,12 +1681,12 @@ mod tests {
 
         // The guard sits at Java's own position — after the arity check (`:271`) and
         // after the alphabet-compatibility loop (`:276-281`) — so both still win when
-        // they also apply.
-        let mut two_track = thue_morse();
-        // Deliberately desynced (same reasoning as `a_two_track_automaton_is_rejected`
-        // above): `thue_morse()` is 1-track, `msd` alone is grown to 2 -- `set_track_msds`
-        // would panic here, so this stays a raw field write.
-        two_track.msd = vec![None, None];
+        // they also apply. A genuine 2-track automaton, both tracks carrying no number
+        // system (same U9 Stage C conversion as `a_two_track_automaton_is_rejected`
+        // above) -- real-world reachable through an `{0,1} {0,1}`-declared file, and it
+        // proves the arity check wins even when the OTHER guard's own trigger condition
+        // (no NS on track 0) is ALSO present.
+        let mut two_track = two_track_automaton(vec![None, None]);
         assert_eq!(
             runsum2()
                 .transduce_non_deterministic(&mut two_track, &mut logging)

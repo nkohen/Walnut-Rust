@@ -10,8 +10,8 @@
 //! labels, msd/lsd-ness, and the mixed-radix symbol encoder/decoder. **This is
 //! deliberately NOT full Java parity** — no `NumberSystem` objects attached per track
 //! (only the two facts any ported code reads off one: msd/lsd direction via
-//! [`Automaton::msd`], and the custom-base valid-representation restriction via
-//! [`Automaton::all_reps`], added in U5), no DFAO/`combine` bookkeeping (see
+//! [`Track::msd`], and the custom-base valid-representation restriction via
+//! [`Track::all_reps`], added in U5), no DFAO/`combine` bookkeeping (see
 //! `docs/DESIGN.md` §8 Phase 1's spike scope).
 //!
 //! # U0 addition: the trivial (TRUE/FALSE) automaton
@@ -62,7 +62,7 @@
 //! of scope, so `useAllRepresentations()` could never be `true`. Phase 3a's U5 made
 //! custom bases real ([`crate::numsys::NumberSystem::with_custom_base_files`]), which
 //! invalidated that premise, so both methods are ported here now, along with the per-track
-//! state they read ([`Automaton::all_reps`]) and `determineRandomLabel`/`unlabel`'s role in
+//! state they read ([`Track::all_reps`]) and `determineRandomLabel`/`unlabel`'s role in
 //! them. See [`Automaton::apply_all_representations`] for the empirical confirmation that
 //! these are load-bearing (not merely reachable) on a custom base.
 //!
@@ -217,85 +217,33 @@ impl std::error::Error for DecodeError {}
 /// A multi-track automaton: the raw [`Fa`] plus enough track metadata to encode/decode
 /// symbols and (for `wr-logic`) know which tracks are quantifiable and how to fix up
 /// leading/trailing zeros after projection.
+///
+/// # `tracks`, and where the per-track documentation now lives
+///
+/// U9 (idiomatic-refactor, Stage C) replaced this struct's four parallel `Vec`s
+/// (`alphabet`/`msd`/`all_reps`/`ns_name` — Stage A/B's `Vec<Track>`-shaped read/write
+/// accessor surface delegated to them without changing storage) with a single
+/// `tracks: Vec<Track>`. The field is now private — every access goes through the
+/// `track_*` methods below — and the extensive per-facet documentation that used to live
+/// on the four public fields now lives on [`Track`]'s own four fields, which are what
+/// they describe. See [`Track`]'s doc comment for the full account (why `all_reps` and
+/// `ns_name` exist, their invariants, and why `label` is deliberately NOT one of
+/// `Track`'s fields).
 #[derive(Debug, Clone)]
 pub struct Automaton {
     pub fa: Fa,
-    /// Per-track alphabet, e.g. `[0, 1, ..., base-1]` for an ordinary base-*k* track.
-    pub alphabet: Vec<Vec<i32>>,
-    /// Per-track variable name (e.g. `"i"`, `"x"`), parallel to `alphabet`.
+    /// Per-track variable name (e.g. `"i"`, `"x"`) — deliberately NOT parallel to
+    /// `tracks` (see [`Track`]'s doc comment for why: this is Java's null-label
+    /// "unbound" state, encoded here as `label.len() != track_count()`).
     pub label: Vec<String>,
-    /// Per-track msd (`Some(true)`)/lsd (`Some(false)`)/non-arithmetic (`None`) — parallel
-    /// to `alphabet`. Mirrors `NumberSystem.determineMsd`'s three-way outcome (mixed
-    /// arithmetic tracks or no arithmetic tracks both yield `None`/"skip the zero fixup").
-    /// Also this crate's stand-in for Java's per-track `List<NumberSystem>` wherever a
-    /// port needs "the NS list", e.g. [`Automaton::reduce_dimension`] below.
-    pub msd: Vec<Option<bool>>,
-    /// The OTHER half of the per-track `NumberSystem` stand-in, added in Phase 3a's U5:
-    /// per track, `Some(N)` iff Java's `getNS().get(i) != null &&
-    /// getNS().get(i).useAllRepresentations()`, carrying that number system's
-    /// `getAllRepresentations()` automaton (`NumberSystem.java:253-263`).
-    ///
-    /// # Why a second parallel vector rather than a `NumberSystem` per track
-    ///
-    /// [`Automaton::apply_all_representations`] is the only code **currently ported in
-    /// this crate** that reads a track's `NumberSystem` for anything other than its
-    /// msd/lsd direction, and it reads exactly these two facts. (Java has at least one
-    /// other reader outside this crate's scope so far — `Image.determineImageNumberSystemPrefix`,
-    /// which reads `NumberSystem::toString()`; already flagged in `docs/WALNUT-BUGS.md`'s
-    /// not-yet-confirmed section, unrelated to this field.) Storing exactly these two facts
-    /// directly keeps `Automaton` free of a `NumberSystem` field — which would be circular
-    /// (`NumberSystem` *owns* three `Automaton`s) and would force every one of this crate's
-    /// hand-built test automata to construct a real numeration system.
-    ///
-    /// # Invariant (kept by every mutator in this crate, checked by [`Automaton::debug_assert_track_invariant`])
-    ///
-    /// `all_reps.len() == msd.len()`, and `all_reps[i].is_some()` implies
-    /// `msd[i].is_some()` — because both derive from the same Java `NumberSystem` object,
-    /// so "this track has an all-representations automaton" cannot hold for a track whose
-    /// number system is `null`. Every site that permutes, removes, clears, or merges
-    /// `msd` entries below does the same to `all_reps` in the same step, mirroring Java,
-    /// where a single `List<NumberSystem>` element carries both facts at once.
-    ///
-    /// [`Rc`] (not [`Box`]) because Java shares one `getAllRepresentations()` instance
-    /// across every track of every automaton derived from that number system, and because
-    /// `Automaton` is cloned constantly; `Rc` keeps that a pointer bump instead of a deep
-    /// automaton copy. This makes `Automaton` `!Send`/`!Sync`, which is fine — Walnut is
-    /// single-threaded throughout, and `PORTING.md`'s Ruling 1 already picked `Rc` over
-    /// `Arc` for `NumberSystem` handles for the same reason.
-    pub all_reps: Vec<Option<Rc<Automaton>>>,
-    /// The THIRD fact this crate keeps from Java's per-track `NumberSystem` object:
-    /// `NumberSystem.getName()` (`NumberSystem.java:249`) — `"msd_2"`, `"lsd_3"`,
-    /// `"msd_fib"`, … — where the provenance is known, `None` where it is not.
-    ///
-    /// # Why the name has to be stored and cannot be reconstructed
-    ///
-    /// `NumberSystem.isNSDiffering` (`NumberSystem.java:179-192`, the guard behind
-    /// `union`/`intersect`/`concat`'s `"Automata must have the same number system(s)."`)
-    /// compares number systems **by name**. Reconstructing a name from
-    /// `(msd[i], alphabet[i].len())` — which is all [`Automaton::msd`] and
-    /// [`Automaton::alphabet`] carry — is exact for a plain `msd_k`/`lsd_k` base (Java's
-    /// `normalizeNumberSystemToken`, `:273-295`, maps bare `msd`/`lsd` to `msd_2`/`lsd_2`,
-    /// so every plain base's name *is* `msd_<alphabet size>`), but it is WRONG for a
-    /// custom base: `msd_fib`'s alphabet is `{0, 1}` with `msd` direction, so a
-    /// reconstruction reports it as `msd_2` and `isNSDiffering` then answers "same number
-    /// system" for two automata on genuinely different numerations — a fail-open guard
-    /// that silently produces a meaningless mixed-numeration result where real Walnut
-    /// refuses. Hence this field, populated from the resolved [`crate::numsys::NumberSystem`]
-    /// wherever one exists (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`).
-    ///
-    /// # Invariant
-    ///
-    /// Parallel to [`Automaton::msd`]/[`Automaton::all_reps`]/[`Automaton::alphabet`], and
-    /// moved in lockstep with them at every site that permutes, removes, merges, or
-    /// appends tracks — Java has one `List<NumberSystem>` carrying all three facts at
-    /// once, so they cannot drift there and must not drift here. `None` is always a SAFE
-    /// entry in the sense that [`Automaton::track_ns_names`] then falls back to the
-    /// base-*k* reconstruction, which is exact for every plain base; only a custom-base
-    /// track genuinely needs a `Some`.
-    pub ns_name: Vec<Option<String>>,
-    /// `encoder[i]` = product of `alphabet[0..i]`'s sizes (`encoder[0] == 1`). Cached at
-    /// construction, matching Java's `RichAlphabet.encoder` (there computed lazily on
-    /// first `encode()` call; here eagerly, since this crate always needs it).
+    /// Every track's alphabet + msd/lsd direction + all-representations restriction +
+    /// number-system name, bundled one-per-track. See [`Track`]'s own doc comment for
+    /// what each facet means and why it exists; see the `track_*` methods below for the
+    /// read/write surface (this field itself is private).
+    tracks: Vec<Track>,
+    /// `encoder[i]` = product of `tracks[0..i]`'s alphabet sizes (`encoder[0] == 1`).
+    /// Cached at construction, matching Java's `RichAlphabet.encoder` (there computed
+    /// lazily on first `encode()` call; here eagerly, since this crate always needs it).
     encoder: Vec<usize>,
     /// `Automaton.labelSorted` (`Automaton.java:49`): memoizes whether [`Automaton::sort_label`]
     /// has already run against the current `label`, so a repeat call (e.g. from
@@ -518,79 +466,141 @@ pub struct Automaton {
     pub(crate) dfa_typed: bool,
 }
 
-/// One track's worth of `Automaton`'s per-track "`NumberSystem` stand-in" — exactly the
-/// four facets [`Automaton::debug_assert_track_invariant`] already certifies parallel
-/// today: [`Automaton::alphabet`], [`Automaton::msd`], [`Automaton::all_reps`], and
-/// [`Automaton::ns_name`]. Introduced in the idiomatic-refactor's U9 (Stage A): a plain
-/// data-carrier used by the read/write accessors below, which for now still delegate to
-/// those four separate `Vec`s (storage is unchanged in Stage A/B; Stage C replaces the
-/// four vectors with a single `tracks: Vec<Track>` and rewires the accessors to read
-/// from it instead).
+/// One track's worth of `Automaton`'s per-track "`NumberSystem` stand-in": alphabet +
+/// msd/lsd direction + all-representations restriction + number-system name, exactly the
+/// four facets [`Automaton::debug_assert_track_invariant`] certifies parallel. Introduced
+/// in the idiomatic-refactor's U9 (Stage A) as a plain data-carrier for a delegating
+/// accessor surface over four separate `Vec`s (storage unchanged through Stage A/B);
+/// Stage C made it the REAL storage — `Automaton::tracks: Vec<Track>` — so this is now
+/// the canonical home for the documentation that used to live on the four public fields
+/// it replaced (`Automaton::alphabet`/`msd`/`all_reps`/`ns_name`, all gone).
 ///
 /// # Why `label` is NOT a field here
 ///
-/// `Automaton::label` is deliberately **not** parallel to the other four vectors, and
-/// folding it into `Track` would silently force it to be — `docs/
-/// IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`'s carve-out, restated in full because it is
-/// load-bearing: `label.len() != alphabet.len()` is this crate's encoding of Java's
-/// null-label "unbound" automaton state ([`Automaton::is_bound`] literally is
-/// `self.label.len() == self.alphabet.len()`). [`Automaton::unlabel`] sets `label` to an
-/// EMPTY vec while every track keeps its own alphabet/msd/all_reps/ns_name untouched —
-/// there is no meaningful "this track's label" once unbound, so `label` cannot be
-/// represented as a per-`Track` field without inventing a placeholder Java has no
-/// equivalent for. `product`'s unbound-panic tests and `quantify`'s `label.is_empty()`
-/// early return both depend on this exact length divergence surviving unchanged.
+/// `Automaton::label` is deliberately **not** parallel to `tracks`, and folding it in here
+/// would silently force it to be — `docs/IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`'s carve-out,
+/// restated in full because it is load-bearing: `label.len() != track_count()` is this
+/// crate's encoding of Java's null-label "unbound" automaton state
+/// ([`Automaton::is_bound`] literally is `self.label.len() == self.track_count()`).
+/// [`Automaton::unlabel`] sets `label` to an EMPTY vec while every track keeps its own
+/// alphabet/msd/all_reps/ns_name untouched — there is no meaningful "this track's label"
+/// once unbound, so `label` cannot be represented as a per-`Track` field without
+/// inventing a placeholder Java has no equivalent for. `product`'s unbound-panic tests
+/// and `quantify`'s `label.is_empty()` early return both depend on this exact length
+/// divergence surviving unchanged.
+///
+/// # A considered-and-deferred alternative (Stage B checkpoint, ruled out of scope for U9)
+///
+/// Stage B's checkpoint noted that Java's own object model actually keeps `alphabet`
+/// (on `RichAlphabet`) and the msd/all_reps/name triple (on a per-track `NumberSystem`
+/// entry) as two SEPARATE lists, unlike this single bundled `Track`, and floated splitting
+/// `Track` to match — motivated by a few call sites (`flip_ns`, `update_axb_fields`'s
+/// merge branch, Java's `getNS().set(j, ns)` shape) that only ever touch the NS triple,
+/// never the alphabet. Ruled out of scope: re-litigating the four-facet `Track` shape
+/// mid-unit would reopen an already-reviewed design. Those call sites are instead served
+/// by the per-track `set_track_msd`/`set_track_all_reps`/`set_track_ns_name` setters
+/// below, which touch one facet of one track without requiring a split type.
 #[derive(Debug, Clone)]
 pub struct Track {
     /// This track's alphabet, e.g. `[0, 1, ..., base-1]` for an ordinary base-*k* track.
-    /// See [`Automaton::alphabet`].
     pub alphabet: Vec<i32>,
     /// This track's msd (`Some(true)`)/lsd (`Some(false)`)/non-arithmetic (`None`)
-    /// direction. See [`Automaton::msd`].
+    /// direction. Mirrors `NumberSystem.determineMsd`'s three-way outcome (mixed
+    /// arithmetic tracks or no arithmetic tracks both yield `None`/"skip the zero
+    /// fixup"). Also this crate's stand-in for Java's per-track `List<NumberSystem>`
+    /// wherever a port needs "the NS list", e.g. [`Automaton::reduce_dimension`] below.
     pub msd: Option<bool>,
     /// This track's valid-representation restriction automaton, where its number
-    /// system has one. See [`Automaton::all_reps`].
+    /// system has one — `Some(N)` iff Java's `getNS().get(i) != null &&
+    /// getNS().get(i).useAllRepresentations()`, carrying that number system's
+    /// `getAllRepresentations()` automaton (`NumberSystem.java:253-263`).
+    ///
+    /// # Why a fact of `Track` rather than a `NumberSystem` field
+    ///
+    /// [`Automaton::apply_all_representations`] is the only code **currently ported in
+    /// this crate** that reads a track's `NumberSystem` for anything other than its
+    /// msd/lsd direction, and it reads exactly this fact plus [`Track::ns_name`].
+    /// (Java has at least one other reader outside this crate's scope so far —
+    /// `Image.determineImageNumberSystemPrefix`, which reads `NumberSystem::toString()`;
+    /// already flagged in `docs/WALNUT-BUGS.md`'s not-yet-confirmed section, unrelated to
+    /// this field.) Storing exactly these two facts directly keeps `Automaton` free of a
+    /// `NumberSystem` field — which would be circular (`NumberSystem` *owns* three
+    /// `Automaton`s) and would force every one of this crate's hand-built test automata
+    /// to construct a real numeration system.
+    ///
+    /// # Invariant with [`Track::msd`] (checked by [`Automaton::debug_assert_track_invariant`])
+    ///
+    /// `all_reps.is_some()` implies `msd.is_some()` — because both derive from the same
+    /// Java `NumberSystem` object, so "this track has an all-representations automaton"
+    /// cannot hold for a track whose number system is `null`. Every setter that installs
+    /// an `all_reps`/`ns_name` value checks this explicitly (`Track` itself, being a
+    /// plain struct, cannot enforce it at the type level).
+    ///
+    /// [`Rc`] (not [`Box`]) because Java shares one `getAllRepresentations()` instance
+    /// across every track of every automaton derived from that number system, and because
+    /// `Automaton` is cloned constantly; `Rc` keeps that a pointer bump instead of a deep
+    /// automaton copy. This makes `Automaton` `!Send`/`!Sync`, which is fine — Walnut is
+    /// single-threaded throughout, and `PORTING.md`'s Ruling 1 already picked `Rc` over
+    /// `Arc` for `NumberSystem` handles for the same reason.
     pub all_reps: Option<Rc<Automaton>>,
-    /// This track's number-system name, where known. See [`Automaton::ns_name`].
+    /// The THIRD fact this crate keeps from Java's per-track `NumberSystem` object:
+    /// `NumberSystem.getName()` (`NumberSystem.java:249`) — `"msd_2"`, `"lsd_3"`,
+    /// `"msd_fib"`, … — where the provenance is known, `None` where it is not.
+    ///
+    /// # Why the name has to be stored and cannot be reconstructed
+    ///
+    /// `NumberSystem.isNSDiffering` (`NumberSystem.java:179-192`, the guard behind
+    /// `union`/`intersect`/`concat`'s `"Automata must have the same number system(s)."`)
+    /// compares number systems **by name**. Reconstructing a name from `(msd,
+    /// alphabet.len())` — which is all [`Track::msd`] and [`Track::alphabet`] carry — is
+    /// exact for a plain `msd_k`/`lsd_k` base (Java's `normalizeNumberSystemToken`,
+    /// `:273-295`, maps bare `msd`/`lsd` to `msd_2`/`lsd_2`, so every plain base's name
+    /// *is* `msd_<alphabet size>`), but it is WRONG for a custom base: `msd_fib`'s
+    /// alphabet is `{0, 1}` with `msd` direction, so a reconstruction reports it as
+    /// `msd_2` and `isNSDiffering` then answers "same number system" for two automata on
+    /// genuinely different numerations — a fail-open guard that silently produces a
+    /// meaningless mixed-numeration result where real Walnut refuses. Hence this field,
+    /// populated from the resolved [`crate::numsys::NumberSystem`] wherever one exists
+    /// (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`).
+    ///
+    /// # Invariant
+    ///
+    /// Same as [`Track::all_reps`]'s: `ns_name.is_some()` implies `msd.is_some()`. `None`
+    /// is always a SAFE entry in the sense that [`Automaton::track_ns_names`] then falls
+    /// back to the base-*k* reconstruction, which is exact for every plain base; only a
+    /// custom-base track genuinely needs a `Some`.
     pub ns_name: Option<String>,
 }
 
 impl Automaton {
-    /// One track's [`Track`] view, cloned out of the four parallel vectors (Stage A:
-    /// still four separate `Vec`s under the hood; Stage C: a direct `tracks[i].clone()`).
+    /// One track's [`Track`] view — `self.tracks[i].clone()`.
     ///
     /// # Panics
     ///
-    /// If `i >= self.track_count()`, exactly like indexing the underlying `Vec`s
+    /// If `i >= self.track_count()`, exactly like indexing the underlying `Vec`
     /// directly did before this accessor existed.
     pub fn track(&self, i: usize) -> Track {
-        Track {
-            alphabet: self.alphabet[i].clone(),
-            msd: self.msd[i],
-            all_reps: self.all_reps[i].clone(),
-            ns_name: self.ns_name[i].clone(),
-        }
+        self.tracks[i].clone()
     }
 
-    /// The number of tracks — `Automaton::alphabet.len()` (equivalently `msd.len()` /
-    /// `all_reps.len()` / `ns_name.len()`, per the parallel-vector invariant).
+    /// The number of tracks — `self.tracks.len()`.
     pub fn track_count(&self) -> usize {
-        self.alphabet.len()
+        self.tracks.len()
     }
 
-    /// This track's alphabet — `&self.alphabet[i]`.
+    /// This track's alphabet — `&self.tracks[i].alphabet`.
     ///
     /// # Panics
     ///
     /// If `i >= self.track_count()`.
     pub fn track_alphabet(&self, i: usize) -> &[i32] {
-        &self.alphabet[i]
+        &self.tracks[i].alphabet
     }
 
     /// A mutable handle onto this track's alphabet `Vec` — e.g. for a caller appending a
     /// single new digit onto one existing track (`RecursiveConstruction`-style callers in
     /// `wr-core::transducer`). Does **not** refresh [`Automaton::encoder`] /
-    /// `fa.alphabet_size` — same contract as mutating `self.alphabet[i]` directly did
+    /// `fa.alphabet_size` — same contract as mutating this track's alphabet directly did
     /// before this accessor existed; callers must still call
     /// [`Automaton::determine_alphabet_size`] + [`Automaton::setup_encoder`] afterward if
     /// those need to stay in sync.
@@ -599,29 +609,29 @@ impl Automaton {
     ///
     /// If `i >= self.track_count()`.
     pub fn track_alphabet_mut(&mut self, i: usize) -> &mut Vec<i32> {
-        &mut self.alphabet[i]
+        &mut self.tracks[i].alphabet
     }
 
-    /// This track's msd/lsd direction — `self.msd[i]`.
+    /// This track's msd/lsd direction — `self.tracks[i].msd`.
     ///
     /// # Panics
     ///
     /// If `i >= self.track_count()`.
     pub fn track_msd(&self, i: usize) -> Option<bool> {
-        self.msd[i]
+        self.tracks[i].msd
     }
 
     /// This track's all-representations automaton, if its number system has one —
-    /// `self.all_reps[i].as_ref()`.
+    /// `self.tracks[i].all_reps.as_ref()`.
     ///
     /// # Panics
     ///
     /// If `i >= self.track_count()`.
     pub fn track_all_reps(&self, i: usize) -> Option<&Rc<Automaton>> {
-        self.all_reps[i].as_ref()
+        self.tracks[i].all_reps.as_ref()
     }
 
-    /// This track's RAW recorded number-system name — `self.ns_name[i].as_deref()`.
+    /// This track's RAW recorded number-system name — `self.tracks[i].ns_name.as_deref()`.
     /// **Not** the same thing as [`Automaton::track_ns_names`] (plural, existing since
     /// U5): that method reconstructs a `msd_<size>`/`lsd_<size>` fallback name when no
     /// name was recorded; this accessor returns exactly what is stored, `None` included.
@@ -630,80 +640,92 @@ impl Automaton {
     ///
     /// If `i >= self.track_count()`.
     pub fn track_ns_name_raw(&self, i: usize) -> Option<&str> {
-        self.ns_name[i].as_deref()
+        self.tracks[i].ns_name.as_deref()
     }
 
-    /// Every track's alphabet, in track order — `&self.alphabet`. For iteration,
-    /// whole-vector comparison (`a.track_alphabets() == b.track_alphabets()`), and
-    /// cloning (`a.track_alphabets().to_vec()`).
-    pub fn track_alphabets(&self) -> &[Vec<i32>] {
-        &self.alphabet
+    /// Every track's alphabet, in track order. Owned (not borrowed): unlike Stage A/B,
+    /// where this delegated to a contiguous `Vec<Vec<i32>>` and could hand back a plain
+    /// slice, `tracks: Vec<Track>` interleaves each track's alphabet with its other
+    /// three facets — there is no contiguous alphabet-only region left to borrow, so
+    /// this builds a fresh `Vec` per call. Every existing call site's usage (`==`
+    /// comparison, `.iter()`, indexing, `.len()`) is unaffected by the owned-vs-borrowed
+    /// distinction; only a call site that fed the OLD `&[Vec<i32>]` into a function
+    /// expecting a slice needed an explicit `&` added at the Stage C call site.
+    pub fn track_alphabets(&self) -> Vec<Vec<i32>> {
+        self.tracks.iter().map(|t| t.alphabet.clone()).collect()
     }
 
-    /// Every track's msd/lsd direction, in track order — `&self.msd`.
-    pub fn track_msds(&self) -> &[Option<bool>] {
-        &self.msd
+    /// Every track's msd/lsd direction, in track order. Owned — see
+    /// [`Automaton::track_alphabets`]'s doc comment for why (same reasoning, cheaper
+    /// here since `Option<bool>` is `Copy`).
+    pub fn track_msds(&self) -> Vec<Option<bool>> {
+        self.tracks.iter().map(|t| t.msd).collect()
     }
 
-    /// Every track's all-representations automaton, in track order — `&self.all_reps`.
-    pub fn track_all_reps_list(&self) -> &[Option<Rc<Automaton>>] {
-        &self.all_reps
+    /// Every track's all-representations automaton, in track order. Owned — see
+    /// [`Automaton::track_alphabets`]'s doc comment for why (cheap here: cloning an
+    /// `Option<Rc<Automaton>>` is a pointer bump, not a deep copy).
+    pub fn track_all_reps_list(&self) -> Vec<Option<Rc<Automaton>>> {
+        self.tracks.iter().map(|t| t.all_reps.clone()).collect()
     }
 
-    /// Every track's RAW recorded number-system name, in track order —
-    /// `&self.ns_name`. Same "raw, not reconstructed" distinction as
-    /// [`Automaton::track_ns_name_raw`], plural form.
-    pub fn track_ns_names_raw(&self) -> &[Option<String>] {
-        &self.ns_name
+    /// Every track's RAW recorded number-system name, in track order. Owned — see
+    /// [`Automaton::track_alphabets`]'s doc comment for why. Same "raw, not
+    /// reconstructed" distinction as [`Automaton::track_ns_name_raw`], plural form.
+    pub fn track_ns_names_raw(&self) -> Vec<Option<String>> {
+        self.tracks.iter().map(|t| t.ns_name.clone()).collect()
     }
 
     /// A mutable iterator over every track's all-representations slot — e.g. for a
-    /// caller clearing every track's restriction in place
-    /// (`crate::logicalops`'s `a.all_reps.iter_mut()` shape).
+    /// caller clearing every track's restriction in place (`crate::logicalops::flip_ns`'s
+    /// shape).
     pub fn track_all_reps_iter_mut(&mut self) -> impl Iterator<Item = &mut Option<Rc<Automaton>>> {
-        self.all_reps.iter_mut()
+        self.tracks.iter_mut().map(|t| &mut t.all_reps)
     }
 
     /// Appends one whole new [`Track`] (one alphabet + msd + all_reps + ns_name entry) —
-    /// the four-vector analogue of `axb.alphabet.push(...)` / `axb.msd.push(...)` /
-    /// `axb.all_reps.push(...)` / `axb.ns_name.push(...)` done together, in the same
-    /// step, so the parallel-vector invariant can never observably drift mid-push (the
-    /// four-separate-`push`-calls shape this replaces relied on every call site doing
-    /// all four in lockstep by convention, not by construction).
+    /// the parallel-vector-era four-separate-`push`-calls shape done atomically, in one
+    /// step, now enforced by construction rather than convention (`tracks: Vec<Track>`
+    /// cannot desync mid-push the way four separate `Vec`s could).
     ///
     /// Does **not** update `fa.alphabet_size`/`encoder`/`label` — same division of
     /// responsibility the four separate `push` calls this replaces already had; callers
     /// still own those separately (see [`Automaton::determine_alphabet_size`],
     /// [`Automaton::setup_encoder`]).
     pub fn push_track(&mut self, track: Track) {
-        self.alphabet.push(track.alphabet);
-        self.msd.push(track.msd);
-        self.all_reps.push(track.all_reps);
-        self.ns_name.push(track.ns_name);
+        self.tracks.push(track);
     }
 
     /// Replaces every track's alphabet wholesale, keeping each track's other facets
-    /// (msd/all_reps/ns_name) untouched — the accessor form of `self.alphabet = new_alphabet`.
+    /// (msd/all_reps/ns_name) untouched.
+    ///
+    /// Does **not** update `fa.alphabet_size`/`encoder` — same division of
+    /// responsibility [`Automaton::track_alphabet_mut`]/[`Automaton::push_track`]/
+    /// [`Automaton::replace_all_tracks`] already have; callers still own those
+    /// separately (see [`Automaton::determine_alphabet_size`],
+    /// [`Automaton::setup_encoder`]).
     ///
     /// # Panics
     ///
     /// If `alphabets.len() != self.track_count()` — a whole-vector alphabet replacement
-    /// that changes the number of tracks would desynchronize `msd`/`all_reps`/`ns_name`,
-    /// which no existing call site does (a track-count change goes through
-    /// [`Automaton::push_track`]/[`Automaton::clear`]/a fresh [`Automaton::new`], never a
-    /// same-length-assumed wholesale replace).
+    /// that changes the number of tracks would desynchronize `Track`'s other three
+    /// facets, which no existing call site does (a track-count change goes through
+    /// [`Automaton::push_track`]/[`Automaton::clear`]/a fresh [`Automaton::new`]/
+    /// [`Automaton::replace_all_tracks`], never a same-length-assumed wholesale
+    /// per-facet replace).
     pub fn set_track_alphabets(&mut self, alphabets: Vec<Vec<i32>>) {
         assert_eq!(
             alphabets.len(),
-            self.alphabet.len(),
+            self.tracks.len(),
             "set_track_alphabets: replacing the alphabet vector must not change the track count"
         );
-        self.alphabet = alphabets;
+        for (track, alphabet) in self.tracks.iter_mut().zip(alphabets) {
+            track.alphabet = alphabet;
+        }
     }
 
     /// Replaces every track's msd/lsd direction wholesale, keeping each track's other
-    /// facets (alphabet/all_reps/ns_name) untouched — the accessor form of
-    /// `self.msd = new_msd`.
+    /// facets (alphabet/all_reps/ns_name) untouched.
     ///
     /// # Panics
     ///
@@ -712,39 +734,140 @@ impl Automaton {
     pub fn set_track_msds(&mut self, msds: Vec<Option<bool>>) {
         assert_eq!(
             msds.len(),
-            self.alphabet.len(),
+            self.tracks.len(),
             "set_track_msds: replacing the msd vector must not change the track count"
         );
-        self.msd = msds;
+        for (track, msd) in self.tracks.iter_mut().zip(msds) {
+            track.msd = msd;
+        }
+    }
+
+    /// Overwrites ONE track's msd/lsd direction in place, leaving its alphabet/all_reps/
+    /// ns_name untouched — Java's `getNS().set(j, ns)` shape (the direction half).
+    /// Added in Stage C for `logicalops::flip_ns`'s and `numsys::set_less_than_automaton`'s
+    /// per-track direction-flip loops, both of which previously had no single-index
+    /// setter to use and fell back to a raw field write (U9's Stage B checkpoint report,
+    /// gap #1 — "no single-index setter for msd/all_reps/ns_name in place").
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`.
+    pub fn set_track_msd(&mut self, i: usize, msd: Option<bool>) {
+        self.tracks[i].msd = msd;
+    }
+
+    /// Overwrites ONE track's all-representations restriction in place, leaving its
+    /// alphabet/msd/ns_name untouched — the other half of Java's `getNS().set(j, ns)`
+    /// shape. Added in Stage C for `product::update_axb_fields`'s merge branch (same
+    /// checkpoint gap as [`Automaton::set_track_msd`]).
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`, or if `all_reps` is `Some` while track `i`'s `msd`
+    /// is `None` — the invariant documented on [`Track::all_reps`] (a track with no
+    /// number system cannot carry that number system's all-representations
+    /// restriction).
+    pub fn set_track_all_reps(&mut self, i: usize, all_reps: Option<Rc<Automaton>>) {
+        assert!(
+            all_reps.is_none() || self.tracks[i].msd.is_some(),
+            "set_track_all_reps: track {i} would have an all-representations automaton but no number system"
+        );
+        self.tracks[i].all_reps = all_reps;
+    }
+
+    /// Overwrites ONE track's number-system name in place, leaving its alphabet/msd/
+    /// all_reps untouched — the naming third of Java's `getNS().set(j, ns)` shape.
+    /// Added in Stage C for `logicalops::flip_ns`'s per-track name-flip (same checkpoint
+    /// gap as [`Automaton::set_track_msd`]).
+    ///
+    /// # Panics
+    ///
+    /// If `i >= self.track_count()`, or if `ns_name` is `Some` while track `i`'s `msd`
+    /// is `None` — the invariant documented on [`Track::ns_name`].
+    pub fn set_track_ns_name(&mut self, i: usize, ns_name: Option<String>) {
+        assert!(
+            ns_name.is_none() || self.tracks[i].msd.is_some(),
+            "set_track_ns_name: track {i} would have a number-system name but no number system"
+        );
+        self.tracks[i].ns_name = ns_name;
+    }
+
+    /// Replaces EVERY track wholesale — alphabet + msd + all_reps + ns_name together, as
+    /// one whole new [`Track`] list — and, unlike [`Automaton::set_track_alphabets`]/
+    /// [`Automaton::set_track_msds`], is **allowed to change the track count**. Named
+    /// loudly and kept as a separate method from those two on purpose: they exist
+    /// specifically to make an accidental track-count change during what is meant to be
+    /// a same-length replacement a hard panic (documented on them since Stage A), and
+    /// this method is the one genuine, Java-faithful exception found so far —
+    /// `logicalops::right_quotient`'s `otherClone.setNS(A.getNS())`
+    /// (`AutomatonLogicalOps.java:206`) installs `a`'s WHOLE per-track state onto
+    /// `other_clone`, and `a`/`b` need not be the same arity there: Java's
+    /// `rightQuotient` has no arity check between the two operands at all, only the
+    /// guarded alphabet-SUBSET check the caller can skip (`SubsetCheck::Skip`). `List`
+    /// reassignment in Java carries no "must not resize" guard either — a real
+    /// `getNS()`/`richAlphabet.getA()` swap onto a differently-sized object is exactly
+    /// this shape.
+    ///
+    /// Does **not** update `fa.alphabet_size`/`encoder`/`label` — same division of
+    /// responsibility every other track-mutating accessor here has; callers still own
+    /// those separately (see [`Automaton::determine_alphabet_size`],
+    /// [`Automaton::setup_encoder`]).
+    pub fn replace_all_tracks(&mut self, tracks: Vec<Track>) {
+        self.tracks = tracks;
     }
 
     /// Builds an `Automaton` from an already-constructed [`Fa`] and track metadata.
     /// `alphabet`, `label`, and `msd` must have the same length as each other and match
-    /// `fa.alphabet_size` (`Π alphabet[i].len() == fa.alphabet_size`) — not asserted here
-    /// (this is a Phase-1 slice, not a validating constructor); callers are responsible.
+    /// `fa.alphabet_size` (`Π alphabet[i].len() == fa.alphabet_size`) — `label`'s length
+    /// is still a caller responsibility (this is a Phase-1 slice, not a fully validating
+    /// constructor), but `alphabet.len() == msd.len()` — "one number system per track" —
+    /// is asserted, matching the assert [`AutomatonDFA::from_encoded_regex`] already makes.
     ///
-    /// [`Automaton::all_reps`] starts all-`None` — i.e. "no track uses a custom base's
-    /// valid-representation restriction", the state every plain `msd_k`/`lsd_k` automaton
-    /// is in. Only [`Automaton::set_all_reps`] (called by
-    /// `crate::numsys::NumberSystem`'s custom-base constructor) ever changes that, so this
-    /// constructor's signature is unchanged from U5 and every pre-U5 call site keeps its
-    /// exact previous behavior.
+    /// # Panics
+    ///
+    /// If `alphabet.len() != msd.len()`. Before U9 (idiomatic-refactor) Stage C this was
+    /// unchecked: the old four-`Vec` storage read `msd[i]` lazily per-track-access, so a
+    /// length mismatch panicked (or silently wrapped, depending on caller) only when some
+    /// later accessor actually reached the missing index. Stage C's first draft zipped
+    /// `alphabet`/`msd` together with no check at all, which silently TRUNCATES to the
+    /// shorter side instead of panicking — a real, live-verified wrong-language bug (wrong
+    /// `track_count()`, wrong [`Automaton::is_bound`], wrong `determine_zero`), not merely
+    /// a changed panic site. This assert restores the eager, loud failure Java's own
+    /// `NumberSystem`-per-track contract implies, at the actual point of the violation.
+    ///
+    /// Every track's all-representations restriction and number-system name start
+    /// `None` — i.e. "no track uses a custom base's valid-representation restriction",
+    /// the state every plain `msd_k`/`lsd_k` automaton is in. Only
+    /// [`Automaton::set_all_reps`]/[`Automaton::set_track_all_reps`] (called by
+    /// `crate::numsys::NumberSystem`'s custom-base constructor) ever change that, so
+    /// this constructor's signature is unchanged from U5 and every pre-U5 call site keeps
+    /// its exact previous behavior.
     pub fn new(
         fa: Fa,
         alphabet: Vec<Vec<i32>>,
         label: Vec<String>,
         msd: Vec<Option<bool>>,
     ) -> Self {
+        assert_eq!(
+            alphabet.len(),
+            msd.len(),
+            "Automaton::new: one number system per track required"
+        );
         let encoder = Self::compute_encoder(&alphabet);
-        let all_reps = vec![None; alphabet.len()];
-        let ns_name = vec![None; alphabet.len()];
+        let tracks = alphabet
+            .into_iter()
+            .zip(msd)
+            .map(|(alphabet, msd)| Track {
+                alphabet,
+                msd,
+                all_reps: None,
+                ns_name: None,
+            })
+            .collect();
         Automaton {
             fa,
-            alphabet,
             label,
-            msd,
-            all_reps,
-            ns_name,
+            tracks,
             encoder,
             label_sorted: false,
             canonized: false,
@@ -757,16 +880,13 @@ impl Automaton {
     /// accepts nothing. Therefore, `M and false` is false for every automaton `M`, and
     /// `M or true` is true for every automaton `M`."
     ///
-    /// No tracks at all — `alphabet`/`label`/`msd` are empty, matching Java (`this()`
+    /// No tracks at all — `tracks`/`label` are empty, matching Java (`this()`
     /// initializes `richAlphabet`/`NS`/`label` to empties before the flags are set).
     pub fn true_false(truth: bool) -> Self {
         Automaton {
             fa: Fa::trivial(truth),
-            alphabet: Vec::new(),
             label: Vec::new(),
-            msd: Vec::new(),
-            all_reps: Vec::new(),
-            ns_name: Vec::new(),
+            tracks: Vec::new(),
             encoder: Vec::new(),
             label_sorted: false,
             canonized: false,
@@ -801,12 +921,8 @@ impl Automaton {
     /// instead.
     pub fn clear(&mut self) {
         self.fa.clear();
-        self.alphabet.clear();
+        self.tracks.clear();
         self.encoder.clear();
-        self.msd.clear();
-        // Java's single `NS = null` covers all three parts of this crate's NS stand-in.
-        self.all_reps.clear();
-        self.ns_name.clear();
         self.label.clear();
         self.label_sorted = false;
         // `FA.clear()`'s own `canonized = false` (`FA.java:93`) -- the flag lives on the
@@ -814,42 +930,41 @@ impl Automaton {
         self.canonized = false;
     }
 
-    /// Installs the per-track [`Automaton::all_reps`] entries wholesale — the write half
+    /// Installs the per-track [`Track::all_reps`] entries wholesale — the write half
     /// of Java's `Automaton.setNS(List<NumberSystem>)`/`getNS().set(i, ns)` for the
-    /// all-representations facet.
+    /// all-representations facet, across every track at once.
     ///
     /// # Panics
     ///
-    /// If `all_reps` is not one entry per track, if `msd` is not already parallel to
-    /// `alphabet`, or if any `Some` entry sits on a track whose `msd` is `None` — the
-    /// invariant documented on [`Automaton::all_reps`]. Java cannot violate it (one
-    /// `NumberSystem` object carries both facts); this crate can, so the one public entry
-    /// point checks.
+    /// If `all_reps` is not one entry per track, or if any `Some` entry sits on a track
+    /// whose `msd` is `None` — the invariant documented on [`Track::all_reps`]. Java
+    /// cannot violate it (one `NumberSystem` object carries both facts); this crate can,
+    /// so the one public entry point checks. (The parallel-vector-era "`msd` must
+    /// already be the same length as `alphabet`" check is gone: `Track` makes that
+    /// unconditionally true now.)
     pub fn set_all_reps(&mut self, all_reps: Vec<Option<Rc<Automaton>>>) {
         assert_eq!(
             all_reps.len(),
-            self.alphabet.len(),
+            self.tracks.len(),
             "set_all_reps: one entry per track required"
-        );
-        assert_eq!(
-            self.msd.len(),
-            self.alphabet.len(),
-            "set_all_reps: msd must already be parallel to alphabet"
         );
         for (i, entry) in all_reps.iter().enumerate() {
             assert!(
-                entry.is_none() || self.msd[i].is_some(),
+                entry.is_none() || self.tracks[i].msd.is_some(),
                 "set_all_reps: track {i} has an all-representations automaton but no number system"
             );
         }
-        self.all_reps = all_reps;
+        for (track, entry) in self.tracks.iter_mut().zip(all_reps) {
+            track.all_reps = entry;
+        }
     }
 
-    /// Installs the per-track [`Automaton::ns_name`] entries wholesale — the naming part
-    /// of Java's `Automaton.setNS(List<NumberSystem>)`. Every caller that has real
-    /// [`crate::numsys::NumberSystem`] objects in hand (`wr-io`'s reader, `wr-cli`'s
-    /// `alphabet`/`reg`) should call this alongside [`Automaton::set_all_reps`], so the
-    /// name that `NumberSystem.isNSDiffering` compares survives into this crate.
+    /// Installs the per-track [`Track::ns_name`] entries wholesale — the naming part
+    /// of Java's `Automaton.setNS(List<NumberSystem>)`, across every track at once.
+    /// Every caller that has real [`crate::numsys::NumberSystem`] objects in hand
+    /// (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`) should call this alongside
+    /// [`Automaton::set_all_reps`], so the name that `NumberSystem.isNSDiffering`
+    /// compares survives into this crate.
     ///
     /// # Panics
     ///
@@ -858,49 +973,41 @@ impl Automaton {
     pub fn set_ns_names(&mut self, names: Vec<Option<String>>) {
         assert_eq!(
             names.len(),
-            self.alphabet.len(),
+            self.tracks.len(),
             "set_ns_names: one entry per track required"
-        );
-        assert_eq!(
-            self.msd.len(),
-            self.alphabet.len(),
-            "set_ns_names: msd must already be parallel to alphabet"
         );
         for (i, entry) in names.iter().enumerate() {
             assert!(
-                entry.is_none() || self.msd[i].is_some(),
+                entry.is_none() || self.tracks[i].msd.is_some(),
                 "set_ns_names: track {i} has a number-system name but no number system"
             );
         }
-        self.ns_name = names;
+        for (track, entry) in self.tracks.iter_mut().zip(names) {
+            track.ns_name = entry;
+        }
     }
 
-    /// Debug-only check of [`Automaton::all_reps`]'s documented invariant. Deliberately
-    /// side-effect-free (`PORTING.md`'s "`debug_assert!` erasing side effects" regression
-    /// class) — it only reads.
+    /// Debug-only structural check. Two of its four original (Stage A/B-era) checks —
+    /// `all_reps`/`ns_name` staying parallel to `alphabet`/`msd` in LENGTH — are now
+    /// enforced unconditionally by `Track`'s own shape: `tracks: Vec<Track>` cannot
+    /// desync those lengths, so those checks would always pass and are gone. The two
+    /// SEMANTIC checks `Track`'s shape does NOT enforce — an `all_reps`/`ns_name` entry
+    /// implies its own track's `msd` is `Some` (`Track` is a plain struct with public
+    /// fields, so nothing stops a caller reaching in and setting `all_reps: Some(_)` on
+    /// an `msd: None` track by hand) — still run. Deliberately side-effect-free
+    /// (`PORTING.md`'s "`debug_assert!` erasing side effects" regression class) — it
+    /// only reads.
     pub(crate) fn debug_assert_track_invariant(&self) {
-        debug_assert_eq!(
-            self.all_reps.len(),
-            self.msd.len(),
-            "all_reps must stay parallel to msd"
-        );
         debug_assert!(
-            self.all_reps
+            self.tracks
                 .iter()
-                .zip(self.msd.iter())
-                .all(|(reps, msd)| reps.is_none() || msd.is_some()),
+                .all(|t| t.all_reps.is_none() || t.msd.is_some()),
             "a track with an all-representations automaton must have a number system"
         );
-        debug_assert_eq!(
-            self.ns_name.len(),
-            self.msd.len(),
-            "ns_name must stay parallel to msd"
-        );
         debug_assert!(
-            self.ns_name
+            self.tracks
                 .iter()
-                .zip(self.msd.iter())
-                .all(|(name, msd)| name.is_none() || msd.is_some()),
+                .all(|t| t.ns_name.is_none() || t.msd.is_some()),
             "a track with a number-system name must have a number system"
         );
     }
@@ -928,7 +1035,32 @@ impl Automaton {
     /// silently; panicking here is the improvement `PORTING.md`'s type/error mapping
     /// table calls for over stringly-typed Java exceptions).
     pub fn encode(&self, digits: &[i32]) -> i32 {
-        Self::encode_with(digits, &self.alphabet, &self.encoder)
+        // U9 (idiomatic-refactor) Stage C: inlined rather than delegating to
+        // `encode_with` (which needs a contiguous `&[Vec<i32>]` -- `tracks: Vec<Track>`
+        // interleaves each track's alphabet with its other three facets, so there is no
+        // such contiguous region to borrow anymore, only to rebuild). `encode` is a hot
+        // path (called per encoded symbol, inside the tight construction loops
+        // `benches/STATUS.md`'s U33/U34 profiled and optimized), so this avoids paying a
+        // fresh `Vec<Vec<i32>>` allocation on every call -- the same logic
+        // `encode_with` has, reading straight off `self.tracks`/`self.encoder` instead.
+        let mut encoding: i32 = 0;
+        for (i, &d) in digits.iter().enumerate() {
+            let idx = self.tracks[i]
+                .alphabet
+                .iter()
+                .position(|&v| v == d)
+                .unwrap_or_else(|| panic!("digit {d} not in track {i}'s alphabet"));
+            let encoder_i =
+                i32::try_from(self.encoder[i]).expect("encoder entry exceeds i32 range");
+            let idx_i = i32::try_from(idx).expect("alphabet index exceeds i32 range");
+            let term = encoder_i
+                .checked_mul(idx_i)
+                .expect("encode overflow (Math.multiplyExact equivalent)");
+            encoding = encoding
+                .checked_add(term)
+                .expect("encode overflow (Math.addExact equivalent)");
+        }
+        encoding
     }
 
     /// `RichAlphabet.encode(List<Integer> l, List<List<Integer>> A, IntList encoder)`
@@ -1011,7 +1143,8 @@ impl Automaton {
 
         let mut encoding: i32 = 0;
         for (i, &d) in digits.iter().enumerate() {
-            let index = self.alphabet[i]
+            let index = self.tracks[i]
+                .alphabet
                 .iter()
                 .position(|&v| v == d)
                 .map_or(INDEX_NOT_FOUND, |p| p as i32);
@@ -1070,8 +1203,9 @@ impl Automaton {
     /// in `validateTransition`, and did not touch it.
     pub fn try_decode(&self, sym: i32) -> Result<Vec<i32>, DecodeError> {
         let mut n = sym;
-        let mut out = Vec::with_capacity(self.alphabet.len());
-        for track in &self.alphabet {
+        let mut out = Vec::with_capacity(self.tracks.len());
+        for t in &self.tracks {
+            let track = &t.alphabet;
             let size = track.len() as i32;
             if size == 0 {
                 // `n % 0` is Java's `ArithmeticException: / by zero`. Unreachable for
@@ -1131,7 +1265,7 @@ impl Automaton {
     /// ordinary base-*k* tracks are `[0, 1, ..., k-1]`). Revisit if a non-zero-first
     /// track alphabet is ever introduced.
     pub fn determine_zero(&self) -> i32 {
-        let zero_digits = vec![0; self.alphabet.len()];
+        let zero_digits = vec![0; self.tracks.len()];
         self.encode(&zero_digits)
     }
 
@@ -1140,19 +1274,19 @@ impl Automaton {
     /// matching this crate's convention that "unbound" is an empty label vec (see
     /// [`Automaton::unlabel`]) rather than `null`.
     pub fn is_bound(&self) -> bool {
-        self.label.len() == self.alphabet.len()
+        self.label.len() == self.tracks.len()
     }
 
     /// `Automaton.getArity` (`Automaton.java:498-501`), including its
     /// `isTRUE_FALSE_AUTOMATON -> 0` short-circuit (U0). Redundant in practice — a
-    /// trivial automaton's `alphabet` is empty anyway — but ported so the branch
+    /// trivial automaton's `tracks` is empty anyway — but ported so the branch
     /// structure matches Java's, and so the stale-field trivial shape (see `crate::fa`'s
     /// module docs) can never report a non-zero arity.
     pub fn get_arity(&self) -> usize {
         if self.fa.is_true_false_automaton() {
             return 0;
         }
-        self.alphabet.len()
+        self.tracks.len()
     }
 
     /// `Automaton.isEmpty` (`Automaton.java:514-519`), including its
@@ -1196,19 +1330,22 @@ impl Automaton {
     /// always pair the two, via `richAlphabet.setupEncoder()`.)
     pub fn determine_alphabet_size(&mut self) {
         self.fa.alphabet_size = self
-            .alphabet
+            .tracks
             .iter()
-            .try_fold(1usize, |acc, track| acc.checked_mul(track.len()))
+            .try_fold(1usize, |acc, track| acc.checked_mul(track.alphabet.len()))
             .expect("alphabet size overflow (Math.multiplyExact equivalent)");
     }
 
     /// `RichAlphabet.setupEncoder` (`RichAlphabet.java:96-98`): recomputes `encoder` from
-    /// the current `alphabet`. Added alongside [`Automaton::determine_alphabet_size`]
-    /// (adversarial-review finding: `encoder` is a private field with no other public
-    /// recompute path, so a caller that mutates `alphabet` directly had no faithful way
-    /// to resync it before this existed).
+    /// the current per-track alphabets. Added alongside
+    /// [`Automaton::determine_alphabet_size`] (adversarial-review finding: `encoder` is a
+    /// private field with no other public recompute path, so a caller that mutates a
+    /// track's alphabet directly had no faithful way to resync it before this existed).
+    /// Not a hot path (called once per alphabet-mutating event, never per-symbol like
+    /// [`Automaton::encode`]), so the intermediate `Vec<Vec<i32>>`
+    /// [`Automaton::track_alphabets`] builds here is an acceptable allocation.
     pub fn setup_encoder(&mut self) {
-        self.encoder = Self::compute_encoder(&self.alphabet);
+        self.encoder = Self::compute_encoder(&self.track_alphabets());
     }
 
     /// Read-only accessor for the per-track encoder (`RichAlphabet.encoder`), added in
@@ -1226,7 +1363,7 @@ impl Automaton {
 
     /// `Automaton.randomLabel` (`Automaton.java:299-305`).
     pub fn random_label(&mut self) {
-        self.label = (0..self.alphabet.len()).map(|i| i.to_string()).collect();
+        self.label = (0..self.tracks.len()).map(|i| i.to_string()).collect();
     }
 
     /// `Automaton.unlabel` (`Automaton.java:307-310`). Its Java callers are
@@ -1252,7 +1389,7 @@ impl Automaton {
     /// track's valid-representation restriction.
     ///
     /// For every track whose number system supplies an all-representations automaton
-    /// ([`Automaton::all_reps`]), that automaton is bound to the track's label and
+    /// ([`Track::all_reps`]), that automaton is bound to the track's label and
     /// intersected in. For a plain base-*k* numeration every entry is `None` and this is a
     /// no-op *except* for the label bookkeeping, which Java performs unconditionally (see
     /// the "even with nothing to apply" note below) — that is why this is a real method
@@ -1303,8 +1440,8 @@ impl Automaton {
         let flag = self.determine_random_label();
         // `None` == "K is still `this`" (Java's alias).
         let mut k: Option<Automaton> = None;
-        for i in 0..self.alphabet.len() {
-            let Some(n) = self.all_reps[i].as_ref() else {
+        for i in 0..self.tracks.len() {
+            let Some(n) = self.tracks[i].all_reps.as_ref() else {
                 continue;
             };
             let mut n = (**n).clone();
@@ -1356,8 +1493,8 @@ impl Automaton {
         self.debug_assert_track_invariant();
         let flag = self.determine_random_label();
         let mut k: Option<Automaton> = None;
-        for i in 0..self.alphabet.len() {
-            let Some(n) = self.all_reps[i].as_ref() else {
+        for i in 0..self.tracks.len() {
+            let Some(n) = self.tracks[i].all_reps.as_ref() else {
                 continue;
             };
             let mut n = (**n).clone();
@@ -1403,7 +1540,7 @@ impl Automaton {
     /// recomputes an identical encoder from an identical alphabet. The only *observable*
     /// change `setAlphabet` makes here is installing a `NumberSystem` whose
     /// `useAllRepresentations()` is `false` — i.e., exactly `all_reps[i] = None` in this
-    /// crate's parallel-vector stand-in (see [`Automaton::all_reps`]'s field docs) — plus
+    /// crate's parallel-vector stand-in (see [`Track::all_reps`]'s field docs) — plus
     /// re-running `determinizeAndMinimize`/`forceCanonize`/
     /// `applyAllRepresentationsWithOutput`, all three of which this crate's `Automaton`
     /// already exposes and are called here directly. The wider "new base" fact
@@ -1422,7 +1559,7 @@ impl Automaton {
     /// The replacement `NumberSystem` Java builds for a switched track is named
     /// `ns.determineBaseNameUnderscore() + (max + 1)` (`:169`), `max` being the largest
     /// digit in **that track's** alphabet — so `msd_fib`'s track becomes `msd_2`, and the
-    /// name genuinely changes. [`Automaton::ns_name`] records that new name explicitly
+    /// name genuinely changes. [`Track::ns_name`] records that new name explicitly
     /// rather than leaning on [`Automaton::track_ns_names`]'s reconstruction, because
     /// `max + 1` and `alphabet[i].len()` coincide only for a contiguous-from-zero
     /// alphabet.
@@ -1433,14 +1570,18 @@ impl Automaton {
     /// alphabet changed, not one of the progress/timing detail lines this port skips.
     pub fn normalize_number_systems(&mut self, logging: &mut crate::logging::Logging) {
         let mut switch_ns = false;
-        for i in 0..self.all_reps.len() {
-            if self.all_reps[i].is_some() {
+        for i in 0..self.tracks.len() {
+            if self.tracks[i].all_reps.is_some() {
                 switch_ns = true;
-                self.all_reps[i] = None;
+                self.tracks[i].all_reps = None;
                 // `new NumberSystem(ns.determineBaseNameUnderscore() + (max + 1))`
                 // (`:168-169`): `max` is `Collections.max(richAlphabet.getA().get(i))`.
-                let renamed = self.msd[i].and_then(|is_msd| {
-                    self.alphabet[i].iter().max().map(|max| {
+                // U9 Stage C: the `if i < self.ns_name.len()` guard from the
+                // parallel-vector era is gone -- `self.tracks[i]` always has an
+                // `ns_name` slot, unconditionally, so the write below can never be
+                // out of range.
+                let renamed = self.tracks[i].msd.and_then(|is_msd| {
+                    self.tracks[i].alphabet.iter().max().map(|max| {
                         let prefix = if is_msd {
                             crate::numsys::MSD_UNDERSCORE
                         } else {
@@ -1449,9 +1590,7 @@ impl Automaton {
                         format!("{prefix}{}", max + 1)
                     })
                 });
-                if i < self.ns_name.len() {
-                    self.ns_name[i] = renamed;
-                }
+                self.tracks[i].ns_name = renamed;
             }
         }
         if !switch_ns {
@@ -1468,7 +1607,7 @@ impl Automaton {
     /// automaton. `None` where the track carries no arithmetic number system at all
     /// (`msd[i] == None`), mirroring Java's literal `null` `NS` list entry.
     ///
-    /// Prefers the REAL name recorded in [`Automaton::ns_name`] — threaded through from
+    /// Prefers the REAL name recorded in [`Track::ns_name`] — threaded through from
     /// the resolved [`crate::numsys::NumberSystem`] by every caller that has one
     /// (`wr-io`'s reader, `wr-cli`'s `alphabet`/`reg`), so a custom base reports
     /// `msd_fib` and not the `msd_2` its alphabet cardinality alone would suggest. Falls
@@ -1487,24 +1626,20 @@ impl Automaton {
     /// agrees with Java on which entries are `null` even if a caller's parallel vectors
     /// were built inconsistently (which [`Automaton::set_ns_names`] rejects outright).
     pub fn track_ns_names(&self) -> Vec<Option<String>> {
-        self.msd
+        self.tracks
             .iter()
-            .enumerate()
-            .zip(self.alphabet.iter())
-            .map(|((i, msd), alphabet)| {
-                msd.map(
-                    |is_msd| match self.ns_name.get(i).and_then(|n| n.as_ref()) {
-                        Some(name) => name.clone(),
-                        None => {
-                            let prefix = if is_msd {
-                                crate::numsys::MSD_UNDERSCORE
-                            } else {
-                                crate::numsys::LSD_UNDERSCORE
-                            };
-                            format!("{prefix}{}", alphabet.len())
-                        }
-                    },
-                )
+            .map(|t| {
+                t.msd.map(|is_msd| match t.ns_name.as_deref() {
+                    Some(name) => name.to_string(),
+                    None => {
+                        let prefix = if is_msd {
+                            crate::numsys::MSD_UNDERSCORE
+                        } else {
+                            crate::numsys::LSD_UNDERSCORE
+                        };
+                        format!("{prefix}{}", t.alphabet.len())
+                    }
+                })
             })
             .collect()
     }
@@ -1533,7 +1668,7 @@ impl Automaton {
     ///
     /// # Panics
     ///
-    /// If `new_alphabet.len() != old.alphabet.len()` (arity mismatch). Java's real
+    /// If `new_alphabet.len() != old.track_count()` (arity mismatch). Java's real
     /// guard against this lives in the CALLER, `setAlphabet`
     /// (`Automaton.java:185-187`, `"The number of alphabets must match..."`) — which
     /// this unit deliberately does not port (see module docs). An adversarial review
@@ -1549,7 +1684,7 @@ impl Automaton {
     ) -> Vec<BTreeMap<i32, Vec<usize>>> {
         assert_eq!(
             new_alphabet.len(),
-            old.alphabet.len(),
+            old.track_count(),
             "rebuild_transitions_for_new_alphabet: arity mismatch (matches setAlphabet's own guard)"
         );
         old.fa
@@ -1645,7 +1780,14 @@ impl Automaton {
         // permutedA is going to hold the alphabet of the sorted inputs. The same logic
         // is behind permutedEncoder.
         let label_permutation = Self::get_label_permutation(&self.label, &sorted_label);
-        let permuted_alphabet = Self::permute(&self.alphabet, &label_permutation);
+        // U9 (idiomatic-refactor) Stage C: ONE `Vec<Track>` permute now does what four
+        // separate `Self::permute` calls (on `alphabet`/`msd`/`all_reps`/`ns_name`) used
+        // to -- Java permutes the single `NS` list, which already carries all three of
+        // those (`Automaton.java:377`); `Track` bundling all four together makes that
+        // true of `alphabet` as well, by construction rather than by convention.
+        let permuted_tracks = Self::permute(&self.tracks, &label_permutation);
+        let permuted_alphabet: Vec<Vec<i32>> =
+            permuted_tracks.iter().map(|t| t.alphabet.clone()).collect();
         let permuted_encoder = Self::compute_encoder(&permuted_alphabet);
 
         // encoded_input_permutation[i] = j means encoded input i becomes j after sorting.
@@ -1658,13 +1800,8 @@ impl Automaton {
         }
 
         self.label = sorted_label;
-        self.alphabet = permuted_alphabet;
+        self.tracks = permuted_tracks;
         self.encoder = permuted_encoder;
-        self.msd = Self::permute(&self.msd, &label_permutation);
-        // Java permutes the single `NS` list, which carries all three parts of this
-        // crate's per-track number-system stand-in (`Automaton.java:377`).
-        self.all_reps = Self::permute(&self.all_reps, &label_permutation);
-        self.ns_name = Self::permute(&self.ns_name, &label_permutation);
 
         for row in self.fa.d.iter_mut() {
             let mut permuted_row = BTreeMap::new();
@@ -1740,7 +1877,7 @@ impl Automaton {
         if self.fa.is_true_false_automaton() {
             0
         } else {
-            self.alphabet.len()
+            self.tracks.len()
         }
     }
 
@@ -1758,11 +1895,7 @@ impl Automaton {
             !self.fa.is_true_false_automaton(),
             "invalid use of method bind"
         );
-        assert_eq!(
-            self.alphabet.len(),
-            names.len(),
-            "invalid use of method bind"
-        );
+        assert_eq!(self.tracks.len(), names.len(), "invalid use of method bind");
         self.label = names;
         self.label_sorted = false;
         // `fa.setCanonized(false);` (`Automaton.java:442`).
@@ -1774,18 +1907,18 @@ impl Automaton {
     /// the same label as input `i`; if so, merges the duplicates into one track (e.g. an
     /// expression like `f(a,a)` becomes a one-input automaton).
     fn remove_same_inputs(automaton: &mut Automaton, i: usize) {
-        if i >= automaton.alphabet.len() {
+        if i >= automaton.tracks.len() {
             return;
         }
         let mut same_label_indices = vec![i];
-        for j in (i + 1)..automaton.alphabet.len() {
+        for j in (i + 1)..automaton.tracks.len() {
             if automaton.label[i] == automaton.label[j] {
                 // `UtilityMethods.areEqual`: SET equality, not ordered-list equality —
                 // two same-label tracks with the same digits in a different order are
                 // accepted here, ported faithfully (see `areEqual`'s own doc comment:
                 // "Checks if the set of L and R are equal").
-                let set_i: HashSet<i32> = automaton.alphabet[i].iter().copied().collect();
-                let set_j: HashSet<i32> = automaton.alphabet[j].iter().copied().collect();
+                let set_i: HashSet<i32> = automaton.tracks[i].alphabet.iter().copied().collect();
+                let set_j: HashSet<i32> = automaton.tracks[j].alphabet.iter().copied().collect();
                 assert_eq!(
                     set_i, set_j,
                     "Inputs {i} and {j} have the same label but different alphabets."
@@ -1814,11 +1947,11 @@ impl Automaton {
         let keep = |i: usize| !same_label_indices.contains(&i) || same_label_indices[0] == i;
 
         let new_alphabet: Vec<Vec<i32>> = automaton
-            .alphabet
+            .tracks
             .iter()
             .enumerate()
             .filter(|&(i, _)| keep(i))
-            .map(|(_, track)| track.clone())
+            .map(|(_, t)| t.alphabet.clone())
             .collect();
         let new_encoder = Self::compute_encoder(&new_alphabet);
 
@@ -1865,12 +1998,18 @@ impl Automaton {
         automaton.fa.d = new_d;
 
         same_label_indices.remove(0);
-        remove_indices(&mut automaton.msd, &same_label_indices);
-        // Java's `removeIndices(A.getNS(), I)` removes the whole `NumberSystem` entry,
-        // i.e. all three parts of this crate's stand-in.
-        remove_indices(&mut automaton.all_reps, &same_label_indices);
-        remove_indices(&mut automaton.ns_name, &same_label_indices);
-        automaton.alphabet = new_alphabet;
+        // U9 (idiomatic-refactor) Stage C: ONE `Vec<Track>` removal now reduces
+        // alphabet + msd + all_reps + ns_name together -- Java's `removeIndices(A
+        // .getNS(), I)` already removed all three NS-stand-in parts as one list entry;
+        // `Track` bundling the alphabet in too extends that to all four. `new_alphabet`
+        // above is provably the SAME kept-track set this produces for the alphabet facet
+        // (same index list: `same_label_indices` here is exactly `keep()`'s captured
+        // list with its own first element removed) -- the explicit per-track
+        // re-assignment below is belt-and-suspenders on top of that, not load-bearing.
+        remove_indices(&mut automaton.tracks, &same_label_indices);
+        for (track, alphabet) in automaton.tracks.iter_mut().zip(new_alphabet) {
+            track.alphabet = alphabet;
+        }
         automaton.encoder = new_encoder;
         automaton.determine_alphabet_size();
         remove_indices(&mut automaton.label, &same_label_indices);
@@ -2556,20 +2695,20 @@ mod tests {
             Vec::new(),
             vec![Some(true), Some(true)],
         );
-        let alphabet_before = a.alphabet.clone();
+        let alphabet_before = a.track_alphabets();
         a.sort_label();
         assert!(a.label.is_empty());
-        assert_eq!(a.alphabet, alphabet_before);
+        assert_eq!(a.track_alphabets(), alphabet_before);
     }
 
     #[test]
     fn sort_label_is_a_noop_when_already_sorted() {
         let mut a = two_track_b_then_a_automaton();
         a.label = vec!["a".to_string(), "b".to_string()];
-        let alphabet_before = a.alphabet.clone();
+        let alphabet_before = a.track_alphabets();
         a.sort_label();
         assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(a.alphabet, alphabet_before);
+        assert_eq!(a.track_alphabets(), alphabet_before);
         // Second call short-circuits on `label_sorted` -- still a no-op.
         a.sort_label();
         assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
@@ -2592,12 +2731,12 @@ mod tests {
         a.sort_label();
 
         assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1, 2]]);
         // msd must travel WITH its track's label, not stay positional: "a" (now track
         // 0) was `Some(false)`, "b" (now track 1) was `Some(true)` -- also caught by
         // mutation-testing (deleting the `msd` permutation line left this green when
         // both tracks shared one msd value).
-        assert_eq!(a.msd, vec![Some(false), Some(true)]);
+        assert_eq!(a.track_msds(), vec![Some(false), Some(true)]);
 
         // New order is [a, b]: the same digit pair is now written (a=1, b=1).
         let new_sym = a.encode(&[1, 1]);
@@ -2776,8 +2915,8 @@ mod tests {
         a.bind(vec!["x".to_string(), "x".to_string()]);
 
         assert_eq!(a.label, vec!["x".to_string()]);
-        assert_eq!(a.alphabet, vec![vec![0, 1]]);
-        assert_eq!(a.msd, vec![Some(true)]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1]]);
+        assert_eq!(a.track_msds(), vec![Some(true)]);
         assert_eq!(a.fa.alphabet_size, 2);
         // (0,0) and (1,1) survive as digits 0 and 1 on the single remaining track;
         // (0,1)/(1,0) are gone entirely (they mapped to MISSING).
@@ -2831,11 +2970,11 @@ mod tests {
         a.bind(vec!["a".to_string(), "b".to_string(), "a".to_string()]);
 
         assert_eq!(a.label, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(a.alphabet, vec![vec![0, 1], vec![0, 1, 2]]);
+        assert_eq!(a.track_alphabets(), vec![vec![0, 1], vec![0, 1, 2]]);
         // The FIRST "a" (old track 0, msd `Some(true)`) must survive, not the second
         // (old track 2, msd `None`) -- this is what a keep-the-last-duplicate mutant
         // gets backwards.
-        assert_eq!(a.msd, vec![Some(true), Some(false)]);
+        assert_eq!(a.track_msds(), vec![Some(true), Some(false)]);
 
         // The reduced-dimension transition table must carry exactly the symbols
         // `(x, y)` with `y == 1` (mirroring the pre-merge `(x, y, x)` predicate),
@@ -3128,7 +3267,9 @@ mod tests {
             let a = Automaton::true_false(truth);
             assert!(a.is_true_false_automaton());
             assert_eq!(a.is_true_automaton(), truth);
-            assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+            assert!(
+                a.track_alphabets().is_empty() && a.label.is_empty() && a.track_msds().is_empty()
+            );
             assert_eq!(a.get_arity(), 0, "Automaton.java:499");
             // Vacuously bound (0 labels for 0 tracks) -- worth pinning, because it is
             // exactly why `bind`'s and `create_basic_automaton`'s trivial guards cannot
@@ -3169,7 +3310,7 @@ mod tests {
         a.fa.true_false = Some(true);
         a.clear();
 
-        assert!(a.alphabet.is_empty() && a.label.is_empty() && a.msd.is_empty());
+        assert!(a.track_alphabets().is_empty() && a.label.is_empty() && a.track_msds().is_empty());
         assert!(a.fa.o.is_empty() && a.fa.d.is_empty());
         assert_eq!(a.fa.q, 2, "stale, faithfully -- see FA.clear()");
         assert!(a.is_true_false_automaton() && a.is_true_automaton());
@@ -3321,8 +3462,8 @@ mod tests {
         assert_eq!(after.fa.o, before.fa.o);
         assert_eq!(after.fa.d, before.fa.d);
         assert_eq!(after.label, before.label);
-        assert_eq!(after.alphabet, before.alphabet);
-        assert_eq!(after.msd, before.msd);
+        assert_eq!(after.track_alphabets(), before.track_alphabets());
+        assert_eq!(after.track_msds(), before.track_msds());
     }
 
     #[test]
@@ -3506,9 +3647,11 @@ mod tests {
         a.set_all_reps(vec![Some(Rc::clone(&restriction)), None, None]);
         a.sort_label();
         assert_eq!(a.label, vec!["a", "b", "c"]);
-        assert_eq!(a.msd, vec![Some(false), None, Some(true)]);
+        assert_eq!(a.track_msds(), vec![Some(false), None, Some(true)]);
         assert!(
-            a.all_reps[0].is_none() && a.all_reps[1].is_none() && a.all_reps[2].is_some(),
+            a.track_all_reps(0).is_none()
+                && a.track_all_reps(1).is_none()
+                && a.track_all_reps(2).is_some(),
             "the restriction followed track `c` to its new position"
         );
     }
@@ -3530,9 +3673,9 @@ mod tests {
         // Two tracks share a label, so `bind` merges them via `reduceDimension`.
         a.bind(vec!["x".into(), "x".into(), "y".into()]);
         assert_eq!(a.label, vec!["x", "y"]);
-        assert_eq!(a.msd.len(), 2);
-        assert_eq!(a.all_reps.len(), 2, "stayed parallel to msd");
-        assert!(a.all_reps[0].is_some() && a.all_reps[1].is_none());
+        assert_eq!(a.track_msds().len(), 2);
+        assert_eq!(a.track_all_reps_list().len(), 2, "stayed parallel to msd");
+        assert!(a.track_all_reps(0).is_some() && a.track_all_reps(1).is_none());
     }
 
     #[test]
@@ -3540,8 +3683,8 @@ mod tests {
         let mut a = universal_tracks(&["x"], 1);
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("ignored")))]);
         a.clear();
-        assert!(a.all_reps.is_empty());
-        assert!(a.msd.is_empty());
+        assert!(a.track_all_reps_list().is_empty());
+        assert!(a.track_msds().is_empty());
     }
 
     #[test]
@@ -3581,7 +3724,7 @@ mod tests {
         a.normalize_number_systems(&mut crate::logging::Logging::new());
         assert_eq!(a.fa.q, before_q);
         assert_eq!(a.fa.o, before_o);
-        assert!(a.all_reps[0].is_none());
+        assert!(a.track_all_reps(0).is_none());
     }
 
     #[test]
@@ -3593,12 +3736,15 @@ mod tests {
             vec![Some(true)],
         );
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x")))]);
-        assert!(a.all_reps[0].is_some(), "precondition: track is switched");
+        assert!(
+            a.track_all_reps(0).is_some(),
+            "precondition: track is switched"
+        );
 
         a.normalize_number_systems(&mut crate::logging::Logging::new());
 
         assert!(
-            a.all_reps[0].is_none(),
+            a.track_all_reps(0).is_none(),
             "the restriction must be dropped on the switched track"
         );
         // Still a well-formed, deterministic automaton -- `determinizeAndMinimize` ran.
@@ -3615,9 +3761,9 @@ mod tests {
         );
         a.set_all_reps(vec![Some(Rc::new(no_adjacent_ones("x"))), None]);
         a.normalize_number_systems(&mut crate::logging::Logging::new());
-        assert!(a.all_reps[0].is_none());
+        assert!(a.track_all_reps(0).is_none());
         assert!(
-            a.all_reps[1].is_none(),
+            a.track_all_reps(1).is_none(),
             "track 1 had no restriction to begin with"
         );
     }
@@ -3760,14 +3906,14 @@ mod tests {
     fn track_count_matches_the_alphabet_vectors_length() {
         let a = three_track_fixture();
         assert_eq!(a.track_count(), 3);
-        assert_eq!(a.track_count(), a.alphabet.len());
+        assert_eq!(a.track_count(), a.track_alphabets().len());
     }
 
     #[test]
     fn track_alphabet_matches_the_indexed_alphabet_field() {
         let a = three_track_fixture();
-        assert_eq!(a.track_alphabet(0), &a.alphabet[0][..]);
-        assert_eq!(a.track_alphabet(1), &a.alphabet[1][..]);
+        assert_eq!(a.track_alphabet(0), &[0, 1]);
+        assert_eq!(a.track_alphabet(1), &[0, 1, 2]);
         assert_eq!(a.track_alphabet(2), &[0, 1]);
     }
 
@@ -3782,10 +3928,10 @@ mod tests {
     fn track_alphabet_mut_can_append_a_new_digit_to_one_track() {
         let mut a = three_track_fixture();
         a.track_alphabet_mut(1).push(3);
-        assert_eq!(a.alphabet[1], vec![0, 1, 2, 3]);
+        assert_eq!(a.track_alphabet(1), vec![0, 1, 2, 3]);
         // The other tracks are untouched.
-        assert_eq!(a.alphabet[0], vec![0, 1]);
-        assert_eq!(a.alphabet[2], vec![0, 1]);
+        assert_eq!(a.track_alphabet(0), vec![0, 1]);
+        assert_eq!(a.track_alphabet(2), vec![0, 1]);
     }
 
     #[test]
@@ -3796,15 +3942,32 @@ mod tests {
         assert_eq!(a.track_msd(2), None);
     }
 
+    /// U9 (idiomatic-refactor) review finding, fixed: the previous version of this test
+    /// (named `track_all_reps_matches_the_indexed_all_reps_field`, a reference to the
+    /// pre-U9 `Automaton::all_reps` field that no longer exists — `Track::all_reps` is
+    /// the field now) compared `a.track_all_reps(0)` against a SECOND call to
+    /// `a.track_all_reps(0)` — the same read twice, so `ptr::eq` was trivially always
+    /// true regardless of whether `Track::all_reps` actually shares the installed `Rc`
+    /// or deep-copies it. Fixed by holding the `Rc` [`Automaton::set_all_reps`] is given
+    /// and comparing the accessor's result against THAT — a real deep-copy bug would now
+    /// be caught.
     #[test]
-    fn track_all_reps_matches_the_indexed_all_reps_field() {
-        let a = three_track_fixture();
+    fn track_all_reps_shares_the_rc_installed_by_set_all_reps() {
+        let mut a = Automaton::new(
+            trivial_fa(8),
+            vec![vec![0, 1], vec![0, 1, 2], vec![0, 1]],
+            vec!["x".into(), "y".into(), "z".into()],
+            vec![Some(true), Some(false), None],
+        );
+        let installed = Rc::new(no_adjacent_ones("ignored"));
+        a.set_all_reps(vec![Some(Rc::clone(&installed)), None, None]);
+
         assert!(a.track_all_reps(0).is_some());
         assert!(a.track_all_reps(1).is_none());
         assert!(a.track_all_reps(2).is_none());
         assert!(std::ptr::eq(
             a.track_all_reps(0).unwrap().as_ref() as *const Automaton,
-            a.all_reps[0].as_ref().unwrap().as_ref() as *const Automaton
+            installed.as_ref() as *const Automaton
         ));
     }
 
@@ -3834,26 +3997,50 @@ mod tests {
         assert_eq!(t2.ns_name, None);
     }
 
+    /// U9 (idiomatic-refactor) Stage C conversion, recorded explicitly: this test
+    /// originally (Stage A/B, when storage was still the four parallel `Vec`s) compared
+    /// each plural accessor's return value against the raw field it delegated to,
+    /// proving the delegation itself was correct. Once storage became `tracks:
+    /// Vec<Track>` the raw fields it compared against no longer exist -- there is only
+    /// one way left to read a track's facets, so a self-comparison
+    /// (`a.track_alphabets() == a.track_alphabets()`) would be vacuously true
+    /// regardless of what the accessor actually returned, silently testing nothing.
+    /// Converted to pin the plural accessors' LITERAL expected output for
+    /// `three_track_fixture()` instead (cross-checked against the per-index accessors'
+    /// own values, asserted elsewhere by `track_alphabet_matches_the_indexed_alphabet_field`
+    /// et al.), which is real, non-vacuous coverage of the same surface.
     #[test]
-    fn whole_vector_accessors_match_the_underlying_fields_exactly() {
+    fn whole_vector_accessors_match_the_literal_expected_values() {
         let a = three_track_fixture();
-        assert_eq!(a.track_alphabets(), a.alphabet.as_slice());
-        assert_eq!(a.track_msds(), a.msd.as_slice());
-        assert_eq!(a.track_all_reps_list().len(), a.all_reps.len());
-        for (accessor_entry, field_entry) in a.track_all_reps_list().iter().zip(a.all_reps.iter()) {
-            assert_eq!(accessor_entry.is_some(), field_entry.is_some());
-        }
-        assert_eq!(a.track_ns_names_raw(), a.ns_name.as_slice());
+        assert_eq!(
+            a.track_alphabets(),
+            vec![vec![0, 1], vec![0, 1, 2], vec![0, 1]]
+        );
+        assert_eq!(a.track_msds(), vec![Some(true), Some(false), None]);
+        assert_eq!(
+            a.track_all_reps_list()
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        assert_eq!(
+            a.track_ns_names_raw(),
+            vec![Some("msd_fib".to_string()), Some("lsd_3".to_string()), None]
+        );
     }
 
     #[test]
     fn track_all_reps_iter_mut_can_clear_every_slot_in_place() {
         let mut a = three_track_fixture();
-        assert!(a.all_reps[0].is_some(), "sanity: track 0 starts populated");
+        assert!(
+            a.track_all_reps(0).is_some(),
+            "sanity: track 0 starts populated"
+        );
         for slot in a.track_all_reps_iter_mut() {
             *slot = None;
         }
-        assert!(a.all_reps.iter().all(Option::is_none));
+        assert!(a.track_all_reps_list().iter().all(Option::is_none));
     }
 
     #[test]
@@ -3866,14 +4053,14 @@ mod tests {
             ns_name: Some("msd_4".to_string()),
         });
         assert_eq!(a.track_count(), 4);
-        assert_eq!(a.alphabet[3], vec![0, 1, 2, 3]);
-        assert_eq!(a.msd[3], Some(true));
-        assert!(a.all_reps[3].is_none());
-        assert_eq!(a.ns_name[3].as_deref(), Some("msd_4"));
+        assert_eq!(a.track_alphabet(3), vec![0, 1, 2, 3]);
+        assert_eq!(a.track_msd(3), Some(true));
+        assert!(a.track_all_reps(3).is_none());
+        assert_eq!(a.track_ns_name_raw(3), Some("msd_4"));
         // The first three tracks are untouched.
-        assert_eq!(a.alphabet[0], vec![0, 1]);
-        assert_eq!(a.msd[1], Some(false));
-        assert!(a.all_reps[0].is_some());
+        assert_eq!(a.track_alphabet(0), vec![0, 1]);
+        assert_eq!(a.track_msd(1), Some(false));
+        assert!(a.track_all_reps(0).is_some());
     }
 
     #[test]
@@ -3881,14 +4068,14 @@ mod tests {
         let mut a = three_track_fixture();
         a.set_track_alphabets(vec![vec![0, 1, 2], vec![0, 1], vec![0]]);
         assert_eq!(
-            a.alphabet,
+            a.track_alphabets(),
             vec![vec![0, 1, 2], vec![0, 1], vec![0]],
             "alphabet is replaced wholesale"
         );
         // msd/all_reps/ns_name are untouched by this call.
-        assert_eq!(a.msd, vec![Some(true), Some(false), None]);
-        assert!(a.all_reps[0].is_some());
-        assert_eq!(a.ns_name[1].as_deref(), Some("lsd_3"));
+        assert_eq!(a.track_msds(), vec![Some(true), Some(false), None]);
+        assert!(a.track_all_reps(0).is_some());
+        assert_eq!(a.track_ns_name_raw(1), Some("lsd_3"));
     }
 
     #[test]
@@ -3902,7 +4089,7 @@ mod tests {
     fn set_track_msds_replaces_every_direction_and_leaves_other_facets_alone() {
         let mut a = three_track_fixture();
         a.set_track_msds(vec![None, Some(true), Some(false)]);
-        assert_eq!(a.msd, vec![None, Some(true), Some(false)]);
+        assert_eq!(a.track_msds(), vec![None, Some(true), Some(false)]);
         // alphabet/all_reps/ns_name are untouched -- including track 0's, whose
         // `all_reps`/`ns_name` now sit on a `None`-msd track, exactly the shape
         // `debug_assert_track_invariant` would reject if this setter tried to enforce
@@ -3910,8 +4097,8 @@ mod tests {
         // `set_all_reps`/`set_ns_names` check it, matching the existing division of
         // responsibility between `alphabet`/`msd`'s free-form field and the two
         // invariant-checked setters).
-        assert_eq!(a.alphabet[0], vec![0, 1]);
-        assert!(a.all_reps[0].is_some());
+        assert_eq!(a.track_alphabet(0), vec![0, 1]);
+        assert!(a.track_all_reps(0).is_some());
     }
 
     #[test]
