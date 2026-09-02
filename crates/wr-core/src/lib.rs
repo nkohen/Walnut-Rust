@@ -44,6 +44,7 @@ pub mod minimize;
 pub mod morphism;
 pub mod numsys;
 pub mod ostrowski;
+pub mod par_determinize;
 pub mod product;
 pub mod quantify;
 pub mod regex;

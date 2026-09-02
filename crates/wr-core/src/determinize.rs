@@ -278,7 +278,12 @@ pub fn determinize(
 
     // Java `:121-125`'s switch, minus the deferred OTF arm.
     a.fa = match strategy {
-        Strategy::Sc => subset_construction(&a.fa, initial),
+        // `agent/par-posthoc` experiment: this is the engine's single `SC` entry point,
+        // so one dispatcher switches every determinization in the port between the
+        // sequential implementation and the racy-parallel one whose numbering is
+        // reconstructed post hoc. `WR_PAR=0` restores the stock call exactly; see
+        // `crate::par_determinize`'s module docs.
+        Strategy::Sc => crate::par_determinize::dispatch_subset_construction(&a.fa, initial),
         Strategy::Brz => brzozowski(&a.fa, initial, logging)?,
     };
     // In Java this is a brand-new `FA` object, so its `canonized` memo is `false` by
