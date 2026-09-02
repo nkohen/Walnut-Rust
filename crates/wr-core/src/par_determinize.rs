@@ -181,7 +181,28 @@ type Pending = (usize, Vec<usize>);
 /// resurfaced by `thread::scope`, so the *message* is wrapped rather than identical.
 /// Below that threshold the call is delegated and the panic is bit-identical.
 pub fn subset_construction_par(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> Fa {
-    subset_construction_par_with_threshold(fa, initial, threads, MIN_STATES_FOR_PARALLEL)
+    subset_construction_par_with_threshold(fa, initial, threads, min_states())
+}
+
+/// The effective delegation threshold: [`MIN_STATES_FOR_PARALLEL`], or whatever
+/// `WR_PAR_MIN_STATES` overrides it to.
+///
+/// The override exists for VERIFICATION, not tuning. At the production threshold only the
+/// few genuinely large determinizations in Walnut's corpus take the parallel path, so a
+/// golden-corpus run would exercise the racy code on a handful of fixtures and the
+/// sequential delegation on the rest — weak evidence for a lane whose whole claim is that
+/// racy numbering is unobservable. `WR_PAR_MIN_STATES=1` forces essentially every
+/// determinization in the corpus down the parallel path instead, turning the same run into
+/// a much stronger test. It is slower, deliberately.
+fn min_states() -> usize {
+    use std::sync::OnceLock;
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("WR_PAR_MIN_STATES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(MIN_STATES_FOR_PARALLEL, |v| v.max(1))
+    })
 }
 
 /// [`subset_construction_par`] with the delegation threshold supplied explicitly.
@@ -201,14 +222,21 @@ pub fn subset_construction_par_with_threshold(
     min_states: usize,
 ) -> Fa {
     if threads <= 1 || fa.q < min_states || fa.alphabet_size == 0 {
-        return subset_construction(fa, initial);
+        let t = std::time::Instant::now();
+        let out = subset_construction(fa, initial);
+        stats::record_delegated(t.elapsed());
+        return out;
     }
+    let t = std::time::Instant::now();
     let mut result = build_racy(fa, initial, threads);
+    let compute = t.elapsed();
     // The whole thesis, in one call: production canonicalization maps the racy numbering
     // back onto the sequential one (module docs, L1 + L2). This is the "post-hoc
     // reconstruction phase" whose cost the report accounts for separately from the
     // parallel compute win.
+    let t = std::time::Instant::now();
     result.canonicalize();
+    stats::record_parallel(compute, t.elapsed());
     result
 }
 
@@ -359,6 +387,71 @@ fn process_metastate(
     (out, row)
 }
 
+
+// ---------------------------------------------------------------------------
+// Instrumentation: the parallel compute win vs the post-hoc reconstruction cost.
+// ---------------------------------------------------------------------------
+
+/// Process-global counters splitting [`subset_construction_par`]'s wall time into its
+/// racy-compute phase and its post-hoc reconstruction phase.
+///
+/// The experiment's central question is whether reconstruction eats the parallel win, so
+/// the two are measured separately rather than inferred. Counters are `Relaxed` atomics —
+/// they are a measurement aid, never read by the engine, and a lost update under
+/// contention would cost a few nanoseconds of accuracy, not correctness.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    static COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+    static RECOVER_NS: AtomicU64 = AtomicU64::new(0);
+    static DELEGATED_NS: AtomicU64 = AtomicU64::new(0);
+    static PAR_CALLS: AtomicU64 = AtomicU64::new(0);
+    static DELEGATED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn record_parallel(compute: Duration, recover: Duration) {
+        COMPUTE_NS.fetch_add(compute.as_nanos() as u64, Ordering::Relaxed);
+        RECOVER_NS.fetch_add(recover.as_nanos() as u64, Ordering::Relaxed);
+        PAR_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_delegated(elapsed: Duration) {
+        DELEGATED_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+        DELEGATED_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A snapshot of the counters.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Snapshot {
+        /// Wall time inside the racy parallel phase.
+        pub compute: Duration,
+        /// Wall time inside post-hoc canonicalization — the reconstruction overhead.
+        pub recover: Duration,
+        /// Wall time inside calls that fell below the threshold and ran sequentially.
+        pub delegated: Duration,
+        pub parallel_calls: u64,
+        pub delegated_calls: u64,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            compute: Duration::from_nanos(COMPUTE_NS.load(Ordering::Relaxed)),
+            recover: Duration::from_nanos(RECOVER_NS.load(Ordering::Relaxed)),
+            delegated: Duration::from_nanos(DELEGATED_NS.load(Ordering::Relaxed)),
+            parallel_calls: PAR_CALLS.load(Ordering::Relaxed),
+            delegated_calls: DELEGATED_CALLS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset() {
+        COMPUTE_NS.store(0, Ordering::Relaxed);
+        RECOVER_NS.store(0, Ordering::Relaxed);
+        DELEGATED_NS.store(0, Ordering::Relaxed);
+        PAR_CALLS.store(0, Ordering::Relaxed);
+        DELEGATED_CALLS.store(0, Ordering::Relaxed);
+    }
+}
+
 /// How many workers [`subset_construction_par`] should use by default.
 pub fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -421,10 +514,16 @@ pub fn dispatch_subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
 /// [`subset_construction_par`] without the post-hoc canonicalization — the racy numbering
 /// escapes. Isomorphic to the sequential result, but **not** equal to it.
 pub fn subset_construction_par_raw(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> Fa {
-    if threads <= 1 || fa.q < MIN_STATES_FOR_PARALLEL || fa.alphabet_size == 0 {
-        return subset_construction(fa, initial);
+    if threads <= 1 || fa.q < min_states() || fa.alphabet_size == 0 {
+        let t = std::time::Instant::now();
+        let out = subset_construction(fa, initial);
+        stats::record_delegated(t.elapsed());
+        return out;
     }
-    build_racy(fa, initial, threads)
+    let t = std::time::Instant::now();
+    let out = build_racy(fa, initial, threads);
+    stats::record_parallel(t.elapsed(), std::time::Duration::ZERO);
+    out
 }
 
 #[cfg(test)]
