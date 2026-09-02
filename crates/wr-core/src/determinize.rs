@@ -308,6 +308,229 @@ pub fn determinize(
 /// worklist that grows by appending newly-discovered metastates — the same
 /// array-append-as-worklist shape as the Java `metastateList`, not a separate queue.
 pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
+    // U34-P1 (`~/.claude/plans/glossy-compacting-lantern.md` §3) replaced the
+    // per-(metastate, symbol) `BTreeSet<usize>` union — heap-allocated per iteration and
+    // cloned just to probe `metastate_to_id` — with the reusable `scratch: Vec<usize>` +
+    // `sort_unstable()`/`dedup()` canonicalization + borrowed `HashMap` lookup this
+    // function still uses. P1(a) (`~/.claude/plans/perf-beyond-p1a-subset-construction.md`)
+    // keeps all of that and changes only HOW `scratch` is filled, because profiling put
+    // 59.5-89.4% of the engine's real work inside this one function:
+    //
+    //   * **C1 — member-outer, row-once.** The union used to be built symbol-outer, with
+    //     a `fa.d[q].get(&sym)` B-tree descent per (symbol, member): `alphabet_size ×
+    //     |current|` full tree lookups per metastate. It is now built member-outer —
+    //     each member's row is walked ONCE, in its native ascending-symbol order, and
+    //     every destination list is appended RAW into `buckets[sym]`, a flat table
+    //     indexed by symbol and reused across the whole call.
+    //   * **C2 — dedup at drain.** `seen`/`epoch` suppress repeats while a bucket is
+    //     drained into `scratch`, so the `sort_unstable()` below sorts the DEDUPED union
+    //     rather than the raw one (measured mean union size on the profiled fixtures:
+    //     75.9 raw -> 42.6 deduped on 230, 29.1 -> 18.1 on 179).
+    //
+    // **The output `Fa` is unchanged, bit for bit** — same metastate discovery order,
+    // hence the same state numbering that every `.txt`/`.gv` byte and `::`-details count
+    // depends on (`docs/IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`'s `wr_core::determinize`
+    // entry). One qualifier: this holds for any `alphabet_size` within the `int`-checked
+    // bound the construction sites already enforce (`Automaton::determine_alphabet_size`)
+    // — on a malformed `Fa` whose `alphabet_size` exceeds `i32::MAX`, the old code's
+    // `as i32` cast emptied its loop and returned transition-less rows, while the eager
+    // alphabet-sized bucket allocation below aborts first. The argument, in the three
+    // places it could break:
+    //
+    //   1. *Symbol order.* The drain below walks `0..alphabet_size` ascending, the
+    //      identical sequence the old symbol-outer loop walked, and skips exactly the
+    //      symbols the old code's `scratch.is_empty()` check skipped (`buckets[sym]` is
+    //      non-empty iff at least one member had a non-empty destination list for `sym`
+    //      — precisely the old `scratch`'s emptiness condition). So ids are minted in
+    //      the same order, and a symbol with no union still gets NO row entry (SC does
+    //      not totalize).
+    //   2. *Member order.* For a fixed symbol, `buckets[sym]` receives one contribution
+    //      per member in `current`'s ascending order (the outer loop's order), each
+    //      appended raw — byte-identical to the old inner `for &q in &current` fill. C1
+    //      alone therefore preserves even the pre-sort sequence; C2 then deletes
+    //      duplicates from it, which the old code's `dedup()` deleted one step later.
+    //      Nothing observes the sequence in between: only `is_empty()` and the
+    //      post-sort-dedup key are read, and dropping duplicates cannot empty a
+    //      non-empty list.
+    //   3. *Cross-symbol independence.* The epoch is bumped once per drained
+    //      (metastate, symbol) pair — see `epoch += 1` below — so a destination seen
+    //      under symbol 0 is NOT suppressed under symbol 1. (That failure mode is the
+    //      silent-wrong-automaton bug class this unit's snapshot test
+    //      `subset_construction_does_not_suppress_a_destination_across_symbols` and the
+    //      debug cross-check at the drain exist to catch.)
+    //
+    // Cost of the two per-call buffers, stated plainly: `buckets` is 24 bytes ×
+    // `alphabet_size` (`alphabet_size` is int-checked at the established call sites), and
+    // `seen` is 8 bytes × `fa.q`. Both are allocated once per call, not per metastate.
+    // `subset_construction_reference` below is a verbatim copy of the pre-P1(a) body,
+    // and `new_matches_the_pre_p1a_reference_implementation` compares the two outputs
+    // field-for-field over 20,000 generated automata.
+    let mut metastate_list: Vec<Vec<usize>> = vec![initial.iter().copied().collect()];
+    let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
+    metastate_to_id.insert(metastate_list[0].clone(), 0);
+
+    let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
+    let mut scratch: Vec<usize> = Vec::new();
+    // C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the
+    // metastate currently being processed, and is emptied again before the next one.
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); fa.alphabet_size];
+    // The symbols this metastate actually touched, so the clear-down is proportional to
+    // what was filled rather than to `alphabet_size`. No duplicates: a symbol is
+    // recorded only on the fill that takes its bucket from empty to non-empty.
+    let mut touched: Vec<usize> = Vec::new();
+    // C2's dedup marker. `seen[dest] == epoch` means `dest` is already in `scratch` for
+    // the (metastate, symbol) currently being drained. A `u64` epoch cannot wrap in
+    // practice and so needs no reset/wraparound branch: 2^64 bumps at an implausible
+    // 10^8 drains/second is ~5,800 years of continuous running.
+    let mut seen: Vec<u64> = vec![0; fa.q];
+    let mut epoch: u64 = 0;
+    let mut cursor = 0;
+    while cursor < metastate_list.len() {
+        let current = metastate_list[cursor].clone();
+        let mut row = BTreeMap::new();
+        // `alphabet_size == 0` is the one shape where the old code never read `fa.d[q]`
+        // at all (its `for sym in 0..0` body never ran), so neither may this one: on a
+        // malformed `Fa` whose `d` is shorter than `initial`'s members, the old code
+        // reached the `o`-build and panicked there, and moving that panic earlier —
+        // into a member walk that today does not happen — would be a behavior change.
+        // With `alphabet_size >= 1` both shapes index `fa.d[q]` for the same first
+        // offending member, so the panic site and message already coincide.
+        if fa.alphabet_size > 0 {
+            for &q in &current {
+                for (&sym, dests) in &fa.d[q] {
+                    // The mechanical equivalent of the old `for sym in
+                    // 0..fa.alphabet_size as i32` probe range, which never LOOKED UP a
+                    // key outside it: a negative or `>= alphabet_size` key contributes
+                    // nothing and is silently dropped with no diagnostic, matching Java
+                    // (WB-038 outcome (b)). This is that load-bearing drop, not a
+                    // defensive bounds check — `Fa` has no invariant excluding such
+                    // keys and this function is `pub`.
+                    if sym < 0 || sym as usize >= fa.alphabet_size {
+                        continue;
+                    }
+                    if dests.is_empty() {
+                        continue;
+                    }
+                    let bucket = &mut buckets[sym as usize];
+                    if bucket.is_empty() {
+                        touched.push(sym as usize);
+                    }
+                    bucket.extend(dests.iter().copied());
+                }
+            }
+        }
+        for sym in 0..fa.alphabet_size as i32 {
+            let bucket = &buckets[sym as usize];
+            if bucket.is_empty() {
+                // SC does not totalize: no transition is recorded here at all.
+                continue;
+            }
+            // Exactly one bump per drained (metastate, symbol) pair, so the marker
+            // never carries a destination's membership across symbols.
+            epoch += 1;
+            scratch.clear();
+            for &dest in bucket {
+                if dest < fa.q {
+                    if seen[dest] == epoch {
+                        continue;
+                    }
+                    seen[dest] = epoch;
+                } else {
+                    // A destination id outside `0..fa.q` has no marker slot. Push it
+                    // unmarked rather than growing/bounds-checking `seen`: the
+                    // `sort_unstable()`/`dedup()` below canonicalizes such ids exactly
+                    // as the old code did, giving the identical key, and — load-bearing
+                    // — leaving the resulting `fa.d[garbage]` panic at the same later
+                    // BFS iteration, with the same message, that
+                    // `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`
+                    // pins. Indexing `seen` here instead would move that panic earlier.
+                }
+                scratch.push(dest);
+            }
+            scratch.sort_unstable();
+            // A provable no-op on the marker-deduped run above, except for the
+            // `>= fa.q` ids it deliberately does not mark. Kept because it is what
+            // canonicalizes those, and because it is cheap on an already-deduped slice.
+            scratch.dedup();
+            // Adversarial review found breaking this invariant (e.g. dropping the sort
+            // or the dedup) has NO clean test tripwire: a non-canonical key makes every
+            // metastate look "new" to `metastate_to_id`, so `while cursor <
+            // metastate_list.len()` never terminates and the test process is killed by
+            // its resource cap rather than failing an assertion -- exactly what
+            // CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail exists
+            // to prevent. This turns that failure mode into an immediate, located panic.
+            debug_assert!(
+                scratch.windows(2).all(|w| w[0] < w[1]),
+                "subset_construction: metastate key must be sorted with no duplicates"
+            );
+            // ... but that invariant is blind to OVER-dedup: dropping a destination
+            // that belongs in the union leaves a shorter key that is still sorted and
+            // still duplicate-free, so it passes the check above and silently builds a
+            // different automaton. This is the tripwire for that class (the cross-symbol
+            // suppression of C2's marker being the concrete way to cause it): the
+            // canonicalized RAW bucket must equal what the epoch-dedup produced.
+            #[cfg(debug_assertions)]
+            {
+                let mut canonical_raw = bucket.clone();
+                canonical_raw.sort_unstable();
+                canonical_raw.dedup();
+                assert!(
+                    canonical_raw == scratch,
+                    "subset_construction: the epoch-deduped union for symbol {sym} \
+                     differs from the canonicalized raw union ({scratch:?} vs \
+                     {canonical_raw:?}) -- the dedup marker dropped or kept the wrong \
+                     destinations"
+                );
+            }
+            let id = if let Some(&id) = metastate_to_id.get(scratch.as_slice()) {
+                id
+            } else {
+                let next_id = metastate_list.len();
+                metastate_to_id.insert(scratch.clone(), next_id);
+                metastate_list.push(scratch.clone());
+                next_id
+            };
+            row.insert(sym, vec![id]);
+        }
+        for &sym in &touched {
+            buckets[sym].clear();
+        }
+        touched.clear();
+        d.push(row);
+        cursor += 1;
+    }
+
+    let o = metastate_list
+        .iter()
+        .map(|ms| i32::from(ms.iter().any(|&q| fa.is_accepting(q))))
+        .collect();
+
+    Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
+}
+
+// ---------------------------------------------------------------------------
+// P1(a)'s frozen reference implementation.
+//
+// Everything from the `/// Determinizes ...` line to this function's closing brace is a
+// VERBATIM copy of `subset_construction`'s pre-P1(a) body at commit `06fc85c`, with the
+// single edit of the `pub fn subset_construction` signature line to `fn
+// subset_construction_reference` (verify with
+// `git show 06fc85c:crates/wr-core/src/determinize.rs | sed -n '302,398p'`). It exists so
+// `new_matches_the_pre_p1a_reference_implementation` can compare the two implementations'
+// output `Fa` field-for-field over 20,000 generated automata, and it is deliberately NOT
+// kept in sync with anything: if a future change to `subset_construction` makes this
+// comparison fail, the change altered observable output.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+/// Determinizes `fa` via subset construction, starting from the metastate `initial`
+/// (a *set* of NFA states, matching Java's generalized multi-initial-state entry point
+/// used e.g. by Brzozowski's algorithm — for an ordinary single-initial-state NFA,
+/// pass `[fa.q0].into_iter().collect()`).
+///
+/// Metastates are hash-consed (deduplicated) via `metastate_to_id`, and processed as a
+/// worklist that grows by appending newly-discovered metastates — the same
+/// array-append-as-worklist shape as the Java `metastateList`, not a separate queue.
+fn subset_construction_reference(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
     // U34-P1 (`~/.claude/plans/glossy-compacting-lantern.md` §3): the per-(metastate,
     // symbol) union used to be a fresh `BTreeSet<usize>`, heap-allocated on every
     // iteration, then unconditionally `.clone()`d just to probe `metastate_to_id` via
@@ -584,6 +807,341 @@ mod tests {
                 "mismatch on {word:?}"
             );
         }
+    }
+
+    // --- P1(a): new vs the frozen pre-P1(a) reference implementation ---------
+
+    /// SplitMix64 — a deterministic, self-contained PRNG so a failure reported by
+    /// [`new_matches_the_pre_p1a_reference_implementation`] reproduces exactly (the
+    /// failing case's seed is printed, and re-running it re-generates the same
+    /// automaton). Deliberately not `proptest`: this test wants a fixed, large,
+    /// cheap-to-run case count with hand-controlled class coverage, not shrinking.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in `0..n`. `n == 0` is never passed.
+        fn below(&mut self, n: usize) -> usize {
+            (self.next_u64() % n as u64) as usize
+        }
+
+        fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+    }
+
+    /// What one generated case looked like, so the test can prove its generator really
+    /// did emit every input class the comparison is supposed to cover rather than
+    /// silently degenerating into 20,000 copies of the easy shape.
+    #[derive(Default)]
+    struct GeneratorCoverage {
+        out_of_range_key: usize,
+        negative_key: usize,
+        empty_dest_list: usize,
+        unsorted_dest_list: usize,
+        duplicated_dest_list: usize,
+        empty_row: usize,
+        alphabet_zero: usize,
+        alphabet_one: usize,
+        single_state: usize,
+        multi_state_initial: usize,
+        empty_initial: usize,
+        unreachable_initial_member: usize,
+        nonempty_output: usize,
+    }
+
+    /// Builds one random `Fa` + `initial` pair.
+    ///
+    /// **Destination ids are always `< q`, deliberately.** An id `>= fa.q` makes BOTH
+    /// implementations panic (pinned by
+    /// `refactor_structural_snapshots.rs`'s
+    /// `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`), which
+    /// would abort this comparison loop rather than compare anything; that shape is
+    /// covered by that snapshot test on both sides of the change instead. Symbol keys,
+    /// by contrast, ARE generated out of range and negative, because those are silently
+    /// dropped rather than fatal, so the two implementations must agree on them.
+    fn random_case(rng: &mut Rng, cov: &mut GeneratorCoverage) -> (Fa, BTreeSet<usize>) {
+        let q = 1 + rng.below(6);
+        // Weighted so the two degenerate alphabet sizes the plan calls out are common,
+        // not a once-in-20,000 accident.
+        let alphabet_size = match rng.below(8) {
+            0 => 0,
+            1 | 2 => 1,
+            _ => 2 + rng.below(3),
+        };
+        let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::with_capacity(q);
+        for _ in 0..q {
+            let mut row: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
+            let keys = rng.below(alphabet_size + 3);
+            for _ in 0..keys {
+                let sym: i32 = match rng.below(10) {
+                    // Out of range (>= alphabet_size, including when it is 0).
+                    0 => (alphabet_size + rng.below(3)) as i32,
+                    // Negative.
+                    1 => -1 - rng.below(3) as i32,
+                    // In range -- unless the alphabet is empty, in which case every
+                    // key is out of range by construction.
+                    _ if alphabet_size == 0 => rng.below(3) as i32,
+                    _ => rng.below(alphabet_size) as i32,
+                };
+                let len = rng.below(4);
+                let dests: Vec<usize> = (0..len).map(|_| rng.below(q)).collect();
+                row.insert(sym, dests);
+            }
+            // Coverage is counted from the FINAL row: a later duplicate `sym` overwrites
+            // an earlier entry via `row.insert`, so counting at generation time would
+            // credit shapes that never appear in any tested `Fa` (adversarial-review
+            // finding on this test's first draft).
+            for (&sym, dests) in &row {
+                if sym < 0 {
+                    cov.negative_key += 1;
+                } else if sym as usize >= alphabet_size {
+                    cov.out_of_range_key += 1;
+                }
+                if dests.is_empty() {
+                    cov.empty_dest_list += 1;
+                }
+                if dests.windows(2).any(|w| w[0] > w[1]) {
+                    cov.unsorted_dest_list += 1;
+                }
+                let mut sorted = dests.clone();
+                sorted.sort_unstable();
+                if sorted.windows(2).any(|w| w[0] == w[1]) {
+                    cov.duplicated_dest_list += 1;
+                }
+            }
+            if row.is_empty() {
+                cov.empty_row += 1;
+            }
+            d.push(row);
+        }
+        let o: Vec<i32> = (0..q).map(|_| rng.below(2) as i32).collect();
+        let fa = Fa::with_states(0, q, alphabet_size, o, d);
+
+        let mut initial: BTreeSet<usize> = BTreeSet::new();
+        if !rng.one_in(20) {
+            let members = 1 + rng.below(q);
+            for _ in 0..members {
+                initial.insert(rng.below(q));
+            }
+        }
+        if alphabet_size == 0 {
+            cov.alphabet_zero += 1;
+        } else if alphabet_size == 1 {
+            cov.alphabet_one += 1;
+        }
+        if q == 1 {
+            cov.single_state += 1;
+        }
+        match initial.len() {
+            0 => cov.empty_initial += 1,
+            1 => {}
+            _ => cov.multi_state_initial += 1,
+        }
+        // A seed member other than `q0` is a member the ordinary `{fa.q0}` seeding could
+        // never reach -- the "q0-unreachable member" class.
+        if initial.iter().any(|&s| s != fa.q0) {
+            cov.unreachable_initial_member += 1;
+        }
+        (fa, initial)
+    }
+
+    /// The P1(a) contract test: the restructured [`subset_construction`] must produce a
+    /// field-for-field identical `Fa` to the frozen pre-change implementation
+    /// ([`subset_construction_reference`]) on every input, not merely an equivalent
+    /// language. State numbering here is observable output (see
+    /// `docs/IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`), so "same language" is not the bar.
+    #[test]
+    fn new_matches_the_pre_p1a_reference_implementation() {
+        const CASES: usize = 20_000;
+        let mut cov = GeneratorCoverage::default();
+        for case in 0..CASES {
+            // Per-case seeding: the printed seed alone reproduces the failing input.
+            let seed = 0x5C_01A0_5EED_0001_u64 ^ case as u64;
+            let mut rng = Rng(seed);
+            let (fa, initial) = random_case(&mut rng, &mut cov);
+            let expected = subset_construction_reference(&fa, &initial);
+            let actual = subset_construction(&fa, &initial);
+            if actual.q > 1 || !actual.d[0].is_empty() {
+                cov.nonempty_output += 1;
+            }
+            let context =
+                format!("case {case} (seed {seed:#x}): fa = {fa:?}, initial = {initial:?}");
+            assert_eq!(actual.q, expected.q, "q -- {context}");
+            assert_eq!(actual.q0, expected.q0, "q0 -- {context}");
+            assert_eq!(
+                actual.alphabet_size, expected.alphabet_size,
+                "alphabet_size -- {context}"
+            );
+            assert_eq!(actual.o, expected.o, "o -- {context}");
+            assert_eq!(actual.d, expected.d, "d -- {context}");
+            assert_eq!(
+                actual.true_false, expected.true_false,
+                "true_false -- {context}"
+            );
+        }
+
+        // The generator's own coverage, asserted rather than assumed: a comparison over
+        // 20,000 inputs that all look alike proves nothing.
+        for (name, count, min) in [
+            ("out-of-range symbol keys", cov.out_of_range_key, 1000),
+            ("negative symbol keys", cov.negative_key, 1000),
+            ("empty destination lists", cov.empty_dest_list, 1000),
+            ("unsorted destination lists", cov.unsorted_dest_list, 1000),
+            (
+                "duplicated destination lists",
+                cov.duplicated_dest_list,
+                1000,
+            ),
+            ("empty rows", cov.empty_row, 1000),
+            ("alphabet_size == 0", cov.alphabet_zero, 1000),
+            ("alphabet_size == 1", cov.alphabet_one, 1000),
+            ("single-state automata", cov.single_state, 1000),
+            ("multi-state initial seeds", cov.multi_state_initial, 1000),
+            ("empty initial seeds", cov.empty_initial, 100),
+            (
+                "initial members other than q0",
+                cov.unreachable_initial_member,
+                1000,
+            ),
+            // Without this one the whole comparison could be 20,000 trivial
+            // one-state-no-transitions results agreeing vacuously.
+            (
+                "results with a real transition or >1 state",
+                cov.nonempty_output,
+                10_000,
+            ),
+        ] {
+            assert!(
+                count >= min,
+                "generator coverage: only {count} case(s) of {name} in {CASES} \
+                 (expected at least {min})"
+            );
+        }
+    }
+
+    /// The one `dest >= fa.q` shape the randomized comparison above deliberately cannot
+    /// generate: an automaton whose `o`/`d` are longer than its declared `q`. No known
+    /// production code path constructs this shape (`Fa::clear` leaves the OPPOSITE
+    /// mismatch — `q` larger than the emptied vectors); it is built here via the raw
+    /// struct literal, the same convention `refactor_structural_snapshots.rs`'s
+    /// malformed-shape pins use. Ordinarily a destination id `>= fa.q` panics in the
+    /// next BFS iteration (pinned by that suite's
+    /// `subset_construction_panics_on_a_destination_id_out_of_range_of_fa_q`), which is
+    /// why the generator excludes it; here `d`/`o` are big enough that the reference
+    /// implementation completes normally instead.
+    ///
+    /// That makes this the test that distinguishes P1(a)'s marker fallback from the
+    /// obvious wrong alternative. `seen` has length `fa.q == 1`, so indexing it with the
+    /// destination id `5` would panic — the fallback pushes such ids WITHOUT marking
+    /// instead, leaving `sort_unstable()`/`dedup()` to canonicalize them exactly as the
+    /// old code did.
+    ///
+    /// The TWO-symbol shape is what makes this test release-mode load-bearing (both
+    /// adversarial reviewers independently proved the first draft's one-symbol fixture
+    /// was not): symbol 0 reaches state 5 via the duplicated raw list `[5, 5]`, symbol 1
+    /// via the clean singleton `[5]`. With `dedup()` present both drains produce the
+    /// canonical key `[5]`, so both symbols map to the SAME minted id and `q == 2`.
+    /// With `dedup()` dropped, symbol 0's key stays `[5, 5]` — a "different" metastate —
+    /// and the output silently becomes `q == 3` with `d[0] = {0: [1], 1: [2]}`: a wrong
+    /// automaton caught by the plain `assert_eq!`s below in BOTH debug and release,
+    /// where the `#[cfg(debug_assertions)]` cross-check (previously the only guard, per
+    /// `fa.rs`'s own warning about debug-assert-only correctness guards) compiles out.
+    #[test]
+    fn an_unmarkable_destination_id_is_canonicalized_exactly_as_the_reference_does() {
+        let mut d0 = BTreeMap::new();
+        d0.insert(0, vec![5, 5]);
+        d0.insert(1, vec![5]);
+        let fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 2,
+            o: vec![0, 0, 0, 0, 0, 1],
+            d: vec![
+                d0,
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+            ],
+            true_false: None,
+        };
+        let initial: BTreeSet<usize> = [0].into_iter().collect();
+
+        let expected = subset_construction_reference(&fa, &initial);
+        let actual = subset_construction(&fa, &initial);
+
+        // Hand-traced: id0 = {0}; symbol 0's raw union [5, 5] and symbol 1's raw union
+        // [5] BOTH canonicalize to the key [5], so both symbols reach the same minted
+        // id1 = {5}, which has an empty row, and state 5's output is 1, so id1 is
+        // accepting.
+        assert_eq!(expected.q, 2);
+        assert_eq!(expected.o, vec![0, 1]);
+        let mut expected_row = BTreeMap::new();
+        expected_row.insert(0, vec![1]);
+        expected_row.insert(1, vec![1]);
+        assert_eq!(expected.d, vec![expected_row, BTreeMap::new()]);
+
+        assert_eq!(actual.q, expected.q, "q");
+        assert_eq!(actual.q0, expected.q0, "q0");
+        assert_eq!(
+            actual.alphabet_size, expected.alphabet_size,
+            "alphabet_size"
+        );
+        assert_eq!(actual.o, expected.o, "o");
+        assert_eq!(actual.d, expected.d, "d");
+        assert_eq!(actual.true_false, expected.true_false, "true_false");
+    }
+
+    /// The other shape the randomized comparison cannot reach: `alphabet_size == 0` on
+    /// an automaton whose `d` is EMPTY while `initial` names a member. The pre-P1(a)
+    /// implementation's `for sym in 0..0` body never ran, so it never read `fa.d[q]` at
+    /// all and completed normally; P1(a)'s fill loop would read `fa.d[0]` — and panic —
+    /// were it not skipped when the alphabet is empty.
+    ///
+    /// This is the tripwire for that guard (mutation-verified: removing the
+    /// `fa.alphabet_size > 0` condition fails this test and nothing else in the
+    /// workspace). Note the contrast with `refactor_structural_snapshots.rs`'s
+    /// `subset_construction_with_zero_alphabet_size_and_an_out_of_bounds_initial_member_panics`,
+    /// which pins a panic on a `d` that IS long enough and an `o` that is not — the two
+    /// fixtures pin opposite halves of the same "never touch `fa.d` when the alphabet is
+    /// empty" rule.
+    #[test]
+    fn a_zero_alphabet_automaton_with_no_transition_table_is_not_indexed_at_all() {
+        let fa = Fa {
+            q0: 0,
+            q: 1,
+            alphabet_size: 0,
+            o: vec![1],
+            d: vec![],
+            true_false: None,
+        };
+        let initial: BTreeSet<usize> = [0].into_iter().collect();
+
+        let expected = subset_construction_reference(&fa, &initial);
+        let actual = subset_construction(&fa, &initial);
+
+        assert_eq!(expected.q, 1);
+        assert_eq!(expected.o, vec![1]);
+        assert_eq!(expected.d, vec![BTreeMap::new()]);
+
+        assert_eq!(actual.q, expected.q, "q");
+        assert_eq!(actual.q0, expected.q0, "q0");
+        assert_eq!(
+            actual.alphabet_size, expected.alphabet_size,
+            "alphabet_size"
+        );
+        assert_eq!(actual.o, expected.o, "o");
+        assert_eq!(actual.d, expected.d, "d");
+        assert_eq!(actual.true_false, expected.true_false, "true_false");
     }
 
     #[test]
