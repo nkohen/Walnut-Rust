@@ -947,10 +947,10 @@ fn try_match_morphism_mapping(
     // UtilityMethods.parseInt is only called on m1.group(1) / each m2 piece AFTER
     // m1.find() has already confirmed the whole INPUT -> IMAGE* mapping).
     let key = try_parse_int(&s[key_span.0..key_span.1])?;
-    let mut image = Vec::with_capacity(image_spans.len());
-    for sp in image_spans {
-        image.push(try_parse_int(&s[sp.0..sp.1])?);
-    }
+    let image = image_spans
+        .into_iter()
+        .map(|sp| try_parse_int(&s[sp.0..sp.1]))
+        .collect::<Result<Vec<i32>, _>>()?;
     Ok(Some((key, image, i)))
 }
 
@@ -1551,6 +1551,23 @@ mod tests {
         // not an integer-parse-failure variant.
         let err = parse_morphism("garbage 99999999999999 garbage").unwrap_err();
         assert_eq!(err, ParseMethodsError::NoValidMorphismMappings);
+    }
+
+    #[test]
+    fn morphism_image_reports_the_first_overflowing_span_not_the_last() {
+        // `try_match_morphism_mapping`'s image-parsing loop (the U11 idiomatic-refactor
+        // pass) is now `image_spans.into_iter().map(try_parse_int).collect::<Result<Vec<i32>,
+        // _>>()`, whose short-circuit-on-first-`Err` is the sole thing guaranteeing
+        // first-error-wins when an image has more than one i32-overflowing symbol --
+        // exactly Java's own left-to-right `parseMorphism` loop, which calls
+        // `UtilityMethods.parseInt` on each `m2` match in order and fails at the first
+        // one. Two overflowing spans on purpose, so a last-wins regression (e.g. an
+        // accidental `.last()`/reduce that keeps only the final error) would be caught.
+        let err = parse_morphism("0 -> [99999999999][88888888888]").unwrap_err();
+        match err {
+            ParseMethodsError::NumberFormat(e) => assert_eq!(e.payload(), "99999999999"),
+            other => panic!("expected NumberFormat(payload \"99999999999\"), got {other:?}"),
+        }
     }
 
     // -- is_whitespace_line / is_comment_line ----------------------------------

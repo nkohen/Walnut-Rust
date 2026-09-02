@@ -1422,21 +1422,20 @@ fn probe_custom_base_candidate(
 /// Java's `AbstractCollection.toString()` shape (`[a, b, c]`), used to render a track's
 /// alphabet inside [`ReadError::DigitNotInAlphabet`]'s message exactly as Java's own
 /// `"… is not in the alphabet " + a.get(i) + " of that input: …"` string concatenation
-/// does for a `List<Integer>`. Third private copy of this three-line formatter in the
-/// workspace (`wr_core::regex`'s `format_java_int_list` and `wr_core::ostrowski`'s
+/// does for a `List<Integer>`. Third private copy of this formatter in the workspace
+/// (`wr_core::regex`'s `format_java_int_list` and `wr_core::ostrowski`'s
 /// `format_int_list` are the other two, both private to their crate and both documented
-/// as deliberately un-shared); kept local for the same reason rather than widening
-/// `wr_core::util`'s public surface for a `join(", ")` with brackets.
+/// as deliberately un-shared — they still use the manual accumulator form, a divergence
+/// in shape from this one with no difference in output); kept local for the same reason
+/// rather than widening `wr_core::util`'s public surface for this exact bracketed-join
+/// shape.
 fn format_java_int_list(list: &[i32]) -> String {
-    let mut s = String::from("[");
-    for (i, v) in list.iter().enumerate() {
-        if i > 0 {
-            s.push_str(", ");
-        }
-        s.push_str(&v.to_string());
-    }
-    s.push(']');
-    s
+    let joined = list
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
 }
 
 /// `AutomatonReader.validateTransition`'s arity check (`:122-125`) plus the per-digit
@@ -1480,15 +1479,15 @@ fn validate_transition(
             address: address.to_string(),
         });
     }
-    for (i, digit) in input.iter().enumerate() {
+    for (i, (digit, track_alphabet)) in input.iter().zip(alphabet.iter()).enumerate() {
         let Some(digit) = *digit else { continue };
-        if !alphabet[i].contains(&digit) {
+        if !track_alphabet.contains(&digit) {
             return Err(ReadError::DigitNotInAlphabet {
                 line,
                 digit,
                 // Java prints `(i + 1)`, i.e. 1-based.
                 position: i + 1,
-                alphabet: alphabet[i].clone(),
+                alphabet: track_alphabet.clone(),
                 address: address.to_string(),
             });
         }
@@ -1738,13 +1737,11 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
 /// module), then trimmed top and bottom (`String.strip()` -> `str::trim`).
 pub fn read_comments<P: AsRef<Path>>(path: P) -> Result<String, ReadError> {
     let content = std::fs::read_to_string(path)?;
-    let mut out = String::new();
-    for line in split_lines_java(&content) {
-        if parse_methods::is_comment_line(line) {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
+    let out = split_lines_java(&content)
+        .into_iter()
+        .filter(|line| parse_methods::is_comment_line(line))
+        .collect::<Vec<_>>()
+        .join("\n");
     Ok(out.trim().to_string())
 }
 
