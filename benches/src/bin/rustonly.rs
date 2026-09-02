@@ -27,9 +27,36 @@
 //! Env knobs are a subset of `compare`'s and mean the same things: `WR_BENCH_ONLY`,
 //! `WR_BENCH_ITERS`, `WR_BENCH_WARMUP`, `WR_BENCH_HEAVY`.
 
+use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
 use wr_bench::{fmt_dur, golden, is_non_fixture_row, label, same_answer, workloads, RustEngine};
+
+/// A stable digest of one dispatch's answer, for the run-to-run determinism check.
+///
+/// Deliberately a digest of the answer's **exact text** (the `.txt` automaton body, or the
+/// TRUE/FALSE/error rendering), not a semantic-equivalence class: the point of this check is to
+/// catch a parallel schedule that returns the right *language* under a run-dependent state
+/// numbering, which `wr_core::equiv` would pass and this will not. It is therefore a strictly
+/// stronger determinism assertion than the correctness bar this branch actually has to meet.
+///
+/// `DefaultHasher` is not a cryptographic hash and is not stable across Rust releases — both
+/// irrelevant here, since every digest being compared is produced by one binary in one session.
+fn answer_digest(a: &wr_bench::Answer) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match a {
+        wr_bench::Answer::Automaton(txt) => {
+            "automaton".hash(&mut h);
+            txt.hash(&mut h);
+        }
+        wr_bench::Answer::Error(msg) => {
+            "error".hash(&mut h);
+            msg.hash(&mut h);
+        }
+        other => other.kind().hash(&mut h),
+    }
+    h.finish()
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -74,6 +101,32 @@ fn run() -> Result<(), String> {
     let t0 = Instant::now();
     let rust = RustEngine::prepare(&root, &scratch.join("rust"))?;
     eprintln!("  ready in {:.1}s", t0.elapsed().as_secs_f64());
+
+    // `WR_RUSTONLY_DIGEST=N` skips timing entirely and instead dispatches each workload N
+    // times in the same warm session, printing a digest of each answer's exact text. Three
+    // identical digests across three separate PROCESSES is the determinism evidence; three
+    // within one process additionally rules out a schedule whose result depends on how the
+    // worker pool happens to have warmed up.
+    if let Some(reps) = std::env::var("WR_RUSTONLY_DIGEST")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        println!("fix        rep   answer digest        kind");
+        println!("--------------------------------------------------");
+        for w in &selected {
+            for rep in 0..reps {
+                let a = rust.dispatch(&w.command)?;
+                println!(
+                    "{:<10} {:>3}   {:#018x}   {}",
+                    label(w.id),
+                    rep,
+                    answer_digest(&a),
+                    a.kind()
+                );
+            }
+        }
+        return Ok(());
+    }
 
     println!("fix        iters      rust mean    rust median   vs recorded corpus automaton");
     println!("-----------------------------------------------------------------------------");
