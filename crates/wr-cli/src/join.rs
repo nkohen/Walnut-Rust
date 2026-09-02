@@ -379,14 +379,7 @@ mod tests {
         d[1].insert(0, vec![1]);
         d[1].insert(1, vec![1]);
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![output0, output1],
-                d,
-            },
+            Fa::with_states(0, 2, 2, vec![output0, output1], d),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],

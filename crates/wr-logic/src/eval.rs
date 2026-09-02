@@ -814,17 +814,16 @@ mod tests {
     /// Reading order doesn't matter for a pure XOR/parity walk, so this is well-defined
     /// msd-first (Walnut's convention) despite being usually described lsd-first.
     fn thue_morse_word_automaton() -> Automaton {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![
+        let fa = Fa::with_states(
+            0,
+            2,
+            2,
+            vec![0, 1],
+            vec![
                 BTreeMap::from([(0, vec![0]), (1, vec![1])]),
                 BTreeMap::from([(0, vec![1]), (1, vec![0])]),
             ],
-        };
+        );
         Automaton::new(fa, vec![vec![0, 1]], Vec::new(), vec![Some(true)])
     }
 
@@ -1021,14 +1020,7 @@ mod tests {
     /// checks this same predicate against the fixture file itself.
     fn zphi_a_less_than_b() -> Automaton {
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 4,
-                o: vec![0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 4, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             Vec::new(),
             vec![Some(true), Some(true)],

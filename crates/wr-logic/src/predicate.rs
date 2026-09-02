@@ -2278,14 +2278,13 @@ mod tests {
     /// below (none of them execute `act()`; that's U9/U10/U11 territory), only
     /// `get_arity()` and `bind`'s arity check matter here.
     fn stub_automaton(arity: usize) -> Automaton {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2usize.saturating_pow(arity as u32).max(1),
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa = wr_core::fa::Fa::with_states(
+            0,
+            1,
+            2usize.saturating_pow(arity as u32).max(1),
+            vec![1],
+            vec![std::collections::BTreeMap::new()],
+        );
         Automaton::new(
             fa,
             vec![vec![0, 1]; arity],

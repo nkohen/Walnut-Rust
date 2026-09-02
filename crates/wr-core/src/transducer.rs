@@ -31,9 +31,9 @@
 //! so the later unit doesn't have to re-derive it:
 //!
 //! ```text
-//! Fa { q0: data.q0, q: data.q, alphabet_size: data.alphabet_size,
-//!      o: vec![0; data.q],           // readTransducer's discarded state outputs
-//!      d: data.d, true_false: None }
+//! Fa::with_states(data.q0, data.q, data.alphabet_size,
+//!                 vec![0; data.q],   // readTransducer's discarded state outputs
+//!                 data.d)
 //! Transducer::new(Automaton::new(fa, data.alphabet, label, data.msd), data.sigma)
 //! ```
 //!
@@ -777,14 +777,7 @@ impl Transducer {
         // N will be the returned Automaton, just have to build it up.
         // `M.clonePartialFields(N)` (`Automaton.java:139-146`): the rich alphabet, one
         // number system per track, and the labels *only if* `M` is bound.
-        let n_fa = Fa {
-            q0: 0,
-            q: 0,
-            alphabet_size: 0,
-            o: Vec::new(),
-            d: Vec::new(),
-            true_false: None,
-        };
+        let n_fa = Fa::with_states(0, 0, 0, Vec::new(), Vec::new());
         let n_label = if m.is_bound() {
             m.label.clone()
         } else {
@@ -1250,14 +1243,7 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|&(sym, dest)| (sym, vec![dest])).collect())
             .collect();
-        let fa = Fa {
-            q0: 0,
-            q: outputs.len(),
-            alphabet_size: 2,
-            o: outputs.to_vec(),
-            d: table,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, outputs.len(), 2, outputs.to_vec(), table);
         Automaton::new(
             fa,
             vec![vec![0, 1]],
@@ -1287,16 +1273,9 @@ mod tests {
             d.push(d_row);
             sigma.push(sigma_row);
         }
-        let fa = Fa {
-            q0: 0,
-            q: rows.len(),
-            alphabet_size: alphabet.len(),
-            // `readTransducer` discards state outputs ("state output does not matter
-            // for transducers").
-            o: vec![0; rows.len()],
-            d,
-            true_false: None,
-        };
+        // `readTransducer` discards state outputs ("state output does not matter for
+        // transducers").
+        let fa = Fa::with_states(0, rows.len(), alphabet.len(), vec![0; rows.len()], d);
         let automaton = Automaton::new(
             fa,
             vec![alphabet.to_vec()],
@@ -1601,14 +1580,7 @@ mod tests {
     /// state itself is irrelevant to every caller (the arity guard fires before any
     /// state is ever consulted), so a single self-looping state is enough.
     fn two_track_automaton(msd: Vec<Option<bool>>) -> Automaton {
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 4,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 4, vec![0], vec![BTreeMap::new()]);
         Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
@@ -2228,14 +2200,7 @@ mod tests {
             .iter()
             .map(|row| row.iter().map(|&(sym, dest)| (sym, vec![dest])).collect())
             .collect();
-        let fa = Fa {
-            q0: 0,
-            q: outputs.len(),
-            alphabet_size: 3,
-            o: outputs.to_vec(),
-            d: table,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, outputs.len(), 3, outputs.to_vec(), table);
         Automaton::new(
             fa,
             vec![vec![0, 1, 2]],

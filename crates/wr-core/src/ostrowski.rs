@@ -417,14 +417,7 @@ impl Ostrowski {
         // silently turn `sort_label` into a real permutation and change the written
         // track order.
         let mut automaton = Automaton::new(
-            Fa {
-                q0: 0,
-                q: 0,
-                alphabet_size: 0,
-                o: Vec::new(),
-                d: Vec::new(),
-                true_false: None,
-            },
+            Fa::with_states(0, 0, 0, Vec::new(), Vec::new()),
             alphabet,
             Vec::new(),
             msd,

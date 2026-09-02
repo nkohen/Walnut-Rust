@@ -221,14 +221,7 @@ mod tests {
             d1.insert(digit, vec![dest]);
         }
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: alphabet.len(),
-                o: vec![1, 0],
-                d: vec![d0, d1],
-            },
+            Fa::with_states(0, 2, alphabet.len(), vec![1, 0], vec![d0, d1]),
             vec![alphabet],
             vec!["x".to_string()],
             vec![Some(true)],

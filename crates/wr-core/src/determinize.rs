@@ -394,14 +394,7 @@ pub fn subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
         .map(|ms| i32::from(ms.iter().any(|&q| fa.is_accepting(q))))
         .collect();
 
-    Fa {
-        true_false: None,
-        q0: 0,
-        q: metastate_list.len(),
-        alphabet_size: fa.alphabet_size,
-        o,
-        d,
-    }
+    Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
 }
 
 /// `DeterminizationStrategies.Brz`/`brzStep` (`Brz`: `DeterminizationStrategies.java:140-149`;
@@ -546,14 +539,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        }
+        Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1])
     }
 
     /// Adversarial-review-requested regression test (both independent reviewers of
@@ -570,14 +556,7 @@ mod tests {
         // d[0][0] = [1, 0, 1] -- unsorted AND duplicated (1 appears twice).
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![1, 0, 1]);
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![d0, BTreeMap::new()],
-        };
+        let fa = Fa::with_states(0, 2, 1, vec![0, 1], vec![d0, BTreeMap::new()]);
         let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
         let dfa = subset_construction(&fa, &initial);
 
@@ -627,14 +606,7 @@ mod tests {
         // A 1-state NFA with no transition at all on symbol 1.
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0]);
-        let nfa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![0],
-            d: vec![d0],
-        };
+        let nfa = Fa::with_states(0, 1, 2, vec![0], vec![d0]);
         let initial: BTreeSet<usize> = [0].into_iter().collect();
         let dfa = subset_construction(&nfa, &initial);
         assert!(
@@ -675,14 +647,7 @@ mod tests {
                             .collect::<BTreeMap<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }
@@ -743,14 +708,7 @@ mod tests {
         // L(fa) = {"", "0"}: q0 accepting, --0--> state 1 (accepting, dead end).
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![1]);
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 1],
-            d: vec![d0, BTreeMap::new()],
-        };
+        let fa = Fa::with_states(0, 2, 2, vec![1, 1], vec![d0, BTreeMap::new()]);
         let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
         let brz = brzozowski(&fa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert!(brz.accepts_word(&[]), "empty word must be accepted");
@@ -769,14 +727,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0]);
         d0.insert(1, vec![0]);
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![0],
-            d: vec![d0],
-        };
+        let fa = Fa::with_states(0, 1, 2, vec![0], vec![d0]);
         let initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
         let brz = brzozowski(&fa, &initial, &mut crate::logging::Logging::new()).unwrap();
         assert_eq!(brz.q, 1);
@@ -894,14 +845,7 @@ mod tests {
         let mut sink2 = BTreeMap::new();
         sink2.insert(0, vec![2]);
         sink2.insert(1, vec![2]);
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 1],
-            d: vec![d0, sink, sink2],
-        }
+        Fa::with_states(0, 3, 2, vec![0, 1, 1], vec![d0, sink, sink2])
     }
 
     fn assert_same_fa(actual: &Fa, expected: &Fa) {

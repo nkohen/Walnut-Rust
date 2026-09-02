@@ -645,14 +645,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![0, 1],
-                d: vec![d0, d1],
-            },
+            wr_core::fa::Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -777,14 +770,13 @@ mod tests {
         let mut d0 = std::collections::BTreeMap::new();
         d0.insert(symbol, vec![1]);
         Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![0, 1],
-                d: vec![d0, std::collections::BTreeMap::new()],
-            },
+            wr_core::fa::Fa::with_states(
+                0,
+                2,
+                2,
+                vec![0, 1],
+                vec![d0, std::collections::BTreeMap::new()],
+            ),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -1007,14 +999,7 @@ mod tests {
         // Arity 1 vs arity 2: `cross_product`'s "must have labeled inputs" guard.
         write_library_automaton(&dir, "A", contains_one());
         let two_track = Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 4,
-                o: vec![1],
-                d: vec![std::collections::BTreeMap::new()],
-            },
+            wr_core::fa::Fa::with_states(0, 1, 4, vec![1], vec![std::collections::BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["x".to_string(), "y".to_string()],
             vec![Some(true), Some(true)],

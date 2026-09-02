@@ -74,14 +74,7 @@ mod tests {
     /// built from an explicit transition list of `((state, y, x), dest)`.
     fn two_track(q: usize, o: Vec<i32>, edges: &[((usize, i32, i32), usize)]) -> Automaton {
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q,
-                alphabet_size: 4,
-                o,
-                d: vec![BTreeMap::new(); q],
-            },
+            Fa::with_states(0, q, 4, o, vec![BTreeMap::new(); q]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["y".to_string(), "x".to_string()],
             vec![Some(true), Some(true)],
@@ -263,14 +256,7 @@ mod tests {
         // used to index the stale q0 into an empty transition table via
         // trim -> subset_construction.
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 0,
-                alphabet_size: 4,
-                o: vec![],
-                d: vec![],
-            },
+            Fa::with_states(0, 0, 4, vec![], vec![]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["y".to_string(), "x".to_string()],
             vec![Some(true), Some(true)],
@@ -330,14 +316,7 @@ mod tests {
     #[test]
     fn quantifying_a_middle_track_preserves_survivor_order() {
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 8,
-                o: vec![0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 8, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1], vec![0, 1]],
             vec!["a".to_string(), "b".to_string(), "c".to_string()],
             vec![Some(true), Some(true), Some(true)],
@@ -363,14 +342,13 @@ mod tests {
     #[test]
     fn zero_reachable_states_forces_a_q0_self_loop() {
         // q0 has no zero-transition at all going in.
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![BTreeMap::from([(1, vec![1])]), BTreeMap::new()],
-        };
+        let mut fa = Fa::with_states(
+            0,
+            2,
+            2,
+            vec![0, 1],
+            vec![BTreeMap::from([(1, vec![1])]), BTreeMap::new()],
+        );
         let reached = zero_reachable_states(&mut fa, 0);
         assert_eq!(reached, BTreeSet::from([0]));
         assert_eq!(
@@ -383,18 +361,17 @@ mod tests {
     #[test]
     fn zero_reachable_states_is_a_multi_step_closure_and_does_not_duplicate() {
         // 0 -0-> 1 -0-> 2, and 0 already self-loops on zero.
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![0, 0, 1],
-            d: vec![
+        let mut fa = Fa::with_states(
+            0,
+            3,
+            1,
+            vec![0, 0, 1],
+            vec![
                 BTreeMap::from([(0, vec![0, 1])]),
                 BTreeMap::from([(0, vec![2])]),
                 BTreeMap::new(),
             ],
-        };
+        );
         let reached = zero_reachable_states(&mut fa, 0);
         assert_eq!(reached, BTreeSet::from([0, 1, 2]), "BFS must be transitive");
         assert_eq!(
@@ -499,14 +476,7 @@ mod tests {
                     })
                     .collect();
                 let mut a = Automaton::new(
-                    Fa {
-                        true_false: None,
-                        q0: 0,
-                        q,
-                        alphabet_size: 4,
-                        o,
-                        d,
-                    },
+                    Fa::with_states(0, q, 4, o, d),
                     vec![vec![0, 1], vec![0, 1]],
                     vec!["y".to_string(), "x".to_string()],
                     vec![Some(msd), Some(msd)],

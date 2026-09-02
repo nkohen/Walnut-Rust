@@ -567,14 +567,7 @@ mod tests {
     fn two_track_y_x() -> Automaton {
         let sym = |a: &Automaton, y: i32, x: i32| a.encode(&[y, x]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 4,
-                o: vec![0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 4, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["y".to_string(), "x".to_string()],
             vec![Some(true), Some(true)],
@@ -706,14 +699,13 @@ mod tests {
     fn two_track_needing_the_trailing_fixup(direction: crate::numsys::Direction) -> Automaton {
         let msd = direction == crate::numsys::Direction::Msd;
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 3,
-                alphabet_size: 4,
-                o: vec![0, 0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(
+                0,
+                3,
+                4,
+                vec![0, 0, 1],
+                vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+            ),
             vec![vec![0, 1], vec![0, 1]],
             vec!["y".to_string(), "x".to_string()],
             vec![Some(msd), Some(msd)],
@@ -781,14 +773,7 @@ mod tests {
     fn quantify_on_a_zero_state_lsd_automaton_is_a_silent_noop() {
         let empty = || {
             Automaton::new(
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q: 0,
-                    alphabet_size: 4,
-                    o: vec![],
-                    d: vec![],
-                },
+                Fa::with_states(0, 0, 4, vec![], vec![]),
                 vec![vec![0, 1], vec![0, 1]],
                 vec!["y".to_string(), "x".to_string()],
                 vec![Some(false), Some(false)],
@@ -967,14 +952,7 @@ mod tests {
             let dest_y1_x1 = prop::collection::vec(0..q, q);
             (o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1).prop_map(
                 move |(o, dest_y0_x0, dest_y1_x0, dest_y0_x1, dest_y1_x1)| {
-                    let fa = Fa {
-                        true_false: None,
-                        q0: 0,
-                        q,
-                        alphabet_size: 4,
-                        o,
-                        d: vec![BTreeMap::new(); q],
-                    };
+                    let fa = Fa::with_states(0, q, 4, o, vec![BTreeMap::new(); q]);
                     let mut a = Automaton::new(
                         fa,
                         vec![vec![0, 1], vec![0, 1]],

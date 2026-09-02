@@ -465,14 +465,7 @@ mod tests {
         let mut d = vec![BTreeMap::new(), BTreeMap::new()];
         d[0].insert(0, vec![0, 1]);
         d[1].insert(0, vec![1]);
-        let fa = Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 7],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 2, 2, vec![0, 7], d);
         let mut a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
         assert!(a.is_fao() && !a.fa.is_deterministic(), "sanity");
         let err = find_accepted(&mut a, &mut Logging::new(), 1).unwrap_err();
@@ -510,14 +503,7 @@ mod tests {
         let mut d = vec![BTreeMap::new(), BTreeMap::new()];
         d[0].insert(0, vec![1]);
         d[0].insert(1, vec![1]);
-        let fa = Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 2, 2, vec![0, 1], d);
         Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None])
     }
 
@@ -564,14 +550,7 @@ mod tests {
     fn find_accepted_terminates_on_a_self_looping_automaton_with_no_accepting_state() {
         let mut d = vec![BTreeMap::new()];
         d[0].insert(0, vec![0]);
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 1, vec![0], d);
         let mut a = Automaton::new(fa, vec![vec![0]], vec!["x".to_string()], vec![None]);
         assert_eq!(
             find_accepted(&mut a, &mut Logging::new(), 3).unwrap(),
@@ -592,14 +571,7 @@ mod tests {
         let mut d = vec![BTreeMap::new()];
         d[0].insert(0, vec![0]);
         d[0].insert(1, vec![0]);
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 2, vec![1], d);
         Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None])
     }
 
@@ -679,14 +651,7 @@ mod tests {
         for sym in 0..4 {
             d[0].insert(sym, vec![0]);
         }
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 4,
-            o: vec![1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 4, vec![1], d);
         let mut a = Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
@@ -720,14 +685,7 @@ mod tests {
         for sym in 0..3 {
             d[0].insert(sym, vec![0]);
         }
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 3,
-            o: vec![1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 3, vec![1], d);
         let mut a = Automaton::new(fa, vec![vec![-1, 0, 10]], vec!["x".to_string()], vec![None]);
         assert_eq!(
             find_accepted(&mut a, &mut Logging::new(), 3).unwrap(),

@@ -53,14 +53,7 @@ pub fn trim(fa: &Fa) -> Fa {
         let d0: BTreeMap<i32, Vec<usize>> = (0..fa.alphabet_size as i32)
             .map(|sym| (sym, vec![0]))
             .collect();
-        return Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: fa.alphabet_size,
-            o: vec![0],
-            d: vec![d0],
-        };
+        return Fa::with_states(0, 1, fa.alphabet_size, vec![0], vec![d0]);
     }
 
     let old_to_new: HashMap<usize, usize> = keep
@@ -86,21 +79,21 @@ pub fn trim(fa: &Fa) -> Fa {
         })
         .collect();
 
-    Fa {
-        true_false: None,
-        // Safe: keep.is_empty() was handled above, and if keep is nonempty then q0
-        // must be in it — any forward-reachable state that's also backward-reachable
-        // proves q0 itself can reach acceptance (via q0 -> ... -> that state -> ... ->
-        // an accepting state), so q0 is backward-reachable too, and q0 is trivially
-        // forward-reachable from itself.
-        q0: *old_to_new
-            .get(&fa.q0)
-            .expect("q0 is always in `keep` when `keep` is nonempty"),
-        q: keep.len(),
-        alphabet_size: fa.alphabet_size,
-        o: keep.iter().map(|&old_id| fa.o[old_id]).collect(),
-        d: new_d,
-    }
+    // Safe: keep.is_empty() was handled above, and if keep is nonempty then q0
+    // must be in it — any forward-reachable state that's also backward-reachable
+    // proves q0 itself can reach acceptance (via q0 -> ... -> that state -> ... ->
+    // an accepting state), so q0 is backward-reachable too, and q0 is trivially
+    // forward-reachable from itself.
+    let new_q0 = *old_to_new
+        .get(&fa.q0)
+        .expect("q0 is always in `keep` when `keep` is nonempty");
+    Fa::with_states(
+        new_q0,
+        keep.len(),
+        fa.alphabet_size,
+        keep.iter().map(|&old_id| fa.o[old_id]).collect(),
+        new_d,
+    )
 }
 
 fn forward_reachable(fa: &Fa) -> Vec<bool> {
@@ -168,14 +161,7 @@ mod tests {
         let mut d3 = BTreeMap::new();
         d3.insert(0, vec![3]);
         d3.insert(1, vec![3]);
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 4,
-            alphabet_size: 2,
-            o: vec![0, 1, 0, 0],
-            d: vec![d0, d1, d2, d3],
-        };
+        let fa = Fa::with_states(0, 4, 2, vec![0, 1, 0, 0], vec![d0, d1, d2, d3]);
         let trimmed = trim(&fa);
         assert_eq!(trimmed.q, 2, "only q0 and the accepting state survive");
         assert!(trimmed.accepts_word(&[0]));
@@ -186,14 +172,7 @@ mod tests {
     fn empty_language_collapses_to_canonical_one_state() {
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0]);
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![d0],
-        };
+        let fa = Fa::with_states(0, 1, 1, vec![0], vec![d0]);
         let trimmed = trim(&fa);
         assert_eq!(trimmed.q, 1);
         assert!(trimmed.is_language_empty());
@@ -220,14 +199,7 @@ mod tests {
 
     #[test]
     fn zero_state_automaton_passes_through() {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 2,
-            o: vec![],
-            d: vec![],
-        };
+        let fa = Fa::with_states(0, 0, 2, vec![], vec![]);
         let trimmed = trim(&fa);
         assert_eq!(trimmed.q, 0);
     }
@@ -259,14 +231,7 @@ mod tests {
                             .collect::<BTreeMap<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }

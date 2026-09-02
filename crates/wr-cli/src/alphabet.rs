@@ -662,14 +662,7 @@ mod tests {
     /// no outgoing transitions. Language: exactly the one-symbol words.
     fn one_track_over_four_digits() -> Automaton {
         let mut automaton = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 4,
-                o: vec![0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 4, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![digits(&[0, 1, 2, 3])],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -765,14 +758,7 @@ mod tests {
     /// state outputting `7`. Every other digit has no outgoing transition.
     fn one_track_word_automaton_over_four_digits() -> Automaton {
         let mut automaton = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 4,
-                o: vec![5, 7],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 4, vec![5, 7], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![digits(&[0, 1, 2, 3])],
             vec!["x".to_string()],
             vec![Some(true)],

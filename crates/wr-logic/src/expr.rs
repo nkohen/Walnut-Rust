@@ -796,14 +796,13 @@ mod tests {
     fn labeled_automaton(labels: &[&str]) -> Automaton {
         let alphabet: Vec<Vec<i32>> = labels.iter().map(|_| vec![0, 1]).collect();
         let alphabet_size: usize = alphabet.iter().map(|a| a.len()).product::<usize>().max(1);
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
+        let fa = wr_core::fa::Fa::with_states(
+            0,
+            1,
             alphabet_size,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+            vec![1],
+            vec![std::collections::BTreeMap::new()],
+        );
         Automaton::new(
             fa,
             alphabet,
@@ -816,14 +815,8 @@ mod tests {
     /// mismatched lengths, matching [`wr_core::automaton::Automaton::is_bound`]'s
     /// `label.len() == alphabet.len()` contract.
     fn unbound_arity_one_automaton() -> Automaton {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 2, vec![1], vec![std::collections::BTreeMap::new()]);
         Automaton::new(fa, vec![vec![0, 1]], vec![], vec![Some(true)])
     }
 
@@ -846,14 +839,7 @@ mod tests {
         let mut d1 = std::collections::BTreeMap::new();
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 0],
-            d: vec![d0, d1],
-        };
+        let fa = wr_core::fa::Fa::with_states(0, 2, 2, vec![1, 0], vec![d0, d1]);
         Automaton::new(
             fa,
             vec![vec![0, 1]],
@@ -871,14 +857,7 @@ mod tests {
         let mut d0 = std::collections::BTreeMap::new();
         d0.insert(0, vec![0]);
         d0.insert(1, vec![0]);
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![1],
-            d: vec![d0],
-        };
+        let fa = wr_core::fa::Fa::with_states(0, 1, 2, vec![1], vec![d0]);
         Automaton::new(
             fa,
             vec![vec![0, 1]],

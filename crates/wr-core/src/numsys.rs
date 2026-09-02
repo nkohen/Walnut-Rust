@@ -242,14 +242,13 @@ pub fn less_than_msd(base: i32) -> Automaton {
     let alphabet_size = (base * base) as usize;
 
     let mut automaton = Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
+        Fa::with_states(
+            0,
+            2,
             alphabet_size,
-            o: vec![0, 1],
-            d: vec![BTreeMap::new(), BTreeMap::new()],
-        },
+            vec![0, 1],
+            vec![BTreeMap::new(), BTreeMap::new()],
+        ),
         vec![digits.clone(), digits.clone()],
         vec!["a".to_string(), "b".to_string()],
         vec![Some(true), Some(true)],
@@ -956,14 +955,7 @@ fn init_basic_automaton(
 ) -> Automaton {
     let q = o.len();
     let mut a = Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q,
-            alphabet_size: 1,
-            o,
-            d: vec![BTreeMap::new(); q],
-        },
+        Fa::with_states(0, q, 1, o, vec![BTreeMap::new(); q]),
         vec![alphabet.to_vec(); input_size],
         // Java's `Automaton()` leaves `label` an empty list; these automata are bound
         // later, by `comparison`/`arithmetic`.
@@ -2464,17 +2456,7 @@ impl NumberSystem {
         // `0*`: one accepting state self-looping on digit 0.
         let mut d0 = BTreeMap::new();
         d0.insert(0, vec![0usize]);
-        self.make_constant(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 1,
-                o: vec![1],
-                d: vec![d0],
-            },
-            0,
-        )
+        self.make_constant(Fa::with_states(0, 1, 1, vec![1], vec![d0]), 0)
     }
 
     /// `NumberSystem.makeOne()` (`:1064-1066`) — `makeConstant(isMsd ? "0*1" : "10*", 1)`.
@@ -2485,14 +2467,7 @@ impl NumberSystem {
             let mut d0 = BTreeMap::new();
             d0.insert(0, vec![0usize]);
             d0.insert(1, vec![1usize]);
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 1,
-                o: vec![0, 1],
-                d: vec![d0, BTreeMap::new()],
-            }
+            Fa::with_states(0, 2, 1, vec![0, 1], vec![d0, BTreeMap::new()])
         } else {
             // `10*`: state 0 moves to the accepting state 1 on digit 1; state 1 loops
             // on digit 0.
@@ -2500,14 +2475,7 @@ impl NumberSystem {
             d0.insert(1, vec![1usize]);
             let mut d1 = BTreeMap::new();
             d1.insert(0, vec![1usize]);
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 1,
-                o: vec![0, 1],
-                d: vec![d0, d1],
-            }
+            Fa::with_states(0, 2, 1, vec![0, 1], vec![d0, d1])
         };
         self.make_constant(fa, 1)
     }
@@ -5421,14 +5389,13 @@ mod tests {
     /// the shape `Custom Bases/*.txt` files declare.
     fn one_track_fixture(rows: &[(i32, &[(i32, usize)])]) -> Automaton {
         let q = rows.len();
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
+        let mut fa = Fa::with_states(
+            0,
             q,
-            alphabet_size: 2,
-            o: rows.iter().map(|(o, _)| *o).collect(),
-            d: vec![BTreeMap::new(); q],
-        };
+            2,
+            rows.iter().map(|(o, _)| *o).collect(),
+            vec![BTreeMap::new(); q],
+        );
         for (state, (_, edges)) in rows.iter().enumerate() {
             for (digit, dest) in *edges {
                 fa.d[state].insert(*digit, vec![*dest]);
@@ -5523,14 +5490,13 @@ mod tests {
         let q = rows.len();
         let alphabet = vec![vec![0, 1], vec![0, 1], vec![0, 1]];
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
+            Fa::with_states(
+                0,
                 q,
-                alphabet_size: 8,
-                o: rows.iter().map(|(o, _)| *o).collect(),
-                d: vec![BTreeMap::new(); q],
-            },
+                8,
+                rows.iter().map(|(o, _)| *o).collect(),
+                vec![BTreeMap::new(); q],
+            ),
             alphabet,
             Vec::new(),
             vec![None, None, None],
@@ -6059,14 +6025,7 @@ mod tests {
     #[test]
     fn a_file_loaded_adder_with_the_wrong_arity_is_a_clean_error() {
         let two_track = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 4,
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 4, vec![1], vec![BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             Vec::new(),
             vec![None, None],

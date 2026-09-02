@@ -297,14 +297,7 @@ mod tests {
 
     fn unary_automaton(alphabet: Vec<i32>, msd: Option<bool>) -> Automaton {
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: alphabet.len(),
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, alphabet.len(), vec![1], vec![BTreeMap::new()]),
             vec![alphabet],
             vec!["x".to_string()],
             vec![msd],
@@ -377,14 +370,7 @@ mod tests {
         d[1].insert(0, vec![1]);
         d[1].insert(1, vec![0]);
         let t = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![0, 1],
-                d,
-            },
+            Fa::with_states(0, 2, 2, vec![0, 1], d),
             vec![vec![0, 1]],
             vec!["n".to_string()],
             vec![Some(true)],
@@ -501,14 +487,7 @@ mod tests {
 
         // A 2-track word automaton: `image` requires a unary (single-track) old word.
         let mut multi = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 4,
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 4, vec![1], vec![BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["a".to_string(), "b".to_string()],
             vec![Some(true), Some(true)],

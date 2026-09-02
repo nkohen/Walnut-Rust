@@ -186,14 +186,7 @@ mod tests {
         d2.insert(0, vec![2]);
         d2.insert(1, vec![1]);
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 3,
-                alphabet_size: 2,
-                o: vec![0, 1, 1],
-                d: vec![d0, d1, d2],
-            },
+            Fa::with_states(0, 3, 2, vec![0, 1, 1], vec![d0, d1, d2]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -227,14 +220,7 @@ mod tests {
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![1]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![0, 1],
-                d: vec![d0, BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -270,14 +256,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![2]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 3,
-                alphabet_size: 2,
-                o: vec![0, 0, 1],
-                d: vec![d0, d1, BTreeMap::new()],
-            },
+            Fa::with_states(0, 3, 2, vec![0, 0, 1], vec![d0, d1, BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],
@@ -440,14 +419,7 @@ mod tests {
                     })
                     .collect();
                 Automaton::new(
-                    Fa {
-                        true_false: None,
-                        q0: 0,
-                        q,
-                        alphabet_size: 2,
-                        o,
-                        d,
-                    },
+                    Fa::with_states(0, q, 2, o, d),
                     vec![vec![0, 1]],
                     vec!["x".to_string()],
                     vec![Some(true)],

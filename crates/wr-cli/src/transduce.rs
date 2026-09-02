@@ -118,9 +118,9 @@ simple_error_froms!(
 /// out there specifically so this unit didn't have to re-derive it:
 ///
 /// ```text
-/// Fa { q0: data.q0, q: data.q, alphabet_size: data.alphabet_size,
-///      o: vec![0; data.q],           // readTransducer's discarded state outputs
-///      d: data.d, true_false: None }
+/// Fa::with_states(data.q0, data.q, data.alphabet_size,
+///                 vec![0; data.q],   // readTransducer's discarded state outputs
+///                 data.d)
 /// Transducer::new(Automaton::new(fa, data.alphabet, label, data.msd), data.sigma)
 /// ```
 ///
@@ -130,14 +130,7 @@ simple_error_froms!(
 /// `read_transducer_txt` itself already applies to its scratch automaton.
 fn build_transducer(data: TransducerData) -> Transducer {
     let label: Vec<String> = (0..data.alphabet.len()).map(|i| i.to_string()).collect();
-    let fa = Fa {
-        q0: data.q0,
-        q: data.q,
-        alphabet_size: data.alphabet_size,
-        o: vec![0; data.q],
-        d: data.d,
-        true_false: None,
-    };
+    let fa = Fa::with_states(data.q0, data.q, data.alphabet_size, vec![0; data.q], data.d);
     let automaton = Automaton::new(fa, data.alphabet, label, data.msd);
     Transducer::new(automaton, data.sigma)
 }

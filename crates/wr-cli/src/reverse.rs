@@ -133,14 +133,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(1, vec![2]);
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 3,
-                alphabet_size: 2,
-                o: vec![0, 0, 1],
-                d: vec![d0, d1, BTreeMap::new()],
-            },
+            Fa::with_states(0, 3, 2, vec![0, 0, 1], vec![d0, d1, BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![Some(true)],

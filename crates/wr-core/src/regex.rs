@@ -970,14 +970,7 @@ impl NfaBuilder {
             d.push(row);
         }
 
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: order.len(),
-            alphabet_size: self.alphabet_size,
-            o,
-            d,
-        }
+        Fa::with_states(0, order.len(), self.alphabet_size, o, d)
     }
 
     fn epsilon_closure(&self, q: usize) -> BTreeSet<usize> {
@@ -1074,14 +1067,13 @@ fn remove_dead_states(fa: &Fa) -> Fa {
         })
         .collect();
 
-    Fa {
-        true_false: None,
-        q0: old_to_new[&fa.q0],
-        q: keep.len(),
-        alphabet_size: fa.alphabet_size,
-        o: keep.iter().map(|&old| fa.o[old]).collect(),
+    Fa::with_states(
+        old_to_new[&fa.q0],
+        keep.len(),
+        fa.alphabet_size,
+        keep.iter().map(|&old| fa.o[old]).collect(),
         d,
-    }
+    )
 }
 
 fn forward_reachable(fa: &Fa) -> Vec<bool> {

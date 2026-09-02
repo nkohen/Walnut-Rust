@@ -108,6 +108,41 @@ impl Fa {
         }
     }
 
+    /// Constructs an ordinary (non-TRUE/FALSE) automaton from its state/transition data
+    /// (`true_false: None`) — the common shape every real construction site in this
+    /// workspace builds (subset construction, minimize, product, trim, regex-to-NFA,
+    /// the `.txt` reader, …), factored out during the U10 idiomatic-refactor pass
+    /// (`docs/IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md`) so those call sites stop repeating
+    /// the same six-field struct literal. `Fa`'s fields stay `pub` — this is a
+    /// convenience constructor, not an encapsulation boundary; call sites that build a
+    /// deliberately malformed shape (to exercise a validation/guard path) keep using
+    /// the struct literal directly.
+    ///
+    /// `debug_assert`s the two size invariants a well-formed `Fa` maintains
+    /// (`o.len() == q`, `d.len() == q`) — `debug_assert!`, not `assert!`, so release
+    /// behavior is unchanged (this crate's own convention). Java has no explicit check
+    /// here (it crashes later on the stale-`q` shape — see this module's `is_fao` doc
+    /// comment); some test fixtures deliberately violate this invariant via the raw
+    /// struct literal this constructor does not replace.
+    pub fn with_states(
+        q0: usize,
+        q: usize,
+        alphabet_size: usize,
+        o: Vec<i32>,
+        d: Vec<BTreeMap<i32, Vec<usize>>>,
+    ) -> Fa {
+        debug_assert!(o.len() == q, "Fa::with_states: o.len() must equal q");
+        debug_assert!(d.len() == q, "Fa::with_states: d.len() must equal q");
+        Fa {
+            q0,
+            q,
+            alphabet_size,
+            o,
+            d,
+            true_false: None,
+        }
+    }
+
     /// `FA.isTRUE_FALSE_AUTOMATON()` (`FA.java:599-601`).
     pub fn is_true_false_automaton(&self) -> bool {
         self.true_false.is_some()
@@ -773,14 +808,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        }
+        Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1])
     }
 
     #[test]
@@ -804,13 +832,12 @@ mod tests {
         // One state, one symbol, TWO destinations -- Java's TransitionsNFA sums
         // destination-list lengths, so this must count as 2, not 1 (which a
         // key-counting implementation, correct only for a true DFA table, would give).
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 0],
-            d: vec![
+        let fa = Fa::with_states(
+            0,
+            2,
+            1,
+            vec![0, 0],
+            vec![
                 {
                     let mut m = BTreeMap::new();
                     m.insert(0, vec![0, 1]);
@@ -818,20 +845,13 @@ mod tests {
                 },
                 BTreeMap::new(),
             ],
-        };
+        );
         assert_eq!(fa.determine_transition_count(), 2);
     }
 
     #[test]
     fn determine_transition_count_is_zero_for_a_zero_state_automaton() {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 2,
-            o: vec![],
-            d: vec![],
-        };
+        let fa = Fa::with_states(0, 0, 2, vec![], vec![]);
         assert_eq!(fa.determine_transition_count(), 0);
     }
 
@@ -844,14 +864,7 @@ mod tests {
 
     #[test]
     fn zero_state_automaton_is_empty() {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 2,
-            o: vec![],
-            d: vec![],
-        };
+        let fa = Fa::with_states(0, 0, 2, vec![], vec![]);
         assert!(fa.is_language_empty());
     }
 
@@ -947,14 +960,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![0]);
         d1.insert(1, vec![1]);
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        };
+        let mut fa = Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1]);
         let old_initial: BTreeSet<usize> = [fa.q0].into_iter().collect();
         let new_initial = fa.reverse(&old_initial);
         let reversed_dfa = crate::determinize::subset_construction(&fa, &new_initial);
@@ -1003,14 +1009,7 @@ mod tests {
                             .collect::<BTreeMap<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }
@@ -1050,14 +1049,7 @@ mod tests {
                             .collect::<BTreeMap<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(q0, q, alphabet_size, o, d)
             })
         })
     }
@@ -1101,14 +1093,7 @@ mod tests {
         d0.insert(0, vec![1]);
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![2]);
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![0, 0, 1],
-            d: vec![d0, d1, BTreeMap::new()],
-        };
+        let mut fa = Fa::with_states(0, 3, 1, vec![0, 0, 1], vec![d0, d1, BTreeMap::new()]);
         let old_initial: BTreeSet<usize> = [0, 1].into_iter().collect();
         let new_initial = fa.reverse(&old_initial);
 
@@ -1177,14 +1162,7 @@ mod tests {
         // dead end).
         let mut d0 = BTreeMap::new();
         d0.insert(1, vec![1]);
-        let a = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, BTreeMap::new()],
-        };
+        let a = Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, BTreeMap::new()]);
         let mut n = a.clone();
         Fa::star_states(&a, &mut n);
 
@@ -1207,24 +1185,11 @@ mod tests {
         // graft-target fix is not separately exercised by this test).
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
-        let first = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d_first0, BTreeMap::new()],
-        };
+        let first = Fa::with_states(0, 2, 2, vec![0, 1], vec![d_first0, BTreeMap::new()]);
         let mut d_other0 = BTreeMap::new();
         d_other0.insert(1, vec![1]);
-        let other = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 1], // q0 accepting: eps is in L(other)
-            d: vec![d_other0, BTreeMap::new()],
-        };
+        // q0 accepting: eps is in L(other)
+        let other = Fa::with_states(0, 2, 2, vec![1, 1], vec![d_other0, BTreeMap::new()]);
         let original_q = first.q;
         let mut n = first.clone();
         Fa::concat_states(&other, &mut n, original_q);
@@ -1265,29 +1230,17 @@ mod tests {
         // q0's, so a wrong graft is directly observable in the transition table --
         // independent of WB-009's accepting-flag fix, which this test does not
         // exercise (`other` has no accepting states at all).
+        // q0=0, Q=2, alphabet_size=1, state 1 accepting
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
-        let first = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![d_first0, BTreeMap::new()],
-        };
+        let first = Fa::with_states(0, 2, 1, vec![0, 1], vec![d_first0, BTreeMap::new()]);
 
+        // q0=1 (not 0!), Q=2, alphabet_size=1, no accepting states
         let mut d_other0 = BTreeMap::new();
         d_other0.insert(0, vec![0]); // state 0 (NOT q0): 0 --0--> 0 (self loop)
         let mut d_other1 = BTreeMap::new();
         d_other1.insert(0, vec![1]); // state 1 (q0):     1 --0--> 1 (self loop)
-        let other = Fa {
-            true_false: None,
-            q0: 1, // q0=1 (not 0!), Q=2, alphabet_size=1, no accepting states
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 0],
-            d: vec![d_other0, d_other1],
-        };
+        let other = Fa::with_states(1, 2, 1, vec![0, 0], vec![d_other0, d_other1]);
 
         let original_q = first.q; // 2 (states 0 and 1)
         let mut n = first.clone();
@@ -1317,24 +1270,12 @@ mod tests {
         // accepting after grafting the second operand's transitions in (when
         // epsilon is not in L(other)), so the concatenation doesn't leak L(first)
         // into L(first)*L(other).
+        // q0=0, Q=2, alphabet_size=1, state 1 accepting
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
-        let first = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![d_first0, BTreeMap::new()],
-        };
-        let other = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1, // q0=0, Q=1, alphabet_size=1, no accepting states (rejects epsilon)
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-        };
+        let first = Fa::with_states(0, 2, 1, vec![0, 1], vec![d_first0, BTreeMap::new()]);
+        // q0=0, Q=1, alphabet_size=1, no accepting states (rejects epsilon)
+        let other = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
 
         let original_q = first.q;
         let mut n = first.clone();
@@ -1353,24 +1294,12 @@ mod tests {
         // merged final states must stay accepting (L(first)*L(other) still
         // contains L(first) itself in that case) -- a naive unconditional "always
         // clear" fix would be a fresh, different bug.
+        // q0=0, Q=2, alphabet_size=1, state 1 accepting
         let mut d_first0 = BTreeMap::new();
         d_first0.insert(0, vec![1]);
-        let first = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2, // q0=0, Q=2, alphabet_size=1, state 1 accepting
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![d_first0, BTreeMap::new()],
-        };
-        let other = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1, // q0=0, Q=1, alphabet_size=1, state 0 accepting (accepts epsilon)
-            alphabet_size: 1,
-            o: vec![1],
-            d: vec![BTreeMap::new()],
-        };
+        let first = Fa::with_states(0, 2, 1, vec![0, 1], vec![d_first0, BTreeMap::new()]);
+        // q0=0, Q=1, alphabet_size=1, state 0 accepting (accepts epsilon)
+        let other = Fa::with_states(0, 1, 1, vec![1], vec![BTreeMap::new()]);
 
         let original_q = first.q;
         let mut n = first.clone();
@@ -1404,14 +1333,8 @@ mod tests {
         let mut d_first1 = BTreeMap::new();
         d_first1.insert(0, vec![0]);
         d_first1.insert(1, vec![0]);
-        let first = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2, // q0=0, Q=2, alphabet {0,1}, state 1 accepting
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d_first0, d_first1],
-        };
+        // q0=0, Q=2, alphabet {0,1}, state 1 accepting
+        let first = Fa::with_states(0, 2, 2, vec![0, 1], vec![d_first0, d_first1]);
 
         let mut d_other0 = BTreeMap::new();
         d_other0.insert(0, vec![0]);
@@ -1422,14 +1345,8 @@ mod tests {
         let mut d_other2 = BTreeMap::new();
         d_other2.insert(0, vec![1]);
         d_other2.insert(1, vec![1]);
-        let other = Fa {
-            true_false: None,
-            q0: 2, // q0=2 (not 0!), Q=3, alphabet {0,1}, state 1 accepting
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 0],
-            d: vec![d_other0, d_other1, d_other2],
-        };
+        // q0=2 (not 0!), Q=3, alphabet {0,1}, state 1 accepting
+        let other = Fa::with_states(2, 3, 2, vec![0, 1, 0], vec![d_other0, d_other1, d_other2]);
 
         let original_q = first.q;
         let mut n = first.clone();
@@ -1455,14 +1372,7 @@ mod tests {
         let mut e4 = BTreeMap::new();
         e4.insert(0, vec![3]);
         e4.insert(1, vec![4]);
-        let expected = Fa {
-            true_false: None,
-            q0: 0,
-            q: 5,
-            alphabet_size: 2,
-            o: vec![0, 0, 0, 1, 1],
-            d: vec![e0, e1, e2, e3, e4],
-        };
+        let expected = Fa::with_states(0, 5, 2, vec![0, 0, 0, 1, 1], vec![e0, e1, e2, e3, e4]);
 
         assert_eq!(
             crate::equiv::language_equivalent(&actual, &expected),
@@ -1519,14 +1429,7 @@ mod tests {
         d0.insert(0, vec![1]); // state 0 --0--> state 1 (real transition)
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![]); // state 1 --0--> {} (empty destination list)
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        };
+        let mut fa = Fa::with_states(0, 2, 1, vec![0, 1], vec![d0, d1]);
 
         fa.canonicalize();
 
@@ -1550,14 +1453,7 @@ mod tests {
         d1.insert(0, vec![2]);
         let mut d2 = BTreeMap::new();
         d2.insert(0, vec![1]);
-        let mut fa = Fa {
-            true_false: None,
-            q0: 1,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![0, 0, 1],
-            d: vec![d0, d1, d2],
-        };
+        let mut fa = Fa::with_states(1, 3, 1, vec![0, 0, 1], vec![d0, d1, d2]);
 
         fa.canonicalize();
 
@@ -1568,14 +1464,7 @@ mod tests {
 
     #[test]
     fn canonicalize_is_a_noop_on_a_zero_state_automaton() {
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 2,
-            o: vec![],
-            d: vec![],
-        };
+        let mut fa = Fa::with_states(0, 0, 2, vec![], vec![]);
         fa.canonicalize();
         assert_eq!(fa.q, 0);
     }
@@ -1681,14 +1570,13 @@ mod tests {
 
     #[test]
     fn restrict_output_to_collapses_every_state_to_a_boolean() {
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![3, 7, 3],
-            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
-        };
+        let mut fa = Fa::with_states(
+            0,
+            3,
+            1,
+            vec![3, 7, 3],
+            vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+        );
         fa.restrict_output_to(3);
         assert_eq!(fa.o, vec![1, 0, 1]);
     }
@@ -1703,14 +1591,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Output alphabet is empty")]
     fn determine_min_output_panics_on_no_states() {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 2,
-            o: Vec::new(),
-            d: Vec::new(),
-        };
+        let fa = Fa::with_states(0, 0, 2, Vec::new(), Vec::new());
         fa.determine_min_output();
     }
 
@@ -1725,14 +1606,7 @@ mod tests {
     #[test]
     fn add_distinguished_dead_state_adds_a_sink_with_output_one_below_the_minimum() {
         // Partial automaton (state 0 has no transition for symbol 1), min output 0.
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![0],
-            d: vec![BTreeMap::from([(0, vec![0])])],
-        };
+        let mut fa = Fa::with_states(0, 1, 2, vec![0], vec![BTreeMap::from([(0, vec![0])])]);
         let added = fa.add_distinguished_dead_state();
         assert!(added);
         assert_eq!(fa.q, 2);
@@ -1764,14 +1638,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        };
+        let mut fa = Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1]);
         assert!(
             !fa.is_deterministic_and_total(),
             "sanity: the strict, determinism-requiring check correctly says NOT total"

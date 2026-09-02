@@ -480,14 +480,7 @@ fn multi_track_input_is_rejected_with_javas_message() {
     // Two tracks, both msd_2; the body is irrelevant, the guard fires on arity alone.
     let mut d0: BTreeMap<i32, Vec<usize>> = BTreeMap::new();
     d0.insert(0, vec![0]);
-    let a_fa = wr_core::fa::Fa {
-        true_false: None,
-        q0: 0,
-        q: 1,
-        alphabet_size: 4,
-        o: vec![1],
-        d: vec![d0],
-    };
+    let a_fa = wr_core::fa::Fa::with_states(0, 1, 4, vec![1], vec![d0]);
     let mut a = Automaton::new(
         a_fa,
         vec![vec![0, 1], vec![0, 1]],

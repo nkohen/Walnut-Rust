@@ -3717,14 +3717,8 @@ mod tests {
     /// irrelevant to what these tests check (arity/binding/dispatch, never the
     /// automaton's language) — mirroring `expr.rs`'s own `labeled_automaton` helper.
     fn stub_word_automaton() -> Automaton {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 4,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 4, vec![1], vec![std::collections::BTreeMap::new()]);
         Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
@@ -3787,14 +3781,13 @@ mod tests {
     /// its name recorded in [`wr_core::automaton::Track::ns_name`].
     fn track(alphabet: Vec<i32>, is_msd: bool, ns_name: Option<&str>) -> Automaton {
         let mut a = Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: alphabet.len(),
-                o: vec![1],
-                d: vec![std::collections::BTreeMap::new()],
-            },
+            wr_core::fa::Fa::with_states(
+                0,
+                1,
+                alphabet.len(),
+                vec![1],
+                vec![std::collections::BTreeMap::new()],
+            ),
             vec![alphabet],
             Vec::new(),
             vec![Some(is_msd)],
@@ -3827,17 +3820,16 @@ mod tests {
     /// condition, i.e. `msd_fib`'s own `Custom Bases/msd_fib.txt`.
     fn no_eleven_restriction() -> Automaton {
         let mut a = Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![1, 1],
-                d: vec![
+            wr_core::fa::Fa::with_states(
+                0,
+                2,
+                2,
+                vec![1, 1],
+                vec![
                     [(0, vec![0]), (1, vec![1])].into_iter().collect(),
                     [(0, vec![0])].into_iter().collect(),
                 ],
-            },
+            ),
             vec![vec![0, 1]],
             Vec::new(),
             vec![Some(true)],
@@ -3900,14 +3892,8 @@ mod tests {
     /// all-representations restriction. Only track 1 is Java's `null`.
     #[test]
     fn track_equality_automaton_reports_javas_null_only_for_a_declared_alphabet_track() {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 8,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 8, vec![1], vec![std::collections::BTreeMap::new()]);
         let mut a = Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1], vec![0, 1]],
@@ -4220,14 +4206,8 @@ mod tests {
     /// now computes an answer.
     #[test]
     fn word_act_on_a_repeated_index_into_a_file_less_custom_base_succeeds() {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 9,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 9, vec![1], vec![std::collections::BTreeMap::new()]);
         let mut word_automaton = Automaton::new(
             fa,
             vec![vec![0, 1, 5], vec![0, 1, 5]],
@@ -4279,14 +4259,8 @@ mod tests {
     /// now computes the answer.
     #[test]
     fn word_act_on_a_repeated_custom_base_index_succeeds() {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 4,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 4, vec![1], vec![std::collections::BTreeMap::new()]);
         let mut word_automaton = Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
@@ -4329,14 +4303,8 @@ mod tests {
     /// `tests/differential/tests/java_bugfix_wb013.rs` for the captured output).
     #[test]
     fn word_act_on_a_repeated_declared_alphabet_index_is_still_wb013() {
-        let fa = wr_core::fa::Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 4,
-            o: vec![1],
-            d: vec![std::collections::BTreeMap::new()],
-        };
+        let fa =
+            wr_core::fa::Fa::with_states(0, 1, 4, vec![1], vec![std::collections::BTreeMap::new()]);
         let mut word_automaton = Automaton::new(
             fa,
             vec![vec![0, 1], vec![0, 1]],
@@ -4585,14 +4553,7 @@ mod tests {
             table.push(m);
         }
         Automaton::new(
-            Fa {
-                q0: 0,
-                q,
-                alphabet_size: 2,
-                o: outputs.to_vec(),
-                d: table,
-                true_false: None,
-            },
+            Fa::with_states(0, q, 2, outputs.to_vec(), table),
             vec![vec![0, 1]],
             vec![label.to_string()],
             vec![Some(true)],
@@ -6282,14 +6243,7 @@ mod tests {
             d2.insert(sym, vec![2]); // dead self-loop
         }
         let mixr = Automaton::new(
-            Fa {
-                q0: 0,
-                q: 3,
-                alphabet_size: 4,
-                o: vec![0, 1, 0],
-                d: vec![d0, d1, d2],
-                true_false: None,
-            },
+            Fa::with_states(0, 3, 4, vec![0, 1, 0], vec![d0, d1, d2]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["x".to_string(), "y".to_string()],
             vec![Some(false), Some(true)], // x = lsd, y = msd
@@ -6320,14 +6274,7 @@ mod tests {
             d2.insert(sym, vec![2]);
         }
         let mixr2 = Automaton::new(
-            Fa {
-                q0: 0,
-                q: 3,
-                alphabet_size: 4,
-                o: vec![0, 1, 0],
-                d: vec![d0, d1, d2],
-                true_false: None,
-            },
+            Fa::with_states(0, 3, 4, vec![0, 1, 0], vec![d0, d1, d2]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["x".to_string(), "y".to_string()],
             vec![Some(false), Some(true)],

@@ -445,14 +445,7 @@ mod tests {
     }
 
     fn fa_with(q0: usize, q: usize, alphabet_size: usize, o: Vec<i32>) -> Fa {
-        Fa {
-            true_false: None,
-            q0,
-            q,
-            alphabet_size,
-            o,
-            d: vec![BTreeMap::new(); q],
-        }
+        Fa::with_states(q0, q, alphabet_size, o, vec![BTreeMap::new(); q])
     }
 
     fn add_transition(fa: &mut Fa, from: usize, symbol: i32, to: usize) {

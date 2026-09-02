@@ -547,14 +547,7 @@ mod tests {
             m.insert(1, vec![row[1]]);
             table.push(m);
         }
-        let fa = Fa {
-            q0,
-            q,
-            alphabet_size: 2,
-            o: outputs.to_vec(),
-            d: table,
-            true_false: None,
-        };
+        let fa = Fa::with_states(q0, q, 2, outputs.to_vec(), table);
         Automaton::new(
             fa,
             vec![vec![0, 1]],

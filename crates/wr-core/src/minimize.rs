@@ -437,14 +437,13 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
         // one non-accepting state, no transitions (Walnut's DFAs are partial, so a
         // transition-less state is a well-formed sink). `alphabet_size` is carried over
         // untouched, exactly as Java leaves `FA.alphabetSize` alone here.
-        return Ok(Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: fa.alphabet_size,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-        });
+        return Ok(Fa::with_states(
+            0,
+            1,
+            fa.alphabet_size,
+            vec![0],
+            vec![BTreeMap::new()],
+        ));
     }
 
     let new_q = blocks.z;
@@ -469,14 +468,7 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
         .map(|q| i32::from(blocks.first[q] < num_final_states))
         .collect();
 
-    Ok(Fa {
-        true_false: None,
-        q0: new_q0,
-        q: new_q,
-        alphabet_size: fa.alphabet_size,
-        o,
-        d,
-    })
+    Ok(Fa::with_states(new_q0, new_q, fa.alphabet_size, o, d))
 }
 
 /// [`minimize`], bracketed in `FA.justMinimize`'s own `Minimizing:`/`Minimized:` logging
@@ -529,18 +521,17 @@ mod tests {
         // States 1 and 2 both accept every continuation (Σ*), by construction — they are
         // language-equivalent but structurally distinct, so a correct minimizer must
         // merge them. Minimal result: 2 states (recognizing "any nonempty word").
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 1],
-            d: vec![
+        let fa = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![0, 1, 1],
+            vec![
                 row(&[(0, 1), (1, 2)]),
                 row(&[(0, 1), (1, 1)]),
                 row(&[(0, 2), (1, 2)]),
             ],
-        };
+        );
         let min = minimize(&fa).unwrap();
         assert_eq!(min.q, 2, "the two equivalent sinks must collapse into one");
         assert_eq!(
@@ -555,14 +546,13 @@ mod tests {
     fn already_minimal_dfa_is_unchanged_in_size() {
         // "contains at least one 1" — 2 states, provably minimal (ε is rejected, `1` is
         // accepted, so the two states are distinguishable).
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![row(&[(0, 0), (1, 1)]), row(&[(0, 1), (1, 1)])],
-        };
+        let fa = Fa::with_states(
+            0,
+            2,
+            2,
+            vec![0, 1],
+            vec![row(&[(0, 0), (1, 1)]), row(&[(0, 1), (1, 1)])],
+        );
         let min = minimize(&fa).unwrap();
         assert_eq!(min.q, 2, "no false merge on an already-minimal DFA");
         assert_eq!(
@@ -573,32 +563,30 @@ mod tests {
 
     #[test]
     fn rejects_nondeterministic_input() {
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![row(&[(0, 0), (1, 1)]), row(&[(0, 1), (1, 1)])],
-        };
+        let mut fa = Fa::with_states(
+            0,
+            2,
+            2,
+            vec![0, 1],
+            vec![row(&[(0, 0), (1, 1)]), row(&[(0, 1), (1, 1)])],
+        );
         fa.d[0].insert(1, vec![0, 1]); // two destinations for symbol 1
         assert_eq!(minimize(&fa).unwrap_err(), MinimizeError::NotDeterministic);
     }
 
     #[test]
     fn no_accepting_states_collapses_to_one_dead_state() {
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 0, 0],
-            d: vec![
+        let fa = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![0, 0, 0],
+            vec![
                 row(&[(0, 1), (1, 2)]),
                 row(&[(0, 2), (1, 0)]),
                 row(&[(0, 0), (1, 1)]),
             ],
-        };
+        );
         let min = minimize(&fa).unwrap();
         assert_eq!(min.q, 1);
         assert!(min.is_language_empty());
@@ -611,18 +599,17 @@ mod tests {
         // State 2 is a non-accepting sink: reachable from q0 but not co-reachable, so
         // Valmari's own pre-pass removes it (and its transitions) even though `minimize`
         // does no q0-reachability pruning of its own.
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 0],
-            d: vec![
+        let fa = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![0, 1, 0],
+            vec![
                 row(&[(0, 1), (1, 2)]),
                 row(&[(0, 1), (1, 2)]),
                 row(&[(0, 2), (1, 2)]),
             ],
-        };
+        );
         let min = minimize(&fa).unwrap();
         assert_eq!(min.q, 2);
         assert!(min.accepts_word(&[0, 0]));
@@ -645,14 +632,7 @@ mod tests {
     fn minimize_wb_001_trigger_now_yields_the_empty_language() {
         // q0 self-loops and is non-accepting; state 1 is a disjoint accepting self-loop
         // that q0 can never reach. The true language is ∅.
-        let fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![row(&[(0, 0)]), row(&[(0, 1)])],
-        };
+        let fa = Fa::with_states(0, 2, 1, vec![0, 1], vec![row(&[(0, 0)]), row(&[(0, 1)])]);
         assert!(fa.is_language_empty());
 
         let min = minimize(&fa).unwrap();
@@ -689,18 +669,17 @@ mod tests {
     fn the_guard_is_a_no_op_on_every_non_defective_input() {
         // (a) q0 IS co-reachable: "contains at least one 1", plus a stranded but
         //     co-reachable extra state so the input is genuinely untrimmed.
-        let ordinary = Fa {
-            true_false: None,
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 1],
-            d: vec![
+        let ordinary = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![0, 1, 1],
+            vec![
                 row(&[(0, 0), (1, 1)]),
                 row(&[(0, 1), (1, 1)]),
                 row(&[(0, 2), (1, 2)]), // unreachable from q0, but accepting
             ],
-        };
+        );
         let min = minimize(&ordinary).unwrap();
         assert_eq!(min.q, 2, "the two Σ*-sinks merge; q0 stays separate");
         assert_eq!(min.o, vec![1, 0]);
@@ -713,18 +692,17 @@ mod tests {
 
         // (b) num_coreachable == 0 (no accepting state anywhere): the guard fires for
         //     every q0, and the unguarded path already produced exactly this.
-        let dead = Fa {
-            true_false: None,
-            q0: 1,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 0, 0],
-            d: vec![
+        let dead = Fa::with_states(
+            1,
+            3,
+            2,
+            vec![0, 0, 0],
+            vec![
                 row(&[(0, 1), (1, 2)]),
                 row(&[(0, 2), (1, 0)]),
                 row(&[(0, 0), (1, 1)]),
             ],
-        };
+        );
         let min = minimize(&dead).unwrap();
         assert_eq!(
             (min.q, min.q0, &min.o, &min.d),
@@ -850,14 +828,7 @@ mod tests {
             for o_mask in 0..(1u32 << q) {
                 let o: Vec<i32> = (0..q).map(|s| i32::from(o_mask >> s & 1 == 1)).collect();
                 for q0 in 0..q {
-                    f(Fa {
-                        true_false: None,
-                        q0,
-                        q,
-                        alphabet_size,
-                        o: o.clone(),
-                        d: d.clone(),
-                    });
+                    f(Fa::with_states(q0, q, alphabet_size, o.clone(), d.clone()));
                 }
             }
         }
@@ -976,14 +947,7 @@ mod tests {
                     }
                 }
             }
-            let fa = Fa {
-                true_false: None,
-                q0: (next() % q as u64) as usize,
-                q,
-                alphabet_size,
-                o,
-                d,
-            };
+            let fa = Fa::with_states((next() % q as u64) as usize, q, alphabet_size, o, d);
 
             let min = minimize(&fa).expect("generated tables are deterministic by construction");
             assert!(
@@ -1025,14 +989,7 @@ mod tests {
                             .collect::<Map<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }
@@ -1059,14 +1016,7 @@ mod tests {
                             .collect::<Map<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }

@@ -674,14 +674,7 @@ mod tests {
         // Java's bare `new Automaton()`: no tracks, `FA.alphabetSize` still its `int`
         // default of 0 because `determineAlphabetSize()` was never called.
         let empty = Automaton::new(
-            wr_core::fa::Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 0,
-                o: vec![0],
-                d: vec![Default::default()],
-            },
+            wr_core::fa::Fa::with_states(0, 1, 0, vec![0], vec![Default::default()]),
             Vec::new(),
             Vec::new(),
             Vec::new(),

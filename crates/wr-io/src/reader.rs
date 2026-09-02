@@ -735,14 +735,7 @@ fn read_automaton_str_impl(
     // `Automaton::encode` (mixed-radix, position-in-alphabet indexed) instead of
     // duplicating that formula here.
     let mut automaton = Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size,
-            o: vec![],
-            d: vec![],
-        },
+        Fa::with_states(0, 0, alphabet_size, vec![], vec![]),
         alphabet.clone(),
         label,
         msd,
@@ -853,14 +846,7 @@ fn read_automaton_str_impl(
     for (id, row) in transitions {
         d[id] = row;
     }
-    automaton.fa = Fa {
-        true_false: None,
-        q0,
-        q,
-        alphabet_size,
-        o,
-        d,
-    };
+    automaton.fa = Fa::with_states(q0, q, alphabet_size, o, d);
 
     // `AutomatonReader.readAutomaton`: auto-determinize + minimize non-deterministic
     // input (no DFAO branch here, see module docs).
@@ -1625,14 +1611,7 @@ fn read_transducer_str_impl(content: &str, address: &str) -> Result<TransducerDa
     // Scratch `Automaton`, used only for its `encode` (mixed-radix, position-in-alphabet)
     // — same precedent as `read_automaton_txt_impl`'s placeholder `Fa`.
     let scratch = Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size,
-            o: vec![],
-            d: vec![],
-        },
+        Fa::with_states(0, 0, alphabet_size, vec![], vec![]),
         alphabet.clone(),
         label,
         msd.clone(),
@@ -1962,14 +1941,7 @@ mod tests {
         // The encoder itself is UNCHANGED by the fix -- built here directly, since the
         // reader no longer produces such an automaton to ask.
         let a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 0,
-                alphabet_size: 2,
-                o: vec![],
-                d: vec![],
-            },
+            Fa::with_states(0, 0, 2, vec![], vec![]),
             vec![vec![0, 1]],
             vec!["0".to_string()],
             vec![Some(false)],
@@ -2017,14 +1989,7 @@ mod tests {
         );
 
         let a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 0,
-                alphabet_size: 4,
-                o: vec![],
-                d: vec![],
-            },
+            Fa::with_states(0, 0, 4, vec![], vec![]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["0".to_string(), "1".to_string()],
             vec![Some(true), Some(true)],

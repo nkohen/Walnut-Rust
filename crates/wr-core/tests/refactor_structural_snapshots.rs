@@ -55,14 +55,7 @@ fn map(entries: &[(i32, &[usize])]) -> BTreeMap<i32, Vec<usize>> {
 /// pins.
 #[test]
 fn fa_totalize_fills_missing_transitions_with_a_new_sink_state() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 2,
-        o: vec![1, 0],
-        d: vec![map(&[(0, &[1])]), map(&[])],
-    };
+    let mut fa = Fa::with_states(0, 2, 2, vec![1, 0], vec![map(&[(0, &[1])]), map(&[])]);
 
     fa.totalize(9);
 
@@ -84,14 +77,13 @@ fn fa_totalize_fills_missing_transitions_with_a_new_sink_state() {
 /// (no sink appended).
 #[test]
 fn fa_totalize_is_a_no_op_on_an_already_total_dfa() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 2,
-        o: vec![0, 1],
-        d: vec![map(&[(0, &[1]), (1, &[0])]), map(&[(0, &[1]), (1, &[1])])],
-    };
+    let mut fa = Fa::with_states(
+        0,
+        2,
+        2,
+        vec![0, 1],
+        vec![map(&[(0, &[1]), (1, &[0])]), map(&[(0, &[1]), (1, &[1])])],
+    );
     let before = fa.clone();
 
     fa.totalize(9);
@@ -114,14 +106,13 @@ fn fa_totalize_is_a_no_op_on_an_already_total_dfa() {
 /// stale (documented, unchanged) at its old value.
 #[test]
 fn fa_reverse_reverses_edges_and_swaps_initial_and_accepting_roles() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 3,
-        alphabet_size: 1,
-        o: vec![0, 1, 0],
-        d: vec![map(&[(0, &[1])]), map(&[(0, &[2])]), map(&[(0, &[0])])],
-    };
+    let mut fa = Fa::with_states(
+        0,
+        3,
+        1,
+        vec![0, 1, 0],
+        vec![map(&[(0, &[1])]), map(&[(0, &[2])]), map(&[(0, &[0])])],
+    );
     let old_initial: std::collections::BTreeSet<usize> = [0].into_iter().collect();
 
     let new_initial = fa.reverse(&old_initial);
@@ -141,14 +132,13 @@ fn fa_reverse_reverses_edges_and_swaps_initial_and_accepting_roles() {
 /// the same cycle marks BOTH as accepting afterward, not just one.
 #[test]
 fn fa_reverse_with_a_multi_state_seed_marks_every_seed_state_accepting() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 3,
-        alphabet_size: 1,
-        o: vec![0, 1, 0],
-        d: vec![map(&[(0, &[1])]), map(&[(0, &[2])]), map(&[(0, &[0])])],
-    };
+    let mut fa = Fa::with_states(
+        0,
+        3,
+        1,
+        vec![0, 1, 0],
+        vec![map(&[(0, &[1])]), map(&[(0, &[2])]), map(&[(0, &[0])])],
+    );
     let old_initial: std::collections::BTreeSet<usize> = [0, 2].into_iter().collect();
 
     let new_initial = fa.reverse(&old_initial);
@@ -188,22 +178,14 @@ fn fa_reverse_with_a_multi_state_seed_marks_every_seed_state_accepting() {
 /// against a live run, not assumed).
 #[test]
 fn fa_concat_states_grafts_other_and_keeps_first_accepting_when_other_accepts_epsilon() {
-    let mut n = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 1,
-        o: vec![0, 2],
-        d: vec![map(&[(0, &[1])]), map(&[])],
-    };
-    let other = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 1,
-        o: vec![1, 0],
-        d: vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
-    };
+    let mut n = Fa::with_states(0, 2, 1, vec![0, 2], vec![map(&[(0, &[1])]), map(&[])]);
+    let other = Fa::with_states(
+        0,
+        2,
+        1,
+        vec![1, 0],
+        vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
+    );
     let original_q = 2;
 
     Fa::concat_states(&other, &mut n, original_q);
@@ -231,22 +213,14 @@ fn fa_concat_states_grafts_other_and_keeps_first_accepting_when_other_accepts_ep
 /// flag CLEARED after the graft (WB-009).
 #[test]
 fn fa_concat_states_clears_first_accepting_when_other_rejects_epsilon() {
-    let mut n = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 1,
-        o: vec![0, 1],
-        d: vec![map(&[(0, &[1])]), map(&[])],
-    };
-    let other = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 1,
-        o: vec![0, 1],
-        d: vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
-    };
+    let mut n = Fa::with_states(0, 2, 1, vec![0, 1], vec![map(&[(0, &[1])]), map(&[])]);
+    let other = Fa::with_states(
+        0,
+        2,
+        1,
+        vec![0, 1],
+        vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
+    );
     let original_q = 2;
 
     Fa::concat_states(&other, &mut n, original_q);
@@ -272,14 +246,7 @@ fn fa_concat_states_clears_first_accepting_when_other_rejects_epsilon() {
 /// `0`. Pure in-place `o` rewrite; `q0`/`q`/`d` untouched.
 #[test]
 fn fa_restrict_output_to_collapses_matching_outputs_to_one() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 1,
-        q: 3,
-        alphabet_size: 1,
-        o: vec![0, 2, 5],
-        d: vec![map(&[]), map(&[]), map(&[])],
-    };
+    let mut fa = Fa::with_states(1, 3, 1, vec![0, 2, 5], vec![map(&[]), map(&[]), map(&[])]);
 
     fa.restrict_output_to(2);
 
@@ -301,14 +268,7 @@ fn fa_restrict_output_to_collapses_matching_outputs_to_one() {
 /// self-loops on every symbol.
 #[test]
 fn fa_add_distinguished_dead_state_totalizes_via_the_relaxed_pass() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 2,
-        o: vec![0, 1],
-        d: vec![map(&[(0, &[1])]), map(&[])],
-    };
+    let mut fa = Fa::with_states(0, 2, 2, vec![0, 1], vec![map(&[(0, &[1])]), map(&[])]);
 
     let added = fa.add_distinguished_dead_state();
 
@@ -332,14 +292,7 @@ fn fa_add_distinguished_dead_state_totalizes_via_the_relaxed_pass() {
 /// `is_deterministic_and_total`): no dead state is added.
 #[test]
 fn fa_add_distinguished_dead_state_is_a_no_op_when_every_pair_is_present() {
-    let mut fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 1,
-        alphabet_size: 1,
-        o: vec![1],
-        d: vec![map(&[(0, &[0])])],
-    };
+    let mut fa = Fa::with_states(0, 1, 1, vec![1], vec![map(&[(0, &[0])])]);
     let before = fa.clone();
 
     let added = fa.add_distinguished_dead_state();
@@ -361,14 +314,13 @@ fn fa_add_distinguished_dead_state_is_a_no_op_when_every_pair_is_present() {
 /// symbol. Hand-derived directly from `trim`'s `keep.is_empty()` branch.
 #[test]
 fn trim_collapses_a_language_with_no_accepting_state_to_the_canonical_empty_automaton() {
-    let fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 2,
-        alphabet_size: 3,
-        o: vec![0, 0],
-        d: vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
-    };
+    let fa = Fa::with_states(
+        0,
+        2,
+        3,
+        vec![0, 0],
+        vec![map(&[(0, &[1])]), map(&[(0, &[0])])],
+    );
 
     let trimmed = trim(&fa);
 
@@ -383,14 +335,7 @@ fn trim_collapses_a_language_with_no_accepting_state_to_the_canonical_empty_auto
 /// nontrivial size too.
 #[test]
 fn trim_collapses_to_the_canonical_empty_automaton_with_a_single_symbol_alphabet() {
-    let fa = Fa {
-        true_false: None,
-        q0: 0,
-        q: 1,
-        alphabet_size: 1,
-        o: vec![0],
-        d: vec![map(&[(0, &[0])])],
-    };
+    let fa = Fa::with_states(0, 1, 1, vec![0], vec![map(&[(0, &[0])])]);
 
     let trimmed = trim(&fa);
 
@@ -635,14 +580,7 @@ fn no_adjacent_ones(label: &str) -> Automaton {
     let mut d1 = BTreeMap::new();
     d1.insert(0, vec![0]);
     Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 1],
-            d: vec![d0, d1],
-        },
+        Fa::with_states(0, 2, 2, vec![1, 1], vec![d0, d1]),
         vec![vec![0, 1]],
         vec![label.to_string()],
         vec![Some(true)],
@@ -660,14 +598,7 @@ fn universal_tracks(labels: &[&str], output: i32) -> Automaton {
         d0.insert(sym, vec![0usize]);
     }
     Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size,
-            o: vec![output],
-            d: vec![d0],
-        },
+        Fa::with_states(0, 1, alphabet_size, vec![output], vec![d0]),
         vec![vec![0, 1]; n],
         labels.iter().map(|s| s.to_string()).collect(),
         vec![Some(true); n],

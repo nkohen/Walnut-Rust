@@ -375,14 +375,7 @@ where
         time_before.elapsed().as_millis()
     ));
 
-    Fa {
-        true_false: None,
-        q0: 0,
-        q: states_list.len(),
-        alphabet_size: axb_alphabet_size,
-        o,
-        d,
-    }
+    Fa::with_states(0, states_list.len(), axb_alphabet_size, o, d)
 }
 
 /// `ProductStrategies.joinTwoInputsForCrossProduct` (`ProductStrategies.java:339-353`).
@@ -617,14 +610,7 @@ fn create_basic_automaton(a: &Automaton, b: &Automaton) -> (Automaton, Vec<i32>)
     let same_inputs_in_a_and_b = compute_same_inputs(a, b);
 
     let mut axb = Automaton::new(
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            alphabet_size: 1,
-            o: Vec::new(),
-            d: Vec::new(),
-        },
+        Fa::with_states(0, 0, 1, Vec::new(), Vec::new()),
         Vec::new(),
         Vec::new(),
         Vec::new(),
@@ -819,14 +805,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn one_state_fa(alphabet_size: usize, output: i32) -> Fa {
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size,
-            o: vec![output],
-            d: vec![BTreeMap::new()],
-        }
+        Fa::with_states(0, 1, alphabet_size, vec![output], vec![BTreeMap::new()])
     }
 
     fn unbound_automaton() -> Automaton {
@@ -835,14 +814,7 @@ mod tests {
         // (0 == 0), which does NOT hit `create_basic_automaton`'s guard. One real
         // track with zero labels is the actual mismatch shape.
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 2,
-                o: vec![0],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 2, vec![0], vec![BTreeMap::new()]),
             vec![vec![0, 1]],
             Vec::new(),
             vec![None],
@@ -853,14 +825,7 @@ mod tests {
         let alphabet_size = alphabet.iter().map(|t| t.len()).product();
         let msd = vec![None; alphabet.len()];
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size,
-                o: vec![0],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, alphabet_size, vec![0], vec![BTreeMap::new()]),
             alphabet,
             label,
             msd,
@@ -972,14 +937,7 @@ mod tests {
         for &k in keys {
             d0.insert(k, vec![0]);
         }
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![1],
-            d: vec![d0],
-        }
+        Fa::with_states(0, 1, 2, vec![1], vec![d0])
     }
 
     /// **The heart of the fix.** Java hoists `inputA * B.getAlphabetSize()` into the outer
@@ -1149,14 +1107,7 @@ mod tests {
         // alphabet entry -- label size (1) mismatches alphabet size (0), the
         // opposite-direction mismatch from `cross_product_panics_when_a_is_unbound`.
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 1,
-                o: vec![0],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -1188,14 +1139,7 @@ mod tests {
 
     fn one_track_automaton(msd: Option<bool>) -> Automaton {
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 2,
-                o: vec![0],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 2, vec![0], vec![BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["x".to_string()],
             vec![msd],
@@ -1244,14 +1188,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![1]);
         d1.insert(1, vec![0]);
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 0],
-            d: vec![d0, d1],
-        }
+        Fa::with_states(0, 2, 2, vec![1, 0], vec![d0, d1])
     }
 
     fn ends_with_one_dfa() -> Fa {
@@ -1262,14 +1199,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![0]);
         d1.insert(1, vec![1]);
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        }
+        Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1])
     }
 
     #[test]
@@ -1356,14 +1286,7 @@ mod tests {
             d0.insert(sym, vec![if sym == 3 { 1 } else { 0 }]);
             d1.insert(sym, vec![if sym == 3 { 1 } else { 0 }]);
         }
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 2,
-            alphabet_size: 4,
-            o: vec![0, 1],
-            d: vec![d0, d1],
-        }
+        Fa::with_states(0, 2, 4, vec![0, 1], vec![d0, d1])
     }
 
     #[test]
@@ -1485,14 +1408,7 @@ mod tests {
                     let sym = 1 + j * 2; // encoder [1,2]: i + 2*j
                     d.insert(sym, vec![0]);
                 }
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q: 1,
-                    alphabet_size: 6,
-                    o: vec![1],
-                    d: vec![d],
-                }
+                Fa::with_states(0, 1, 6, vec![1], vec![d])
             },
             a_alphabets,
             vec!["i".to_string(), "j".to_string()],
@@ -1509,14 +1425,7 @@ mod tests {
                         d.insert(sym, vec![0]);
                     }
                 }
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q: 1,
-                    alphabet_size: 30,
-                    o: vec![1],
-                    d: vec![d],
-                }
+                Fa::with_states(0, 1, 30, vec![1], vec![d])
             },
             b_alphabets,
             vec!["p".to_string(), "q".to_string(), "j".to_string()],
@@ -1587,14 +1496,7 @@ mod tests {
                             .collect::<BTreeMap<i32, Vec<usize>>>()
                     })
                     .collect();
-                Fa {
-                    true_false: None,
-                    q0: 0,
-                    q,
-                    alphabet_size,
-                    o,
-                    d,
-                }
+                Fa::with_states(0, q, alphabet_size, o, d)
             })
         })
     }
@@ -1654,14 +1556,7 @@ mod tests {
             .map(|row| row.into_iter().collect())
             .collect();
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: o.len(),
-                alphabet_size: 2,
-                o,
-                d,
-            },
+            Fa::with_states(0, o.len(), 2, o, d),
             vec![vec![0, 1]],
             vec![name.to_string()],
             vec![None],

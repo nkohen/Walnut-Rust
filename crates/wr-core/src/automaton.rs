@@ -2350,14 +2350,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn trivial_fa(alphabet_size: usize) -> Fa {
-        Fa {
-            true_false: None,
-            q0: 0,
-            q: 1,
-            alphabet_size,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-        }
+        Fa::with_states(0, 1, alphabet_size, vec![0], vec![BTreeMap::new()])
     }
 
     #[test]
@@ -2562,14 +2555,7 @@ mod tests {
     #[test]
     fn is_empty_matches_fa_language_emptiness() {
         let accepting = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 2,
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 2, vec![1], vec![BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["a".into()],
             vec![Some(true)],
@@ -2761,19 +2747,12 @@ mod tests {
         let mut d2 = BTreeMap::new();
         d2.insert(0, vec![1]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 1,
-                q: 3,
-                // Must be the true product of the two 2-symbol tracks (4), not 1 --
-                // an adversarial review found the original fixture set this to 1
-                // despite a 2-track alphabet, an internally-inconsistent `Automaton`
-                // that only avoided panicking because every transition below happens
-                // to use symbol 0.
-                alphabet_size: 4,
-                o: vec![0, 0, 1],
-                d: vec![d0, d1, d2],
-            },
+            // alphabet_size must be the true product of the two 2-symbol tracks (4),
+            // not 1 -- an adversarial review found the original fixture set this to 1
+            // despite a 2-track alphabet, an internally-inconsistent `Automaton` that
+            // only avoided panicking because every transition below happens to use
+            // symbol 0.
+            Fa::with_states(1, 3, 4, vec![0, 0, 1], vec![d0, d1, d2]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["b".to_string(), "a".to_string()],
             vec![Some(true), Some(true)],
@@ -2809,14 +2788,7 @@ mod tests {
         let mut d2 = BTreeMap::new();
         d2.insert(0, vec![1]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 1,
-                q: 3,
-                alphabet_size: 4,
-                o: vec![0, 0, 1],
-                d: vec![d0, d1, d2],
-            },
+            Fa::with_states(1, 3, 4, vec![0, 0, 1], vec![d0, d1, d2]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["b".to_string(), "a".to_string()],
             vec![Some(true), Some(true)],
@@ -2890,14 +2862,7 @@ mod tests {
     /// language-preserving and easy to check by hand.
     fn diagonal_two_track_automaton() -> Automaton {
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size: 4,
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, 4, vec![1], vec![BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["a".to_string(), "b".to_string()],
             vec![Some(true), Some(true)],
@@ -2944,14 +2909,7 @@ mod tests {
         // original diagonal test's style above.)
         let alphabet_size = 2 * 3 * 2; // a(2) * b(3) * a(2), a fastest-varying.
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size,
-                o: vec![1],
-                d: vec![BTreeMap::new()],
-            },
+            Fa::with_states(0, 1, alphabet_size, vec![1], vec![BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1, 2], vec![0, 1]],
             vec!["p".to_string(), "q".to_string(), "r".to_string()],
             vec![Some(true), Some(false), None],
@@ -3032,14 +2990,7 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![0, 1],
-                d: vec![d0, d1],
-            },
+            Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1]),
             vec![vec![0, 1]],
             vec!["a".to_string()],
             vec![Some(true)],
@@ -3079,14 +3030,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![1]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 1,
-                o: vec![0, 1],
-                d: vec![d0, d1],
-            },
+            Fa::with_states(0, 2, 1, vec![0, 1], vec![d0, d1]),
             vec![vec![0]],
             vec!["a".to_string()],
             vec![Some(true)],
@@ -3127,14 +3071,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![2]);
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 3,
-                alphabet_size: 2,
-                o: vec![0, 0, 1],
-                d: vec![d0, d1, BTreeMap::new()],
-            },
+            Fa::with_states(0, 3, 2, vec![0, 0, 1], vec![d0, d1, BTreeMap::new()]),
             vec![vec![0, 1]],
             vec!["a".to_string()],
             vec![Some(true)],
@@ -3295,14 +3232,7 @@ mod tests {
         // `Automaton.clear()` (`:506-512`), as invoked by
         // `AutomatonQuantification.quantifyHelper:63`.
         let mut a = Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 4,
-                o: vec![0, 1],
-                d: vec![BTreeMap::new(), BTreeMap::new()],
-            },
+            Fa::with_states(0, 2, 4, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]),
             vec![vec![0, 1], vec![0, 1]],
             vec!["y".into(), "x".into()],
             vec![Some(true), Some(true)],
@@ -3414,14 +3344,7 @@ mod tests {
         let mut d1 = BTreeMap::new();
         d1.insert(0, vec![0]);
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 2,
-                alphabet_size: 2,
-                o: vec![1, 1],
-                d: vec![d0, d1],
-            },
+            Fa::with_states(0, 2, 2, vec![1, 1], vec![d0, d1]),
             vec![vec![0, 1]],
             vec![label.to_string()],
             vec![Some(true)],
@@ -3439,14 +3362,7 @@ mod tests {
             d0.insert(sym, vec![0usize]);
         }
         Automaton::new(
-            Fa {
-                true_false: None,
-                q0: 0,
-                q: 1,
-                alphabet_size,
-                o: vec![output],
-                d: vec![d0],
-            },
+            Fa::with_states(0, 1, alphabet_size, vec![output], vec![d0]),
             vec![vec![0, 1]; n],
             labels.iter().map(|s| s.to_string()).collect(),
             vec![Some(true); n],

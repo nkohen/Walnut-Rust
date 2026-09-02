@@ -425,20 +425,13 @@ impl Morphism {
         // this wider-domain shape still passes it, on both the pre-fix and fixed jar.
         new_d.truncate(q);
 
-        let mut fa = Fa {
-            true_false: None,
-            q0: 0,
-            q: 0,
-            // Java leaves `alphabetSize` at its `0` default here and lets a later
-            // `setAlphabetSize`/`richAlphabet` pass fill it in; setting it up front is
-            // an intentional, safe divergence -- `max_image_length` is exactly the
-            // product of this automaton's one track's alphabet (`0..max_image_length`),
-            // i.e. what any later recomputation would produce anyway, and the flagless
-            // `0` would make `Automaton::decode`/`encode` misbehave in this crate.
-            alphabet_size: max_image_length,
-            o: Vec::new(),
-            d: Vec::new(),
-        };
+        // Java leaves `alphabetSize` at its `0` default here and lets a later
+        // `setAlphabetSize`/`richAlphabet` pass fill it in; setting it up front is
+        // an intentional, safe divergence -- `max_image_length` is exactly the
+        // product of this automaton's one track's alphabet (`0..max_image_length`),
+        // i.e. what any later recomputation would produce anyway, and the flagless
+        // `0` would make `Automaton::decode`/`encode` misbehave in this crate.
+        let mut fa = Fa::with_states(0, 0, max_image_length, Vec::new(), Vec::new());
         // `promotion.getFa().setFields(maxEntry + 1, new IntArrayList(
         //  UtilityMethods.intRangeList(maxEntry + 1)), newD);` (`:84-85`) -- the
         // output vector is `0, 1, ..., maxEntry`, i.e. state `q`'s output IS `q`.

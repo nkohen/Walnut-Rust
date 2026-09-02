@@ -758,14 +758,7 @@ mod tests {
             d[0].insert(sym, vec![if sym == watched_symbol { 1 } else { 0 }]);
             d[1].insert(sym, vec![1]);
         }
-        Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d,
-            true_false: None,
-        }
+        Fa::with_states(0, 2, 2, vec![0, 1], d)
     }
 
     #[test]
@@ -791,14 +784,7 @@ mod tests {
     fn product_negative_start_component_with_want_accept_true_returns_none_immediately() {
         // start[0] == -1 (already-dead marker) with want_accept[0] == true must
         // short-circuit to None before any BFS.
-        let mut trivial = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let mut trivial = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
         trivial.d[0].insert(0, vec![0]);
 
         let dfas = [trivial.clone(), trivial];
@@ -815,25 +801,12 @@ mod tests {
         // "good enough" for that component, so this must NOT be rejected by the
         // `start_local_state < 0` branch. Component 1 still needs to reach its own
         // accepting state via BFS.
-        let mut comp1 = Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 1,
-            o: vec![0, 1],
-            d: vec![BTreeMap::new(), BTreeMap::new()],
-            true_false: None,
-        };
+        let mut comp1 =
+            Fa::with_states(0, 2, 1, vec![0, 1], vec![BTreeMap::new(), BTreeMap::new()]);
         comp1.d[0].insert(0, vec![1]);
         comp1.d[1].insert(0, vec![1]);
 
-        let mut dead_component = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let mut dead_component = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
         dead_component.d[0].insert(0, vec![0]);
 
         let dfas = [dead_component, comp1];
@@ -848,14 +821,7 @@ mod tests {
     fn product_live_start_that_can_never_reach_wanted_returns_none_via_live_check() {
         // start component is >= 0 (live) but its DFA can never reach an accepting
         // state at all, while want_accept requires accepting.
-        let mut never_accepts = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let mut never_accepts = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
         never_accepts.d[0].insert(0, vec![0]);
 
         let dfas = [never_accepts];
@@ -872,14 +838,13 @@ mod tests {
         // (accepting). want_accept = true. Taking sym 0 first leads into a state
         // from which acceptance is unreachable, so mid-BFS pruning must discard it,
         // forcing the search to use sym 1 directly.
-        let mut dfa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 0, 1],
-            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
-            true_false: None,
-        };
+        let mut dfa = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![0, 0, 1],
+            vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+        );
         dfa.d[0].insert(0, vec![1]);
         dfa.d[0].insert(1, vec![2]);
         dfa.d[1].insert(0, vec![1]);
@@ -913,14 +878,8 @@ mod tests {
         // A component whose only relevant local symbol is unset (dead) from its
         // (accepting) start state, with want_accept == false for that component:
         // reaching dead is already good when want_accept is false.
-        let mut dfa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 2,
-            o: vec![1], // accepting start state, so it does NOT already satisfy want_accept=false
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        // o: accepting start state, so it does NOT already satisfy want_accept=false
+        let mut dfa = Fa::with_states(0, 1, 2, vec![1], vec![BTreeMap::new()]);
         dfa.d[0].insert(0, vec![0]); // local symbol 0 defined (self-loop); local symbol 1 left UNSET (dead)
 
         let dfas = [dfa];
@@ -939,14 +898,13 @@ mod tests {
         // even construct; `&[Fa]` does not. Following `dests[0]` here would let the
         // reverse-reachability precomputation discard the real destination 2 and prune
         // away a witness that genuinely exists.
-        let mut nfa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![0, 0, 1],
-            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
-            true_false: None,
-        };
+        let mut nfa = Fa::with_states(
+            0,
+            3,
+            1,
+            vec![0, 0, 1],
+            vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+        );
         nfa.d[0].insert(0, vec![1, 2]); // nondeterministic
         nfa.d[2].insert(0, vec![2]);
 
@@ -965,14 +923,7 @@ mod tests {
         // `Fa` does not constrain destinations to `< q`; the predecessor-counting pass
         // indexes an array sized by `q` with one, so this used to be a raw slice-index
         // panic rather than a diagnosable error.
-        let mut malformed = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let mut malformed = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
         malformed.d[0].insert(0, vec![7]);
 
         let dfas = [malformed];
@@ -1061,14 +1012,7 @@ mod tests {
         d[0].insert(1, vec![1]);
         d[1].insert(0, vec![1]);
         d[1].insert(1, vec![1]);
-        let fa = Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![0, 1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 2, 2, vec![0, 1], d);
         let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
         assert_eq!(shortest_accepted_word(&a), Ok(Some(vec![1])));
     }
@@ -1084,14 +1028,8 @@ mod tests {
         d[0].insert(1, vec![0]); // 0 --1--> 0 (accepting, back to the start)
         d[1].insert(0, vec![1]);
         d[1].insert(1, vec![1]);
-        let fa = Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 2,
-            o: vec![1, 0], // q0 itself accepts
-            d,
-            true_false: None,
-        };
+        // o: q0 itself accepts
+        let fa = Fa::with_states(0, 2, 2, vec![1, 0], d);
         let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
         assert!(a.fa.is_accepting(a.fa.q0));
         assert_eq!(shortest_accepted_word(&a), Ok(Some(vec![1])));
@@ -1103,14 +1041,13 @@ mod tests {
         // is reachable only via the SECOND destination of `d[0][0]`, so a `dests[0]`-
         // only search reports "no accepted word" while [0] is genuinely accepted.
         // Rejected loudly instead of answered wrongly.
-        let mut nfa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 1,
-            o: vec![0, 0, 1],
-            d: vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
-            true_false: None,
-        };
+        let mut nfa = Fa::with_states(
+            0,
+            3,
+            1,
+            vec![0, 0, 1],
+            vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
+        );
         nfa.d[0].insert(0, vec![1, 2]);
         nfa.d[2].insert(0, vec![2]);
         assert!(
@@ -1127,14 +1064,7 @@ mod tests {
 
     #[test]
     fn shortest_accepted_word_rejects_a_malformed_automaton() {
-        let mut malformed = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let mut malformed = Fa::with_states(0, 1, 1, vec![0], vec![BTreeMap::new()]);
         malformed.d[0].insert(0, vec![7]);
         let a = Automaton::new(malformed, vec![vec![0]], vec!["x".to_string()], vec![None]);
         assert_eq!(
@@ -1146,14 +1076,7 @@ mod tests {
         );
 
         // A `q0` outside the state set would index `d[q0]` in the step closure.
-        let stale = Fa {
-            q0: 3,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![0],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let stale = Fa::with_states(3, 1, 1, vec![0], vec![BTreeMap::new()]);
         let a = Automaton::new(stale, vec![vec![0]], vec!["x".to_string()], vec![None]);
         assert_eq!(
             shortest_accepted_word(&a),
@@ -1176,14 +1099,7 @@ mod tests {
         d[1].insert(1, vec![2]);
         d[2].insert(0, vec![2]);
         d[2].insert(1, vec![2]);
-        let fa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 0, 1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 3, 2, vec![0, 0, 1], d);
         let a = Automaton::new(fa, vec![vec![0, 1]], vec!["x".to_string()], vec![None]);
 
         let witness = shortest_accepted_word(&a).unwrap().expect("a witness");
@@ -1279,21 +1195,22 @@ mod tests {
                 q,
             );
             let o = prop::collection::vec(0i32..=1, q);
-            (table, o).prop_map(move |(table, o)| Fa {
-                true_false: None,
-                q0: 0,
-                q,
-                alphabet_size,
-                o,
-                d: table
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter()
-                            .enumerate()
-                            .filter_map(|(sym, dest)| dest.map(|dest| (sym as i32, vec![dest])))
-                            .collect::<BTreeMap<i32, Vec<usize>>>()
-                    })
-                    .collect(),
+            (table, o).prop_map(move |(table, o)| {
+                Fa::with_states(
+                    0,
+                    q,
+                    alphabet_size,
+                    o,
+                    table
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .enumerate()
+                                .filter_map(|(sym, dest)| dest.map(|dest| (sym as i32, vec![dest])))
+                                .collect::<BTreeMap<i32, Vec<usize>>>()
+                        })
+                        .collect(),
+                )
             })
         })
     }

@@ -914,19 +914,18 @@ mod tests {
         // respectively (this track's alphabet is `[1, 2, 3]`, not `[0, 1, 2]`). State 0
         // (q0, non-accepting) transitions to state 1 (accepting, no outgoing
         // transitions) on every symbol.
-        let fa = wr_core::fa::Fa {
-            q0: 0,
-            q: 2,
-            alphabet_size: 3,
-            o: vec![0, 1],
-            d: vec![
+        let fa = wr_core::fa::Fa::with_states(
+            0,
+            2,
+            3,
+            vec![0, 1],
+            vec![
                 [(0i32, vec![1usize]), (1, vec![1]), (2, vec![1])]
                     .into_iter()
                     .collect(),
                 std::collections::BTreeMap::new(),
             ],
-            true_false: None,
-        };
+        );
         let mut a = Automaton::new(fa, vec![vec![1, 2, 3]], vec!["x".to_string()], vec![None]);
         let mut buf: Vec<u8> = Vec::new();
         let mut emitter = MapleEmitter::new(&mut buf);

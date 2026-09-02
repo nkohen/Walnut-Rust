@@ -609,14 +609,7 @@ mod tests {
         let mut d = vec![BTreeMap::new(); 3];
         d[0].insert(0, vec![1, 2]);
         d[0].insert(1, vec![2]);
-        let nfa_fa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![0, 1, 1],
-            d,
-            true_false: None,
-        };
+        let nfa_fa = Fa::with_states(0, 3, 2, vec![0, 1, 1], d);
         let original = wr_core::automaton::Automaton::new(
             nfa_fa,
             vec![vec![0, 1]],
@@ -719,14 +712,7 @@ mod tests {
         d[1].insert(1, vec![0]);
         d[2].insert(0, vec![1]);
         d[2].insert(1, vec![1]);
-        let fa = Fa {
-            q0: 0,
-            q: 3,
-            alphabet_size: 2,
-            o: vec![5, 3, 7],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 3, 2, vec![5, 3, 7], d);
         // Unbound (empty) label -- matches real `walnut-java`'s freshly-loaded
         // `new Automaton(address)` shape (`getLabel()` empty -> `to_tuple` prints
         // "()"), same convention the multi-track `.gv` test above uses via
@@ -795,14 +781,7 @@ mod tests {
         let mut d = vec![BTreeMap::new(); 5];
         d[0].insert(0, vec![2]);
         d[0].insert(1, vec![1, 2, 3, 4]);
-        let fa = Fa {
-            q0: 0,
-            q: 5,
-            alphabet_size: 3,
-            o: vec![0, 1, 1, 0, 1],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 5, 3, vec![0, 1, 1, 0, 1], d);
         let mut buf = Vec::new();
         export_to_ba(&fa, &mut buf, false).unwrap();
         assert_eq!(buf, fixture_bytes("writer_order.ba"));
@@ -817,14 +796,7 @@ mod tests {
         d[0].insert(0, vec![1]);
         d[2].insert(1, vec![3]);
         d[3].insert(0, vec![0]);
-        let fa = Fa {
-            q0: 0,
-            q: 4,
-            alphabet_size: 2,
-            o: vec![0, 0, 0, 0],
-            d,
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 4, 2, vec![0, 0, 0, 0], d);
         let mut buf = Vec::new();
         export_to_ba(&fa, &mut buf, false).unwrap();
         assert_eq!(buf, fixture_bytes("writer_order2.ba"));
@@ -832,14 +804,7 @@ mod tests {
 
     #[test]
     fn ba_rejects_dfao_matching_walnut_exception() {
-        let fa = Fa {
-            q0: 0,
-            q: 1,
-            alphabet_size: 1,
-            o: vec![1],
-            d: vec![BTreeMap::new()],
-            true_false: None,
-        };
+        let fa = Fa::with_states(0, 1, 1, vec![1], vec![BTreeMap::new()]);
         let mut buf = Vec::new();
         let err = export_to_ba(&fa, &mut buf, true).unwrap_err();
         assert!(matches!(err, BaWriteError::DfaoNotSupported));
