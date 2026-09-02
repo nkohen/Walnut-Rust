@@ -221,7 +221,11 @@ pub fn subset_construction_par_with_threshold(
     threads: usize,
     min_states: usize,
 ) -> Fa {
-    if threads <= 1 || fa.q < min_states || fa.alphabet_size == 0 {
+    if threads <= 1
+        || fa.q < min_states
+        || fa.alphabet_size == 0
+        || !is_safe_to_parallelize(fa, initial)
+    {
         let t = std::time::Instant::now();
         let out = subset_construction(fa, initial);
         stats::record_delegated(t.elapsed());
@@ -238,6 +242,38 @@ pub fn subset_construction_par_with_threshold(
     result.canonicalize();
     stats::record_parallel(compute, t.elapsed());
     result
+}
+
+/// Whether `fa` is well-formed enough that no worker can panic — and therefore whether the
+/// parallel path may be entered at all.
+///
+/// **This is a liveness guard, not a defensive style choice.** `build_racy`'s workers
+/// synchronize on a [`Barrier`] sized to the worker count, so a worker that panics never
+/// arrives at its next `wait()` and every other worker blocks there forever: an input that
+/// makes the SEQUENTIAL implementation panic cleanly would make the parallel one **hang**.
+/// CLAUDE.md's superexponential-cost guardrail is explicit that every path must yield a
+/// diagnosable verdict and never hang, so the malformed shapes are detected up front and
+/// routed to the sequential implementation, which panics at exactly the site and with
+/// exactly the message its existing tests pin (`subset_construction_panics_on_a_
+/// destination_id_out_of_range_of_fa_q`,
+/// `subset_construction_with_zero_alphabet_size_and_an_out_of_bounds_initial_member_panics`).
+///
+/// The two panic sources inside [`process_metastate`] are `fa.d[q]` and `fa.is_accepting(q)`,
+/// so the bound is `min(d.len(), o.len())` and the ids that must respect it are the seed
+/// members plus every destination in every row.
+///
+/// Deliberately CONSERVATIVE: it scans every row, including ones no metastate ever reaches,
+/// so it can route to the sequential implementation for an automaton the parallel path would
+/// in fact have survived. That costs performance on a malformed input, never correctness —
+/// and a well-formed `Fa`, which is every automaton this engine actually builds, always
+/// passes.
+fn is_safe_to_parallelize(fa: &Fa, initial: &BTreeSet<usize>) -> bool {
+    let bound = fa.d.len().min(fa.o.len());
+    if initial.iter().any(|&s| s >= bound) {
+        return false;
+    }
+    fa.d.iter()
+        .all(|row| row.values().all(|dests| dests.iter().all(|&x| x < bound)))
 }
 
 /// Phase A on its own: the racy parallel computation, returning an `Fa` whose state
@@ -387,7 +423,6 @@ fn process_metastate(
     (out, row)
 }
 
-
 // ---------------------------------------------------------------------------
 // Instrumentation: the parallel compute win vs the post-hoc reconstruction cost.
 // ---------------------------------------------------------------------------
@@ -514,7 +549,11 @@ pub fn dispatch_subset_construction(fa: &Fa, initial: &BTreeSet<usize>) -> Fa {
 /// [`subset_construction_par`] without the post-hoc canonicalization — the racy numbering
 /// escapes. Isomorphic to the sequential result, but **not** equal to it.
 pub fn subset_construction_par_raw(fa: &Fa, initial: &BTreeSet<usize>, threads: usize) -> Fa {
-    if threads <= 1 || fa.q < min_states() || fa.alphabet_size == 0 {
+    if threads <= 1
+        || fa.q < min_states()
+        || fa.alphabet_size == 0
+        || !is_safe_to_parallelize(fa, initial)
+    {
         let t = std::time::Instant::now();
         let out = subset_construction(fa, initial);
         stats::record_delegated(t.elapsed());
@@ -796,6 +835,71 @@ mod tests {
             differed > 0,
             "all 20 raw parallel runs happened to reproduce the sequential numbering exactly, \
              so this module's recovery tests prove nothing -- investigate before trusting them"
+        );
+    }
+
+    /// A malformed automaton — one with a destination id outside `0..q` — must PANIC (as
+    /// the sequential implementation does), not hang.
+    ///
+    /// The test is written with an explicit spawned-thread + `recv_timeout` watchdog rather
+    /// than a bare `should_panic`, because the failure mode being guarded against is a
+    /// DEADLOCK: without [`is_safe_to_parallelize`], the panicking worker never reaches its
+    /// next `Barrier::wait()` and the others block there forever, so a `should_panic` test
+    /// would hang the whole `cargo test` run instead of failing. Mutation-checking this
+    /// (deleting the guard) reproduces exactly that, which is why the watchdog is here.
+    #[test]
+    fn a_malformed_automaton_panics_rather_than_deadlocking_the_workers() {
+        let q = MIN_STATES_FOR_PARALLEL + 40;
+        let mut d: Vec<BTreeMap<i32, Vec<usize>>> = vec![BTreeMap::new(); q];
+        for (i, row) in d.iter_mut().enumerate() {
+            row.insert(0, vec![(i + 1) % q]);
+        }
+        // The poison: a destination id past the end of the state set.
+        d[0].insert(1, vec![q + 7]);
+        let fa = Fa::with_states(0, q, 2, vec![0; q], d);
+        let initial: BTreeSet<usize> = [0usize].into_iter().collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                subset_construction_par(&fa, &initial, default_threads().max(2))
+            }));
+            let _ = tx.send(outcome.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "a destination id outside 0..q must panic, as the sequential implementation does"
+            ),
+            Err(_) => panic!(
+                "subset_construction_par neither returned nor panicked within 30s on a \
+                 malformed automaton -- the workers are deadlocked on the barrier, which is \
+                 exactly what is_safe_to_parallelize exists to prevent"
+            ),
+        }
+    }
+
+    /// The guard must not fire on well-formed input, or it would silently disable the whole
+    /// parallel path (and every other test here would still pass, vacuously).
+    #[test]
+    fn the_liveness_guard_admits_well_formed_automata() {
+        let mut rng = Rng(0x11FF_2200_3344_5566);
+        let (fa, initial) = random_nfa(&mut rng, 200, 3, 2);
+        assert!(
+            is_safe_to_parallelize(&fa, &initial),
+            "a well-formed generated automaton must be admitted to the parallel path"
+        );
+        let mut poisoned = fa.clone();
+        poisoned.d[3].insert(0, vec![fa.q]);
+        assert!(
+            !is_safe_to_parallelize(&poisoned, &initial),
+            "an out-of-range destination must be rejected"
+        );
+        let bad_seed: BTreeSet<usize> = [fa.q + 1].into_iter().collect();
+        assert!(
+            !is_safe_to_parallelize(&fa, &bad_seed),
+            "an out-of-range seed member must be rejected"
         );
     }
 
