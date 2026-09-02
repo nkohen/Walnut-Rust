@@ -1,0 +1,64 @@
+# perf/beyond campaign baseline — STATUS: NOT YET VALID (attempt 1 discarded)
+#
+# 2026-09-02, attempt 1: three full 'cargo run -p wr-bench --release --bin compare' runs
+# at cc64579 (branch point), sibling walnut-java at 14509f1 (bugfix/wb-001), same jar as
+# the refactor-U0 baseline. All 33 answer checks green; all 9 automaton-valued workloads
+# match the recorded corpus automata. BUT the numbers are NOT usable as the campaign
+# baseline and no medians-of-medians are blessed here, because the machine was measurably
+# unfit during the runs:
+#   - two unrelated python3 processes at ~99% CPU each (load averages 10.42 / 17.22 / 16.43)
+#   - on battery power, 16% and discharging (Apple Silicon throttles on battery)
+# Observed effect: fixture 230's Java median spans 3.86s..14.85s across the three runs;
+# Rust's own 230 median spans 0.70s..2.07s on identical code; run 2's fixture 286 mean is
+# 2.3x its median. Per the dispatch's honest-measurement rule, this file records the raw
+# tables as evidence and blesses nothing. Re-run on a quiet, plugged-in machine and replace
+# this header with the real medians-of-medians before any unit's A/B claims anything.
+#
+# One real finding: the port's details trace now equals Java's peak on all 11 fixtures
+# (U28's Logging threading) — benches/README.md's 'lower bound' caveat is stale.
+
+## attempt-1 run 1 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50     2.796 ms     2.030 ms     5.602 ms     4.333 ms     2.00x            6           6
+207      50     1.982 ms     1.798 ms     4.307 ms     3.317 ms     2.17x            3           3
+293      20    57.613 ms    48.198 ms   294.606 ms   264.415 ms     5.11x        12334       12334
+521      20    28.856 ms    24.866 ms   309.751 ms   289.335 ms    10.73x            3           3
+179      20   152.863 ms   151.544 ms   560.917 ms   529.024 ms     3.67x        33000       33000
+266      20    52.213 ms    46.428 ms   181.033 ms   161.118 ms     3.47x         7657        7657
+230       5   886.463 ms   923.478 ms     14.628 s     14.845 s    16.50x       115802      115802
+295      20   229.361 ms   167.956 ms      1.218 s   732.515 ms     5.31x        11589       11589
+261      20   142.783 ms   140.065 ms   741.059 ms   648.246 ms     5.19x        18674       18674
+286      20   230.515 ms   212.894 ms   614.277 ms   584.760 ms     2.66x        34988       34988
+637      20    28.915 ms    27.474 ms    99.336 ms    93.768 ms     3.44x         4965        4965
+
+## attempt-1 run 2 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50     1.358 ms     1.247 ms     3.676 ms     3.013 ms     2.71x            6           6
+207      50   756.525 µs   752.208 µs     1.326 ms     1.275 ms     1.75x            3           3
+293      20    59.907 ms    52.852 ms   190.545 ms   176.298 ms     3.18x        12334       12334
+521      20    36.985 ms    35.255 ms   127.533 ms   106.512 ms     3.45x            3           3
+179      20   139.828 ms   126.227 ms   562.885 ms   509.625 ms     4.03x        33000       33000
+266      20    46.766 ms    40.238 ms   123.186 ms   104.645 ms     2.63x         7657        7657
+230       5   694.607 ms   698.018 ms      3.988 s      3.863 s     5.74x       115802      115802
+295      20   108.160 ms    75.059 ms   270.538 ms   257.371 ms     2.50x        11589       11589
+261      20   429.914 ms   328.390 ms   661.663 ms   575.193 ms     1.54x        18674       18674
+286      20   676.298 ms   299.377 ms   677.748 ms   683.840 ms     1.00x        34988       34988
+637      20    26.443 ms    25.822 ms    96.622 ms    93.025 ms     3.65x         4965        4965
+
+## attempt-1 run 3 (raw summary table)
+fix   iters    rust mean  rust median    java mean  java median   speedup  peak states  rust trace
+---------------------------------------------------------------------------------------------------------
+1        50   501.290 µs   403.646 µs   956.162 µs   733.437 µs     1.91x            6           6
+207      50   354.640 µs   325.854 µs   484.243 µs   472.729 µs     1.37x            3           3
+293      20    33.690 ms    33.417 ms   117.147 ms   110.863 ms     3.48x        12334       12334
+521      20    22.279 ms    21.327 ms    66.610 ms    66.761 ms     2.99x            3           3
+179      20   149.898 ms   145.782 ms      1.204 s      1.088 s     8.03x        33000       33000
+266      20   120.742 ms   111.055 ms   480.538 ms   478.730 ms     3.98x         7657        7657
+230       5      2.149 s      2.070 s      5.744 s      5.440 s     2.67x       115802      115802
+295      20   172.071 ms   171.380 ms   579.240 ms   598.323 ms     3.37x        11589       11589
+261      20   197.263 ms   173.320 ms   687.743 ms   651.269 ms     3.49x        18674       18674
+286      20   220.307 ms   216.300 ms   652.845 ms   658.649 ms     2.96x        34988       34988
+637      20    43.309 ms    41.657 ms    81.793 ms    73.866 ms     1.89x         4965        4965
+
