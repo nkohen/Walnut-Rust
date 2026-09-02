@@ -204,3 +204,34 @@ fix   iters    rust mean  rust median    java mean  java median   speedup  peak 
 286      20   264.126 ms   252.307 ms      1.685 s      1.537 s     6.38x        34988       34988
 637      20    40.774 ms    37.570 ms   155.823 ms   146.298 ms     3.82x         4965        4965
 
+
+############################################################################
+# FRESH PROFILE (2026-09-02, same session as the blessed baseline)
+############################################################################
+# sample(1), 15 s of the Rust timing phase per fixture (WR_BENCH_ONLY, iters sized so the
+# whole sample lands inside the Rust loop), top-of-stack summary, blocked JVM-pipe-reader
+# `read` discarded. ~12,000-12,500 real-work samples per fixture. Attribution of the two big
+# generic frames verified against the call TREE, not assumed: the `quicksort<usize>` frames
+# and the SipHash/`DefaultHasher` frames are both children of `subset_construction` (its
+# scratch-vec sort_unstable and its HashMap<Vec<usize>, usize> metastate probe).
+#
+#   bucket                          fix286   fix230   fix179   fix261
+#   sc: body                         52.3%    47.1%    56.5%    59.7%
+#   sc: scratch sort (usize)          4.8%    34.0%    24.3%     4.8%
+#   sc: metastate HashMap/SipHash     2.4%     8.3%     3.9%     2.3%
+#   SUBSET_CONSTRUCTION TOTAL        59.5%    89.4%    84.7%    66.9%
+#   minimize (Valmari)               20.7%     2.7%     5.9%    12.2%
+#   allocator+memops                  8.8%     5.6%     5.2%     9.0%
+#   io/format (result-file writes)    3.8%     0.1%     0.7%     4.0%
+#   Fa.d BTreeMap insert/drop/clone   2.4%     0.6%     1.0%     2.8%
+#   fa.rs canonicalize/perm/is_det    2.2%     0.6%     0.4%     2.3%
+#   other engine code                 2.5%     1.1%     2.1%     2.8%
+#
+# Consequences for the dispatch's ranked levers:
+#   - Lever 1 (Fa.d -> TransitionRow migration): NOT justified — Fa.d-rooted BTreeMap frames
+#     are 0.6-2.8% of real work on every profiled fixture (U34's 4.7% checkpoint verdict,
+#     reconfirmed on four fixtures). Stays shelved.
+#   - Lever 2 (subset-construction internals) is THE target: 59-89% of real work.
+#   - Lever 3 (Valmari Partition locality) is second: 12-21% on 286/261, minor on 230/179.
+#   - Lever 4 (allocation reuse): allocator bucket is 5-9% post-mimalloc — modest ceiling.
+# Raw sample files: session scratchpad profiles/sample_{286,230,179,261}.txt (not committed).
