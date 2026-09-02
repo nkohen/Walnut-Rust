@@ -1,4 +1,12 @@
-# RESUME-HERE — Idiomatic-Rust refactor (Phase R) in progress on `refactor/idiomatic`
+# RESUME-HERE — Idiomatic-Rust refactor COMPLETE on `refactor/idiomatic` (Phases 0–3; Phase 4 declined at the boundary)
+
+**2026-09-02: the user chose "Stop here" at the Phase 3→4 boundary.** All 11 units (U0–U11) are
+landed; the optional `Fa.d` → `TransitionRow` migration (Phase R4 / U12a–d) was declined — no
+performance case (U34's pre-registered stop + the port faster than Java everywhere), code-quality
+argument judged not worth the risk/cost. The triple-reviewed design remains on the shelf at
+`~/.claude/plans/glossy-compacting-lantern.md`. **The branch is NOT pushed** (standing rule:
+nothing pushed without the user's explicit go-ahead) and is source-breaking for the `ct-research`
+submodule embedder (pointer bump is the user's deliberate act).
 
 **Reconciled 2026-08-29.** This file's previous contents were the 2026-08-17 "Phase 4 COMPLETE"
 checkpoint, which predated everything that landed after U34: U28 (Logging threading), the four
@@ -38,7 +46,7 @@ resolved as a negative-hypothesis finding with new coverage; U34's Phase 2 is no
 | U9 | Automaton Track struct (label stays separate; encoder decided) | **done** — 3 commits (A `632cf76` type+accessors, B `01a8ace` ~700-site migration, C the storage flip). Opus+Fable on the full 4,250-line unit: no correctness-fatal; ONE blocking correctness-risk (Automaton::new's zip silently truncated on contract-violating input where HEAD panicked — closed with a constructor assert, golden re-verified). Opus PROVED sort_label/reduce_dimension consolidations equivalent by exhaustive probe (110,592 + 3,672 cases vs independent oracles); encoder rebuild audited at every mutation point. equiv.rs: one compile-forced mechanical hunk, signed off. 2 WB-013 comment deletions signed off (scenario unrepresentable; WB-013 still referenced in-function). Full ladder green; doc warnings multiset-identical to baseline. |
 | U10 | Fa named constructors | **done** — `Fa::with_states` (+ pre-existing `Fa::trivial`), ~247 sites converted, net −1,395 lines; 4 literals kept (2 quirk-shape tests + constructor bodies); a self-introduced infinite-recursion script bug self-caught via profiling before review; equiv.rs/wr-cts conversions reverted by coordinator direction (discretionary changes in frozen modules — the freeze stays bright-line). Opus review: no correctness defect — ALL 247 conversions machine-verified positionally vs HEAD (balanced-delimiter parser, 0 mismatches); the debug_assert pair proven a real q0/q-transposition tripwire; 3 style fixes applied. T0 green; T1 exactly 670/675. |
 | U11 | wr-io reader/writer idioms (write_gv/export_to_ba frozen) | **done** — only 4 conversions (the files were already near-idiomatic); writer.rs zero-diff (entire non-trivial surface frozen). Opus+Fable both "no defect" (Opus brute-forced 4,681 read_comments cases + probed format outputs vs the removed code as oracle; Fable proved zip-truncation impossible via the arity guard's dominance). 2 findings applied (doc reword; a first-error-wins pin test). Full ladder green incl. 54k-exec fuzz smoke. **Phase 3 complete.** |
-| R4 (U12a–d) | OPTIONAL Fa.d → TransitionRow — **user go/no-go at Phase 3→4 boundary** | not decided |
+| R4 (U12a–d) | OPTIONAL Fa.d → TransitionRow | **declined by the user at the boundary (2026-09-02)** — design stays on the shelf |
 
 ### U0 baseline (2026-08-29)
 

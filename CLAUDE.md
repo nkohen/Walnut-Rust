@@ -1280,3 +1280,36 @@ trusting the implementer's report. Golden corpus and `cargo test --workspace` st
 **Nothing has been pushed to any remote and no real PR has been opened anywhere** — this
 whole effort is local, stacked branches on both `walnut-java` and `walnut-rs`, awaiting the
 user's explicit go-ahead per this project's standing risky-action confirmation rule.
+
+**The idiomatic-Rust refactor (`refactor/idiomatic`, 2026-08-29 → 2026-09-02) is COMPLETE —
+Phases 0–3 of the plan at `~/.claude/plans/robust-seeking-flamingo.md` (v2; itself
+adversarially plan-reviewed by independent Sonnet + Opus agents before approval, which caught
+a correctness-fatal design premise — U9's same-length "invariant" is false for `label` — and
+an unprotected-oracle hole before any code ran).** This is CLAUDE.md's own long-scheduled
+"idiomatic Rust later, in separate commits", built on `bugfix/wb-001` @ `8fc95eb` (top of the
+18-PR stack). Eighteen commits, eleven units, every one through the
+Sonnet-implements → verify → adversarial-review (Opus + Fable split-context pairs on all
+trust-critical diffs; Sonnet/Opus single reviews on the light tier) → fix loop, coordinated
+by a Fable dispatcher that wrote no refactor code itself. Highlights: wr-cli error
+boilerplate behind `simple_error_froms!` gated by a 412-assertion four-channel snapshot
+landed first; boolean flags → domain-explicit enums across wr-cli (U3) and wr-core (U5 — six
+enums, ~60 sites, every msd/lsd polarity independently verified against the Java originals);
+curated loop→iterator and clone-removal passes (U6/U7, both S-gated by structural snapshots
+landed against unchanged code); `Automaton`'s four parallel track vectors → `tracks:
+Vec<Track>` (U9, three staged commits, `label` kept separate as the unbound encoding,
+`encoder` a rebuilt cache, the frozen `equiv.rs` touched by exactly one compile-forced
+mechanical hunk); `Fa::with_states` replacing ~247 struct literals (U10, net −1,395 lines,
+all conversions machine-verified positionally); wr-io idioms with `write_gv`/`export_to_ba`
+emission frozen (U11). **Review caught three blocking correctness-risks that every test tier
+had passed** — two bound-drop conversions in U6 and one silent constructor truncation in U9,
+all the same panic-to-silent class, all closed and re-verified — plus dozens of test-strength
+and doc-accuracy findings. Verification held throughout: golden corpus exactly 670/675
+(fixture 383 the sole, pre-existing divergence) at every commit, differential-gen soaks
+clean, fuzz targets clean, and the U0-baselined bench NO-REGRESSION gate actually improved
+(all 11 fixtures faster post-U7). **Phase 4 — U34's deferred `Fa.d` → `TransitionRow`
+migration — was explicitly DECLINED by the user at the Phase 3→4 boundary (2026-09-02)**: no
+performance case exists and the code-quality argument wasn't worth the risk; the
+triple-reviewed design stays resumable at `~/.claude/plans/glossy-compacting-lantern.md`.
+The branch is local-only (nothing pushed, per the standing rule) and source-breaking for
+`ct-research`'s submodule (pointer bump = the user's deliberate act). Execution ledger:
+`RESUME-HERE.md`.
