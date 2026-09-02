@@ -226,6 +226,180 @@ pub fn workloads() -> Result<Vec<Workload>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Opt-in, heavier, research-shaped workloads (`WR_BENCH_HEAVY=1`)
+// ---------------------------------------------------------------------------
+
+/// One opt-in heavy row: `(label, command, why, approx_secs)`, the same shape as [`SC_VARIANT`]
+/// (a NON-fixture command, not looked up in the manifest) but as a table since there is more
+/// than one.
+///
+/// **Why not real corpus fixtures.** The obvious first attempt — wrap the prelude's own
+/// `rudin_rich`/`rudin_priv`/`period_doubling_rich` `def`s in an extra quantifier the way
+/// fixtures 254/264/268/298/302/325/326 already do — was tried and measured, not assumed: every
+/// one of them is sub-2ms on both engines (`peak states` in the low hundreds at most). That is
+/// not a mistake in this table, it is a real property of the corpus: Walnut's own integration
+/// suite is built to finish all 675 fixtures inside its own 1800s budget
+/// (`benches/README.md`'s "note on the corpus's size distribution"), so no fixture reaches the
+/// heavy end research work actually lives at — the two outliers that DO (230, 286) are already
+/// in [`WORKLOADS`]. These rows instead compose the same prelude `def`s and word automata into
+/// NEW, deeper eval strings, exactly as [`SC_VARIANT`] composes fixture 637's own formula into a
+/// new one — not new shapes invented from nothing.
+///
+/// **How these three were chosen.** Every candidate below was actually run on both engines
+/// before being kept (`benches/README.md`'s `WR_BENCH_HEAVY` section has the full calibration
+/// log). Several natural-looking candidates were tried and rejected during calibration — an
+/// informal give-up-and-try-something-smaller rule around ~60 s of Rust-side dispatch, not a
+/// mechanism this crate enforces at run time — for running well past that with no sign of
+/// terminating (fixture 230's own T-based shape combined with RS's conditions in the same
+/// alternation; RS at the same depth as T with fixture 230's original coefficient-3 offset; RS
+/// under the same 3-level alternation `alt3` uses) — RS in particular turned out to be far
+/// costlier per unit of alternation/arithmetic depth than T, not just proportionally heavier, so
+/// "swap T for RS" is not a safe scaling knob on its own. What is kept is what measured inside
+/// budget:
+///
+/// Every command below is reachable from [`golden::PRELUDE`] alone, uses no custom base (the
+/// cross-engine answer check parses the JVM's serialized automaton), and is checked by the same
+/// `wr_core::equiv` semantic-equivalence comparison as every other row before its timing is
+/// believed.
+pub const HEAVY_WORKLOADS: [(&str, &str, &str, f64); 3] = [
+    (
+        "alt3",
+        "eval benchalt3 \"Ei At (((0<t) & (t<n)) => (Ej (j<t) & (T[i+j]=T[i+j+n]) & (T[i+t]=T[i+t+n]) & (T[i+t]=T[i+3*n-1-t])))\";",
+        "genuine E-A-E quantifier alternation depth 3 over Thue-Morse (fixture 230 is E-A, \
+         depth 2): an inner `Ej` witness search nested inside the universal `At` branch. The \
+         `Ej` elimination itself runs exactly once, in the postfix evaluation of that one \
+         subformula; its determinized result then compounds through two more \
+         determinizations on the way out — the `At`'s `¬∃¬` complementation, then the outer \
+         `Ei`'s own projection — which is what the peak-state count reflects, not repeated \
+         re-elimination. The `(0<t)` conjunct excludes the one value of `t` (t=0) at which the \
+         inner `Ej (j<t)` has an empty domain and the whole formula degenerates to the trivial \
+         language `{n=0}` — see `benches/README.md`'s `WR_BENCH_HEAVY` section for the \
+         derivation and the jar verification. Measured 2026-09-02 \
+         (`WR_BENCH_HEAVY=1 WR_BENCH_ITERS=3 WR_BENCH_WARMUP=2`): 7.5 s (JVM) / 1.8 s (Rust), \
+         326,396 peak states",
+        7.5,
+    ),
+    (
+        "rsp1",
+        "eval benchrsp1 \"Ei At ((t<n) => ((RS[i+t]=RS[i+t+n]) & (RS[i+t]=RS[i+n-1-t])))\";",
+        "fixture 230's exact E-A shape with Rudin-Shapiro instead of Thue-Morse and a \
+         palindromic (coefficient-1) second condition — RS alone at this depth is already far \
+         heavier than T's coefficient-3 version (230 itself). Measured 2026-09-02 \
+         (`WR_BENCH_HEAVY=1 WR_BENCH_ITERS=3 WR_BENCH_WARMUP=2`): 13 s (JVM) / 3.8 s (Rust), \
+         524,748 peak states",
+        13.0,
+    ),
+    (
+        "rsp2",
+        "eval benchrsp2 \"Ei At ((t<n) => ((RS[i+t]=RS[i+t+n]) & (RS[i+t]=RS[i+2*n-1-t])))\";",
+        "the same shape as `rsp1` with the second condition's coefficient raised from 1 to 2 \
+         — kept alongside it to show the arithmetic-coefficient axis alone drives real cost \
+         growth over RS, and as the set's heaviest, widest-spread-from-230 row. Measured \
+         2026-09-02 (`WR_BENCH_HEAVY=1 WR_BENCH_ITERS=3 WR_BENCH_WARMUP=2`): 20 s (JVM) / \
+         5.8 s (Rust), 649,748 peak states",
+        20.0,
+    ),
+];
+
+/// Synthetic ids for [`HEAVY_WORKLOADS`]'s rows: `HEAVY_ID_BASE + i` for the i-th entry.
+///
+/// Far below [`SC_VARIANT`]'s `usize::MAX` sentinel (so the two opt-in mechanisms can never
+/// collide) and far above any real fixture id (675 fixtures total, so anything past a few
+/// thousand is unambiguously synthetic) — chosen for readability over `usize::MAX - i`, not for
+/// any behavioral reason.
+pub const HEAVY_ID_BASE: usize = 1_000_000;
+
+/// Builds the opt-in heavy rows as [`Workload`]s. Not manifest-backed (there is no
+/// `test-manifest.json` row for a NEW query), so unlike [`workloads`] this cannot fail — the
+/// only way one of these could be wrong is a typo in [`HEAVY_WORKLOADS`] itself, which
+/// `src/bin/compare.rs`'s non-fixture-row guard (see [`is_non_fixture_row`]) catches before any
+/// timing happens: a typo'd formula that comes back as [`Answer::Error`] (or [`Answer::None`])
+/// on the Rust side aborts the run there, loudly. It is NOT caught by the two-engine answer
+/// check alone (`same_answer`) — that check deliberately accepts identical `Error == Error` (a
+/// real corpus fixture can legitimately be an error case), so a typo whose error text happens
+/// to match on both engines would otherwise be timed as if it were a legitimate result.
+pub fn heavy_workloads() -> Vec<Workload> {
+    HEAVY_WORKLOADS
+        .iter()
+        .enumerate()
+        .map(|(i, (_, command, why, approx_secs))| Workload {
+            id: HEAVY_ID_BASE + i,
+            command: (*command).to_string(),
+            why,
+            approx_secs: *approx_secs,
+        })
+        .collect()
+}
+
+/// The report label for a heavy row's synthetic id (`None` for a real fixture id or
+/// [`SC_VARIANT`]'s `usize::MAX`) — [`label`] uses this the same way it special-cases `sc637`.
+pub fn heavy_label(id: usize) -> Option<&'static str> {
+    if id < HEAVY_ID_BASE {
+        return None;
+    }
+    HEAVY_WORKLOADS
+        .get(id - HEAVY_ID_BASE)
+        .map(|(label, ..)| *label)
+}
+
+/// A workload's name in the report: its fixture id, `sc637` for the opt-in strategy-variant row
+/// ([`SC_VARIANT`]'s `usize::MAX` sentinel), or the matching `WR_BENCH_HEAVY` row's own label.
+///
+/// Lifted out of `src/bin/compare.rs` (where it originated) so it can be unit-tested here
+/// alongside [`is_non_fixture_row`], which must classify ids the same way.
+pub fn label(id: usize) -> String {
+    if id == usize::MAX {
+        "sc637".to_string()
+    } else if let Some(name) = heavy_label(id) {
+        name.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+/// Whether `id` names a row that is **not** a real corpus fixture — a [`SC_VARIANT`] or
+/// `WR_BENCH_HEAVY` row, built from a hand-written `eval` string rather than looked up in
+/// `test-manifest.json`.
+///
+/// This is the load-bearing classification behind the answer-kind guard `src/bin/compare.rs`
+/// runs before timing any row: a real fixture legitimately CAN answer `Answer::Error` (some
+/// fixtures are error cases) or, per Java's own dispatch contract, `Answer::None`, so
+/// `same_answer` rightly allows `Error == Error`/`None == None` there. A non-fixture row has no
+/// such legitimate case — there is no manifest entry describing what it is *supposed* to
+/// answer, so an `Error`/`None` here can only mean a typo in the hand-written command string,
+/// and must abort the run rather than being silently timed as if it were a real result.
+pub fn is_non_fixture_row(id: usize) -> bool {
+    id == usize::MAX || heavy_label(id).is_some()
+}
+
+/// Rejects a command that declares a non-numeric-base numeration system prefix (`?msd_fib`,
+/// `?lsd_pell`, …) — i.e. a custom base. Only checks `?msd_`/`?lsd_` occurrences; a bare `msd`/
+/// `lsd` with no leading `?` is not a numeration-system declaration in Walnut's grammar.
+///
+/// This is the real property behind [`HEAVY_WORKLOADS`]'s "no custom base" rule (see its own
+/// docs): the cross-engine answer check parses the JVM's serialized automaton, and a custom
+/// base drags in a base-resolution surface unrelated to speed. An earlier draft of this check
+/// was a `contains("fib")` heuristic, which only ever caught one specific base family by name;
+/// this instead inspects every `?msd_`/`?lsd_` occurrence's base part directly.
+pub fn command_declares_only_numeric_bases(command: &str) -> bool {
+    for prefix in ["?msd_", "?lsd_"] {
+        let mut rest = command;
+        while let Some(pos) = rest.find(prefix) {
+            let after = &rest[pos + prefix.len()..];
+            let base_part: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if base_part.is_empty() || !base_part.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            rest = &after[base_part.len()..];
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Peak state count
 // ---------------------------------------------------------------------------
 
@@ -244,22 +418,18 @@ pub fn workloads() -> Result<Vec<Workload>, String> {
 /// `IntegrationTest.assertEqualMessages` strips those lines before comparing details for the
 /// same reason.
 ///
-/// # The port's number is a LOWER BOUND, and the report says so
+/// # The two traces cover the same steps since U28
 ///
-/// The two traces are not equally complete, and pretending otherwise would be the dishonest
-/// version of this measurement. Java's `details` covers the whole computation, including every
-/// `wr-core`-level step (`computing cross product:N states`, `Determinizing […]: N states`,
-/// `Minimized:N states`). The port's covers only the `wr-logic`-level steps: threading
-/// `&mut Logging` through `wr-core`'s product/determinize/minimize/quantify is the *known,
-/// pre-existing* gap behind seven of the golden corpus's nine remaining divergences
-/// (`tests/golden/STATUS.md`, the "U28" follow-up), and closing it is a production change that
-/// U32 deliberately does not make.
-///
-/// So: Java's peak is the authoritative one; the port's is the largest automaton its partial
-/// trace happens to name, i.e. a lower bound. `src/bin/compare.rs` labels the two columns
-/// accordingly rather than reporting a "difference" that is really a logging gap. Both engines
-/// are separately proven to compute the *same language* on every workload, so the authoritative
-/// peak characterises both computations up to that verified-identical answer.
+/// When U32 built this harness, the port's trace covered only the `wr-logic`-level steps and
+/// its peak was honestly labeled a lower bound. U28 (2026-08-17/19) threaded `&mut Logging`
+/// through `wr-core`'s product/determinize/minimize/quantify, so the port's `details` now
+/// names the same construction steps Java's does (`computing cross product:N states`,
+/// `Determinizing […]: N states`, `Minimized:N states`). Empirically the two columns agree on
+/// every benchmarked workload (2026-09-02 campaign-baseline runs, all 11 fixtures). The report
+/// keeps both columns because their agreement is a free per-run cross-check that both engines
+/// walked comparably-sized intermediates — a disagreement is a finding, not a labeling matter.
+/// Both engines are separately proven to compute the *same language* on every workload before
+/// any of this is read.
 pub fn peak_states(details: &str) -> Option<u64> {
     let mut peak: Option<u64> = None;
     for line in details.lines() {
@@ -986,6 +1156,138 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "a fixture id is listed twice in WORKLOADS");
+    }
+
+    /// The heavy table's labels must be distinct (the report keys on them) and fit the summary
+    /// table's `{:<5}` column (`src/bin/compare.rs`'s `render` formats labels `{:<5}`; a label
+    /// over 5 chars shifts every column after it -- widening the column instead would change
+    /// the default report format the blessed baseline uses, so the length limit is enforced
+    /// here as a table invariant rather than there), its synthetic ids
+    /// must never land in the real fixture id space or collide with `SC_VARIANT`'s `usize::MAX`,
+    /// and none of its commands may declare a custom-base numeration system (the cross-engine
+    /// answer check parses the JVM's serialized automaton, which a custom base's own resolution
+    /// surface would drag in for no reason connected to speed).
+    ///
+    /// Pins the table's exact shape (three rows, these three labels) rather than just its
+    /// length: this table is small and hand-curated (see its own module docs on how each row
+    /// was chosen and measured), so a silent addition/removal/rename should fail loudly, not
+    /// just "still well-formed."
+    #[test]
+    fn the_heavy_workload_table_is_well_formed() {
+        assert_eq!(HEAVY_WORKLOADS.len(), 3, "HEAVY_WORKLOADS grew or shrank");
+        let labels: Vec<&str> = HEAVY_WORKLOADS.iter().map(|(label, ..)| *label).collect();
+        assert_eq!(
+            labels,
+            vec!["alt3", "rsp1", "rsp2"],
+            "HEAVY_WORKLOADS' labels changed -- update this pin deliberately, along with README"
+        );
+        for label in &labels {
+            assert!(
+                label.len() <= 5,
+                "label {label:?} is longer than 5 chars and will shift the summary table's \
+                 `{{:<5}}` column"
+            );
+        }
+
+        for w in &heavy_workloads() {
+            assert!(
+                w.id >= HEAVY_ID_BASE,
+                "heavy id {} is below HEAVY_ID_BASE",
+                w.id
+            );
+            assert!(
+                w.id < usize::MAX,
+                "heavy id {} collides with SC_VARIANT's sentinel",
+                w.id
+            );
+            assert!(
+                w.command.contains("eval") || w.command.contains("def"),
+                "heavy row is not an eval/def workload: {}",
+                w.command
+            );
+            assert!(
+                command_declares_only_numeric_bases(&w.command),
+                "heavy row declares a custom-base numeration system, which the cross-engine \
+                 answer check cannot compare: {}",
+                w.command
+            );
+            assert!(
+                w.approx_secs > 0.0,
+                "heavy row has a non-positive approx_secs"
+            );
+        }
+        for (id, (label, ..)) in heavy_workloads().iter().zip(HEAVY_WORKLOADS.iter()) {
+            assert_eq!(heavy_label(id.id), Some(*label));
+        }
+        assert_eq!(
+            heavy_label(usize::MAX),
+            None,
+            "sc637's own sentinel must not resolve here"
+        );
+        assert_eq!(
+            heavy_label(637),
+            None,
+            "a real fixture id must not resolve here"
+        );
+
+        // Item 6 of this table's own review (see benches/README.md's `WR_BENCH_HEAVY` section):
+        // a fast-tier PARSE sanity check on these three command strings, if reachable cheaply,
+        // was considered and rejected. `wr_logic::predicate::Predicate`'s tokenizer takes a
+        // `&dyn PredicateEnv` (see `crates/wr-logic/src/predicate_env.rs`), and these commands
+        // reference library word automata (`T`, `RS`) that only resolve through a real
+        // `Session`-backed environment reading `Word Automata/*.txt` -- there is no
+        // Session-free tokenize-only entry point to call here. Building a throwaway `Session`
+        // just for this test would duplicate `RustEngine::prepare`'s corpus-tree setup (a
+        // gated-slow, walnut-java-dependent operation) inside the FAST tier, which is the
+        // wrong trade for a parse check alone. So the earliest check on these three strings is
+        // still a real dispatch -- `src/bin/compare.rs`'s `is_non_fixture_row` guard, which
+        // aborts loudly on `Answer::Error`/`Answer::None` before any timing is believed (see
+        // that guard's own doc comment on why a typo can't slip through as a silent
+        // `Error == Error` match the way it could for a real fixture).
+    }
+
+    #[test]
+    fn label_maps_every_row_kind_to_its_report_name() {
+        assert_eq!(label(230), "230");
+        assert_eq!(label(1), "1");
+        for (i, (name, ..)) in HEAVY_WORKLOADS.iter().enumerate() {
+            assert_eq!(label(HEAVY_ID_BASE + i), *name);
+        }
+        assert_eq!(label(usize::MAX), "sc637");
+    }
+
+    #[test]
+    fn is_non_fixture_row_flags_only_heavy_and_sc637_rows() {
+        assert!(!is_non_fixture_row(230));
+        assert!(!is_non_fixture_row(1));
+        assert!(!is_non_fixture_row(0));
+        for i in 0..HEAVY_WORKLOADS.len() {
+            assert!(is_non_fixture_row(HEAVY_ID_BASE + i));
+        }
+        assert!(is_non_fixture_row(usize::MAX));
+    }
+
+    #[test]
+    fn command_declares_only_numeric_bases_accepts_plain_and_rejects_custom_bases() {
+        assert!(command_declares_only_numeric_bases(
+            "eval t \"?msd_2 Ei i<x\";"
+        ));
+        assert!(command_declares_only_numeric_bases(
+            "eval t \"?lsd_17 x=x\";"
+        ));
+        // No numeration-system declaration at all is fine (the default applies).
+        assert!(command_declares_only_numeric_bases("eval t \"x=x\";"));
+        assert!(!command_declares_only_numeric_bases(
+            "eval t \"?msd_fib x=x\";"
+        ));
+        assert!(!command_declares_only_numeric_bases(
+            "eval t \"?lsd_pell x=x\";"
+        ));
+        // A bare `msd`/`lsd` with no leading `?` is not a declaration at all, so it must not
+        // be misread as one.
+        assert!(command_declares_only_numeric_bases(
+            "eval msd_thing \"x=x\";"
+        ));
     }
 
     /// Skipped (not failed) without the sibling oracle checkout, exactly like every other

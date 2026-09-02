@@ -44,8 +44,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use wr_bench::{
-    detail_variant, fmt_dur, golden, peak_states, same_answer, workloads, JavaEngine, RustEngine,
-    Stats, Workload,
+    detail_variant, fmt_dur, golden, is_non_fixture_row, label, peak_states, same_answer,
+    workloads, JavaEngine, RustEngine, Stats, Workload,
 };
 
 /// How many throwaway iterations each engine runs before the clock starts. Three is enough for
@@ -126,7 +126,23 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let all = workloads()?;
+    let mut all = workloads()?;
+    // Opt-in heavier, research-shaped rows (new, non-fixture `eval` strings composed from the
+    // same prelude `def`s and word automata the default rows use — see `HEAVY_WORKLOADS`'s own
+    // docs for why these aren't real corpus fixtures). Added to `all` BEFORE the `WR_BENCH_ONLY`
+    // filter below, so `WR_BENCH_HEAVY=1 WR_BENCH_ONLY=1000000` selects just one heavy row the
+    // same way it already selects one default-set fixture — no separate selection mechanism
+    // needed.
+    let heavy = std::env::var("WR_BENCH_HEAVY").is_ok_and(|v| v != "0");
+    if heavy {
+        eprintln!(
+            "WR_BENCH_HEAVY: adding {} opt-in research-shaped row(s) -- see \
+             benches/README.md's WR_BENCH_HEAVY section. These are NOT part of the campaign \
+             baseline table.",
+            wr_bench::HEAVY_WORKLOADS.len()
+        );
+        all.extend(wr_bench::heavy_workloads());
+    }
     let mut selected: Vec<Workload> = all
         .into_iter()
         // Not `is_none_or`: that is stable only since 1.82 and the workspace declares
@@ -189,6 +205,38 @@ fn run() -> Result<(), String> {
 
         // -- 1. correctness, before any timing is believed ---------------------
         let rust_answer = rust.dispatch(&w.command)?;
+        // A non-fixture row (a `WR_BENCH_HEAVY` row or `sc637`) has no manifest entry saying
+        // what it is SUPPOSED to answer, unlike a real corpus fixture (some of which are
+        // legitimately error cases). So an `Answer::Error`/`Answer::None` here can only mean a
+        // typo in the hand-written command string -- and `same_answer` below would happily
+        // accept an identical `Error == Error` on both engines and let it be timed as if it
+        // were a real result. Abort loudly instead, before either engine's clock starts.
+        if is_non_fixture_row(w.id) {
+            match &rust_answer {
+                wr_bench::Answer::Error(msg) => {
+                    return Err(format!(
+                        "row {}: this is not a corpus fixture, and its Rust answer is \
+                         Answer::Error({msg:?}) -- almost certainly a typo in the hand-written \
+                         command, not a legitimate heavy workload. Aborting before timing it.\n\
+                         command: {}",
+                        label(w.id),
+                        w.command
+                    ));
+                }
+                wr_bench::Answer::None => {
+                    return Err(format!(
+                        "row {}: this is not a corpus fixture, and its Rust answer is \
+                         Answer::None (the command produced no TestCase at all) -- almost \
+                         certainly a typo in the hand-written command, not a legitimate heavy \
+                         workload. Aborting before timing it.\n\
+                         command: {}",
+                        label(w.id),
+                        w.command
+                    ));
+                }
+                _ => {}
+            }
+        }
         let java_answer = java
             .bench(&w.command, 0, 1, deadline)
             .map_err(|e| format!("fixture {}: {e}", w.id))?
@@ -206,7 +254,7 @@ fn run() -> Result<(), String> {
         // than some easier query that happens to agree between the two engines. Reported, not
         // fatal — see `benches/STATUS.md` §"Fidelity to the recorded corpus".
         let recorded = match &rust_answer {
-            _ if w.id == usize::MAX => "n/a (not a corpus fixture)".to_string(),
+            _ if is_non_fixture_row(w.id) => "n/a (not a corpus fixture)".to_string(),
             wr_bench::Answer::Automaton(_) => {
                 let path = root.join(format!("automaton{}.txt", w.id));
                 match std::fs::read_to_string(&path) {
@@ -315,9 +363,9 @@ fn render(rows: &[Row], warmup: usize, cold: bool) -> String {
     }
     let _ = writeln!(
         s,
-        "peak states = the largest automaton named in the JVM's COMPLETE `details` trace.\n\
-         rust trace  = the largest the port's PARTIAL trace names (a lower bound -- the port\n\
-         \x20             does not yet thread `Logging` through wr-core; see benches/README.md)."
+        "peak states = the largest automaton named in the JVM's `details` trace.\n\
+         rust trace  = the largest the port's own trace names. Since U28 both traces cover\n\
+         \x20             the same steps; agreement is a per-run cross-check (benches/README.md)."
     );
     let _ = writeln!(
         s,
@@ -387,10 +435,18 @@ fn render(rows: &[Row], warmup: usize, cold: bool) -> String {
             (Some(j), Some(p)) if j == p => {
                 format!("{j} states (both traces name the same largest automaton)")
             }
-            (Some(j), Some(p)) => format!(
-                "{j} states (JVM, complete trace); the port's partial trace names {p} \
-                 -- a logging gap, not a different computation"
-            ),
+            (Some(j), Some(p)) => {
+                eprintln!(
+                    "  WARNING: fixture {} peak state MISMATCH (java {j} / rust {p}) -- both \
+                     traces have covered the same construction steps since U28; this is worth \
+                     investigating, not assuming away as a logging gap",
+                    label(r.workload.id)
+                );
+                format!(
+                    "peak MISMATCH: java {j} / rust {p} -- both traces cover the same steps \
+                     since U28; investigate before believing this row"
+                )
+            }
             (j, p) => format!(
                 "java {} / rust {}",
                 j.map_or("?".to_string(), |n| n.to_string()),
@@ -424,15 +480,6 @@ fn render(rows: &[Row], warmup: usize, cold: bool) -> String {
         );
     }
     s
-}
-
-/// A workload's name in the report: its fixture id, or `sc637` for the opt-in non-fixture row.
-fn label(id: usize) -> String {
-    if id == usize::MAX {
-        "sc637".to_string()
-    } else {
-        id.to_string()
-    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

@@ -462,6 +462,14 @@ In rough order of expected-return-per-risk:
 
 ## The peak-state column
 
+**[Editor's note, added 2026-09-02, U32's own text below left verbatim by policy — this is a
+historical section, not rewritten in place: the gap this subsection describes is closed. U28
+(2026-08-17/19) threaded `&mut Logging` through `wr-core`'s product/determinize/minimize/
+quantify, so the port's `details` trace now covers the same construction steps Java's does, and
+the two columns have been observed to agree on every benchmarked workload since. See
+`benches/README.md`'s current "Peak state count" section for the now-current description; the
+text below is what was true when U32 first built this harness.]**
+
 The port's peak is a **lower bound**, and the table labels it as such. Java's `details` trace
 covers the whole computation; the port's covers only the `wr-logic`-level steps, because
 threading `&mut Logging` through `wr-core`'s product/determinize/minimize/quantify is a known,
