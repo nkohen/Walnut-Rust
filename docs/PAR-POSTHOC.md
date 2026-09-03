@@ -113,12 +113,40 @@ Level-synchronous BFS over metastates, workers spawned once for the whole call
    first** — the numbering is genuinely nondeterministic run to run.
 4. Barrier; worker 0 swaps the next level in; barrier; repeat.
 
-Then phase B: assemble id-indexed `o`/`d` tables and call `Fa::canonicalize`.
+Then phase B, the post-hoc reconstruction: renumber into the sequential numbering.
+
+**Phase B started as a literal `Fa::canonicalize()` call and had to stop being one.** Production
+canonicalization is the *specification* and much the stronger evidence for the thesis, but
+measured on the isolated micro-benchmark it cost **twice the entire sequential subset
+construction** (680 ms against 337 ms on a 100,000-state input), turning a real 2.53× compute win
+into a net 0.41×. The cause is structural: `Fa::canonicalize` builds each state's `BTreeMap` row
+**twice** and copies it once — `new_d[new_id] = self.d[q].clone()` for every state, then a second
+fresh `BTreeMap` per row for the empty-destination pruning pass. That is more allocation than
+building the automaton was.
+
+`reconstruct` does the same job in one pass: BFS for the permutation, then walk states in new-id
+order *moving* each row out of the racy table and remapping destinations in place. Because
+`canonicalize` remains the specification, the two are compared **directly** over generated
+automata (`fused_reconstruction_agrees_with_production_canonicalize`), including the two shapes
+subset construction never produces and which an "obviously equivalent" rewrite gets wrong —
+forward-unreachable states and symbol entries whose destination lists empty out.
+
+### Two guards on entering the parallel path
 
 Inputs below `MIN_STATES_FOR_PARALLEL = 64`, or with `alphabet_size == 0`, delegate to the
 sequential implementation. That threshold is not only a performance guard: `subset_construction` is
 `pub` and `Fa` has no invariant forbidding a destination id `>= q`, so several *panic* shapes are
 pinned by existing tests, and delegating small inputs keeps those panic sites bit-identical.
+
+`is_safe_to_parallelize` is the second guard, and it is a **liveness** requirement rather than a
+defensive nicety. The workers synchronize on a `Barrier` sized to the worker count, so a worker
+that panics never arrives at its next `wait()` and every other worker blocks there forever: an
+input that makes the sequential implementation panic cleanly would make the parallel one **hang**,
+which CLAUDE.md's "never hangs, always a diagnosable verdict" guardrail forbids outright. The
+guard pre-scans the two bounds a worker can violate and routes any violation to the sequential
+implementation, so the panic site and message stay exactly what the existing tests pin. Deleting
+it makes `a_malformed_automaton_panics_rather_than_deadlocking_the_workers` fail on its 30-second
+watchdog — the deadlock is real, not hypothetical.
 
 ## 4. Honest limits of the prototype
 
