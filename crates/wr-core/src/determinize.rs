@@ -398,11 +398,33 @@ impl Default for Pipeline {
 /// key-computation pipeline. `0` disables the pipeline entirely, leaving the exact
 /// pre-parallel code path.
 ///
-/// `WR_SC_THREADS` overrides it — read once per process, both so the benchmark harness can
-/// pin a thread count and so a `0` there restores the sequential engine for A/B
-/// verification. One less than the machine's parallelism, capped at 7, because the calling
-/// thread is itself a full participant (it does all the minting and, whenever a key is not
-/// yet ready, computes one itself).
+/// `WR_SC_THREADS` overrides it — read once per process, both so `benches/src/bin/scbench.rs`
+/// can pin a thread count and so a `0` there restores the sequential engine for A/B
+/// verification.
+///
+/// **The cap of 4 is deliberately conservative, and it is not a tuned optimum.** The only
+/// sweep available when this landed ran on a heavily contended machine (8 logical cores,
+/// load average 11-42, two other agents building), where per-workload speedups over the
+/// sequential engine went the *wrong* way as threads were added:
+///
+/// | threads | fixture 293 | 179 | 230 | 261 | 286 |
+/// |---------|-------------|-----|-----|-----|-----|
+/// | 2       | 1.54x | 1.60x | 1.58x | 1.32x | 1.28x |
+/// | 4       | 1.10x | 1.27x | 1.19x | 1.16x | 1.07x |
+/// | 7       | 0.84x | 1.04x | 1.08x | 0.98x | 0.68x |
+///
+/// Seven workers were *slower than sequential* on two of five workloads there. Four was
+/// faster than sequential on all five, so four is the largest count the evidence actually
+/// supports; two may well be better still, and on a quiet machine the ordering may reverse
+/// entirely. Re-run `scbench` on an idle machine before raising this.
+///
+/// The cap also makes this a better citizen as a library: `ct-research` embeds `wr-core`,
+/// and a determinize call that unconditionally grabs every core would oversubscribe an
+/// embedder that is already running its own parallel harness.
+///
+/// One less than the machine's parallelism is the other bound, because the calling thread is
+/// itself a full participant — it does all the minting and, whenever a key is not yet ready,
+/// computes one itself.
 fn default_workers() -> usize {
     use std::sync::OnceLock;
     static WORKERS: OnceLock<usize> = OnceLock::new();
@@ -411,7 +433,7 @@ fn default_workers() -> usize {
             return v.trim().parse().unwrap_or(0);
         }
         std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).min(7))
+            .map(|n| n.get().saturating_sub(1).min(4))
             .unwrap_or(0)
     })
 }
@@ -830,6 +852,14 @@ fn pipelined_tail(
                             Err(payload) => {
                                 #[cfg(test)]
                                 WORKER_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                // `key_rows` unwound part-way, so `bufs` still holds that
+                                // metastate's half-filled `buckets`/`touched` — both are
+                                // cleared only at the very end of a successful call. This
+                                // worker goes on to serve OTHER metastates, and reusing
+                                // dirty buffers would union stale destinations into their
+                                // keys, which the mint loop may well consume before the
+                                // cursor ever reaches the index that panicked. Start clean.
+                                bufs = ScBuffers::new(fa);
                                 Reply::Panicked(payload)
                             }
                         }
@@ -1610,6 +1640,48 @@ mod tests {
              ({} carried-back panic(s)), which prints panic-hook output the sequential \
              engine never produces",
             after - before
+        );
+    }
+
+    /// Why a worker that caught a panic must throw its `ScBuffers` away rather than serve
+    /// the next metastate with them.
+    ///
+    /// `key_rows` clears `buckets`/`touched` only at the very END of a successful call, so
+    /// an unwind part-way through leaves them holding the failed metastate's partial
+    /// union. This pins the consequence directly — the same members through dirty buffers
+    /// produce a DIFFERENT key — which is what makes the reset load-bearing rather than
+    /// defensive tidying.
+    ///
+    /// Stated plainly: today the only way to reach that unwind is `key_rows`' own
+    /// `cfg(debug_assertions)` over-dedup tripwire, since `members_are_in_range` screens
+    /// the one panic an ordinary malformed `Fa` causes. So this test pins the invariant,
+    /// not a currently-reachable bug.
+    #[test]
+    fn key_rows_gives_a_different_answer_through_buffers_a_panic_left_dirty() {
+        // Both states go to {0} on symbol 0, so the clean union is exactly [0] and a
+        // stray `1` left in the bucket is genuinely visible (a residue already inside the
+        // union would be absorbed by the dedup and prove nothing).
+        let mut row = BTreeMap::new();
+        row.insert(0, vec![0]);
+        let fa = Fa::with_states(0, 2, 1, vec![0, 1], vec![row.clone(), row]);
+        let members = [0usize, 1];
+
+        let mut clean = ScBuffers::new(&fa);
+        let mut from_clean = KeyRows::default();
+        key_rows(&fa, &members, &mut clean, &mut from_clean);
+
+        // Exactly the residue a half-finished call leaves: a bucket filled but never
+        // drained, and its symbol recorded in `touched`.
+        let mut dirty = ScBuffers::new(&fa);
+        dirty.buckets[0].push(1);
+        dirty.touched.push(0);
+        let mut from_dirty = KeyRows::default();
+        key_rows(&fa, &members, &mut dirty, &mut from_dirty);
+
+        assert_ne!(
+            from_clean.flat, from_dirty.flat,
+            "dirty buffers must be observable here -- if they are not, this test has \
+             stopped proving that a worker's post-panic `ScBuffers` reset matters"
         );
     }
 
