@@ -44,6 +44,12 @@ pub mod minimize;
 pub mod morphism;
 pub mod numsys;
 pub mod ostrowski;
+// P5: the std-only parallel-coordination primitives behind `determinize`'s level-parallel
+// subset construction. The module is an implementation substrate (no public signature changes
+// with it), but it exposes ONE public item -- the embedder opt-out `set_thread_count`,
+// re-exported at the crate root below.
+mod parallel;
+pub use parallel::{set_thread_count, ParallelismAlreadyStarted};
 pub mod product;
 pub mod quantify;
 pub mod regex;
