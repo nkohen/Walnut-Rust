@@ -8,6 +8,15 @@ duplicated here. The R4 design remains on the shelf at
 `~/.claude/plans/glossy-compacting-lantern.md` and is explicitly a ranked candidate (lever 1) for
 THIS campaign, gated on a fresh profile.
 
+## PUSHED 2026-09-03 — `perf/beyond` is on `origin` (`8c7cb47`, tracking `origin/perf/beyond`)
+
+The user gave the explicit go-ahead ("wrap and push") and the campaign branch was pushed to
+`git@github.com:nkohen/Walnut-Rust.git`. This is the first push of any campaign work. The three
+parallelization-experiment branches (`agent/par-max`/`par-det`/`par-posthoc`, referenced by
+`docs/PARALLELISM-EXPERIMENT.md`) remain LOCAL-ONLY — not pushed; push them separately if the
+doc's references need to resolve on the remote. Open follow-up: the D3 thread-tuning sweep
+(`docs/BACKLOG-D3-THREAD-TUNING.md`).
+
 ## Current work: the performance campaign
 
 - **Dispatch:** `docs/PERF-CAMPAIGN-DISPATCH.md` — read it in full; every rule binds
