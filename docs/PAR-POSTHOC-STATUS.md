@@ -318,9 +318,14 @@ advantage — it is about how much code you must reason about, not how fast it r
   construction's frontier is often narrow even when the automaton is large.
 - Reconstruction must be the fused renumber. The obvious implementation (production
   `canonicalize`) costs more than the entire operation.
-- Walnut's own recorded corpus essentially never reaches the size where any of this pays: at the
-  production 64-state threshold only a handful of the corpus's determinizations take the parallel
-  path at all.
+- On Walnut's own recorded corpus the effect is at best marginal. An earlier draft of this
+  section claimed "only a handful of the corpus's determinizations take the parallel path at
+  all"; §2b's measurement **contradicts that** and it is corrected here rather than left
+  standing. Seven of the eleven benchmark fixtures do reach the parallel path, several of them
+  on every dispatch. The problem is not reach, it is *payoff*: once the table's own noise floor
+  (0.76×–1.40×, calibrated from the four fixtures whose code path does not change at all) is
+  applied, exactly one fixture — 230, at 1.94× — shows a win that the measurement can actually
+  support.
 
 **Recommendation: do not merge the eager mode as a default.** It is correct, invisible, and a
 small net loss on this corpus. What is worth keeping is the *analysis* — the Canonical Recovery
