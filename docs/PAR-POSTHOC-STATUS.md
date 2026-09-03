@@ -98,7 +98,20 @@ is recorded and **not interpreted**. The controlled timing is §2's micro-benchm
 
 ### 1d. Determinism of written artifacts (the 5× check)
 
-*(filled in below)*
+Eleven real corpus fixtures, dispatched through `wr-cli`'s real path and hashed on the **written
+`.txt` bytes** (`RustEngine::dispatch` renders through the real writer, so `canonize()` has run).
+Eleven distinct, non-trivial hashes — the check is not comparing empty output (see §3 for why that
+warning is here).
+
+| Comparison | Result |
+|---|---|
+| eager, 5 runs vs the sequential engine | **5/5 byte-identical**, all 11 workloads |
+| deferred, 5 runs vs the sequential engine | **5/5 byte-identical**, all 11 workloads |
+| deferred, run-to-run (1 vs 2,3,4,5) | **all byte-identical** |
+
+So the written artifacts are stable across racy runs *and* equal to what the sequential engine
+writes — in both modes. Computation is nondeterministic (proven separately by
+`the_parallel_phase_really_does_produce_a_different_numbering`); output is not.
 
 ---
 
@@ -199,6 +212,93 @@ class of defect this project's review discipline exists to catch, and it was in 
 
 ---
 
-## 4. Verdict
+## 4. Verdict — post-hoc reconstruction vs deterministic parallelization
 
-*(filled in below)*
+### 4a. The thesis is correct, and holds further than expected
+
+Not merely for the primitive. In the **deferred** mode the racy numbering is never repaired inside
+the engine at all — it flows through `trim`, `minimize`'s Valmari block ids, `product`, `quantify`
+and every `Commands/*` handler, and the only normalization anywhere is the `canonize()` that
+`write_txt`/`write_gv`/`matrix_writer` already performed before this branch existed. That
+reproduces Walnut's entire 675-fixture recorded corpus (automata, `.gv` bytes, CAS matrix bytes,
+`details` text) and passes the full 1,811-test workspace suite. Zero tests were ignored, weakened
+or deleted.
+
+### 4b. But *why* it holds is narrow, and the coverage map has real holes
+
+It is **not** "canonicalization fixes everything". It holds because `build_racy`'s output is a
+genuine *relabelling* of the sequential one, so every downstream operation behaves isomorphically
+and the minimal DFA that reaches the writer is unique up to isomorphism. `PAR-POSTHOC.md` §2b lists
+where the same trick fails, and those are not hypothetical:
+
+- `export_to_ba` never canonicalizes — `.ba` bytes carry raw ids.
+- `morphism::to_word_automaton` and `ostrowski` deliberately `set_canonized(true)` to **suppress**
+  the writer's canonicalization so unreachable states survive; post-hoc canonicalization there
+  would *change* the output, not restore it.
+- NFA-shaped intermediates are not normalized by `canonicalize` at all (it preserves
+  destination-list order, and that order feeds its own BFS).
+- Metacommand `[strategy n]`/`[export n]` indices and `::` details-text *ordering* are **ordering**
+  problems, which canonicalization cannot touch in principle.
+
+The corpus does not exercise the first three against a racy numbering, so "670/675 in deferred
+mode" is evidence that those paths were not reached, not that they are safe.
+
+### 4c. On this workload, the post-hoc freedom bought almost nothing
+
+This is the part worth being blunt about. The freedom the lane buys is *arbitrary metastate
+numbering during compute*. For subset construction specifically, that turns out not to be the
+binding constraint:
+
+A deterministic lane can use the **identical** parallel structure — level-synchronous BFS, workers
+computing each metastate's per-symbol union keys in parallel — and then mint ids in a short
+**serial** pass over the frontier in id order, symbols ascending. That reproduces the sequential
+numbering exactly (level-synchronous frontiers are contiguous id ranges in increasing order, so
+frontier order *is* sequential mint order), and it parallelizes exactly the same expensive part:
+the union computation. So the post-hoc lane does not unlock a better parallel algorithm here. It
+**trades a serial hash-cons pass for a serial renumber pass** — measured at 10–21 % of compute for
+the fused renumber — and the two are plausibly a wash.
+
+Where post-hoc genuinely wins is **engineering scope, not speed**: the deferred-mode result means
+you can parallelize anything upstream of the write path without auditing `minimize`, `product`,
+`quantify` and `trim` for order-sensitivity one at a time. The deterministic lane must establish
+order-preservation at every one of those boundaries; the post-hoc lane establishes one lemma at
+the writer and is done. For a codebase whose own `docs/IDIOMATIC-REFACTOR-DO-NOT-TOUCH.md` exists
+because iteration order is load-bearing in several ported algorithms, that is a real and reusable
+advantage — it is about how much code you must reason about, not how fast it runs.
+
+### 4d. The performance verdict is negative for Walnut's actual workloads
+
+- The parallel phase wins only around **10⁵ input states** (1.8–2.5×); at 20,000 it is a wash and
+  at 2,000 it loses. Level-synchronous BFS is bounded by **frontier width**, and a subset
+  construction's frontier is often narrow even when the automaton is large.
+- Reconstruction must be the fused renumber. The obvious implementation (production
+  `canonicalize`) costs more than the entire operation.
+- Walnut's own recorded corpus essentially never reaches the size where any of this pays: at the
+  production 64-state threshold only a handful of the corpus's determinizations take the parallel
+  path at all.
+
+**Recommendation: do not merge the eager mode as a default.** It is correct, invisible, and a
+small net loss on this corpus. What is worth keeping is the *analysis* — the Canonical Recovery
+Lemma, the coverage map, and the demonstration that the deferred mode is viable end to end —
+because those are what make a future, better-targeted parallelization cheap to justify.
+
+## 5. What I would do next, in priority order
+
+1. **Replace the level-synchronous barrier with a work-stealing deque plus termination
+   detection.** Frontier width, not thread count, is the measured ceiling; a worklist that lets a
+   worker start on a newly-discovered metastate without waiting for the level to close removes it,
+   and removes the per-level barrier cost with it.
+2. **Raise `MIN_STATES_FOR_PARALLEL` to ~10⁴.** The current 64 is a guess; the micro-benchmark says
+   the parallel path is a measured *loss* below roughly 20,000 states.
+3. **Move up a level: DAG-parallel `eval` over independent subtrees.** This is where the large
+   independent work actually is, and unlike subset construction it has no frontier-width ceiling.
+   It needs the three *ordering* reconstructions in `PAR-POSTHOC.md` §5 — per-subtree `Logging`
+   buffers spliced in sequential post-order, metacommand-index renumbering at join, and a decision
+   about the `Session` `NumberSystem` cache (whose warmth is already observable in `details` text —
+   that is fixture 383's and the 375–379 harness limitation's whole story).
+4. **A parallel `product` with a bespoke post-hoc renumber.** `canonicalize` cannot recover
+   `cross_product`'s numbering (its discovery order is A-symbol-major, which is not ascending
+   *result*-symbol order once the second operand adds a track), but a second BFS that re-walks
+   `a.d[p] × b.d[q]` in Java's own order, over already-computed edges, would — and that is a
+   genuinely different post-hoc reconstruction from canonicalization, which would test the thesis
+   somewhere it is not already known to hold.
