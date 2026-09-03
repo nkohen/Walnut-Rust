@@ -94,7 +94,21 @@ is recorded and **not interpreted**. The controlled timing is §2's micro-benchm
 
 ### 1c. Tier 3 — differential vs the real JVM
 
-*(filled in below)*
+```
+WALNUT_JAVA_DIR=... WR_DIFFGEN_QUERIES=10000 WR_DIFFGEN_SEED=0x9C4E7B21A05D33F1 \
+  cargo test -p wr-differential-gen --release -- --ignored --nocapture
+```
+
+Fresh seed, eager mode, against a live `walnut-java` JVM:
+
+```
+match            : 10000
+divergence       :     0
+skip-too-big     :     0
+  jvm errors     :     0
+```
+
+**10000 / 0 / 0** — the brief's bar, met exactly.
 
 ### 1d. Determinism of written artifacts (the 5× check)
 
