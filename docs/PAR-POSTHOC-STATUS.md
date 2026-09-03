@@ -166,10 +166,41 @@ input) as sound, and every absolute speedup as a spot check with a wide error ba
 
 ### 2b. End-to-end, on real corpus fixtures
 
-At the production threshold the parallel path is reached by only a handful of the corpus's
-determinizations — most inputs to `determinize` are far below 64 states — so the end-to-end
-picture is dominated by workloads that never take it. That is itself the finding: **Walnut's own
-recorded corpus contains almost nothing big enough for this to help.**
+`benches/src/bin/par_compare`, the same 11 fixtures `compare.rs` benchmarks against the JVM,
+sequential vs eager parallel recovery. `par-calls` counts determinizations that actually took the
+parallel path across the whole warmup+measure batch; `compute`/`recover` are per-dispatch means.
+
+| fixture | sequential | parallel | speedup | par-compute | recover | par-calls | artifact |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.469 ms | 0.455 ms | 1.03× | — | — | **0** | identical |
+| 207 | 0.468 ms | 0.334 ms | 1.40× | — | — | **0** | identical |
+| 293 | 34.226 ms | 26.339 ms | 1.30× | 14.616 ms | 2.081 ms | 30 | identical |
+| 521 | 23.328 ms | 30.897 ms | 0.76× | — | — | **0** | identical |
+| 179 | 117.679 ms | 80.621 ms | 1.46× | 51.103 ms | 7.281 ms | 10 | identical |
+| 266 | 32.131 ms | 45.216 ms | 0.71× | 24.744 ms | 1.713 ms | 40 | identical |
+| 230 | 498.771 ms | 256.490 ms | **1.94×** | 188.310 ms | 21.449 ms | 4 | identical |
+| 295 | 66.608 ms | 71.594 ms | 0.93× | 26.466 ms | 6.537 ms | 40 | identical |
+| 261 | 95.098 ms | 107.405 ms | 0.89× | 43.187 ms | 11.957 ms | 40 | identical |
+| 286 | 180.715 ms | 212.955 ms | 0.85× | 77.309 ms | 23.842 ms | 10 | identical |
+| 637 | 21.426 ms | 20.191 ms | 1.06× | — | — | **0** | identical |
+
+**Every one of the 11 written artifacts is byte-identical to the sequential engine's.** That is the
+correctness result and it is not noisy.
+
+**The noise floor, calibrated from this table itself.** Four fixtures (1, 207, 521, 637) took the
+parallel path **zero** times — for them the two columns are the *same code executing the same
+work*, so their spread is pure measurement noise. They span **0.76× to 1.40×**. Any speedup inside
+that band in this table therefore means nothing, which disqualifies seven of the eleven rows
+outright and leaves exactly one result above the floor: **fixture 230 at 1.94×** (and 179 at 1.46×
+sitting right on the edge of it).
+
+Fixture 637 is worth noting separately: it is the `[strategy 6 BRZ]` workload, and 0 par-calls is
+correct rather than a miss — `determinize`'s Brzozowski arm calls the sequential
+`subset_construction` internally and was deliberately left unwired (`PAR-POSTHOC.md` §4).
+
+**Reconstruction overhead on real workloads** is 7–31 % of the parallel compute phase (293: 14 %,
+179: 14 %, 230: 11 %, 266: 7 %, 295: 25 %, 261: 28 %, 286: 31 %), consistent with the micro
+benchmark's 10–21 % and nowhere near the 100–165 % that production `canonicalize` cost.
 
 ---
 
