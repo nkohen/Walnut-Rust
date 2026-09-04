@@ -32,6 +32,20 @@
 //! saves `NAME.txt` under `Session/<timestamp>/Automata Library/`). Nothing in
 //! this module reaches outside that `home_dir`.
 //!
+//! # Resource safety (READ THIS)
+//!
+//! The decision procedure is worst-case **superexponential**, and walnut-rs has
+//! **no `-Xmx`-style memory ceiling** (only `wr_core::transducer` self-limits). A
+//! query run directly on the calling thread via [`Engine`] **cannot be
+//! interrupted** — Rust cannot safely kill a running thread, so a state blow-up
+//! allocates until the OS OOM-kills the process or the host freezes, and a
+//! watchdog thread cannot stop it. Drive [`Engine`] directly **only** for
+//! provably-small queries you control; run anything unbounded or externally
+//! supplied in a **separate, resource-capped child process** (an `RLIMIT_AS` /
+//! cgroup memory cap on Linux, an RSS-sampling watchdog on macOS, plus a
+//! wall-clock watchdog that kills it). Full guidance and the rationale:
+//! `docs/EMBEDDING-RESOURCE-SAFETY.md`.
+//!
 //! ```no_run
 //! use wr_cli::embed::{Engine, set_thread_count};
 //!

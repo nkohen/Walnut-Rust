@@ -127,6 +127,14 @@ unchanged — walnut-rs's `::` output carries the same `N reachable states` line
 
 ## Mechanism 2 — in-process embedding
 
+> **Resource safety — required reading: [`EMBEDDING-RESOURCE-SAFETY.md`](EMBEDDING-RESOURCE-SAFETY.md).**
+> The decision procedure is worst-case superexponential and walnut-rs has **no `-Xmx`-style
+> memory ceiling**. A query run directly on your own thread **cannot be interrupted** (Rust
+> cannot safely kill a running thread), so a blow-up can freeze the host. Only run
+> provably-small queries directly in-process; isolate anything else in a child process under a
+> memory cap **and** a wall-clock watchdog (e.g. `bin/walnut-guard`). Read the doc before
+> embedding.
+
 Link `wr-cli` directly and drive the engine with `wr_cli::embed::Engine` — no subprocess,
 no stdin pipe, no `.txt` round-trip.
 

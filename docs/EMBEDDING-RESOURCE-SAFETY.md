@@ -1,0 +1,111 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.). -->
+
+# Resource safety when embedding walnut-rs (READ BEFORE running a query in-process)
+
+**Audience:** anything that consumes walnut-rs — a human, or an automated agent in a
+downstream repo (e.g. ct-research). This is a hard requirement, not advice. If you run a
+walnut-rs query, you must build in the protection described here. You are free to embed the
+library in-process rather than shelling out to `bin/walnut-rs` — but embedding does **not**
+excuse you from the protection; it *raises* the bar, for the reason below.
+
+## The threat
+
+walnut-rs decides first-order logic over automatic sequences. That decision procedure is
+worst-case **superexponential** — a single innocent-looking query (a deep quantifier
+alternation, a large base, a state-exploding intermediate automaton) can try to build an
+automaton with millions to billions of states. Walnut has the same blowup; the JVM contains
+it with a per-process heap ceiling (`java -Xmx8192m …`), so a runaway query dies with an
+`OutOfMemoryError` instead of exhausting the host's RAM and freezing the machine.
+
+**walnut-rs is a native binary/library with no `-Xmx` analog.** A runaway query allocates
+until the OS OOM-kills the process — or, worse, until the machine swap-thrashes to a halt and
+takes everything else on it down with it. The only in-engine budget anywhere is
+transduce-specific (`wr_core::transducer::TransduceBudget`, which returns a clean error); the
+core `determinize` / `product` / `quantify` / `minimize` path has **no** memory cap, **no**
+state cap, and **no** wall-clock deadline. Do not rely on the engine to stop itself.
+
+## Why in-process is *harder* to protect than a subprocess
+
+A walnut-rs query runs synchronously on the calling thread, and the core has no cooperative
+"check the budget" points you can interrupt at. **Rust has no safe way to kill a running
+thread.** So if you call the engine directly on a thread of your own process:
+
+- a watchdog thread that notices "this is taking too long / using too much RAM" **cannot stop
+  the worker** — it keeps running and keeps allocating;
+- there is no point at which you can reclaim the memory it has taken short of tearing down the
+  whole process;
+- by the time you decide to abort, the host may already be swap-thrashing.
+
+This is the crux: **an in-process query you cannot bound in advance is a query you cannot make
+safe.** The only mechanism that can actually stop a runaway walnut-rs computation and reclaim
+its memory is the operating system killing the **process** it runs in.
+
+## What you MUST do
+
+Classify every query before you run it, and protect accordingly.
+
+### 1. Any query that is not *provably* small → run it in an isolated, resource-capped child process
+
+"Embedding" does not have to mean "the shipped `bin/walnut-rs`." You may write your own small
+runner binary that links `wr-cli` and calls `wr_cli::embed::Engine` — that is fully supported.
+But run that runner (or `bin/walnut-rs`) as a **separate process** that you can cap and kill,
+so the OS is the backstop. Concretely, the child must have all three of:
+
+- **A hard address-space / memory cap — the real `-Xmx` analog.**
+  - **Linux / Linux containers (ct-research's docker path):** the strong, *instantaneous*
+    option. Either `setrlimit(RLIMIT_AS, …)` in the child before it runs the query (allocation
+    then fails and the child aborts cleanly; the parent is untouched), or a cgroup / container
+    memory limit (`docker run --memory=…`, a systemd `MemoryMax=`, or a v2 `memory.max`). Size
+    it below the host's real RAM so the OOM lands on the child, not the machine.
+  - **macOS:** `RLIMIT_AS` is **not reliably enforced** — do not trust it. Fall back to the
+    RSS-sampling watchdog in point 3, which is what actually protects a Mac.
+- **A CPU-time cap.** `setrlimit(RLIMIT_CPU, …)` (SIGXCPU when exceeded) bounds runaway
+  compute even when memory stays flat.
+- **A wall-clock watchdog that kills the child on breach.** Wall time, not just CPU time (a
+  swapping process burns wall clock without burning much CPU).
+
+The already-built, reusable version of all of this is ct-research's `bin/walnut-guard`: it
+samples wall time + RSS (`ps -o rss=`) + optional state count and kills the child, normalizing
+the outcome to `TRUE | FALSE | TIMEOUT | EXPLODED-mem | EXPLODED-states | ERROR`. It is
+**process-external and engine-agnostic**, so it works against a walnut-rs child exactly as it
+works against the JVM — point it at `bin/walnut-rs` (or your own runner) and you are done.
+See `docs/CT-RESEARCH-INTEGRATION.md`.
+
+### 2. State-count watchdog (optional, for early blow-up detection)
+
+walnut-rs's `::` (detailed) output emits `<N> reachable states` lines byte-identically to the
+JVM engine, so a `STATE_MONITOR`-style guard that greps those and kills on a threshold works
+unchanged. Use it when you want to catch a blow-up *before* it exhausts memory rather than
+after.
+
+### 3. Only run a query directly in-process (parent thread) when it is provably bounded
+
+Direct `wr_cli::embed::Engine` use on your own process's thread is appropriate **only** for
+queries whose size you control and know to be small: your own hand-authored fixtures, small
+bases, shallow quantifier alternation, automata of at most a few hundred states. If you cannot
+state a concrete bound, treat it as unbounded and go through point 1. When you do run
+in-process directly, still wrap it in a wall-clock check so a mistake is *noticed* (even though,
+per the section above, noticing cannot stop it — it tells you to fix the query or move it to a
+subprocess).
+
+### 4. Reproducibility (not a safety control, but do it anyway)
+
+Pin the parallel degree: `WR_CORE_THREADS=1` (shell) or `wr_cli::embed::set_thread_count(1)`
+before the first query (in-process). walnut-rs is bit-identical at every thread count; this
+just removes a nondeterminism source from research runs. It does **not** bound memory.
+
+## What NOT to do
+
+- **Do not** call the engine on a thread and assume a timeout thread can rescue you — it
+  cannot stop the worker or free its memory.
+- **Do not** rely on `-Xmx`-style intuition: there is no heap ceiling in this engine.
+- **Do not** trust `RLIMIT_AS` on macOS; use RSS sampling there.
+- **Do not** run an unclassified or externally-supplied query directly in-process. Isolate it.
+
+## The one-line rule
+
+> If you cannot prove the query is small, run it in a child process under a memory cap
+> (`RLIMIT_AS` / cgroup on Linux, RSS-sampling watchdog on macOS) **and** a wall-clock
+> watchdog that kills it — `bin/walnut-guard` already does all of this. Only provably-small
+> queries may run directly in-process.
