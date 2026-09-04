@@ -1,0 +1,64 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Part of walnut-rs, a derivative work of Walnut (GPLv3, Mousavi et al.).
+#
+# walnut-rs launcher — the shell-out drop-in for the JVM `bin/walnut` a consumer
+# (e.g. ct-research) runs today. It is a behavioral analog of that script:
+#
+#   ct-research bin/walnut : cd "$WALNUT_DIR"; java -Xmx... -jar Walnut-all.jar "$@"
+#   this script            : cd "$WALNUT_DIR"; exec target/release/walnut-rs   "$@"
+#
+# Like the JVM engine, walnut-rs is a stdin REPL that resolves (and writes) its
+# library directories — "Automata Library/", "Word Automata Library/", "Custom
+# Bases/", "Session/", "Result/", ... — RELATIVE TO ITS CWD. So a caller stages a
+# writable workspace, points $WALNUT_DIR at it, and pipes commands on stdin:
+#
+#   printf 'eval q "?msd_2 Ex x=x";\nquit;\n' | WALNUT_DIR=/path/to/ws bin/walnut-rs
+#
+# Verdicts print as exact `TRUE`/`FALSE` lines on stdout; `def NAME "..."` writes
+# NAME.txt into "$WALNUT_DIR/Session/<timestamp>/Automata Library/". See
+# docs/CT-RESEARCH-INTEGRATION.md for the full consumption contract and the
+# ready-to-paste ct-research wrapper.
+#
+# Environment:
+#   WALNUT_DIR       Workspace to run in (holds the library dirs). Default: cwd.
+#   WALNUT_RS_BIN    Explicit path to the walnut-rs binary. Overrides discovery.
+#   WR_CORE_THREADS  Parallel degree (WR_CORE_THREADS=1 = deterministic, single-
+#                    threaded). Inherited by the binary; see the perf docs.
+#   (No -Xmx analog is needed: memory/time/state limits are enforced EXTERNALLY by
+#    the caller's watchdog, exactly as ct-research's `bin/walnut-guard` already does
+#    around the JVM — that wrapper works unchanged against this binary.)
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Locate the binary: explicit override, then release (the shipped default), then a
+# debug build as a fallback for local development.
+if [[ -n "${WALNUT_RS_BIN:-}" ]]; then
+  BIN="$WALNUT_RS_BIN"
+elif [[ -x "$REPO_DIR/target/release/walnut-rs" ]]; then
+  BIN="$REPO_DIR/target/release/walnut-rs"
+elif [[ -x "$REPO_DIR/target/debug/walnut-rs" ]]; then
+  BIN="$REPO_DIR/target/debug/walnut-rs"
+else
+  BIN=""
+fi
+
+if [[ -z "$BIN" || ! -x "$BIN" ]]; then
+  echo "walnut-rs binary not found." >&2
+  echo "Build it:  (cd \"$REPO_DIR\" && ./build.sh)" >&2
+  echo "       or:  (cd \"$REPO_DIR\" && cargo build --release -p wr-cli --bin walnut-rs)" >&2
+  echo "Or set WALNUT_RS_BIN to an existing binary." >&2
+  exit 1
+fi
+
+# Run in the workspace so library dirs resolve relative to it, matching the JVM
+# engine's cwd-relative behavior. If $WALNUT_DIR is unset, stay in the caller's cwd.
+if [[ -n "${WALNUT_DIR:-}" ]]; then
+  cd "$WALNUT_DIR"
+fi
+
+# `exec` so the caller's stdin/stdout/stderr, signals, and exit code pass straight
+# through — required for the pipe-to-stdin contract and for an external watchdog
+# (walnut-guard) to signal/kill the real process.
+exec "$BIN" "$@"
