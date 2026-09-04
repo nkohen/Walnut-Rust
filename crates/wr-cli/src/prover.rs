@@ -114,6 +114,7 @@ use regex_automata::Input;
 use wr_core::determinize::DeterminizeContext;
 use wr_core::logging::{LoggableError, Logging, GLOBAL_LOG_FILENAME};
 use wr_core::logicalops::ConvertNsError;
+use wr_core::resource::{Exhausted, Instrumentation, MemoryMeterMissing};
 // Only referenced from `#[cfg(test)] mod tests` below, as of WB-036's fix
 // (`docs/WALNUT-BUGS.md`) merging `MorphismError::DomainDoesNotCoverImageRange` into
 // the same `is_handled()`/`kind()` bucket as every other `MorphismError` variant --
@@ -679,6 +680,20 @@ pub enum ProverError {
         command: &'static str,
         unit: &'static str,
     },
+    /// **Port-specific.** A [`wr_core::resource::ResourceBudget`] cap installed via
+    /// [`Prover::set_instrumentation`] was breached under this command — the engine's
+    /// own `EXPLODED-states`/`EXPLODED-mem` verdict, in place of an OS kill. The
+    /// command's partially-built automata have been freed; the session is usable.
+    ResourceExhausted(Exhausted),
+    /// **Port-specific.** The installed budget has a memory cap but no tracking
+    /// allocator is present, so it could not be enforced; nothing was run.
+    MemoryMeterMissing(MemoryMeterMissing),
+}
+
+impl From<MemoryMeterMissing> for ProverError {
+    fn from(e: MemoryMeterMissing) -> Self {
+        ProverError::MemoryMeterMissing(e)
+    }
 }
 
 impl std::fmt::Display for ProverError {
@@ -723,6 +738,9 @@ impl std::fmt::Display for ProverError {
                 f,
                 "The {command} command is not implemented yet (planned for {unit})."
             ),
+            // `Exhausted`'s own text, which starts with the `EXPLODED-…` verdict token.
+            ProverError::ResourceExhausted(e) => write!(f, "{e}"),
+            ProverError::MemoryMeterMissing(e) => write!(f, "{e}"),
         }
     }
 }
@@ -923,6 +941,8 @@ impl LoggableError for ProverError {
             ProverError::Thrown { .. } => true,
             // This port's own scope errors; no Java analogue.
             ProverError::UnsupportedCommand { .. } | ProverError::NotYetImplemented { .. } => true,
+            // Message-only, like a `WalnutException`: the verdict line is the whole point.
+            ProverError::ResourceExhausted(_) | ProverError::MemoryMeterMissing(_) => true,
         }
     }
 
@@ -1058,6 +1078,10 @@ pub struct Prover {
     /// (the prompt, the file echo, the welcome banner, `TRUE`/`FALSE`, `clearScreen`)
     /// goes here; `Logging`'s own console sink is separate, exactly as in Java.
     out: Box<dyn Write>,
+    /// walnut-rs's own opt-in resource budget / trajectory observer
+    /// (`wr_core::resource`), entered around every dispatch. Inert by default, so the
+    /// drop-in path is untouched unless [`Prover::set_instrumentation`] is called.
+    instrumentation: Instrumentation,
 }
 
 impl Prover {
@@ -1087,6 +1111,7 @@ impl Prover {
             print_flag: false,
             current_eval_name: None,
             out,
+            instrumentation: Instrumentation::new(),
         }
     }
 
@@ -1122,6 +1147,32 @@ impl Prover {
 
     pub fn print_details(&self) -> bool {
         self.print_details
+    }
+
+    /// Install a resource budget and/or trajectory observers
+    /// ([`wr_core::resource::Instrumentation`]) around every subsequent
+    /// [`Prover::dispatch`] / [`Prover::dispatch_for_integration_test`]. A breached cap
+    /// surfaces as [`ProverError::ResourceExhausted`] from that dispatch, with the
+    /// partially-built automata already freed; the session stays usable for the next
+    /// command (unlike a JVM `OutOfMemoryError`, which ends Walnut's REPL — there is no
+    /// drop-in behavior to preserve here, since without a budget the engine would have
+    /// been OS-killed instead).
+    ///
+    /// Fails, without installing anything, if the budget has a memory cap and no
+    /// tracking allocator is installed — see `wr_core::resource`'s module docs.
+    pub fn set_instrumentation(
+        &mut self,
+        instrumentation: Instrumentation,
+    ) -> Result<(), MemoryMeterMissing> {
+        instrumentation.validate()?;
+        self.instrumentation = instrumentation;
+        Ok(())
+    }
+
+    /// The currently installed instrumentation (inert unless
+    /// [`Prover::set_instrumentation`] was called).
+    pub fn instrumentation(&self) -> &Instrumentation {
+        &self.instrumentation
     }
 
     /// `Prover.currentEvalName` (`:252`).
@@ -1233,10 +1284,19 @@ impl Prover {
     fn caught<T>(outcome: Result<Result<T, ProverError>, CaughtPanic>) -> Result<T, ProverError> {
         match outcome {
             Ok(inner) => inner,
-            Err(caught) => Err(ProverError::Thrown {
-                message: caught.message,
-                location: caught.location,
-            }),
+            Err(caught) => {
+                // A breached resource budget (`wr_core::resource`) travels as a typed
+                // panic payload past every inner boundary; this outermost one is where it
+                // becomes a structured error. Checked BEFORE the generic `Thrown` mapping
+                // so it is never flattened to text.
+                if let Some(exhausted) = caught.exhausted().cloned() {
+                    return Err(ProverError::ResourceExhausted(exhausted));
+                }
+                Err(ProverError::Thrown {
+                    message: caught.message,
+                    location: caught.location,
+                })
+            }
         }
     }
 
@@ -1292,6 +1352,9 @@ impl Prover {
     /// line runs inside [`wr_core::walnut_panic::catch_walnut_panic`], the way
     /// everything Java's `readBuffer` calls runs inside its `catch (RuntimeException)`.
     pub fn dispatch(&mut self, s: &str) -> Result<bool, ProverError> {
+        // The resource-budget / observer scope (`wr_core::resource`) brackets the whole
+        // command; inert unless `set_instrumentation` was called.
+        let _scope = self.instrumentation.enter()?;
         Self::caught(catch_walnut_panic_detailed(|| self.dispatch_uncaught(s)))
     }
 
@@ -1342,6 +1405,7 @@ impl Prover {
         s: &str,
         msg: &str,
     ) -> Result<Option<TestCase>, ProverError> {
+        let _scope = self.instrumentation.enter()?;
         Self::caught(catch_walnut_panic_detailed(|| {
             self.dispatch_for_integration_test_uncaught(s, msg)
         }))
@@ -2212,7 +2276,10 @@ fn is_io_class_error(e: &ProverError) -> bool {
         // point of the boundary (see `Prover::caught`): the session survives.
         | ProverError::Thrown { .. }
         | ProverError::UnsupportedCommand { .. }
-        | ProverError::NotYetImplemented { .. } => false,
+        | ProverError::NotYetImplemented { .. }
+        // A breached budget ends the COMMAND, not the session: the next line is read.
+        | ProverError::ResourceExhausted(_)
+        | ProverError::MemoryMeterMissing(_) => false,
     }
 }
 

@@ -301,11 +301,22 @@ where
     let mut states_hash: HashMap<(usize, usize), usize> = HashMap::new();
     states_hash.insert((a.q0, b.q0), 0);
 
+    // walnut-rs instrumentation (`crate::resource`, no Java counterpart) -- inert when
+    // nothing is installed; see `determinize.rs`'s subset construction for the pattern.
+    let meter = crate::resource::Meter::current();
+    meter.emit(|| crate::resource::Event::CrossProductStarted {
+        left_states: a.q,
+        right_states: b.q,
+    });
+
     let mut o: Vec<i32> = Vec::new();
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
 
     let mut current_state = 0usize;
     while current_state < states_list.len() {
+        // Budget check once per expanded pair: the overshoot before an `Exhausted` is
+        // at most one pair's out-degree.
+        meter.check(crate::resource::Operation::CrossProduct, states_list.len());
         let (p, q) = states_list[current_state];
         o.push(combine_output(a.o[p], b.o[q]));
 
@@ -374,6 +385,9 @@ where
         states_list.len(),
         time_before.elapsed().as_millis()
     ));
+    meter.emit(|| crate::resource::Event::CrossProductFinished {
+        states: states_list.len(),
+    });
 
     Fa::with_states(0, states_list.len(), axb_alphabet_size, o, d)
 }

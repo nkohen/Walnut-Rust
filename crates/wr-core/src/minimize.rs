@@ -273,6 +273,15 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     }
     let num_states = fa.q;
 
+    // walnut-rs instrumentation (`crate::resource`, no Java counterpart) -- inert when
+    // nothing is installed. Minimization allocates in proportion to its INPUT (which was
+    // itself built under the same budget), so one check at entry is the whole budget
+    // story here; the two events are what a trajectory observer pairs with the
+    // preceding subset construction to diagnose a transient explosion.
+    let meter = crate::resource::Meter::current();
+    meter.check(crate::resource::Operation::Minimize, num_states);
+    meter.emit(|| crate::resource::Event::MinimizeStarted { states: num_states });
+
     // Flatten the transition table into Valmari's tail/label/head triple arrays. A
     // deterministic `Fa` has at most one destination per (state, symbol); empty
     // destination lists are skipped, mirroring `FA.convertNFAtoDFA`'s `isEmpty()` guard.
@@ -467,6 +476,10 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     let o = (0..new_q)
         .map(|q| i32::from(blocks.first[q] < num_final_states))
         .collect();
+    meter.emit(|| crate::resource::Event::MinimizeFinished {
+        before: num_states,
+        after: new_q,
+    });
 
     Ok(Fa::with_states(new_q0, new_q, fa.alphabet_size, o, d))
 }

@@ -278,6 +278,13 @@ pub fn determinize(
         return Err(DeterminizeError::DfaoWithNonScStrategy(strategy));
     }
 
+    // walnut-rs instrumentation (`crate::resource`, no Java counterpart): tell an
+    // installed observer which strategy is about to run. Inert when none is installed.
+    crate::resource::Meter::current().emit(|| crate::resource::Event::Determinize {
+        strategy,
+        input_states: a.fa.q,
+    });
+
     // Java `:121-125`'s switch, minus the deferred OTF arm.
     a.fa = match strategy {
         Strategy::Sc => subset_construction(&a.fa, initial),
@@ -656,6 +663,18 @@ fn scoped_worker(shared: &ScopedShared<'_, '_>) {
 /// Runs subset construction under `schedule`, using `std::thread::scope` for any level that
 /// goes parallel. See this section's docs for the bit-identity and deadlock arguments.
 fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: Schedule<'_>) -> Fa {
+    // walnut-rs instrumentation (`crate::resource`, no Java counterpart): the resource
+    // budget and trajectory observer, snapshotted once. Every check and every event below
+    // runs on THIS thread — at the merge points, never inside a worker — so the parallel
+    // workers need no access to it. Inert (one predictable branch per merged metastate,
+    // no event evaluated) when nothing is installed.
+    let meter = crate::resource::Meter::current();
+    meter.emit(|| crate::resource::Event::SubsetConstructionStarted {
+        input_states: fa.q,
+        initial_size: initial.len(),
+    });
+    let mut levels = 0usize;
+
     let first: Vec<usize> = initial.iter().copied().collect();
     let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
     metastate_to_id.insert(first.clone(), 0);
@@ -695,6 +714,20 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
             if cursor >= end {
                 break;
             }
+            // Per-level trajectory report (only computed when an observer is listening).
+            meter.emit(|| {
+                let list = shared
+                    .metastate_list
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                crate::resource::Event::SubsetLevel {
+                    level: levels,
+                    frontier: end - cursor,
+                    members: list[cursor..end].iter().map(Vec::len).sum(),
+                    metastates: end,
+                }
+            });
+            levels += 1;
             let parallel = {
                 let list = shared
                     .metastate_list
@@ -763,6 +796,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for out in &chunk_outs {
                     merge_expansion(out, &mut list, &mut metastate_to_id, &mut d);
+                    meter.check(crate::resource::Operation::SubsetConstruction, list.len());
                 }
             } else {
                 // One write guard for the whole sequential level rather than one per
@@ -776,6 +810,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
                     seq_out.clear();
                     expand_metastate(fa, &current, &mut seq_scratch, &mut seq_out);
                     merge_expansion(&seq_out, &mut list, &mut metastate_to_id, &mut d);
+                    meter.check(crate::resource::Operation::SubsetConstruction, list.len());
                 }
             }
             cursor = end;
@@ -790,6 +825,10 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
         .iter()
         .map(|ms| i32::from(ms.iter().any(|&q| fa.is_accepting(q))))
         .collect();
+    meter.emit(|| crate::resource::Event::SubsetConstructionFinished {
+        states: metastate_list.len(),
+        levels,
+    });
 
     Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
 }

@@ -50,10 +50,14 @@ Environment knobs:
 | `WALNUT_DIR` | Workspace holding the library dirs; the launcher `cd`s here first. Default: cwd. |
 | `WALNUT_RS_BIN` | Explicit binary path (overrides discovery). |
 | `WR_CORE_THREADS` | Parallel degree. `WR_CORE_THREADS=1` = deterministic, single-threaded (recommended for reproducible research runs). Default is a small auto-picked value. |
+| `WR_MAX_STATES` | In-engine cap on the state count of any single automaton under construction. Unset = unlimited. See "Observability and resource budgets". |
+| `WR_MAX_BYTES` | In-engine cap on live heap bytes (`K`/`M`/`G` suffix allowed) — the `-Xmx` analog. Unset = unlimited. |
 
-Memory/time/state limits are enforced **externally** by the caller's watchdog, exactly
-as ct-research's `bin/walnut-guard` already does around the JVM — no `-Xmx` analog is
-needed, and the watchdog works unchanged against this process.
+Time limits are enforced **externally** by the caller's watchdog, exactly as
+ct-research's `bin/walnut-guard` already does around the JVM; the watchdog works unchanged
+against this process. State/memory limits can additionally be enforced **inside** the
+engine (`WR_MAX_STATES`/`WR_MAX_BYTES`), which — unlike a sampling watchdog — cannot miss a
+fast spike; see below.
 
 ### ct-research wiring (paste-in)
 
@@ -123,6 +127,80 @@ The RSS/time/state sampling, the `TRUE|FALSE|TIMEOUT|EXPLODED-*|ERROR` normaliza
 the `grep -oE '[0-9]+ reachable states'` STATE_MONITOR (fed by `::` mode) all work
 unchanged — walnut-rs's `::` output carries the same `N reachable states` lines.
 
+Add the in-engine budget to the launch environment so a blow-up the sampler would miss
+still yields a clean verdict, and let the engine's own verdict win when it fires:
+
+```bash
+# alongside the RSS/time sampler: the engine caps itself, per inserted state
+WR_MAX_STATES="${STATE_LIMIT:-2000000}" WR_MAX_BYTES="${XMX_MB}M" \
+  "$REPO/bin/walnut-rs" >"$raw" 2>&1 < <(printf '%s' "$cmd") &
+# ...
+# in the normalizer, before the TRUE/FALSE grep:
+if v=$(grep -oE 'EXPLODED-(states|mem)' "$raw" | head -1); then echo "$v"; exit 0; fi
+```
+
+The engine prints the verdict line on stdout after the `[Walnut]$ ` prompt (like every
+Walnut error message), frees the command's memory, keeps reading the next command, and
+exits 0 — so `grep -o` (not an anchored match) finds it, and a script's later commands
+still run.
+
+---
+
+## Observability and resource budgets (both mechanisms)
+
+Added 2026-09 for the research lines in ct-research's feature request; all opt-in and
+inert when unused, so results stay bit-identical.
+
+| Need | Shell-out | In-process |
+| --- | --- | --- |
+| **Real vs. transient explosion** — did the subset construction's peak exceed the minimized output? | `::` mode: the `Determinizing`/`Minimizing:`/`Minimized:` lines | `engine.record_trajectory(true)`; after a command, `engine.trajectory().unwrap().determinizations()` gives one `DeterminizationRecord { input_states, levels, peak_states, minimized }` per subset construction; `.peak_states()` / `.events()` for the per-level `SubsetLevel { level, frontier, members, metastates }` trajectory |
+| **Clean exhaustion instead of an OS kill** | `WR_MAX_STATES` / `WR_MAX_BYTES` → an `EXPLODED-states:` / `EXPLODED-mem:` line | `Engine::builder(dir).budget(ResourceBudget { max_states, max_bytes })` (or `set_budget`) → `Err(ProverError::ResourceExhausted(Exhausted { reason, operation, at, limit }))` |
+| **The `::` detailed log without shelling out** | n/a | `engine.detailed_log()` after a `::`-suffixed command (byte-identical to the binary's lines), or route the console with `Engine::builder(dir).console(Box::new(sink))` |
+
+```rust
+use wr_cli::embed::resource::{ResourceBudget, Trajectory};
+use wr_cli::embed::Engine;
+use wr_cli::prover::ProverError;
+
+let mut engine = Engine::builder("/path/to/workspace")
+    .budget(ResourceBudget { max_states: Some(2_000_000), max_bytes: None })
+    .build()?;
+engine.record_trajectory(true)?;
+
+match engine.eval_bool(r#"eval q "?msd_2 Ax Ey (y > x)""#) {
+    Ok(verdict) => {
+        let t: Trajectory = engine.trajectory().unwrap();
+        for d in t.determinizations() {
+            // peak >> minimized  =>  transient; peak ~ minimized  =>  real
+            println!("{} -> {} (min {:?})", d.input_states, d.peak_states, d.minimized);
+        }
+        println!("peak states this command: {}", t.peak_states());
+    }
+    Err(ProverError::ResourceExhausted(e)) => println!("{}", e.verdict()), // EXPLODED-states
+    Err(e) => return Err(e.into()),
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`max_bytes` counts live heap bytes process-wide through a tracking global allocator. The
+`walnut-rs` binary installs one; an embedder installs its own (any allocator can be wrapped):
+
+```rust
+#[global_allocator]
+static GLOBAL: wr_cli::tracking_alloc::TrackingAllocator<std::alloc::System> =
+    wr_cli::tracking_alloc::TrackingAllocator(std::alloc::System);
+```
+
+Without it, a `max_bytes` cap is refused (`MemoryMeterMissing`) rather than silently
+ignored; a state-only cap needs nothing. Neither cap bounds wall-clock time — keep the
+external watchdog (`docs/EMBEDDING-RESOURCE-SAFETY.md`). The cost of the allocator wrapper
+in the shipped binary is one relaxed atomic add per allocation; see the measurement note in
+`docs/EMBEDDING-RESOURCE-SAFETY.md`'s companion section of `CLAUDE.md`'s status log.
+
+For a direct `wr-core` user (no `Engine`): `wr_core::resource::run(&Instrumentation::new()
+.with_budget(..).with_observer(rc_refcell_trajectory), || { ... })` brackets any code that
+calls the primitives.
+
 ---
 
 ## Mechanism 2 — in-process embedding
@@ -173,8 +251,10 @@ Notes:
   shell `grep`. Commands may omit the trailing `;` — the facade adds it.
 - `Engine::run` has full file-writing side effects (a `def` saves under the session tree).
   `Engine::eval_structured` returns the automaton in memory.
-- `Engine` sends the detailed (`::`) log to a sink; for the byte-identical detailed log
-  (e.g. a state-count watchdog), use the shell-out binary instead.
+- `Engine` sends the detailed (`::`) log to a sink by default; read it back with
+  `engine.detailed_log()` after a `::`-suffixed command, or route it live with
+  `Engine::builder(dir).console(..)`. Structured per-operation counts:
+  `engine.record_trajectory(true)` — see "Observability and resource budgets".
 - `wr-cli` deliberately does **not** set a `#[global_allocator]`; only the `walnut-rs`
   binary does (`mimalloc`). An embedder picks its own allocator.
 

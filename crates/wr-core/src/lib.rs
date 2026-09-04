@@ -53,6 +53,7 @@ pub use parallel::{set_thread_count, ParallelismAlreadyStarted};
 pub mod product;
 pub mod quantify;
 pub mod regex;
+pub mod resource;
 pub mod search;
 pub mod transducer;
 pub mod trim;

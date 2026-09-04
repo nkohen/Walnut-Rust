@@ -17,6 +17,7 @@
 use std::process::ExitCode;
 
 use wr_cli::prover::{parse_args, ArgsOutcome, Prover, USAGE_MESSAGE};
+use wr_core::resource::Instrumentation;
 
 /// The global allocator (U33, the follow-up to U32's measurement).
 ///
@@ -33,8 +34,11 @@ use wr_cli::prover::{parse_args, ArgsOutcome, Prover, USAGE_MESSAGE};
 /// `lib.rs` because `#[global_allocator]` is a whole-program, link-time choice: the `wr_cli`
 /// *library* deliberately does not make it, leaving an embedder (e.g. `ct-research`) free to
 /// pick its own.
+// U33's mimalloc, wrapped (2026-09) in the live-heap meter that makes `WR_MAX_BYTES`
+// enforceable -- see `wr_cli::tracking_alloc` and `wr_core::resource`.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: wr_cli::tracking_alloc::TrackingAllocator<mimalloc::MiMalloc> =
+    wr_cli::tracking_alloc::TrackingAllocator(mimalloc::MiMalloc);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,7 +51,20 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(ArgsOutcome::Run { filename, session }) => {
+            // `WR_MAX_STATES` / `WR_MAX_BYTES`: the in-engine `-Xmx` analog. Unset means
+            // unlimited (the pre-existing behavior); malformed is a startup error.
+            let budget = match wr_cli::resource_env::budget_from_env() {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let mut prover = Prover::new(session);
+            if let Err(e) = prover.set_instrumentation(Instrumentation::new().with_budget(budget)) {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
             match prover.run(filename.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {

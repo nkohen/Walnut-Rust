@@ -60,7 +60,17 @@
 /// Use [`catch_walnut_panic_detailed`] when the caller needs to *triage* the recovered
 /// panic — inspect where it came from, or re-raise one it does not recognize.
 pub fn catch_walnut_panic<T>(f: impl FnOnce() -> T) -> Result<T, String> {
-    catch_walnut_panic_detailed(f).map_err(|caught| caught.message)
+    match catch_walnut_panic_detailed(f) {
+        Ok(v) => Ok(v),
+        // A breached resource budget (`crate::resource`) is the port's `OutOfMemoryError`:
+        // an `Error`, not a `RuntimeException`, so no `catch (RuntimeException)` — which
+        // is what this boundary models — would ever have absorbed it. Re-raised untouched
+        // so it reaches the outermost boundary (`resource::run`, or `wr-cli`'s dispatch),
+        // which turns it into a structured `Result`. Only the DETAILED form hands the
+        // exhaustion back to a caller, and only so that outermost boundary can map it.
+        Err(caught) if caught.exhausted().is_some() => caught.resume(),
+        Err(caught) => Err(caught.message),
+    }
 }
 
 /// A panic [`catch_walnut_panic_detailed`] recovered, with everything Java's
@@ -94,6 +104,14 @@ impl CaughtPanic {
     /// genuinely new bug reached through the same input, reporting nothing.
     pub fn resume(self) -> ! {
         std::panic::resume_unwind(self.payload)
+    }
+
+    /// The [`crate::resource::Exhausted`] this panic carries, if it is a breached
+    /// resource budget rather than a ported guard. See `crate::resource`'s module docs
+    /// for why exhaustion travels as a typed panic payload and which boundaries may
+    /// absorb it (only the outermost one).
+    pub fn exhausted(&self) -> Option<&crate::resource::Exhausted> {
+        self.payload.downcast_ref::<crate::resource::Exhausted>()
     }
 
     /// Whether this panic is one of the JDK exception texts this port raises on purpose,
@@ -195,6 +213,10 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
+    } else if let Some(e) = payload.downcast_ref::<crate::resource::Exhausted>() {
+        // So a message-only reader (a log line, a `Thrown` rendering) still says what
+        // happened; the structured value stays reachable via `CaughtPanic::exhausted`.
+        e.to_string()
     } else {
         String::new()
     }

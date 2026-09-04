@@ -18,12 +18,16 @@ automaton with millions to billions of states. Walnut has the same blowup; the J
 it with a per-process heap ceiling (`java -Xmx8192m …`), so a runaway query dies with an
 `OutOfMemoryError` instead of exhausting the host's RAM and freezing the machine.
 
-**walnut-rs is a native binary/library with no `-Xmx` analog.** A runaway query allocates
-until the OS OOM-kills the process — or, worse, until the machine swap-thrashes to a halt and
-takes everything else on it down with it. The only in-engine budget anywhere is
-transduce-specific (`wr_core::transducer::TransduceBudget`, which returns a clean error); the
-core `determinize` / `product` / `quantify` / `minimize` path has **no** memory cap, **no**
-state cap, and **no** wall-clock deadline. Do not rely on the engine to stop itself.
+**walnut-rs is a native binary/library; its `-Xmx` analog is opt-in and must be switched
+on.** Left unset, a runaway query allocates until the OS OOM-kills the process — or, worse,
+until the machine swap-thrashes to a halt and takes everything else on it down with it. The
+in-engine budget (`wr_core::resource`, 2026-09; `WR_MAX_STATES` / `WR_MAX_BYTES` for the
+binary, `ResourceBudget` for an embedder — see §0 below) caps the state count of any
+automaton under construction and the process's live heap, checked at every state insertion
+inside `determinize` / `product` / `quantify` / `minimize`, and turns a breach into a clean
+`EXPLODED-states` / `EXPLODED-mem` error with the partial automata freed. It bounds **no**
+wall-clock time, and it does nothing unless you set it. Do not rely on the engine to stop
+itself unless you have configured it to.
 
 ## Why in-process is *harder* to protect than a subprocess
 
@@ -44,6 +48,42 @@ its memory is the operating system killing the **process** it runs in.
 ## What you MUST do
 
 Classify every query before you run it, and protect accordingly.
+
+### 0. Always set the in-engine budget — it is the only thing that catches a fast spike
+
+The external watchdogs below sample; a state explosion can go from "fine" to "OS-killed"
+between two samples (observed: `motp7_rec` killed at a peak a 3 s RSS sampler never saw).
+The in-engine budget is checked **per inserted state**, on the constructing thread, so it
+cannot be outrun. Set it in addition to — never instead of — the process-level protection:
+
+- **Shell-out:** `WR_MAX_STATES=<n>` and `WR_MAX_BYTES=<n>[K|M|G]` in the child's
+  environment (`bin/walnut-rs` passes the environment through). The binary installs the
+  tracking allocator `WR_MAX_BYTES` needs. A breach prints one line containing
+  `EXPLODED-states: …` / `EXPLODED-mem: …` on stdout (after the `[Walnut]$ ` prompt, like
+  every Walnut error message — match it with `grep -o 'EXPLODED-[a-z]*'`), the command's
+  memory is freed, and the REPL reads the next command; exit code stays 0. A malformed value
+  is a startup error (exit 1), never silently ignored.
+- **In-process:** `Engine::builder(dir).budget(ResourceBudget { max_states: Some(n),
+  max_bytes: Some(bytes) })` (or `engine.set_budget(..)`). A breach makes that command return
+  `Err(ProverError::ResourceExhausted(Exhausted { reason, operation, at, limit }))`; the
+  `Engine` stays usable. `max_bytes` counts **live heap bytes process-wide** (the same
+  quantity `-Xmx` bounds), and needs a tracking global allocator in *your* binary:
+
+  ```rust
+  #[global_allocator]
+  static GLOBAL: wr_cli::tracking_alloc::TrackingAllocator<std::alloc::System> =
+      wr_cli::tracking_alloc::TrackingAllocator(std::alloc::System);
+  ```
+
+  Without it a `max_bytes` cap is **refused** (`MemoryMeterMissing`), not silently skipped —
+  a state-only budget still works. Size the byte cap below the host's real RAM, and remember
+  it includes your own process's live data.
+
+What the budget does **not** do: bound wall-clock time (a query can run for hours inside both
+caps), or interrupt anything between check points inside a single primitive — the check
+points are per state, so in practice a breach lands within one metastate's out-degree of the
+cap, but the process-level cap in point 1 remains the backstop for everything this cannot
+see (a third-party allocation, a hang).
 
 ### 1. Any query that is not *provably* small → run it in an isolated, resource-capped child process
 
@@ -83,10 +123,12 @@ after.
 
 Direct `wr_cli::embed::Engine` use on your own process's thread is appropriate **only** for
 queries whose size you control and know to be small: your own hand-authored fixtures, small
-bases, shallow quantifier alternation, automata of at most a few hundred states. If you cannot
-state a concrete bound, treat it as unbounded and go through point 1. When you do run
-in-process directly, still wrap it in a wall-clock check so a mistake is *noticed* (even though,
-per the section above, noticing cannot stop it — it tells you to fix the query or move it to a
+bases, shallow quantifier alternation, automata of at most a few hundred states — **and always
+with a `ResourceBudget` set (§0)**, which turns the one failure mode this section is about (a
+blow-up you cannot interrupt) into an `Err` you get back with the memory already freed. If you
+cannot state a concrete bound, treat it as unbounded and go through point 1. When you do run
+in-process directly, still wrap it in a wall-clock check so a runaway-but-within-budget query
+is *noticed* (noticing cannot stop it — it tells you to fix the query or move it to a
 subprocess).
 
 ### 4. Reproducibility (not a safety control, but do it anyway)
@@ -99,13 +141,16 @@ just removes a nondeterminism source from research runs. It does **not** bound m
 
 - **Do not** call the engine on a thread and assume a timeout thread can rescue you — it
   cannot stop the worker or free its memory.
-- **Do not** rely on `-Xmx`-style intuition: there is no heap ceiling in this engine.
+- **Do not** rely on `-Xmx`-style intuition: the heap ceiling exists only if you set
+  `WR_MAX_BYTES` / `ResourceBudget::max_bytes` (and, in-process, install the tracking
+  allocator). Unset, there is none.
 - **Do not** trust `RLIMIT_AS` on macOS; use RSS sampling there.
 - **Do not** run an unclassified or externally-supplied query directly in-process. Isolate it.
 
 ## The one-line rule
 
+> Always set the in-engine budget (`WR_MAX_STATES`/`WR_MAX_BYTES`, or `ResourceBudget`).
 > If you cannot prove the query is small, run it in a child process under a memory cap
 > (`RLIMIT_AS` / cgroup on Linux, RSS-sampling watchdog on macOS) **and** a wall-clock
-> watchdog that kills it — `bin/walnut-guard` already does all of this. Only provably-small
-> queries may run directly in-process.
+> watchdog that kills it — `bin/walnut-guard` already does all of this. Only provably-small,
+> budgeted queries may run directly in-process.
