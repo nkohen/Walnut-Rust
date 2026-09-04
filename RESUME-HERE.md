@@ -11,11 +11,10 @@ THIS campaign, gated on a fresh profile.
 ## PUSHED 2026-09-03 — `perf/beyond` is on `origin` (`8c7cb47`, tracking `origin/perf/beyond`)
 
 The user gave the explicit go-ahead ("wrap and push") and the campaign branch was pushed to
-`git@github.com:nkohen/Walnut-Rust.git`. This is the first push of any campaign work. The three
-parallelization-experiment branches (`agent/par-max`/`par-det`/`par-posthoc`, referenced by
-`docs/PARALLELISM-EXPERIMENT.md`) remain LOCAL-ONLY — not pushed; push them separately if the
-doc's references need to resolve on the remote. Open follow-up: the D3 thread-tuning sweep
-(`docs/BACKLOG-D3-THREAD-TUNING.md`).
+`git@github.com:nkohen/Walnut-Rust.git`. This is the first push of any campaign work. The three parallelization-experiment branches (`agent/par-max` @ `95c19c1`, `agent/par-det` @
+`9b64464`, `agent/par-posthoc` @ `e95727c`, referenced by `docs/PARALLELISM-EXPERIMENT.md`)
+were also pushed to `origin` — the doc's references resolve on the remote. Open follow-up: the
+D3 thread-tuning sweep (`docs/BACKLOG-D3-THREAD-TUNING.md`).
 
 ## Current work: the performance campaign
 
