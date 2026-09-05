@@ -55,8 +55,12 @@ use wr_core::logging::Logging;
 /// data structure, so it cannot change what any workload computes — and the harness proves
 /// that independently anyway, by checking every answer with `wr_core::equiv` before believing
 /// its timing.
+// Wrapped exactly as the shipped binary wraps it (`crates/wr-cli/src/main.rs`) so the
+// benchmark keeps timing the configuration that actually runs: with no memory cap the
+// wrapper is a flag load per allocation, and that flag is what the bench measures too.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: wr_cli::tracking_alloc::TrackingAllocator<mimalloc::MiMalloc> =
+    wr_cli::tracking_alloc::TrackingAllocator(mimalloc::MiMalloc);
 
 /// `tests/golden`'s harness support module, **included** rather than copied.
 ///

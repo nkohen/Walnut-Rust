@@ -103,6 +103,7 @@
 //! parenthesis in both engines — and [`tests`] pins each one against a real command string
 //! rather than trusting the count.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::sync::OnceLock;
@@ -1082,7 +1083,63 @@ pub struct Prover {
     /// (`wr_core::resource`), entered around every dispatch. Inert by default, so the
     /// drop-in path is untouched unless [`Prover::set_instrumentation`] is called.
     instrumentation: Instrumentation,
+    /// **walnut-rs only (2026-09).** Commands registered at run time
+    /// ([`Prover::register_command`]), consulted only for a name that is NOT one of
+    /// Walnut's own, so the built-in dispatch is untouched. Empty by default.
+    custom_commands: BTreeMap<String, CommandHandler>,
 }
+
+/// What a registered command handler ([`Prover::register_command`]) is handed: the
+/// session and the per-command state the built-in commands themselves work with.
+pub struct CommandContext<'a> {
+    /// The session (library paths, number-system cache, in-memory registrations).
+    pub session: &'a Session,
+    /// The command's already-`configure_for_command`-ed logging (`::` details go here).
+    pub logging: &'a mut Logging,
+    /// Where a bare `System.out.print` goes (the REPL console; the buffer an
+    /// `embed::Engine` captures).
+    pub out: &'a mut dyn Write,
+    /// Whether the command was suffixed `::` (Walnut's `printDetails`).
+    pub print_details: bool,
+    /// Whether the command was suffixed `:` or `::` (Walnut's `printFlag`).
+    pub print_flag: bool,
+    /// The command's parsed `[strategy …]`/`[export …]` metacommands, already stripped
+    /// from the text the handler receives; implements `DeterminizeContext`.
+    pub meta_commands: &'a mut MetaCommands,
+}
+
+/// A registered command's body. Receives the command text with the terminator and any
+/// metacommand prefix removed (so `ctrec foo 3;` arrives as `ctrec foo 3`); returns
+/// what `Prover::process_command` returns for a built-in: an optional structured
+/// result. A panic in the body is recovered by the same boundary that recovers a
+/// built-in's (`Prover::caught`), so a handler may `panic!` a Walnut-style message.
+pub type CommandHandler =
+    Box<dyn FnMut(CommandContext<'_>, &str) -> Result<Option<TestCase>, ProverError>>;
+
+/// Why [`Prover::register_command`] refused a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterCommandError {
+    /// The name is one of Walnut's own commands; those cannot be shadowed (the drop-in
+    /// contract).
+    BuiltIn(String),
+    /// Not a command name the REPL's tokenizer can recognize (`[A-Za-z_][A-Za-z0-9_]*`).
+    InvalidName(String),
+}
+
+impl std::fmt::Display for RegisterCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterCommandError::BuiltIn(n) => {
+                write!(f, "{n} is a built-in Walnut command and cannot be replaced")
+            }
+            RegisterCommandError::InvalidName(n) => {
+                write!(f, "{n:?} is not a valid command name")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegisterCommandError {}
 
 impl Prover {
     /// A prover over `session`, writing to the real process stdout, with the global log
@@ -1112,7 +1169,69 @@ impl Prover {
             current_eval_name: None,
             out,
             instrumentation: Instrumentation::new(),
+            custom_commands: BTreeMap::new(),
         }
+    }
+
+    /// **walnut-rs only.** Register a new REPL command — the registration API a
+    /// downstream consumer uses to expose its own decision procedures as commands
+    /// without editing this crate's dispatch. `name` must not be a built-in command
+    /// (those keep their exact Walnut behavior) and must be a plain identifier. The
+    /// handler runs under the same panic boundary, resource budget and `::`/`;`
+    /// bookkeeping as a built-in, and its result is what `dispatch_for_integration_test`
+    /// returns. Re-registering a name replaces the earlier handler.
+    pub fn register_command(
+        &mut self,
+        name: &str,
+        handler: CommandHandler,
+    ) -> Result<(), RegisterCommandError> {
+        let valid = !name.is_empty()
+            && name.bytes().enumerate().all(|(i, b)| {
+                b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())
+            });
+        if !valid {
+            return Err(RegisterCommandError::InvalidName(name.to_string()));
+        }
+        if patterns().list_of_cmds.is_match(name) {
+            return Err(RegisterCommandError::BuiltIn(name.to_string()));
+        }
+        self.custom_commands.insert(name.to_string(), handler);
+        Ok(())
+    }
+
+    /// The names registered through [`Prover::register_command`], sorted.
+    pub fn registered_commands(&self) -> Vec<&str> {
+        self.custom_commands.keys().map(String::as_str).collect()
+    }
+
+    /// Run a registered command, if `command_name` is one. `None` when it is not.
+    fn run_custom_command(
+        &mut self,
+        command_name: &str,
+        s: &str,
+    ) -> Option<Result<Option<TestCase>, ProverError>> {
+        let Prover {
+            custom_commands,
+            session,
+            logging,
+            out,
+            print_details,
+            print_flag,
+            meta_commands,
+            ..
+        } = self;
+        let handler = custom_commands.get_mut(command_name)?;
+        Some(handler(
+            CommandContext {
+                session,
+                logging,
+                out: out.as_mut(),
+                print_details: *print_details,
+                print_flag: *print_flag,
+                meta_commands,
+            },
+            s,
+        ))
     }
 
     pub fn session(&self) -> &Session {
@@ -1371,7 +1490,12 @@ impl Prover {
             find(&patterns().cmd, &s).ok_or_else(|| ProverError::InvalidCommand(s.clone()))?;
         let command_name = group(&caps, &s, 1).unwrap_or("").to_string();
         if !patterns().list_of_cmds.is_match(command_name.as_str()) {
-            return Err(ProverError::NoSuchCommand);
+            // walnut-rs only: a registered command (`register_command`). Consulted only
+            // here, past the built-in name check, so no built-in can be shadowed.
+            return match self.run_custom_command(&command_name, &s) {
+                Some(outcome) => outcome.map(|_| true),
+                None => Err(ProverError::NoSuchCommand),
+            };
         }
 
         let mut exit_val = !(command_name == EXIT || command_name == QUIT);
@@ -1431,7 +1555,10 @@ impl Prover {
             find(&patterns().cmd, &s).ok_or_else(|| ProverError::InvalidCommand(s.clone()))?;
         let command_name = group(&caps, &s, 1).unwrap_or("").to_string();
         if !patterns().list_of_cmds.is_match(command_name.as_str()) {
-            return Err(ProverError::NoSuchCommand);
+            return match self.run_custom_command(&command_name, &s) {
+                Some(outcome) => outcome,
+                None => Err(ProverError::NoSuchCommand),
+            };
         }
 
         self.process_command(&s, &command_name)

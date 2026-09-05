@@ -17,9 +17,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use wr_cli::embed::resource::{memory_meter, ExhaustedReason, ResourceBudget};
+use std::rc::Rc;
+
+use wr_cli::embed::resource::{
+    memory_meter, Event, ExhaustedReason, Instrumentation, ResourceBudget,
+};
 use wr_cli::embed::Engine;
 use wr_cli::prover::ProverError;
+use wr_core::determinize::Strategy;
+use wr_core::fa::Fa;
+use wr_core::minimize::{MinimizeError, Minimizer};
 
 const BIN: &str = env!("CARGO_BIN_EXE_walnut-rs");
 
@@ -149,11 +156,9 @@ fn the_builder_accepts_a_budget_up_front() {
 
 #[test]
 fn a_memory_cap_without_a_tracking_allocator_is_refused() {
-    // This test binary installs no tracking allocator (only the `walnut-rs` binary
-    // does), so a memory cap cannot be enforced here and must be refused, not ignored.
-    if memory_meter::is_installed() {
-        return;
-    }
+    // This test binary links no tracking allocator (only the `walnut-rs` binary does),
+    // so a memory cap cannot be enforced here and must be refused, not ignored.
+    assert!(!memory_meter::is_enabled());
     let ws = workspace("no-meter");
     let mut engine = Engine::new(&ws).unwrap();
     let cap = ResourceBudget {
@@ -170,6 +175,10 @@ fn a_memory_cap_without_a_tracking_allocator_is_refused() {
             .err()
             .map(|e| e.kind()),
         Some(io::ErrorKind::Unsupported)
+    );
+    assert!(
+        !memory_meter::is_enabled(),
+        "a failed enable must not leave counting on"
     );
     fs::remove_dir_all(&ws).ok();
 }
@@ -311,5 +320,133 @@ fn binary_without_budget_variables_is_unchanged() {
         run.stdout
     );
     assert!(!run.stdout.contains("EXPLODED"));
+    fs::remove_dir_all(&ws).ok();
+}
+
+// ------------------------------------------------------------- item C: SC_OTF + seam
+
+#[test]
+fn the_sc_otf_strategy_is_selectable_by_metacommand_and_by_scope_default() {
+    let ws = workspace("otf");
+    let mut engine = Engine::new(&ws).unwrap();
+    engine.record_trajectory(true).unwrap();
+
+    // Baseline: plain SC everywhere.
+    assert_eq!(engine.eval_bool(QUANTIFIED_TRUE).unwrap(), Some(true));
+    let strategies = |t: &wr_cli::embed::resource::Trajectory| {
+        t.events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Determinize { strategy, .. } => Some(*strategy),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let base = engine.trajectory().unwrap();
+    assert!(!strategies(&base).is_empty());
+    assert!(strategies(&base).iter().all(|s| *s == Strategy::Sc));
+
+    // `[strategy * SC_OTF]` (metacommands are read in `::` mode, like Java): every
+    // dispatcher-level determinization now runs SC_OTF, and the verdict is unchanged.
+    let out = engine
+        .run(r#"[strategy * SC_OTF] eval q "?msd_2 Ax Ey (y > x)"::"#)
+        .unwrap();
+    assert!(out.lines().any(|l| l == "TRUE"), "{out}");
+    let t = engine.trajectory().unwrap();
+    assert!(!strategies(&t).is_empty());
+    assert!(
+        strategies(&t).iter().all(|s| *s == Strategy::ScOtf),
+        "{:?}",
+        strategies(&t)
+    );
+    assert!(
+        engine.detailed_log().contains("strategy: SC_OTF]"),
+        "{}",
+        engine.detailed_log()
+    );
+    // Java's alias normalization: underscores/dashes dropped, case-insensitive.
+    engine
+        .run(r#"[strategy * scotf] eval q "?msd_2 Ax Ey (y > x)"::"#)
+        .unwrap();
+    assert!(strategies(&engine.trajectory().unwrap())
+        .iter()
+        .all(|s| *s == Strategy::ScOtf));
+
+    // Scope default: applies in `;` mode too (no metacommand parsed there), and an
+    // explicit metacommand still wins over it.
+    engine
+        .set_instrumentation(Instrumentation::new().with_default_strategy(Strategy::ScOtf))
+        .unwrap();
+    assert_eq!(engine.eval_bool(QUANTIFIED_TRUE).unwrap(), Some(true));
+    let t = engine.trajectory().unwrap();
+    assert!(
+        strategies(&t).iter().all(|s| *s == Strategy::ScOtf),
+        "{:?}",
+        strategies(&t)
+    );
+    engine
+        .run(r#"[strategy * SC] eval q "?msd_2 Ax Ey (y > x)"::"#)
+        .unwrap();
+    let t = engine.trajectory().unwrap();
+    assert!(
+        strategies(&t).iter().all(|s| *s == Strategy::Sc),
+        "{:?}",
+        strategies(&t)
+    );
+    fs::remove_dir_all(&ws).ok();
+}
+
+/// `wr_cts::moore` — the Tier-4 independent minimizer — installed through the seam. It
+/// returns the minimal COMPLETE DFA (keeps a dead class Valmari drops), which is a
+/// legal, non-identical, language-equivalent minimizer: exactly what the seam must
+/// tolerate without changing any verdict.
+struct Moore(std::cell::Cell<usize>);
+
+impl Minimizer for Moore {
+    fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError> {
+        self.0.set(self.0.get() + 1);
+        if fa.q == 0 {
+            return Ok(fa.clone());
+        }
+        if !fa.is_deterministic() {
+            return Err(MinimizeError::NotDeterministic);
+        }
+        // Moore wants a total DFA; the construction path hands it partial ones.
+        let mut total = wr_core::trim::trim(fa);
+        total.totalize(0);
+        wr_cts::moore::minimize(&total)
+            .map_err(|e| panic!("moore rejected a construction-path automaton: {e:?}"))
+    }
+    fn name(&self) -> &str {
+        "moore"
+    }
+}
+
+#[test]
+fn a_second_minimizer_through_the_seam_decides_the_same_queries() {
+    let ws = workspace("moore-seam");
+    let mut engine = Engine::new(&ws).unwrap();
+    let moore = Rc::new(Moore(std::cell::Cell::new(0)));
+    engine
+        .set_instrumentation(Instrumentation::new().with_minimizer(moore.clone()))
+        .unwrap();
+    let queries = [
+        (QUANTIFIED_TRUE, Some(true)),
+        (r#"eval f "?msd_2 Ax Ey (y < x)""#, Some(false)),
+        (r#"eval g "?msd_3 Ax Ay (x + y = y + x)""#, Some(true)),
+        (r#"eval h "?msd_2 Ex Ay (x <= y)""#, Some(true)),
+    ];
+    for (q, expected) in queries {
+        assert_eq!(engine.eval_bool(q).unwrap(), expected, "{q}");
+    }
+    assert!(moore.0.get() > 0, "the seam must actually have been used");
+    // A `def` result built through Moore still saves and is reusable.
+    engine.run(r#"def lt "?msd_2 x < y""#).unwrap();
+    assert_eq!(
+        engine
+            .eval_bool(r#"eval k "?msd_2 Ax Ey $lt(x, y)""#)
+            .unwrap(),
+        Some(true)
+    );
     fs::remove_dir_all(&ws).ok();
 }

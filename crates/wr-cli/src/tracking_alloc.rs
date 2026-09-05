@@ -18,9 +18,12 @@
 //!     wr_cli::tracking_alloc::TrackingAllocator(std::alloc::System);
 //! ```
 //!
-//! Cost: one relaxed atomic add on every allocation and free (a shared counter; see
-//! `memory_meter`'s docs). Measured on the shipped binary against the benchmark
-//! fixtures before it was installed by default — see `docs/CT-RESEARCH-INTEGRATION.md`.
+//! Cost: one relaxed **load** of a flag per allocation/free while no memory cap has
+//! enabled counting (the shipped binary's default), and one relaxed atomic add on a
+//! shared counter per allocation/free once `WR_MAX_BYTES` / `ResourceBudget::max_bytes`
+//! has enabled it (`memory_meter::enable`). The counting path is the price of the
+//! `-Xmx` analog and is paid only by sessions that ask for one; a direction-only A/B of
+//! the two paths is recorded in `docs/CT-RESEARCH-INTEGRATION.md`.
 
 use std::alloc::{GlobalAlloc, Layout};
 

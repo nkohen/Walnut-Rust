@@ -213,6 +213,11 @@ impl LoggableError for MetaCommandError {
 const STRATEGY_TABLE: &[(&str, bool, &[&str])] = &[
     ("SC", false, &["SC"]),
     ("Brzozowski", false, &["Brz"]),
+    // walnut-rs only (2026-09): `wr_core::otf`'s simulation-subsumption subset
+    // construction. Not an OTF-family member in Java's sense (`usingOTF` stays false, so
+    // Java's `OTF_MESSAGE` is never printed for it). Java's normalization strips the
+    // underscore before matching, hence the `SCOTF` alias; `SC-OTF`/`sc_otf` match too.
+    ("SC_OTF", false, &["SCOTF"]),
     ("CCLS", true, &["CCLS"]),
     ("Brzozowski-CCLS", true, &["BRZCCLS"]),
     ("CCL", true, &["CCL"]),
@@ -245,6 +250,7 @@ pub fn strategy_from_string(name: &str) -> Result<Strategy, MetaCommandError> {
                 return match entry.0 {
                     "SC" => Ok(Strategy::Sc),
                     "Brzozowski" => Ok(Strategy::Brz),
+                    "SC_OTF" => Ok(Strategy::ScOtf),
                     // `strategy.isOTFStrategy()` (`:65-67`) — Java would set
                     // `Prover.usingOTF = true` and carry on; this port stops here.
                     _ => Err(MetaCommandError::OtfStrategyDeferred(name.to_string())),
@@ -587,6 +593,13 @@ impl DeterminizeContext for MetaCommands {
             Ok(idx) => self.get_strategy(idx),
             Err(_) => self.always_on_strategy.unwrap_or(Strategy::Sc),
         }
+    }
+
+    fn has_explicit_strategy(&self, automaton_index: usize) -> bool {
+        self.always_on_strategy.is_some()
+            || i32::try_from(automaton_index)
+                .map(|idx| self.strategy_map.contains_key(&idx))
+                .unwrap_or(false)
     }
 
     fn export_pre_determinization(&mut self, request: ExportRequest<'_>) {

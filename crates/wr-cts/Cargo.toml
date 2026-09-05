@@ -3,16 +3,28 @@ name = "wr-cts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# The substrate is edition 2024, which needs 1.85+; the workspace MSRV (1.75) does not
+# cover this crate's default feature set.
+rust-version = "1.85"
+
+[features]
+# The `Fa` <-> `DFAO` bridge (`src/bridge.rs`) to the ct-research substrate. ON by default
+# so `cargo test --workspace` builds and tests it; `wr-cli` depends on this crate with
+# `default-features = false`, so the shipped `walnut-rs` binary (built with `-p wr-cli`)
+# never links the substrate or its graphviz dependency. An embedder that wants the bridge
+# depends on `wr-cts` itself.
+default = ["substrate"]
+substrate = ["dep:rust_constant_term_sequences"]
 
 [dependencies]
 wr-core = { path = "../wr-core" }
-# The RustConstantTermSequences substrate (primitives: GF(p) linalg, ModInt/LaurentPoly).
-# NOT wired: the Tier-4 independent minimizer it was meant to supply turned out not to be
-# reusable (single-track / DFAO<ModInt,S>-specific, no usable minimize entry point), so
-# `src/moore.rs` is a standalone implementation instead — see the crate docs and
-# DESIGN.md §4. Still a candidate for the numeric primitives:
-# rust-constant-term-sequences = { git = "https://github.com/nkohen/RustConstantTermSequences.git" }
+# The RustConstantTermSequences substrate (the ct-research DFAO type, GF(p) linear
+# algebra, linear representations). Pinned to a commit, not a branch, so a substrate
+# change is a deliberate bump here (the same discipline ct-research applies to this
+# repo's submodule pointer). Optional — see `[features]`. The Tier-4 independent
+# minimizer this crate was originally meant to take from the substrate is still
+# `src/moore.rs`'s standalone implementation (the substrate has no minimize entry point).
+rust_constant_term_sequences = { package = "RustConstantTermSequences", git = "https://github.com/nkohen/RustConstantTermSequences.git", rev = "1643ad13cbf0fa7402e269215dbe8d67e7fe418c", optional = true }
 
 [dev-dependencies]
 # DESIGN.md §5 Tier 4 property invariants (the Valmari-vs-Moore cross-check).

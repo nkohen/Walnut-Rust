@@ -91,6 +91,10 @@ use crate::test_case::TestCase;
 /// [`Engine::set_instrumentation`] / [`Engine::record_trajectory`], re-exported so a
 /// consumer that only links `wr-cli` needs no direct `wr-core` dependency.
 pub use wr_core::resource;
+/// Witness / counterexample extraction from a decided automaton (the `TestCase`
+/// [`Engine::eval_structured`] returns) — `shortest_accepted`, `shortest_rejected`,
+/// per-track decoding. Re-exported for the same reason as [`resource`].
+pub use wr_core::witness;
 pub use wr_core::{set_thread_count, ParallelismAlreadyStarted};
 
 /// A cloneable, in-memory stdout sink. One clone is handed to the [`Prover`] as
@@ -353,6 +357,40 @@ impl Engine {
         if let Some(t) = &self.trajectory {
             t.borrow_mut().clear();
         }
+    }
+
+    // ------------------------------------------------------- in-memory automata
+
+    /// Register an in-memory word automaton as `name` (usable as `name[i]` in every
+    /// later formula on this engine), shadowing any `Word Automata Library/name.txt`.
+    /// No `.txt` is written or parsed — this is how an already-minimal DFAO built on the
+    /// ct-research substrate (`wr_cts::bridge::automaton_from_dfao`) enters the engine.
+    /// The automaton must have the shape the reader produces for a word automaton:
+    /// deterministic, one track per variable, `msd`/`ns_name` set on each track.
+    pub fn register_word_automaton(
+        &mut self,
+        name: &str,
+        automaton: wr_core::automaton::Automaton,
+    ) {
+        self.prover
+            .session()
+            .libraries()
+            .register_word(name, automaton);
+    }
+
+    /// Register an in-memory predicate automaton as `name` (usable as `$name(…)`),
+    /// shadowing any `Automata Library/name.txt`. A `def` result obtained through
+    /// [`Engine::eval_structured`] is the typical source.
+    pub fn register_automaton(&mut self, name: &str, automaton: wr_core::automaton::Automaton) {
+        self.prover
+            .session()
+            .libraries()
+            .register_function(name, automaton);
+    }
+
+    /// Forget an in-memory registration of either kind.
+    pub fn unregister_automaton(&mut self, name: &str) {
+        self.prover.session().libraries().unregister(name);
     }
 
     // --------------------------------------------------------------------- logs

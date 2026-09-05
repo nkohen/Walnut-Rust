@@ -21,5 +21,18 @@
 //!
 //! The substrate's *numeric* primitives remain a candidate for later reuse; nothing here
 //! forecloses that.
+//!
+//! # The substrate bridge (2026-09, feature `substrate`, on by default)
+//!
+//! [`bridge`] converts between [`wr_core::fa::Fa`] / [`wr_core::automaton::Automaton`]
+//! and the substrate's `DFAO<ModInt, S>` in both directions, so an already-minimal
+//! constant-term DFAO computed on the substrate can be registered directly into an
+//! engine session (`wr_cli::embed::Engine::register_word_automaton`) and the engine's
+//! automata can be handed to the substrate's linear-representation machinery — no
+//! `.txt` round trip. The dependency is a pinned git commit and optional; `wr-cli`
+//! disables it so the shipped binary never links it.
 
 pub mod moore;
+
+#[cfg(feature = "substrate")]
+pub mod bridge;

@@ -90,6 +90,13 @@ pub enum Strategy {
     Sc,
     /// Brzozowski double reversal ([`brzozowski`]).
     Brz,
+    /// **walnut-rs only (2026-09), no Java counterpart.** Subset construction with
+    /// on-the-fly simulation-subsumption reduction of every metastate
+    /// ([`crate::otf::subset_construction_otf`]) — the opt-in answer to a *transient*
+    /// determinization explosion. Selected by a `[strategy N SC_OTF]` metacommand or a
+    /// scope default ([`crate::resource::Instrumentation::with_default_strategy`]);
+    /// never chosen implicitly, so plain `SC` stays bit-identical.
+    ScOtf,
 }
 
 impl Strategy {
@@ -99,6 +106,7 @@ impl Strategy {
         match self {
             Strategy::Sc => "SC",
             Strategy::Brz => "Brzozowski",
+            Strategy::ScOtf => "SC_OTF",
         }
     }
 
@@ -178,6 +186,17 @@ pub trait DeterminizeContext {
         Strategy::Sc
     }
 
+    /// **walnut-rs only.** Whether [`DeterminizeContext::strategy`] for this index is a
+    /// user's explicit choice (a `[strategy N …]`/`[strategy * …]` metacommand) rather
+    /// than the `SC` fallback. A scope-level default strategy
+    /// ([`crate::resource::Instrumentation::with_default_strategy`]) applies only when
+    /// this is `false`, so an explicit metacommand always wins over it. Defaults to
+    /// `false` (a context that never distinguishes lets the scope default apply).
+    fn has_explicit_strategy(&self, automaton_index: usize) -> bool {
+        let _ = automaton_index;
+        false
+    }
+
     /// The `[export …]` hook: `getExportName`/`getExportFormat` + the
     /// `ProverHelper.exportAutomata` call they guard (`:103-109`). Doing nothing is the
     /// port of `exportName == null` (no export registered for this index).
@@ -247,11 +266,23 @@ pub fn determinize(
 ) -> Result<(), DeterminizeError> {
     let time_before = std::time::Instant::now();
     let mut strategy = Strategy::Sc;
+    // walnut-rs instrumentation (`crate::resource`, no Java counterpart): a scope may
+    // install a default strategy (e.g. `SC_OTF`); it applies only where no metacommand
+    // chose one explicitly, and never to a DFAO (whose outputs `SC` alone preserves --
+    // the guard below would otherwise turn an opt-in default into an error on a word
+    // automaton that plain `SC` handles).
+    let meter = crate::resource::Meter::current();
+    let scope_default = meter.default_strategy().filter(|_| !a.fa.is_fao());
     if let Some(ctx) = ctx {
         // Java `:100-101`: the counter advances once per non-silent determinization,
         // and the strategy is looked up under that same index.
         let automaton_index = ctx.next_automaton_index();
         strategy = ctx.strategy(automaton_index);
+        if !ctx.has_explicit_strategy(automaton_index) {
+            if let Some(s) = scope_default {
+                strategy = s;
+            }
+        }
 
         // Java `:103-109`: `A` is offered to the export sink BEFORE determinizing
         // (Walnut names the file `..._<idx>_pre` for exactly that reason).
@@ -271,6 +302,8 @@ pub fn determinize(
             strategy.output_name(automaton_index),
             a.fa.q
         ));
+    } else if let Some(s) = scope_default {
+        strategy = s;
     }
 
     // Java `:115-119`.
@@ -278,17 +311,23 @@ pub fn determinize(
         return Err(DeterminizeError::DfaoWithNonScStrategy(strategy));
     }
 
-    // walnut-rs instrumentation (`crate::resource`, no Java counterpart): tell an
-    // installed observer which strategy is about to run. Inert when none is installed.
-    crate::resource::Meter::current().emit(|| crate::resource::Event::Determinize {
+    // walnut-rs instrumentation: tell an installed observer which strategy is about to
+    // run. Inert when none is installed.
+    meter.emit(|| crate::resource::Event::Determinize {
         strategy,
         input_states: a.fa.q,
     });
 
-    // Java `:121-125`'s switch, minus the deferred OTF arm.
+    // Java `:121-125`'s switch, minus the deferred OTF arm, plus this port's own
+    // `SC_OTF`.
     a.fa = match strategy {
         Strategy::Sc => subset_construction(&a.fa, initial),
         Strategy::Brz => brzozowski(&a.fa, initial, logging)?,
+        Strategy::ScOtf => crate::otf::subset_construction_otf(
+            &a.fa,
+            initial,
+            &meter.otf_policy().unwrap_or_default(),
+        ),
     };
     // In Java this is a brand-new `FA` object, so its `canonized` memo is `false` by
     // construction; this port's flag lives on the `Automaton` wrapper and survives the
@@ -563,6 +602,12 @@ struct ScopedLevel {
 /// from.
 struct ScopedShared<'fa, 'h> {
     fa: &'fa Fa,
+    /// The scope's resource budget (`Copy` + `Send`, unlike the full meter), so a
+    /// worker can check the MEMORY cap before expanding each chunk -- bounding the
+    /// memory overshoot on the parallel path to about one chunk's expansion output per
+    /// worker instead of a whole level's. The state cap is checked at the merge, on the
+    /// coordinating thread, once per discovered metastate (see `merge_expansion`).
+    budget: crate::resource::ResourceBudget,
     /// The BFS worklist. See this section's docs for why it is behind a lock.
     metastate_list: RwLock<Vec<Vec<usize>>>,
     level: Mutex<ScopedLevel>,
@@ -581,6 +626,11 @@ impl ScopedShared<'_, '_> {
         if let Some(hook) = self.hook {
             hook(i, level.chunk_count, ChunkPhase::Before);
         }
+        // A breach here panics on whichever thread runs the chunk; `Task::take_results`
+        // re-raises it on the coordinating thread with the payload intact, so the
+        // `Exhausted` value reaches the same boundary as a sequential breach.
+        self.budget
+            .check_memory(crate::resource::Operation::SubsetConstruction);
         let start = level.cursor + i * level.chunk;
         // `saturating_add` as well as `chunk_for`'s clamp: this indexes the worklist
         // absolutely, so a chunk bound is `cursor`-offset and nothing here should be able
@@ -692,6 +742,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
         wake: Condvar::new(),
         task: crate::parallel::Task::new(0),
         hook: schedule.hook(),
+        budget: meter.budget(),
     };
 
     let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
@@ -790,13 +841,15 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
                 // Re-raises the lowest-indexed panic, if any -- `_shutdown` releases the
                 // workers on the way out.
                 let chunk_outs = shared.task.take_results(chunk_count);
+                // The level's whole expansion output is now live: the memory cap gets
+                // one more look before any of it is merged.
+                meter.check(crate::resource::Operation::SubsetConstruction, end);
                 let mut list = shared
                     .metastate_list
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for out in &chunk_outs {
-                    merge_expansion(out, &mut list, &mut metastate_to_id, &mut d);
-                    meter.check(crate::resource::Operation::SubsetConstruction, list.len());
+                    merge_expansion(out, &mut list, &mut metastate_to_id, &mut d, &meter);
                 }
             } else {
                 // One write guard for the whole sequential level rather than one per
@@ -809,8 +862,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
                     let current = list[i].clone();
                     seq_out.clear();
                     expand_metastate(fa, &current, &mut seq_scratch, &mut seq_out);
-                    merge_expansion(&seq_out, &mut list, &mut metastate_to_id, &mut d);
-                    meter.check(crate::resource::Operation::SubsetConstruction, list.len());
+                    merge_expansion(&seq_out, &mut list, &mut metastate_to_id, &mut d, &meter);
                 }
             }
             cursor = end;
@@ -842,7 +894,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
 /// `a_panic_cannot_corrupt_a_later_run_through_reused_scratch` pins). The sequential arm
 /// reuses ONE set across the whole call, exactly as the pre-P5 loop did — and a panic there
 /// unwinds out of `subset_construction` entirely, taking the scratch with it.
-struct ExpandScratch {
+pub(crate) struct ExpandScratch {
     /// C1's bucket table: `buckets[s]` accumulates symbol `s`'s raw union for the metastate
     /// currently being expanded, and is emptied again before the next one.
     buckets: Vec<Vec<usize>>,
@@ -859,7 +911,7 @@ struct ExpandScratch {
 }
 
 impl ExpandScratch {
-    fn new(fa: &Fa) -> ExpandScratch {
+    pub(crate) fn new(fa: &Fa) -> ExpandScratch {
         ExpandScratch {
             buckets: vec![Vec::new(); fa.alphabet_size],
             touched: Vec::new(),
@@ -875,21 +927,21 @@ impl ExpandScratch {
 /// Flat rather than `Vec<(i32, Vec<usize>)>` on purpose — see the allocation note at the
 /// parallel call site.
 #[derive(Default)]
-struct ExpandOut {
+pub(crate) struct ExpandOut {
     /// Every key's members, concatenated in emission order.
-    flat: Vec<usize>,
+    pub(crate) flat: Vec<usize>,
     /// `(symbol, key length)` for each key in `flat`, in emission order. Reconstructing a
     /// key means walking `spans` with a running offset into `flat`.
-    spans: Vec<(i32, u32)>,
+    pub(crate) spans: Vec<(i32, u32)>,
     /// How many `spans` entries belong to each expanded metastate, in expansion order. A
     /// metastate with no outgoing transitions at all contributes a `0`, so this vector's
     /// length is always the number of metastates expanded — that is what keeps the merge's
     /// `d.push(row)` in step with `metastate_list`.
-    per_metastate: Vec<u32>,
+    pub(crate) per_metastate: Vec<u32>,
 }
 
 impl ExpandOut {
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.flat.clear();
         self.spans.clear();
         self.per_metastate.clear();
@@ -903,7 +955,12 @@ impl ExpandOut {
 /// local `scratch` vector. It is a **pure function of `fa` and `current`** — it reads no id,
 /// no worklist and no map — which is the whole reason the caller is free to run many copies
 /// of it concurrently.
-fn expand_metastate(fa: &Fa, current: &[usize], sc: &mut ExpandScratch, out: &mut ExpandOut) {
+pub(crate) fn expand_metastate(
+    fa: &Fa,
+    current: &[usize],
+    sc: &mut ExpandScratch,
+    out: &mut ExpandOut,
+) {
     // `alphabet_size == 0` is the one shape where the pre-P1(a) code never read `fa.d[q]`
     // at all (its `for sym in 0..0` body never ran), so neither may this one: on a
     // malformed `Fa` whose `d` is shorter than `initial`'s members, that code reached the
@@ -1032,11 +1089,17 @@ fn expand_metastate(fa: &Fa, current: &[usize], sc: &mut ExpandScratch, out: &mu
 /// `metastate_to_id` probe/insert sequence the pre-P5 loop performed inline. Running it
 /// after a parallel expansion rather than interleaved with a sequential one is what makes
 /// the two schedules agree bit for bit.
-fn merge_expansion(
+///
+/// `meter` is walnut-rs's resource budget (`crate::resource`, no Java counterpart): both
+/// caps are checked right after every NEWLY DISCOVERED metastate is appended, on the
+/// sequential and the parallel path alike, so the state overshoot before an `Exhausted`
+/// is at most the out-degree of the metastate being merged. Inert when no budget is set.
+pub(crate) fn merge_expansion(
     out: &ExpandOut,
     metastate_list: &mut Vec<Vec<usize>>,
     metastate_to_id: &mut HashMap<Vec<usize>, usize>,
     d: &mut Vec<BTreeMap<i32, Vec<usize>>>,
+    meter: &crate::resource::Meter,
 ) {
     let mut span_at = 0usize;
     let mut flat_at = 0usize;
@@ -1053,6 +1116,10 @@ fn merge_expansion(
                 let next_id = metastate_list.len();
                 metastate_to_id.insert(key.to_vec(), next_id);
                 metastate_list.push(key.to_vec());
+                meter.check(
+                    crate::resource::Operation::SubsetConstruction,
+                    metastate_list.len(),
+                );
                 next_id
             };
             row.insert(sym, vec![id]);
@@ -1326,6 +1393,116 @@ mod tests {
         d1.insert(0, vec![1]);
         d1.insert(1, vec![1]);
         Fa::with_states(0, 2, 2, vec![0, 1], vec![d0, d1])
+    }
+
+    /// "The k-th symbol from the end is 1": exactly 2^k metastates over alphabet 2.
+    fn kth_from_end_nfa(k: usize) -> (Fa, BTreeSet<usize>) {
+        let mut d: Vec<BTreeMap<i32, Vec<usize>>> = Vec::new();
+        let mut first = BTreeMap::new();
+        first.insert(0, vec![0]);
+        first.insert(1, vec![0, 1]);
+        d.push(first);
+        for i in 1..k {
+            let mut row = BTreeMap::new();
+            row.insert(0, vec![i + 1]);
+            row.insert(1, vec![i + 1]);
+            d.push(row);
+        }
+        d.push(BTreeMap::new());
+        let mut o = vec![0; k + 1];
+        o[k] = 1;
+        (
+            Fa::with_states(0, k + 1, 2, o, d),
+            [0usize].into_iter().collect(),
+        )
+    }
+
+    /// Both adversarial reviewers of the resource-budget commit (`a335188`) found the
+    /// parallel path's budget check had ZERO coverage (deleting it kept the whole
+    /// workspace green) and that its overshoot was a whole chunk, not one metastate.
+    /// This forces the parallel path on a small input and pins the per-metastate bound.
+    #[test]
+    fn a_state_cap_is_checked_per_metastate_on_the_parallel_path_too() {
+        use crate::resource::{
+            run, BudgetError, ExhaustedReason, Instrumentation, Operation, ResourceBudget,
+        };
+        let (fa, initial) = kth_from_end_nfa(6); // 64 metastates
+        for limit in [1usize, 9, 33, 40, 63] {
+            let instr = Instrumentation::new().with_budget(ResourceBudget::states(limit));
+            // `chunk_size: 1` maximizes the number of chunks; `Parallel` uses production
+            // chunking; a chunk larger than any level is one chunk per level. All must
+            // breach on the first metastate past the cap.
+            for schedule in [
+                Schedule::Parallel,
+                Schedule::Tuned {
+                    chunk_size: 1,
+                    hook: None,
+                },
+                Schedule::Tuned {
+                    chunk_size: 64,
+                    hook: None,
+                },
+            ] {
+                let outcome = run(&instr, || {
+                    subset_construction_scheduled(&fa, &initial, schedule)
+                });
+                match outcome {
+                    Err(BudgetError::Exhausted(e)) => {
+                        assert_eq!(e.reason, ExhaustedReason::States);
+                        assert_eq!(e.operation, Operation::SubsetConstruction);
+                        assert_eq!(e.limit, limit);
+                        assert_eq!(e.at, limit + 1, "limit {limit}");
+                    }
+                    other => panic!("limit {limit}: expected a breach, got {other:?}"),
+                }
+            }
+        }
+        // Exactly at the cap is not a breach, on the parallel path either.
+        let instr = Instrumentation::new().with_budget(ResourceBudget::states(64));
+        let ok = run(&instr, || {
+            subset_construction_scheduled(&fa, &initial, Schedule::Parallel)
+        })
+        .unwrap();
+        assert_eq!(ok.q, 64);
+    }
+
+    /// The drop-in claim on the parallel path: an installed observer changes nothing
+    /// about the output, and it sees every level.
+    #[test]
+    fn observing_the_parallel_path_is_invisible_to_the_output() {
+        use crate::resource::{run, Event, Instrumentation, Trajectory};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let (fa, initial) = kth_from_end_nfa(7);
+        let expected = subset_construction_scheduled(&fa, &initial, Schedule::Sequential);
+        let t = Rc::new(RefCell::new(Trajectory::new()));
+        let instr = Instrumentation::new().with_observer(t.clone());
+        let observed = run(&instr, || {
+            subset_construction_scheduled(
+                &fa,
+                &initial,
+                Schedule::Tuned {
+                    chunk_size: 3,
+                    hook: None,
+                },
+            )
+        })
+        .unwrap();
+        assert_eq!(observed.q, expected.q);
+        assert_eq!(observed.o, expected.o);
+        assert_eq!(observed.d, expected.d);
+        let t = t.borrow();
+        let levels = t
+            .events()
+            .iter()
+            .filter(|e| matches!(e, Event::SubsetLevel { .. }))
+            .count();
+        assert!(levels >= 7, "one level per BFS depth, got {levels}");
+        assert_eq!(t.peak_states(), 128);
+        assert!(matches!(
+            t.events().last(),
+            Some(Event::SubsetConstructionFinished { states: 128, .. })
+        ));
     }
 
     /// Adversarial-review-requested regression test (both independent reviewers of

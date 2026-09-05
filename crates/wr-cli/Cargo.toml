@@ -17,7 +17,10 @@ path = "src/main.rs"
 wr-core = { path = "../wr-core" }
 wr-logic = { path = "../wr-logic" }
 wr-io = { path = "../wr-io" }
-wr-cts = { path = "../wr-cts" }
+# `default-features = false`: the binary must not link the ct-research substrate (an
+# optional `wr-cts` feature, see that crate's manifest); only the Tier-4 Moore cross-check
+# is wanted here.
+wr-cts = { path = "../wr-cts", default-features = false }
 # `Prover.java`'s ~30 `java.util.regex.Pattern` statics — the command-argument grammar. Same
 # workspace dependency (and same justifying comment) `wr-logic`'s lexer already uses; see the
 # `[workspace.dependencies]` entry. `meta::Regex` keeps `regex`'s own syntax and capture-group

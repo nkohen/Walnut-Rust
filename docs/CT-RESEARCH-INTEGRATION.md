@@ -201,6 +201,143 @@ For a direct `wr-core` user (no `Engine`): `wr_core::resource::run(&Instrumentat
 .with_budget(..).with_observer(rc_refcell_trajectory), || { ... })` brackets any code that
 calls the primitives.
 
+**Where the caps are checked, exactly.** `max_states` and `max_bytes` are checked after
+every newly discovered metastate of a subset construction (sequential and parallel paths
+alike — the parallel workers additionally check the memory cap before each chunk), once
+per expanded pair of a cross product, and once at entry to a minimization. Everything else
+on an `eval` path (reversal, the zero fixups, regex construction, number-system
+construction) is linear in an automaton one of those three built and is not checked; no
+wall-clock bound exists. Full statement: `wr_core::resource`'s module docs.
+
+**Cost of the allocator wrapper in the shipped binary.** Until a memory cap enables
+counting, every allocation pays one relaxed load of a never-written flag; with counting on
+(`WR_MAX_BYTES` set) it pays a relaxed atomic add on a shared counter. The direction-only
+A/B recorded below was taken on a loaded, battery-powered machine (this project's bench
+rule says such numbers are not a blessed measurement) and is reported as such.
+
+<!-- ALLOC-AB-PLACEHOLDER -->
+
+---
+
+## Taming a transient explosion: the `SC_OTF` strategy and the minimizer seam
+
+Once the trajectory says a determinization's peak far exceeds its minimized size
+(*transient*), opt into `SC_OTF` — subset construction with on-the-fly
+simulation-subsumption reduction of every metastate (`wr_core::otf`, walnut-rs only, no
+Java counterpart). It computes the NFA's forward simulation preorder once and reduces every
+destination set to its ⊑-maximal similarity classes before hash-consing it, so sets that
+differ only by language-redundant states collapse immediately. Guarantees: the output is
+language-equivalent to plain `SC`'s and **never larger**; it is not necessarily minimal
+(the usual minimization still runs after it); plain `SC` is untouched. It cannot collapse
+equivalences that simulation does not explain — whether it helps a given query is exactly
+what the trajectory tells you (`peak_states` under `SC_OTF` vs under `SC`).
+
+| How to select it | Where it applies |
+| --- | --- |
+| `[strategy * SC_OTF] eval q "…"::` (or `[strategy N SC_OTF]`; aliases `SCOTF`, `sc_otf`, `SC-OTF`) | that command, `::` mode only (metacommands are read in `::` mode, exactly as in Walnut) |
+| `engine.set_instrumentation(Instrumentation::new().with_default_strategy(Strategy::ScOtf))` | every later command, `;` mode included; an explicit `[strategy …]` still wins; never applied to a word automaton (DFAO), which only `SC` handles |
+| `.with_otf_policy(OtfPolicy { max_nfa_states })` | the size guard (default 4096 NFA states): above it the preorder is not computed and the strategy degrades to plain sequential `SC`, reported as `Event::SimulationSkipped` |
+
+The trajectory records `Event::Determinize { strategy, .. }` per dispatcher-level
+determinization and `Event::SimulationComputed { nfa_states, related_pairs }`, so a run
+can prove which strategy actually ran. `SC_OTF` runs sequentially (no level parallelism).
+
+**Pluggable minimizer.** `Instrumentation::new().with_minimizer(Rc::new(my_minimizer))`
+routes every construction-path minimization (`determinize_and_minimize`,
+`cross_product_and_minimize`, quantifier elimination, …) through a caller-supplied
+`wr_core::minimize::Minimizer` (`fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError>`)
+instead of the ported Valmari. The bare `wr_core::minimize::minimize` is never redirected
+(it is the reference the oracle and the reader rely on). The contract is language
+equivalence, nothing weaker: a minimizer that changes a language corrupts every later
+result and nothing can detect it in-engine — validate a candidate against the Tier-4
+cross-checks first (`crates/wr-cli/tests/embed_instrumentation.rs` runs `wr_cts::moore`
+through the seam as the worked example).
+
+---
+
+## The substrate bridge (`wr-cts` ↔ `RustConstantTermSequences`)
+
+`wr-cts` (feature `substrate`, on by default; pinned to a substrate commit as a git
+dependency, bumped deliberately like your submodule pointer) converts both ways between the
+engine's automata and the substrate's `DFAO<ModInt, S>`:
+
+```rust
+use rust_constant_term_sequences::{dfao::DFAO, laurent_poly::LaurentPoly};
+use wr_cli::embed::Engine;
+use wr_cts::bridge::{automaton_from_poly_dfao, dfao_from_automaton, Direction};
+
+// A constant-term DFAO from the substrate, already minimal, straight into the engine.
+let dfao = DFAO::poly_auto(&p, &q, 10_000)?;               // states are LaurentPolys
+let a = automaton_from_poly_dfao(&dfao, Direction::Lsd)?;  // lsd_p: poly_auto reads lsd-first
+let mut engine = Engine::new("/path/to/workspace")?;
+engine.register_word_automaton("CB", a.clone());         // no .txt written or parsed
+engine.eval_bool(r#"eval odd "?lsd_3 An CB[2*n+1] = 0""#)?;
+
+// And back: the engine's automaton as a substrate DFAO (state values = engine ids).
+let (back, direction) = dfao_from_automaton(&a)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+- `automaton_from_dfao(&dfao, modulus, direction, output_of)` is the general form (any
+  state type, any output projection); `automaton_from_lin_rep_dfao` covers
+  `lin_rep_machine`'s vector states. `fa_from_dfao` / `dfao_from_fa` are the bare `Fa`
+  level; `totalize_dead` prepares a partial (minimized) engine automaton for the substrate,
+  which expects total DFAOs.
+- Direction is explicit: the transition function is the same object either way, only the
+  Walnut number system (`msd_p`/`lsd_p`) differs, so the bridge refuses to guess.
+- `Engine::register_word_automaton` / `register_automaton` / `unregister_automaton` are the
+  in-memory library: a registration shadows the same-named file for the session and is
+  handed out as an independent copy per lookup, exactly like a file. `register_automaton`
+  takes a `def` result (`engine.eval_structured("def …")` → `TestCase::automaton_pairs()`)
+  or anything with the reader's shape.
+- **Coordination points for the substrate repo:** the pin is `1643ad1` (its `master`); the
+  substrate is edition 2024 (`rust-version = "1.85"` on `wr-cts`); and its *uncommitted*
+  working tree at the time of writing contains `use std::os::macos::raw::stat;` in
+  `dfao.rs`, which will not compile on Linux — do not commit that line before bumping the pin.
+- The shipped `walnut-rs` binary does not link the substrate (`wr-cli` uses `wr-cts` with
+  `default-features = false`); `cargo test --workspace` builds and tests the bridge, and
+  `tests/substrate-bridge/` is the end-to-end test (substrate DFAO → engine → verdicts
+  cross-checked against the substrate's own `compute_ct`, and back).
+
+---
+
+## Registering your own REPL commands
+
+```rust
+use wr_cli::prover::CommandContext;
+engine.prover().register_command("ctrec", Box::new(|ctx: CommandContext<'_>, s: &str| {
+    // `s` is the command text minus terminator and metacommands: "ctrec P Q 3".
+    // ctx.session (libraries, in-memory registrations), ctx.logging (`::` detail sink),
+    // ctx.out (the console the verdict goes to), ctx.print_details / print_flag,
+    // ctx.meta_commands (a DeterminizeContext for `[strategy …]`).
+    writeln!(ctx.out, "TRUE")?;
+    Ok(None) // or Ok(Some(TestCase::from_automaton(a)))
+}))?;
+```
+
+A registered name must not be a built-in (those keep their exact Walnut behavior — the
+drop-in contract) and must be an identifier. The handler runs under the same panic
+boundary (a `panic!` becomes `ProverError::Thrown`, the session survives), resource
+budget and `;`/`::` bookkeeping as a built-in; it works identically through the shell-out
+binary if you build your own runner that links `wr-cli` and registers before `run`.
+
+---
+
+## Witnesses and counterexamples
+
+`wr_cli::embed::witness` (re-export of `wr_core::witness`): on the automaton a
+`def`/`eval` with free variables produced (`TestCase::automaton_pairs()[0].automaton()`),
+`shortest_accepted_automaton(&a)` is the shortest satisfying assignment (the empty word
+included), `shortest_rejected_automaton(&a)` the shortest word the automaton rejects —
+including into a missing transition — i.e. the shortest counterexample to the claim the
+automaton encodes; `shortest_word_where` / `shortest_output` are the general forms. A
+`Witness` carries the encoded symbols; `w.tracks(&a)` splits them per track and
+`w.track_value(&a, t, base)` reads track `t` as a base-`base` number in the track's own
+msd/lsd direction. BFS with symbols in ascending order: shortest, then lexicographically
+smallest in symbol order. (Walnut's own `test` command port,
+`wr_core::search::shortest_accepted_word`, keeps Walnut's quirks — no empty word, error on
+the TRUE automaton — on purpose.)
+
 ---
 
 ## Mechanism 2 — in-process embedding

@@ -1,0 +1,23 @@
+[package]
+name = "wr-substrate-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Pulls in the ct-research substrate (edition 2024) through `wr-cts`'s default feature.
+rust-version = "1.85"
+publish = false
+
+# An integration-test-only crate: the one place in the workspace that links BOTH the
+# engine facade (`wr-cli`) and the substrate bridge (`wr-cts` with its `substrate`
+# feature), so the whole "substrate DFAO -> bridge -> registered word automaton ->
+# eval" path is tested end to end. `wr-cli` itself depends on `wr-cts` with the feature
+# OFF (the shipped binary must not link the substrate), which is why this cannot live
+# in `wr-cli`'s own tests.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+wr-cli = { path = "../../crates/wr-cli" }
+wr-core = { path = "../../crates/wr-core" }
+wr-cts = { path = "../../crates/wr-cts", features = ["substrate"] }
+rust_constant_term_sequences = { package = "RustConstantTermSequences", git = "https://github.com/nkohen/RustConstantTermSequences.git", rev = "1643ad13cbf0fa7402e269215dbe8d67e7fe418c" }

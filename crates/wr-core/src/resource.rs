@@ -65,18 +65,38 @@
 //! `max_bytes` bounds the process's **live heap bytes** as counted by a tracking global
 //! allocator — the same quantity `-Xmx` bounds. `wr-core` is `unsafe`-free and a
 //! `GlobalAlloc` impl is inherently `unsafe`, so the allocator wrapper lives in `wr-cli`
-//! (`wr_cli::tracking_alloc::TrackingAllocator`, installed by the shipped `walnut-rs`
+//! (`wr_cli::tracking_alloc::TrackingAllocator`, linked by the shipped `walnut-rs`
 //! binary); it reports through [`memory_meter`]. An embedder that keeps its own allocator
-//! wraps it the same way. **Without an installed meter a memory cap cannot be enforced**,
-//! and this module refuses to pretend otherwise: [`Instrumentation::enter`] fails with
-//! [`MemoryMeterMissing`] rather than silently skipping the check (fail closed — this is a
-//! safety feature). The count is process-wide, so an embedder's own live data counts
-//! toward the cap, exactly as it would toward a JVM heap ceiling; size the cap
-//! accordingly (or compute it from [`memory_meter::live_bytes`] at scope entry).
+//! wraps it the same way. The wrapper **counts only once a memory cap asks it to**
+//! ([`memory_meter::enable`], called by [`Instrumentation::validate`] when `max_bytes` is
+//! set): until then every allocation pays one relaxed load of a never-written flag, so a
+//! session that sets no memory cap runs the allocator exactly as before. **Without a
+//! linked wrapper a memory cap cannot be enforced**, and this module refuses to pretend
+//! otherwise: `enable` proves the wrapper is there by allocating and watching the counter
+//! move, and [`Instrumentation::enter`] fails with [`MemoryMeterMissing`] rather than
+//! silently skipping the check (fail closed — this is a safety feature). The count is
+//! process-wide, so an embedder's own live data counts toward the cap, exactly as it
+//! would toward a JVM heap ceiling; size the cap accordingly (or compute it from
+//! [`memory_meter::live_bytes`] at scope entry).
 //!
-//! # What this does NOT bound
+//! # Where the checks are, exactly, and what they cannot see
 //!
-//! Wall-clock time. A query can run for hours within both caps; the external watchdog
+//! Three primitives are budgeted: [`crate::determinize::subset_construction`] (also
+//! `SC_OTF` and both halves of Brzozowski) checks **both caps after every newly discovered
+//! metastate** on the sequential and the parallel path alike, so the state overshoot is at
+//! most one metastate's out-degree; on the parallel path the workers additionally check
+//! the memory cap before expanding each chunk, so the memory overshoot there is bounded by
+//! one chunk's expansion output plus what the other workers produce concurrently, not by
+//! a whole BFS level. [`crate::product::cross_product_internal`] checks both caps once per
+//! expanded pair. [`crate::minimize::minimize`] checks both **once, at entry**, on its
+//! input's state count — its own working set is proportional to that input (which was
+//! itself built under the same caps), and it is not checked again while it runs.
+//! Everything else on an `eval` path — `Fa::reverse`, the zero fixups and quotients in
+//! `logicalops`, the regex Thompson construction, `NumberSystem` construction, `search`,
+//! `infinite` — is **unbudgeted**; each is linear in an automaton that one of the three
+//! checked primitives produced, which is why they are not checked, but a cap is a bound on
+//! what those three build, not on the process. Wall-clock time is not bounded at all: a
+//! query can run for hours within both caps. The external watchdog
 //! `docs/EMBEDDING-RESOURCE-SAFETY.md` prescribes is still required for that, and for the
 //! in-process-cannot-be-interrupted case that document explains.
 
@@ -85,6 +105,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::determinize::Strategy;
+use crate::minimize::Minimizer;
+use crate::otf::OtfPolicy;
 
 // ---------------------------------------------------------------------------------
 // Budget
@@ -120,6 +142,43 @@ impl ResourceBudget {
     /// Whether any cap is set.
     pub fn is_unlimited(&self) -> bool {
         self.max_states.is_none() && self.max_bytes.is_none()
+    }
+
+    /// Enforce both caps for `operation`, whose automaton currently has `states` states.
+    /// Raises the typed exhaustion panic on a breach (see the module docs). This is the
+    /// `Copy`, `Send` form of [`Meter::check`], for a worker thread that holds no
+    /// [`Meter`].
+    #[inline]
+    pub fn check(&self, operation: Operation, states: usize) {
+        if let Some(limit) = self.max_states {
+            if states > limit {
+                exhaust(Exhausted {
+                    reason: ExhaustedReason::States,
+                    operation,
+                    at: states,
+                    limit,
+                });
+            }
+        }
+        self.check_memory(operation);
+    }
+
+    /// Enforce only the memory cap (for a point where the state count is not at hand).
+    #[inline]
+    pub fn check_memory(&self, operation: Operation) {
+        if let Some(limit) = self.max_bytes {
+            // `enter` refused a memory cap without an enabled meter, so `None` cannot
+            // happen here; treating it as "nothing live" is the only harmless reading.
+            let live = memory_meter::live_bytes().unwrap_or(0);
+            if live > limit {
+                exhaust(Exhausted {
+                    reason: ExhaustedReason::Memory,
+                    operation,
+                    at: live,
+                    limit,
+                });
+            }
+        }
     }
 }
 
@@ -207,9 +266,9 @@ impl fmt::Display for Exhausted {
 
 impl std::error::Error for Exhausted {}
 
-/// A [`ResourceBudget`] with `max_bytes` set was entered while no [`memory_meter`] is
-/// installed, so the memory cap could not be enforced. Refused rather than silently
-/// skipped — see the module docs.
+/// A [`ResourceBudget`] with `max_bytes` set was entered while no tracking allocator is
+/// linked ([`memory_meter::enable`] found no counter movement), so the memory cap could
+/// not be enforced. Refused rather than silently skipped — see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryMeterMissing;
 
@@ -266,41 +325,73 @@ impl From<MemoryMeterMissing> for BudgetError {
 /// wrapper that calls [`allocated`](memory_meter::allocated) /
 /// [`freed`](memory_meter::freed) from its `alloc`/`dealloc`/`realloc` lives in
 /// `wr_cli::tracking_alloc`; an embedder with its own allocator writes the same
-/// three-line wrapper around it. All three functions are `#[inline]` relaxed atomics —
-/// one uncontended atomic add per allocation.
+/// three-line wrapper around it.
+///
+/// **Counting is off until [`enable`](memory_meter::enable) turns it on** — the wrapper
+/// then costs one relaxed load of a flag per allocation, which is what keeps a session
+/// without a memory cap on the allocator's own fast path. Once enabled, the counter is
+/// the net of allocations and frees *since enabling*: a block allocated before and freed
+/// after pushes it below zero, which [`live_bytes`](memory_meter::live_bytes) clamps to
+/// `0` — an underestimate bounded by the (small) heap that was live at enable time, never
+/// a spurious overestimate. Enable early (a memory-capped [`Instrumentation`] does it on
+/// `validate`/`enter`).
 pub mod memory_meter {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use super::MemoryMeterMissing;
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
-    static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
+    static ENABLED: AtomicBool = AtomicBool::new(false);
 
-    /// Report an allocation of `bytes`. Also marks the meter installed (idempotent; a
-    /// relaxed load on the fast path, a store only the first time).
+    /// Report an allocation of `bytes`. A no-op (one relaxed load) until enabled.
     #[inline]
     pub fn allocated(bytes: usize) {
-        LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed);
-        if !INSTALLED.load(Ordering::Relaxed) {
-            INSTALLED.store(true, Ordering::Relaxed);
+        if ENABLED.load(Ordering::Relaxed) {
+            LIVE_BYTES.fetch_add(bytes as isize, Ordering::Relaxed);
         }
     }
 
-    /// Report a deallocation of `bytes`.
+    /// Report a deallocation of `bytes`. A no-op (one relaxed load) until enabled.
     #[inline]
     pub fn freed(bytes: usize) {
-        LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+        if ENABLED.load(Ordering::Relaxed) {
+            LIVE_BYTES.fetch_sub(bytes as isize, Ordering::Relaxed);
+        }
     }
 
-    /// Whether a tracking allocator has reported at least one allocation — i.e. whether
-    /// [`live_bytes`] means anything. Any program has allocated long before it can call
-    /// this, so it is reliable from `main` onward.
-    pub fn is_installed() -> bool {
-        INSTALLED.load(Ordering::Relaxed)
+    /// Start counting, and prove a wrapper is actually linked: after switching the flag
+    /// on, allocate a block and check the counter moved. If it did not — no
+    /// `TrackingAllocator` is the global allocator — the flag is switched back off and
+    /// [`MemoryMeterMissing`] is returned, so a memory cap can never be fail-open.
+    /// Idempotent once it has succeeded.
+    pub fn enable() -> Result<(), MemoryMeterMissing> {
+        if ENABLED.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        ENABLED.store(true, Ordering::SeqCst);
+        let before = LIVE_BYTES.load(Ordering::SeqCst);
+        // Large enough that no allocator serves it from a thread-local cache of
+        // already-counted blocks; `black_box` keeps it from being optimized away.
+        let probe: Vec<u8> = std::hint::black_box(vec![0xA5u8; 1 << 16]);
+        let during = LIVE_BYTES.load(Ordering::SeqCst);
+        drop(probe);
+        if during - before >= (1 << 16) {
+            Ok(())
+        } else {
+            ENABLED.store(false, Ordering::SeqCst);
+            Err(MemoryMeterMissing)
+        }
     }
 
-    /// Live heap bytes right now, or `None` when no meter is installed.
+    /// Whether counting is on, i.e. whether [`live_bytes`] means anything.
+    pub fn is_enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Live heap bytes right now (net since [`enable`]; clamped at `0`), or `None` when
+    /// counting is off.
     pub fn live_bytes() -> Option<usize> {
-        if is_installed() {
-            Some(LIVE_BYTES.load(Ordering::Relaxed))
+        if is_enabled() {
+            Some(LIVE_BYTES.load(Ordering::Relaxed).max(0) as usize)
         } else {
             None
         }
@@ -354,6 +445,15 @@ pub enum Event {
     MinimizeStarted { states: usize },
     /// A minimization finished: `before` states in, `after` out.
     MinimizeFinished { before: usize, after: usize },
+    /// [`crate::otf`]: the NFA's simulation preorder was computed (`related_pairs`
+    /// ordered pairs, diagonal included) before an `SC_OTF` subset construction.
+    SimulationComputed {
+        nfa_states: usize,
+        related_pairs: usize,
+    },
+    /// [`crate::otf`]: the NFA exceeded [`OtfPolicy::max_nfa_states`], so this `SC_OTF`
+    /// subset construction ran as plain sequential `SC`.
+    SimulationSkipped { nfa_states: usize, limit: usize },
 }
 
 /// A sink for [`Event`]s. Install one with [`Instrumentation::with_observer`].
@@ -405,8 +505,9 @@ impl Trajectory {
         self.peak_states
     }
 
-    /// The largest live-heap reading taken at any check point, or `0` when no memory
-    /// meter is installed. A check-point sample, not an allocator-level high-water mark.
+    /// The largest live-heap reading taken at any **event** (level / primitive
+    /// boundary), or `0` when the memory meter is not enabled. Coarser than the budget's
+    /// own per-state checks, and not an allocator-level high-water mark.
     pub fn peak_bytes(&self) -> usize {
         self.peak_bytes
     }
@@ -420,11 +521,13 @@ impl Trajectory {
 
     /// Pair each subset construction with the minimization that followed it.
     ///
-    /// A `MinimizeFinished` is attributed to the most recent finished subset
-    /// construction whose output size equals its `before` (Brzozowski's intermediate
-    /// minimize pairs with its first step this way, and `determinize_and_minimize`'s
-    /// with its only step). A minimization that follows no matching construction —
-    /// e.g. of an already-deterministic automaton — is simply not a record here.
+    /// A `MinimizeFinished` is attributed to the **last** finished subset construction,
+    /// and only if that record has no minimization yet and its output size equals the
+    /// minimization's `before` (Brzozowski's intermediate minimize pairs with its first
+    /// step this way, and `determinize_and_minimize`'s with its only step); otherwise the
+    /// minimization is not attributed to anything. A minimization that follows no
+    /// construction at all — e.g. of an already-deterministic automaton — is likewise not
+    /// a record here.
     pub fn determinizations(&self) -> Vec<DeterminizationRecord> {
         let mut out: Vec<DeterminizationRecord> = Vec::new();
         let mut open: Option<(usize, usize, usize)> = None; // (input, levels, peak)
@@ -477,6 +580,8 @@ impl Observer for Trajectory {
                 right_states,
             } => (*left_states).max(*right_states),
             Event::MinimizeFinished { before, after } => (*before).max(*after),
+            Event::SimulationComputed { nfa_states, .. }
+            | Event::SimulationSkipped { nfa_states, .. } => *nfa_states,
         };
         self.peak_states = self.peak_states.max(states);
         if let Some(live) = memory_meter::live_bytes() {
@@ -496,6 +601,9 @@ impl Observer for Trajectory {
 pub struct Instrumentation {
     budget: ResourceBudget,
     observers: Vec<Rc<RefCell<dyn Observer>>>,
+    minimizer: Option<Rc<dyn Minimizer>>,
+    default_strategy: Option<Strategy>,
+    otf_policy: Option<OtfPolicy>,
 }
 
 impl fmt::Debug for Instrumentation {
@@ -503,6 +611,12 @@ impl fmt::Debug for Instrumentation {
         f.debug_struct("Instrumentation")
             .field("budget", &self.budget)
             .field("observers", &self.observers.len())
+            .field(
+                "minimizer",
+                &self.minimizer.as_ref().map(|m| m.name().to_string()),
+            )
+            .field("default_strategy", &self.default_strategy)
+            .field("otf_policy", &self.otf_policy)
             .finish()
     }
 }
@@ -525,6 +639,29 @@ impl Instrumentation {
         self
     }
 
+    /// Route every construction-path minimization (`minimize_with_logging`) through
+    /// `minimizer` instead of the ported Valmari. See [`Minimizer`] for the contract.
+    pub fn with_minimizer(mut self, minimizer: Rc<dyn Minimizer>) -> Self {
+        self.minimizer = Some(minimizer);
+        self
+    }
+
+    /// The determinization strategy to use wherever no `[strategy …]` metacommand chose
+    /// one explicitly (`determinize`'s dispatcher consults
+    /// [`crate::determinize::DeterminizeContext::has_explicit_strategy`]). Never applied
+    /// to a word automaton (DFAO), which only `SC` handles. The intended value is
+    /// [`Strategy::ScOtf`].
+    pub fn with_default_strategy(mut self, strategy: Strategy) -> Self {
+        self.default_strategy = Some(strategy);
+        self
+    }
+
+    /// Tunables for [`Strategy::ScOtf`] ([`crate::otf`]); the default applies otherwise.
+    pub fn with_otf_policy(mut self, policy: OtfPolicy) -> Self {
+        self.otf_policy = Some(policy);
+        self
+    }
+
     pub fn budget(&self) -> ResourceBudget {
         self.budget
     }
@@ -533,15 +670,33 @@ impl Instrumentation {
         self.observers.len()
     }
 
-    /// Whether entering this would do anything at all.
-    pub fn is_inert(&self) -> bool {
-        self.budget.is_unlimited() && self.observers.is_empty()
+    pub fn default_strategy(&self) -> Option<Strategy> {
+        self.default_strategy
     }
 
-    /// [`MemoryMeterMissing`] if the budget has a memory cap and no meter is installed.
+    pub fn otf_policy(&self) -> Option<OtfPolicy> {
+        self.otf_policy
+    }
+
+    pub fn minimizer(&self) -> Option<&Rc<dyn Minimizer>> {
+        self.minimizer.as_ref()
+    }
+
+    /// Whether entering this would do anything at all.
+    pub fn is_inert(&self) -> bool {
+        self.budget.is_unlimited()
+            && self.observers.is_empty()
+            && self.minimizer.is_none()
+            && self.default_strategy.is_none()
+            && self.otf_policy.is_none()
+    }
+
+    /// Switches the memory meter on if the budget has a memory cap
+    /// ([`memory_meter::enable`]); [`MemoryMeterMissing`] if that finds no tracking
+    /// allocator linked. Otherwise a no-op.
     pub fn validate(&self) -> Result<(), MemoryMeterMissing> {
-        if self.budget.max_bytes.is_some() && !memory_meter::is_installed() {
-            return Err(MemoryMeterMissing);
+        if self.budget.max_bytes.is_some() {
+            memory_meter::enable()?;
         }
         Ok(())
     }
@@ -549,6 +704,12 @@ impl Instrumentation {
     /// Install this instrumentation on the current thread until the returned guard is
     /// dropped. Nested scopes replace the outer one for their duration and restore it
     /// afterwards.
+    ///
+    /// A breached cap inside the scope is a **panic** carrying [`Exhausted`] (see the
+    /// module docs); a caller of `enter` must draw its own boundary
+    /// ([`crate::walnut_panic::catch_walnut_panic_detailed`] +
+    /// [`crate::walnut_panic::CaughtPanic::exhausted`]) or use [`run`], which does exactly
+    /// that. Left uncaught, it reaches the default panic hook like any other panic.
     pub fn enter(&self) -> Result<Scope, MemoryMeterMissing> {
         self.validate()?;
         let previous = ACTIVE.with(|a| a.replace(Some(self.clone())));
@@ -600,6 +761,9 @@ pub fn run<R>(instrumentation: &Instrumentation, f: impl FnOnce() -> R) -> Resul
 pub struct Meter {
     budget: ResourceBudget,
     observers: Vec<Rc<RefCell<dyn Observer>>>,
+    minimizer: Option<Rc<dyn Minimizer>>,
+    default_strategy: Option<Strategy>,
+    otf_policy: Option<OtfPolicy>,
 }
 
 impl Meter {
@@ -610,6 +774,9 @@ impl Meter {
             Some(i) => Meter {
                 budget: i.budget,
                 observers: i.observers.clone(),
+                minimizer: i.minimizer.clone(),
+                default_strategy: i.default_strategy,
+                otf_policy: i.otf_policy,
             },
         })
     }
@@ -619,7 +786,25 @@ impl Meter {
         Meter {
             budget: ResourceBudget::UNLIMITED,
             observers: Vec::new(),
+            minimizer: None,
+            default_strategy: None,
+            otf_policy: None,
         }
+    }
+
+    /// The scope's caller-supplied minimizer, if any.
+    pub fn minimizer(&self) -> Option<&Rc<dyn Minimizer>> {
+        self.minimizer.as_ref()
+    }
+
+    /// The scope's default determinization strategy, if any.
+    pub fn default_strategy(&self) -> Option<Strategy> {
+        self.default_strategy
+    }
+
+    /// The scope's `SC_OTF` policy, if any.
+    pub fn otf_policy(&self) -> Option<OtfPolicy> {
+        self.otf_policy
     }
 
     /// Whether any check can fire.
@@ -628,33 +813,18 @@ impl Meter {
         !self.budget.is_unlimited()
     }
 
+    /// The budget alone — `Copy` and `Send`, for a worker thread that cannot hold the
+    /// observers.
+    #[inline]
+    pub fn budget(&self) -> ResourceBudget {
+        self.budget
+    }
+
     /// Enforce both caps for `operation`, whose automaton currently has `states`
     /// states. Raises the typed exhaustion panic on a breach (see the module docs).
     #[inline]
     pub fn check(&self, operation: Operation, states: usize) {
-        if let Some(limit) = self.budget.max_states {
-            if states > limit {
-                exhaust(Exhausted {
-                    reason: ExhaustedReason::States,
-                    operation,
-                    at: states,
-                    limit,
-                });
-            }
-        }
-        if let Some(limit) = self.budget.max_bytes {
-            // `enter` refused a memory cap without a meter, so `None` cannot happen
-            // here; treating it as "nothing live" is the only harmless reading.
-            let live = memory_meter::live_bytes().unwrap_or(0);
-            if live > limit {
-                exhaust(Exhausted {
-                    reason: ExhaustedReason::Memory,
-                    operation,
-                    at: live,
-                    limit,
-                });
-            }
-        }
+        self.budget.check(operation, states)
     }
 
     /// Report an event to every observer. `event` is only evaluated when there is at
@@ -775,10 +945,11 @@ mod tests {
 
     #[test]
     fn a_memory_cap_without_a_meter_is_refused_not_ignored() {
-        // No tracking allocator is installed in this test binary.
-        if memory_meter::is_installed() {
-            return;
-        }
+        // No tracking allocator is linked into this test binary, so `enable` must find
+        // the counter unmoved and refuse.
+        assert_eq!(memory_meter::enable(), Err(MemoryMeterMissing));
+        assert!(!memory_meter::is_enabled());
+        assert_eq!(memory_meter::live_bytes(), None);
         let instr = Instrumentation::new().with_budget(ResourceBudget {
             max_states: None,
             max_bytes: Some(1),

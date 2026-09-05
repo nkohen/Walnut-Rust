@@ -500,7 +500,24 @@ pub fn minimize_with_logging(
 ) -> Result<Fa, MinimizeError> {
     let time_before = std::time::Instant::now();
     logging.log_message(&format!("{}: {} states.", crate::logging::MINIMIZING, fa.q));
-    let result = minimize(fa)?;
+    // walnut-rs's minimizer seam (`crate::resource`, no Java counterpart): a scope may
+    // install a caller-supplied [`Minimizer`]; otherwise the ported Valmari runs. The
+    // budget check and the observer events are the same on both paths -- `minimize`
+    // does its own, the custom path gets them here.
+    let meter = crate::resource::Meter::current();
+    let result = match meter.minimizer() {
+        None => minimize(fa)?,
+        Some(custom) => {
+            meter.check(crate::resource::Operation::Minimize, fa.q);
+            meter.emit(|| crate::resource::Event::MinimizeStarted { states: fa.q });
+            let result = custom.minimize(fa)?;
+            meter.emit(|| crate::resource::Event::MinimizeFinished {
+                before: fa.q,
+                after: result.q,
+            });
+            result
+        }
+    };
     logging.log_message(&format!(
         "{}:{} states - {}ms.",
         crate::logging::MINIMIZED,
@@ -508,6 +525,44 @@ pub fn minimize_with_logging(
         time_before.elapsed().as_millis()
     ));
     Ok(result)
+}
+
+/// **walnut-rs only, no Java counterpart.** A pluggable DFA minimizer — the injection
+/// point ct-research asked for so `determinize_and_minimize` /
+/// `cross_product_and_minimize` (and every other construction-path minimization, all of
+/// which go through [`minimize_with_logging`]) can run a caller-supplied algorithm
+/// instead of the ported Valmari. Install one for a scope with
+/// [`crate::resource::Instrumentation::with_minimizer`]; the bare [`minimize`] function
+/// is never redirected (it IS the Valmari reference, and the equivalence oracle and the
+/// reader depend on it staying so).
+///
+/// The contract is [`minimize`]'s: given a deterministic `Fa` whose states are all
+/// reachable from `q0`, return a language-equivalent DFA; state numbering is free. A
+/// minimizer that returns a *non-minimal* but equivalent automaton is legal (the
+/// engine only relies on equivalence); one that changes the language corrupts every
+/// later result, and nothing here can detect that — the Tier-4 cross-checks in
+/// `wr-cts` are the model for validating a candidate before installing it.
+pub trait Minimizer {
+    fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError>;
+
+    /// A short name, for diagnostics.
+    fn name(&self) -> &str {
+        "custom"
+    }
+}
+
+/// The default: the ported Valmari algorithm, [`minimize`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Valmari;
+
+impl Minimizer for Valmari {
+    fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError> {
+        minimize(fa)
+    }
+
+    fn name(&self) -> &str {
+        "valmari"
+    }
 }
 
 #[cfg(test)]

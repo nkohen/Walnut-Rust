@@ -544,6 +544,13 @@ pub struct FileLibraries {
     /// so a later identical lookup retries — which matters here for real, since a user can
     /// create the missing file between two commands).
     number_systems: RefCell<BTreeMap<String, Rc<NumberSystem>>>,
+    /// **walnut-rs only (2026-09).** Word automata registered in memory
+    /// ([`FileLibraries::register_word`]), consulted BEFORE `Word Automata Library/` —
+    /// the "load an already-built DFAO directly, no `.txt` round trip" path a
+    /// downstream consumer asked for. Keyed by the bare name (`T` for `T[n]`).
+    registered_words: RefCell<BTreeMap<String, Automaton>>,
+    /// As above for predicate automata (`$name(…)`), consulted before `Automata Library/`.
+    registered_functions: RefCell<BTreeMap<String, Automaton>>,
 }
 
 impl fmt::Debug for FileLibraries {
@@ -564,7 +571,35 @@ impl FileLibraries {
         FileLibraries {
             paths,
             number_systems: RefCell::new(BTreeMap::new()),
+            registered_words: RefCell::new(BTreeMap::new()),
+            registered_functions: RefCell::new(BTreeMap::new()),
         }
+    }
+
+    /// Register `automaton` as the word automaton `name` (used as `name[i]` in a
+    /// formula) for the rest of this session, shadowing any `Word Automata Library/
+    /// name.txt`. The automaton must be what the reader would have produced for such a
+    /// file: deterministic, one track per variable, `ns_name`/`msd` set on each
+    /// arithmetic track (e.g. `wr_cts::bridge::automaton_from_dfao`'s output). Nothing
+    /// is written to disk. Replaces an earlier registration under the same name.
+    pub fn register_word(&self, name: &str, automaton: Automaton) {
+        self.registered_words
+            .borrow_mut()
+            .insert(name.to_string(), automaton);
+    }
+
+    /// As [`FileLibraries::register_word`] for a predicate automaton (`$name(…)`),
+    /// shadowing `Automata Library/name.txt`.
+    pub fn register_function(&self, name: &str, automaton: Automaton) {
+        self.registered_functions
+            .borrow_mut()
+            .insert(name.to_string(), automaton);
+    }
+
+    /// Forget an in-memory registration (both kinds); a later lookup goes to disk again.
+    pub fn unregister(&self, name: &str) {
+        self.registered_words.borrow_mut().remove(name);
+        self.registered_functions.borrow_mut().remove(name);
     }
 
     /// The paths these libraries resolve against.
@@ -768,6 +803,12 @@ impl PredicateEnv for FileLibraries {
         name: &str,
         ctx: Option<&mut (dyn wr_core::determinize::DeterminizeContext + '_)>,
     ) -> Result<Automaton, PredicateEnvError> {
+        // walnut-rs only: an in-memory registration wins over the file (an independent
+        // copy per lookup, the same contract the file path has). Deterministic by the
+        // registration contract, so no load-time determinization and no `ctx` use.
+        if let Some(a) = self.registered_words.borrow().get(name) {
+            return Ok(a.clone());
+        }
         // `Predicate.java:295`:
         // `new Automaton(Session.getReadFileForWordsLibrary(name + ".txt"))`.
         let address = self
@@ -787,6 +828,9 @@ impl PredicateEnv for FileLibraries {
         name: &str,
         ctx: Option<&mut (dyn wr_core::determinize::DeterminizeContext + '_)>,
     ) -> Result<Automaton, PredicateEnvError> {
+        if let Some(a) = self.registered_functions.borrow().get(name) {
+            return Ok(a.clone());
+        }
         // `Automaton.readAutomatonFromFile` (`Automaton.java:148-150`).
         let address = self
             .paths

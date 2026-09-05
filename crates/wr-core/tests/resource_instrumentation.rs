@@ -16,7 +16,8 @@ use wr_core::automaton::Automaton;
 use wr_core::determinize::{determinize, subset_construction, Strategy};
 use wr_core::fa::Fa;
 use wr_core::logging::Logging;
-use wr_core::minimize::minimize;
+use wr_core::minimize::{minimize, MinimizeError, Minimizer};
+use wr_core::otf::OtfPolicy;
 use wr_core::product::cross_product_internal;
 use wr_core::resource::{
     run, BudgetError, DeterminizationRecord, Event, Exhausted, ExhaustedReason, Instrumentation,
@@ -334,4 +335,181 @@ fn nothing_installed_means_nothing_observed_and_nothing_capped() {
     let initial: BTreeSet<usize> = [0].into_iter().collect();
     assert!(!Meter::current().has_budget());
     assert_eq!(subset_construction(&fa, &initial).q, 32);
+}
+
+// ------------------------------------------------------------- item C: the seams
+
+/// Σ* via a chain of accepting states: every reachable metastate is `{0} ∪ C`, so plain
+/// SC builds 2^k of them while `SC_OTF` collapses every one to `{0}`.
+fn sigma_star_via_chain(k: usize) -> Fa {
+    let n = k + 1;
+    let mut d = Vec::with_capacity(n);
+    d.push(row(&[(0, &[0]), (1, &[0, 1])]));
+    for i in 1..k {
+        d.push(row(&[(0, &[i + 1]), (1, &[i + 1])]));
+    }
+    d.push(row(&[]));
+    Fa::with_states(0, n, 2, vec![1; n], d)
+}
+
+#[test]
+fn a_scope_default_strategy_selects_sc_otf_and_the_dispatcher_reports_it() {
+    let fa = sigma_star_via_chain(5);
+    let initial: BTreeSet<usize> = [0].into_iter().collect();
+    let wrap = |fa: &Fa| {
+        Automaton::new(
+            fa.clone(),
+            vec![vec![0, 1]],
+            vec!["x".to_string()],
+            vec![Some(true)],
+        )
+    };
+
+    // Plain: 32 metastates.
+    let mut plain = wrap(&fa);
+    determinize(&mut plain, &initial, None, &mut Logging::new()).unwrap();
+    assert_eq!(plain.fa.q, 32);
+
+    // Scope default SC_OTF: one metastate, and the observer sees the strategy.
+    let t = shared();
+    let instr = Instrumentation::new()
+        .with_default_strategy(Strategy::ScOtf)
+        .with_observer(t.clone());
+    let mut reduced = wrap(&fa);
+    run(&instr, || {
+        determinize(&mut reduced, &initial, None, &mut Logging::new()).unwrap();
+    })
+    .unwrap();
+    assert_eq!(reduced.fa.q, 1);
+    let events = t.borrow().events().to_vec();
+    assert_eq!(
+        events[0],
+        Event::Determinize {
+            strategy: Strategy::ScOtf,
+            input_states: 6
+        }
+    );
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::SimulationComputed { nfa_states: 6, .. })));
+
+    // A policy that refuses the preorder degrades to plain SC, and says so.
+    let t2 = shared();
+    let instr = Instrumentation::new()
+        .with_default_strategy(Strategy::ScOtf)
+        .with_otf_policy(OtfPolicy { max_nfa_states: 2 })
+        .with_observer(t2.clone());
+    let mut degraded = wrap(&fa);
+    run(&instr, || {
+        determinize(&mut degraded, &initial, None, &mut Logging::new()).unwrap();
+    })
+    .unwrap();
+    assert_eq!(degraded.fa.q, 32);
+    assert!(t2.borrow().events().iter().any(|e| matches!(
+        e,
+        Event::SimulationSkipped {
+            nfa_states: 6,
+            limit: 2
+        }
+    )));
+}
+
+#[test]
+fn a_scope_default_strategy_never_touches_a_dfao() {
+    // A word automaton (outputs > 1): only SC may determinize it, so the scope default
+    // is ignored rather than turned into `DfaoWithNonScStrategy`.
+    let fa = Fa::with_states(
+        0,
+        2,
+        2,
+        vec![2, 3],
+        vec![
+            row(&[(0, &[0, 1]), (1, &[1])]),
+            row(&[(0, &[1]), (1, &[0])]),
+        ],
+    );
+    let mut a = Automaton::new(
+        fa,
+        vec![vec![0, 1]],
+        vec!["x".to_string()],
+        vec![Some(true)],
+    );
+    let initial: BTreeSet<usize> = [0].into_iter().collect();
+    let t = shared();
+    let instr = Instrumentation::new()
+        .with_default_strategy(Strategy::ScOtf)
+        .with_observer(t.clone());
+    run(&instr, || {
+        determinize(&mut a, &initial, None, &mut Logging::new()).unwrap();
+    })
+    .unwrap();
+    assert!(matches!(
+        t.borrow().events()[0],
+        Event::Determinize {
+            strategy: Strategy::Sc,
+            ..
+        }
+    ));
+}
+
+/// A minimizer that delegates to Valmari but counts its calls and returns a
+/// deliberately NON-minimal (but equivalent) automaton: the untouched input. That is a
+/// legal `Minimizer` per the trait's contract, and it makes the seam observable.
+struct Identity(RefCell<usize>);
+
+impl Minimizer for Identity {
+    fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError> {
+        *self.0.borrow_mut() += 1;
+        if !fa.is_deterministic() {
+            return Err(MinimizeError::NotDeterministic);
+        }
+        Ok(fa.clone())
+    }
+    fn name(&self) -> &str {
+        "identity"
+    }
+}
+
+#[test]
+fn a_scoped_minimizer_replaces_valmari_on_the_construction_path_only() {
+    let fa = kth_from_end_nfa(3);
+    let initial: BTreeSet<usize> = [0].into_iter().collect();
+    let dfa = subset_construction(&fa, &initial); // 8 states, already minimal
+                                                  // A transient case where Valmari would shrink: the redundant "ends with 1".
+    let transient = subset_construction(&ends_with_one_redundant_nfa(), &initial); // 3
+    assert_eq!(minimize(&transient).unwrap().q, 2);
+
+    let identity = Rc::new(Identity(RefCell::new(0)));
+    let t = shared();
+    let instr = Instrumentation::new()
+        .with_minimizer(identity.clone())
+        .with_observer(t.clone());
+    let (via_logging, bare) = run(&instr, || {
+        (
+            wr_core::minimize::minimize_with_logging(&transient, &mut Logging::new()).unwrap(),
+            minimize(&transient).unwrap(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        via_logging.q, 3,
+        "the construction path used the custom minimizer"
+    );
+    assert_eq!(bare.q, 2, "the bare Valmari reference is never redirected");
+    assert_eq!(*identity.0.borrow(), 1);
+    // The custom path still reports the same events a Valmari run would.
+    assert!(t.borrow().events().contains(&Event::MinimizeFinished {
+        before: 3,
+        after: 3
+    }));
+    // And the seam is on the real eval-path entry point too.
+    let mut a = Automaton::new(
+        dfa.clone(),
+        vec![vec![0, 1]],
+        vec!["x".to_string()],
+        vec![Some(true)],
+    );
+    run(&instr, || a.determinize_and_minimize()).unwrap();
+    assert_eq!(*identity.0.borrow(), 2);
+    assert_eq!(a.fa.q, 8);
 }
