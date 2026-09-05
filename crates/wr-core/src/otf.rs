@@ -323,6 +323,7 @@ fn reduce_expand_out(out: &mut ExpandOut, sim: &Simulation, scratch: &mut Vec<us
 /// **bit-identical** to sequential plain subset construction.
 pub fn subset_construction_otf(fa: &Fa, initial: &BTreeSet<usize>, policy: &OtfPolicy) -> Fa {
     let meter = Meter::current();
+    let started_at = std::time::Instant::now();
     meter.emit(|| Event::SubsetConstructionStarted {
         input_states: fa.q,
         initial_size: initial.len(),
@@ -399,6 +400,7 @@ pub fn subset_construction_otf(fa: &Fa, initial: &BTreeSet<usize>, policy: &OtfP
     meter.emit(|| Event::SubsetConstructionFinished {
         states: metastate_list.len(),
         levels,
+        elapsed: started_at.elapsed(),
     });
     Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)
 }
@@ -510,33 +512,46 @@ mod tests {
     }
 
     /// The review's wide-alphabet case: the preorder must not scale with the alphabet
-    /// width, only with the transitions that occur. 400 chain states over a 1024-symbol
-    /// alphabet, each state using two symbols: sparse work `q·m = 400·800`, admitted by
-    /// the default policy, and fast.
+    /// width, only with the transitions that occur. The same 400-state chain NFA, once
+    /// over a 1024-symbol alphabet (using symbols 0 and 1000) and once over a 2-symbol
+    /// alphabet (symbols 0 and 1): identical sparse work, so the wide one may cost at
+    /// most a small factor more. Under the first draft's dense `0..alphabet_size` scan
+    /// the wide one was ~500x slower. A ratio, not an absolute time, so a loaded CI
+    /// machine (the first version of this test, a 5 s wall-clock bound in a debug
+    /// build, flaked under load) cannot fail it.
     #[test]
     fn a_wide_alphabet_costs_only_its_present_symbols() {
         let q = 400;
-        let mut d = Vec::with_capacity(q);
-        for i in 0..q {
-            let next = (i + 1) % q;
-            d.push(row(&[(0, &[next]), (1000, &[next, 0])]));
-        }
-        let fa = Fa::with_states(
-            0,
-            q,
-            1024,
-            (0..q).map(|i| i32::from(i % 7 == 0)).collect(),
-            d,
-        );
-        assert_eq!(effective_transitions(&fa), 2 * q);
+        let chain = |hi: i32, alphabet: usize| {
+            let mut d = Vec::with_capacity(q);
+            for i in 0..q {
+                let next = (i + 1) % q;
+                d.push(row(&[(0, &[next]), (hi, &[next, 0])]));
+            }
+            Fa::with_states(
+                0,
+                q,
+                alphabet,
+                (0..q).map(|i| i32::from(i % 7 == 0)).collect(),
+                d,
+            )
+        };
+        let wide = chain(1000, 1024);
+        let narrow = chain(1, 2);
+        assert_eq!(effective_transitions(&wide), 2 * q);
         assert!(OtfPolicy::default().admits(q, 2 * q));
-        let started = std::time::Instant::now();
-        let sim = Simulation::compute(&fa);
-        assert!(sim.related_pairs() >= q);
+        // Warm-up (page-in, allocator) so neither measurement pays for it.
+        let _ = Simulation::compute(&narrow);
+        let t_narrow = std::time::Instant::now();
+        let sim_n = Simulation::compute(&narrow);
+        let narrow_time = t_narrow.elapsed();
+        let t_wide = std::time::Instant::now();
+        let sim_w = Simulation::compute(&wide);
+        let wide_time = t_wide.elapsed();
+        assert_eq!(sim_w.related_pairs(), sim_n.related_pairs());
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+            wide_time <= narrow_time * 4 + std::time::Duration::from_millis(50),
+            "wide {wide_time:?} vs narrow {narrow_time:?}: the preorder scaled with the alphabet"
         );
     }
 

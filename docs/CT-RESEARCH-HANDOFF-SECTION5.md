@@ -38,8 +38,11 @@ t.events();                                       // every Event, in order
 Events (`wr_core::resource::Event`): `Determinize { strategy, input_states }`,
 `SubsetConstructionStarted`, `SubsetLevel { level, frontier, members, metastates }` (one per
 BFS level; `metastates` is the running total, i.e. the peak so far), `SubsetConstructionFinished
-{ states, levels }`, `CrossProductStarted/Finished`, `MinimizeStarted/Finished { before, after }`,
-`SimulationComputed/Skipped` (item C). Your own `Observer` impl can be installed instead of, or
+{ states, levels, elapsed }`, `CrossProductStarted/Finished { .., elapsed }`,
+`MinimizeStarted/Finished { before, after, elapsed }`, `SimulationComputed/Skipped` (item C).
+Every `…Finished` event carries its wall time, and `DeterminizationRecord` has
+`determinize_time` / `minimize_time`, so determinize cost and minimize cost are attributable per
+step (your Q5). Your own `Observer` impl can be installed instead of, or
 alongside, the built-in `Trajectory` via `Instrumentation::with_observer(Rc<RefCell<dyn
 Observer>>)`. Direct `wr-core` use without an `Engine`: `wr_core::resource::run(&instr, || …)`.
 
@@ -49,9 +52,10 @@ Not delivered: nothing per-level for the cross product (it reports start/finish 
 ## B. In-engine resource budget (the `-Xmx` analog)
 
 Shell-out: `WR_MAX_STATES=<n>` and `WR_MAX_BYTES=<n>[K|M|G]` in the child's environment. A
-breach prints one line containing `EXPLODED-states: …` or `EXPLODED-mem: …` on stdout (after the
-`[Walnut]$ ` prompt like every Walnut error, so match with `grep -o 'EXPLODED-[a-z]*'`), frees the
-command's memory, keeps reading the next command, exits 0. Malformed value = startup error,
+breach prints the bare token `EXPLODED-states` / `EXPLODED-mem` on a line of its own (after
+Walnut's `____` prompt-erase line, exactly where `TRUE`/`FALSE` go, so your whole-line `grep -x`
+finds it), then the full `EXPLODED-states: …` message on the next line, frees the command's
+memory, keeps reading the next command, exits 0. Malformed value = startup error,
 exit 1. A ready-to-paste `walnut-guard` snippet is in the integration doc.
 
 In-process:
@@ -198,6 +202,79 @@ registration skipped the reader's validation. One remaining honest gap: the work
 memory check has a parallel-path test but no mutation-discriminating one.
 
 ---
+
+## The crux, measured (2026-09-05): p=5 is simulation-shaped, p=7 is not
+
+Run on this machine (Apple Silicon, load 20–30 from concurrent work, `WR_CORE_THREADS=1`,
+release build, budget `max_states = 20M`, `max_bytes = 24 GiB`), MOTP5/MOTP7 copied from
+`experiments/motzkin-uniform-recurrence/automata/`, driver at
+`scratchpad/crux/src/main.rs` (the `Engine` + `record_trajectory` + `with_default_strategy`
+path described above; the `::` log gives the same state counts).
+
+| query | strategy | verdict | wall | peak metastates → minimized (the FactorEq step) | det / min time | peak bytes |
+| --- | --- | --- | --- | --- | --- | --- |
+| motp5_rec | SC | TRUE | 200 s | 504,315 → 111 | 80 s / 94 s | 9.0 GB |
+| motp5_rec | SC_OTF | TRUE | **0.76 s** | **6,328 → 111** | 0.5 s / 0.05 s | 126 MB |
+| motp5_ur | SC | TRUE | 740 s | 504,315 → 111; then 123,059 → 22,090 (393 s minimize); then 114,653 → 278 | | 12.7 GB |
+| motp5_ur | SC_OTF | TRUE | ≈45 s | 6,328 → 111; 30,272 → 22,090; **114,653 → 278 (guard-skipped, ran as SC)** | | |
+| motp7_rec | SC_OTF | TRUE | 4,855 s | **682,122 → 146** | 888 s / **3,858 s** | 33.4 GB |
+| motp7_ur | SC_OTF | `EXPLODED-mem` (clean) | 4,292 s | 682,122 → 146, then the next determinization (549-state NFA, 1.3M transitions, guard-skipped) breached the 24 GiB cap at 25.77 GB inside subset construction | | |
+
+What this says:
+
+1. **p=5: simulation-shaped.** The 221-state projected NFA has 1,176 related pairs; the
+   reduction keeps the FactorEq frontier at 6,328 instead of 504,315 (80× smaller, 264×
+   faster end to end). `SC_OTF` is the answer at p=5.
+2. **p=7: Myhill–Nerode-shaped.** The 186-state projected NFA has only 293 related pairs
+   (186 of them the diagonal), so the reduction barely bites: the same step still peaks at
+   682,122 under `SC_OTF` and only Valmari brings it to 146. `SC_OTF` alone does **not**
+   rescue p=7. It did *complete* `motp7_rec` here (81 min, 33 GB, TRUE) where your run was
+   OS-killed, but that is this machine's RAM, not the strategy.
+3. **Where the p=7 time goes: minimization, not determinization.** 3,858 of 4,855 s is
+   Valmari on 682,122 states over a 7^4-symbol alphabet. Note also that `max_bytes` is
+   checked at minimize *entry* only (documented), which is why `motp7_rec` peaked at 33 GB
+   above the 24 GiB cap inside Valmari without breaching; `motp7_ur` breached cleanly
+   because its next subset construction is where memory ran out.
+4. **The work guard tripped exactly where you predicted.** motp5_ur's third and motp7_ur's
+   second determinizations have NFAs of 15,879 / 549 states with 2.0M / 1.3M transitions
+   (the p^k product alphabet); `states × transitions` blows past 2^26, so those ran as plain
+   SC. The naive fixpoint cannot afford them; a Henzinger–Henzinger–Kopke-style O(n·m)
+   simulation algorithm would be the follow-up if you want the reduction on those steps.
+5. **Brzozowski solves p=7.** Double-reversal determinization (`[strategy N BRZ]`, or
+   `with_default_strategy(Strategy::Brz)` for a session — an existing Walnut strategy,
+   already wired in U32) yields the minimal DFA directly and never materializes the
+   transient:
+
+   | query | BRZ wall | FactorEq step (reverse SC → minimized, then re-reverse SC) | peak bytes |
+   | --- | --- | --- | --- |
+   | motp5_rec | **2.1 s** | 1,350 → 68, then 111 | 40 MB |
+   | motp7_rec | **15.4 s** | 3,181 → 225, then 146 | 218 MB |
+
+   | motp5_ur | 276 s | the 399-state step: 11,195 → 1,596, re-reverse 22,090 (207 s) | 2.8 GB |
+   | motp7_ur | `EXPLODED-mem` after 8,272 s | the 549-state step: reverse SC 82,940 → 5,576 (614 s + **5,234 s** minimize), then the re-reverse breached 24 GiB | 25.3 GB |
+
+   (Each Brzozowski determinization shows up as two `DeterminizationRecord`s in the
+   trajectory, one per subset construction.)
+
+6. **motp7_ur is a wall under all three strategies on this machine**, each failing cleanly
+   at the same 549-state-NFA step: `SC_OTF` guard-skipped it (1.3M transitions) and ran out
+   of memory in plain SC; BRZ minimized the *reversed* language of that step to 5,576
+   states and ran out of memory re-reversing. Its p=5 analog (motp5_ur's 399-state step)
+   minimizes to 22,090 forward, i.e. it is the one step in your set that is not
+   transient. So this may be your first **real** wall — the case the linear-representation
+   seeding (your parked Line 2 direction) exists for — and the trajectory now tells you so
+   directly. The other three queries are solved: motp5_rec 0.76 s (`SC_OTF`) / 2.1 s
+   (BRZ), motp5_ur ≈45 s (`SC_OTF`) / 276 s (BRZ), motp7_rec 15.4 s (BRZ).
+
+Practical recommendation right now: **BRZ for the p=7 `_rec` family, `SC_OTF` for the p=5
+families** (BRZ beats `SC_OTF` at p=7 by three orders of magnitude on `_rec`; `SC_OTF` beats
+BRZ 6× on motp5_ur because that query's large step is real, and re-reversing a real 22,090-
+state language is what BRZ pays for), always with the budget on so a genuine wall yields a
+clean `EXPLODED-mem` instead of a kill. `SC_OTF` remains the right tool where
+the trajectory shows a simulation-shaped transient and BRZ's reversed automaton is the one
+that explodes (Brzozowski has its own failure mode; on fixture 637 it was 500× better than
+SC, but that is not a law either). Use the trajectory to pick per query family; that is
+exactly what A is for.
 
 ## Did I miss anything?
 

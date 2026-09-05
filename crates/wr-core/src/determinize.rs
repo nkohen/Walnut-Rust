@@ -719,6 +719,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
     // workers need no access to it. Inert (one predictable branch per merged metastate,
     // no event evaluated) when nothing is installed.
     let meter = crate::resource::Meter::current();
+    let started_at = std::time::Instant::now();
     meter.emit(|| crate::resource::Event::SubsetConstructionStarted {
         input_states: fa.q,
         initial_size: initial.len(),
@@ -885,6 +886,7 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
     meter.emit(|| crate::resource::Event::SubsetConstructionFinished {
         states: metastate_list.len(),
         levels,
+        elapsed: started_at.elapsed(),
     });
 
     Fa::with_states(0, metastate_list.len(), fa.alphabet_size, o, d)

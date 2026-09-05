@@ -264,6 +264,15 @@ fn binary_state_budget_prints_the_verdict_token_and_keeps_reading() {
         "stdout:\n{}",
         run.stdout
     );
+    // The consumer's guard extracts verdicts with a whole-line `grep -x`: the bare
+    // token stands on its own line (after Walnut's `____` prompt-erase line), exactly
+    // like `TRUE`/`FALSE`.
+    assert_eq!(
+        lines.iter().filter(|l| **l == "EXPLODED-states").count(),
+        1,
+        "stdout:\n{}",
+        run.stdout
+    );
     // The budgeted command printed no verdict; the next command still ran.
     assert_eq!(
         lines.iter().filter(|l| **l == "TRUE").count(),
@@ -286,6 +295,11 @@ fn binary_memory_budget_is_enforced_by_the_installed_tracking_allocator() {
         "stdout:\n{}\nstderr:\n{}",
         run.stdout,
         run.stderr
+    );
+    assert!(
+        run.stdout.lines().any(|l| l == "EXPLODED-mem"),
+        "{}",
+        run.stdout
     );
     // A generous cap changes nothing: both verdicts print.
     let run = run_binary_env(&ws, &[("WR_MAX_BYTES", "4G")], SCRIPT);

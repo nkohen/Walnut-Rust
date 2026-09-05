@@ -114,6 +114,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::determinize::Strategy;
 use crate::minimize::Minimizer;
@@ -449,21 +450,30 @@ pub enum Event {
         members: usize,
         metastates: usize,
     },
-    /// A subset construction finished with `states` metastates after `levels` levels.
-    /// This is the **pre-minimization** size; compare it with the following
-    /// [`Event::MinimizeFinished`]'s `after` to diagnose a transient explosion.
-    SubsetConstructionFinished { states: usize, levels: usize },
+    /// A subset construction finished with `states` metastates after `levels` levels,
+    /// taking `elapsed` wall-clock time. This is the **pre-minimization** size; compare it
+    /// with the following [`Event::MinimizeFinished`]'s `after` to diagnose a transient
+    /// explosion.
+    SubsetConstructionFinished {
+        states: usize,
+        levels: usize,
+        elapsed: Duration,
+    },
     /// A cross product started between automata of `left_states` and `right_states`.
     CrossProductStarted {
         left_states: usize,
         right_states: usize,
     },
-    /// A cross product finished with `states` pairs discovered.
-    CrossProductFinished { states: usize },
+    /// A cross product finished with `states` pairs discovered, in `elapsed`.
+    CrossProductFinished { states: usize, elapsed: Duration },
     /// A minimization started on `states` states.
     MinimizeStarted { states: usize },
-    /// A minimization finished: `before` states in, `after` out.
-    MinimizeFinished { before: usize, after: usize },
+    /// A minimization finished: `before` states in, `after` out, in `elapsed`.
+    MinimizeFinished {
+        before: usize,
+        after: usize,
+        elapsed: Duration,
+    },
     /// [`crate::otf`]: the NFA's simulation preorder was computed (`related_pairs`
     /// ordered pairs, diagonal included) before an `SC_OTF` subset construction.
     SimulationComputed {
@@ -504,6 +514,11 @@ pub struct DeterminizationRecord {
     /// States after the minimization that immediately followed, if one did. A `peak`
     /// far above `minimized` is a *transient* explosion; `peak ≈ minimized` is *real*.
     pub minimized: Option<usize>,
+    /// Wall-clock time of the subset construction itself.
+    pub determinize_time: Duration,
+    /// Wall-clock time of the minimization that followed, if one did — so the cost of a
+    /// transient explosion can be attributed to building it vs collapsing it.
+    pub minimize_time: Option<Duration>,
 }
 
 /// An [`Observer`] that records every event and keeps the running peaks. Share it with
@@ -568,20 +583,31 @@ impl Trajectory {
                         o.2 = o.2.max(*metastates);
                     }
                 }
-                Event::SubsetConstructionFinished { states, levels } => {
+                Event::SubsetConstructionFinished {
+                    states,
+                    levels,
+                    elapsed,
+                } => {
                     if let Some((input_states, _, _)) = open.take() {
                         out.push(DeterminizationRecord {
                             input_states,
                             levels: *levels,
                             peak_states: *states,
                             minimized: None,
+                            determinize_time: *elapsed,
+                            minimize_time: None,
                         });
                     }
                 }
-                Event::MinimizeFinished { before, after } => {
+                Event::MinimizeFinished {
+                    before,
+                    after,
+                    elapsed,
+                } => {
                     if let Some(last) = out.last_mut() {
                         if last.minimized.is_none() && last.peak_states == *before {
                             last.minimized = Some(*after);
+                            last.minimize_time = Some(*elapsed);
                         }
                     }
                 }
@@ -597,7 +623,7 @@ impl Observer for Trajectory {
         let states = match event {
             Event::SubsetLevel { metastates, .. } => *metastates,
             Event::SubsetConstructionFinished { states, .. }
-            | Event::CrossProductFinished { states }
+            | Event::CrossProductFinished { states, .. }
             | Event::MinimizeStarted { states } => *states,
             Event::Determinize { input_states, .. }
             | Event::SubsetConstructionStarted { input_states, .. } => *input_states,
@@ -605,7 +631,7 @@ impl Observer for Trajectory {
                 left_states,
                 right_states,
             } => (*left_states).max(*right_states),
-            Event::MinimizeFinished { before, after } => (*before).max(*after),
+            Event::MinimizeFinished { before, after, .. } => (*before).max(*after),
             Event::SimulationComputed { nfa_states, .. }
             | Event::SimulationSkipped { nfa_states, .. } => *nfa_states,
         };
@@ -1013,11 +1039,13 @@ mod tests {
             m.emit(|| Event::SubsetConstructionFinished {
                 states: 9,
                 levels: 2,
+                elapsed: Duration::from_millis(5),
             });
             m.emit(|| Event::MinimizeStarted { states: 9 });
             m.emit(|| Event::MinimizeFinished {
                 before: 9,
                 after: 2,
+                elapsed: Duration::from_millis(3),
             });
         })
         .unwrap();
@@ -1031,6 +1059,8 @@ mod tests {
                 levels: 2,
                 peak_states: 9,
                 minimized: Some(2),
+                determinize_time: Duration::from_millis(5),
+                minimize_time: Some(Duration::from_millis(3)),
             }]
         );
     }
@@ -1045,10 +1075,12 @@ mod tests {
         t.observe(&Event::SubsetConstructionFinished {
             states: 5,
             levels: 1,
+            elapsed: Duration::ZERO,
         });
         t.observe(&Event::MinimizeFinished {
             before: 7,
             after: 1,
+            elapsed: Duration::ZERO,
         });
         assert_eq!(t.determinizations()[0].minimized, None);
         t.clear();

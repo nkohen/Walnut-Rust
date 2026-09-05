@@ -139,10 +139,11 @@ WR_MAX_STATES="${STATE_LIMIT:-2000000}" WR_MAX_BYTES="${XMX_MB}M" \
 if v=$(grep -oE 'EXPLODED-(states|mem)' "$raw" | head -1); then echo "$v"; exit 0; fi
 ```
 
-The engine prints the verdict line on stdout after the `[Walnut]$ ` prompt (like every
-Walnut error message), frees the command's memory, keeps reading the next command, and
-exits 0 — so `grep -o` (not an anchored match) finds it, and a script's later commands
-still run.
+The engine prints the bare verdict token (`EXPLODED-states` / `EXPLODED-mem`) on a line
+of its own, after Walnut's `____` prompt-erase line — exactly where `TRUE`/`FALSE` go, so a
+whole-line `grep -x` finds it — followed by the full message (`EXPLODED-states: subset
+construction reached … (limit …)`) on the next line; it frees the command's memory, keeps
+reading the next command, and exits 0, so a script's later commands still run.
 
 ---
 
@@ -153,7 +154,7 @@ inert when unused, so results stay bit-identical.
 
 | Need | Shell-out | In-process |
 | --- | --- | --- |
-| **Real vs. transient explosion** — did the subset construction's peak exceed the minimized output? | `::` mode: the `Determinizing`/`Minimizing:`/`Minimized:` lines | `engine.record_trajectory(true)`; after a command, `engine.trajectory().unwrap().determinizations()` gives one `DeterminizationRecord { input_states, levels, peak_states, minimized }` per subset construction; `.peak_states()` / `.events()` for the per-level `SubsetLevel { level, frontier, members, metastates }` trajectory |
+| **Real vs. transient explosion** — did the subset construction's peak exceed the minimized output, and where did the time go? | `::` mode: the `Determinizing`/`Minimizing:`/`Minimized:` lines | `engine.record_trajectory(true)`; after a command, `engine.trajectory().unwrap().determinizations()` gives one `DeterminizationRecord { input_states, levels, peak_states, minimized, determinize_time, minimize_time }` per subset construction; `.peak_states()` / `.events()` for the per-level `SubsetLevel { level, frontier, members, metastates }` trajectory; every `…Finished` event carries its `elapsed` wall time |
 | **Clean exhaustion instead of an OS kill** | `WR_MAX_STATES` / `WR_MAX_BYTES` → an `EXPLODED-states:` / `EXPLODED-mem:` line | `Engine::builder(dir).budget(ResourceBudget { max_states, max_bytes })` (or `set_budget`) → `Err(ProverError::ResourceExhausted(Exhausted { reason, operation, at, limit }))` |
 | **The `::` detailed log without shelling out** | n/a | `engine.detailed_log()` after a `::`-suffixed command (byte-identical to the binary's lines), or route the console with `Engine::builder(dir).console(Box::new(sink))` |
 

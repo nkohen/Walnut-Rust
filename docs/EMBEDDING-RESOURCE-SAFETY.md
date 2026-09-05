@@ -58,11 +58,12 @@ cannot be outrun. Set it in addition to — never instead of — the process-lev
 
 - **Shell-out:** `WR_MAX_STATES=<n>` and `WR_MAX_BYTES=<n>[K|M|G]` in the child's
   environment (`bin/walnut-rs` passes the environment through). The binary installs the
-  tracking allocator `WR_MAX_BYTES` needs. A breach prints one line containing
-  `EXPLODED-states: …` / `EXPLODED-mem: …` on stdout (after the `[Walnut]$ ` prompt, like
-  every Walnut error message — match it with `grep -o 'EXPLODED-[a-z]*'`), the command's
-  memory is freed, and the REPL reads the next command; exit code stays 0. A malformed value
-  is a startup error (exit 1), never silently ignored.
+  tracking allocator `WR_MAX_BYTES` needs. A breach prints the bare token
+  `EXPLODED-states` / `EXPLODED-mem` on its own line (after Walnut's `____` prompt-erase
+  line, exactly like `TRUE`/`FALSE`, so a whole-line `grep -x` finds it) followed by the full
+  message on the next line, the command's memory is freed, and the REPL reads the next
+  command; exit code stays 0. A malformed value is a startup error (exit 1), never silently
+  ignored.
 - **In-process:** `Engine::builder(dir).budget(ResourceBudget { max_states: Some(n),
   max_bytes: Some(bytes) })` (or `engine.set_budget(..)`). A breach makes that command return
   `Err(ProverError::ResourceExhausted(Exhausted { reason, operation, at, limit }))`; the

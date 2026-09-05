@@ -280,6 +280,7 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     // preceding subset construction to diagnose a transient explosion.
     let meter = crate::resource::Meter::current();
     meter.check(crate::resource::Operation::Minimize, num_states);
+    let started_at = std::time::Instant::now();
     meter.emit(|| crate::resource::Event::MinimizeStarted { states: num_states });
 
     // Flatten the transition table into Valmari's tail/label/head triple arrays. A
@@ -479,6 +480,7 @@ pub fn minimize(fa: &Fa) -> Result<Fa, MinimizeError> {
     meter.emit(|| crate::resource::Event::MinimizeFinished {
         before: num_states,
         after: new_q,
+        elapsed: started_at.elapsed(),
     });
 
     Ok(Fa::with_states(new_q0, new_q, fa.alphabet_size, o, d))
@@ -509,11 +511,13 @@ pub fn minimize_with_logging(
         None => minimize(fa)?,
         Some(custom) => {
             meter.check(crate::resource::Operation::Minimize, fa.q);
+            let started_at = std::time::Instant::now();
             meter.emit(|| crate::resource::Event::MinimizeStarted { states: fa.q });
             let result = custom.minimize(fa)?;
             meter.emit(|| crate::resource::Event::MinimizeFinished {
                 before: fa.q,
                 after: result.q,
+                elapsed: started_at.elapsed(),
             });
             result
         }

@@ -2269,6 +2269,18 @@ impl Prover {
                     self.logging.print_truncated_stack_trace(&e);
                     return true;
                 }
+                // walnut-rs only: a breached resource budget also gets its verdict token
+                // on a line of its own -- `____` (Walnut's own prompt-erase line, the one
+                // `eval` prints before `TRUE`/`FALSE`) then the bare `EXPLODED-states` /
+                // `EXPLODED-mem`, so a consumer's whole-line `grep -x` verdict extraction
+                // finds it exactly where it finds `TRUE`; the full message follows on the
+                // next line like every other error.
+                Err(ProverError::ResourceExhausted(ref exhausted)) => {
+                    let _ = writeln!(self.out, "____\n{}", exhausted.verdict());
+                    let _ = self.out.flush();
+                    let e = ProverError::ResourceExhausted(exhausted.clone());
+                    self.logging.print_truncated_stack_trace(&e);
+                }
                 Err(e) => self.logging.print_truncated_stack_trace(&e),
             }
         }

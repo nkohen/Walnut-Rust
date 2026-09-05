@@ -387,6 +387,7 @@ where
     ));
     meter.emit(|| crate::resource::Event::CrossProductFinished {
         states: states_list.len(),
+        elapsed: time_before.elapsed(),
     });
 
     Fa::with_states(0, states_list.len(), axb_alphabet_size, o, d)

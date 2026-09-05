@@ -1378,5 +1378,20 @@ differential-gen soak at 0 divergences, 59 workspace suites / 1,889+ tests green
   ±25% noise; recorded with that caveat in `docs/CT-RESEARCH-INTEGRATION.md`, a
   quiet-machine number owed alongside the D3 thread sweep.
 - Consumer docs: `docs/CT-RESEARCH-INTEGRATION.md` (new sections per item) and
-  `docs/EMBEDDING-RESOURCE-SAFETY.md` (§0: always set the in-engine budget). Committed on
-  the feature branch; nothing pushed.
+  `docs/EMBEDDING-RESOURCE-SAFETY.md` (§0: always set the in-engine budget);
+  `docs/CT-RESEARCH-HANDOFF-SECTION5.md` is the handoff. Committed on the feature branch;
+  nothing pushed.
+- **Follow-up round after ct-research's reply (2026-09-05):** verdict token now on its own
+  line after `____` (their guard uses whole-line `grep -x`); every `…Finished` event and
+  `DeterminizationRecord` carries wall time (`determinize_time`/`minimize_time`). **The crux
+  experiment on their real queries**: at p=5 the FactorEq transient (504,315 → 111) is
+  simulation-shaped and `SC_OTF` collapses it to 6,328 (motp5_rec 200 s → 0.76 s); at p=7
+  it is Myhill–Nerode-shaped (293 related pairs on 186 NFA states), `SC_OTF` still peaks at
+  682,122 → 146, and 80% of the 81-minute run is Valmari; the two guard-skipped steps
+  (15,879- and 549-state NFAs with 1–2M transitions) are the case for an O(n·m) simulation
+  algorithm. **Brzozowski (`[strategy N BRZ]`, wired in U32) turned out to be the p=7
+  answer for `_rec`: motp7_rec TRUE in 15.4 s / 218 MB (peak 3,181), motp5_rec 2.1 s;
+  motp5_ur is best under `SC_OTF` (≈45 s vs BRZ 276 s, its 22,090-state step being real);
+  motp7_ur is a wall under all three strategies (clean `EXPLODED-mem` each time at the same
+  549-state-NFA step, whose reversed language already minimizes to 5,576 states) — likely
+  the consumer's first real wall.** Full table in the handoff doc.

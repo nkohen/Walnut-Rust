@@ -137,10 +137,14 @@ fn the_trajectory_reports_levels_and_the_final_metastate_count() {
             levels += 1;
         }
     }
-    assert_eq!(
+    assert!(matches!(
         *events.last().unwrap(),
-        Event::SubsetConstructionFinished { states: 8, levels }
-    );
+        Event::SubsetConstructionFinished {
+            states: 8,
+            levels: l,
+            ..
+        } if l == levels
+    ));
 }
 
 #[test]
@@ -153,14 +157,23 @@ fn a_transient_explosion_shows_as_peak_above_minimized() {
         minimize(&dfa).unwrap()
     })
     .unwrap();
+    let recs = t.borrow().determinizations();
+    assert_eq!(recs.len(), 1);
+    let DeterminizationRecord {
+        input_states,
+        levels,
+        peak_states,
+        minimized,
+        minimize_time,
+        ..
+    } = recs[0];
     assert_eq!(
-        t.borrow().determinizations(),
-        vec![DeterminizationRecord {
-            input_states: 3,
-            levels: 3,
-            peak_states: 3,
-            minimized: Some(2),
-        }]
+        (input_states, levels, peak_states, minimized),
+        (3, 3, 3, Some(2))
+    );
+    assert!(
+        minimize_time.is_some(),
+        "the following minimization is timed too"
     );
 }
 
@@ -276,16 +289,19 @@ fn a_state_cap_stops_the_cross_product() {
     // And the observer sees the pair count.
     let (instr, t) = observed();
     run(&instr, || product(&mut Logging::new())).unwrap();
+    let events = t.borrow().events().to_vec();
+    assert_eq!(events.len(), 2);
     assert_eq!(
-        t.borrow().events(),
-        &[
-            Event::CrossProductStarted {
-                left_states: 2,
-                right_states: 2
-            },
-            Event::CrossProductFinished { states: 4 }
-        ]
+        events[0],
+        Event::CrossProductStarted {
+            left_states: 2,
+            right_states: 2
+        }
     );
+    assert!(matches!(
+        events[1],
+        Event::CrossProductFinished { states: 4, .. }
+    ));
 }
 
 #[test]
@@ -505,10 +521,14 @@ fn a_scoped_minimizer_replaces_valmari_on_the_construction_path_only() {
     assert_eq!(bare.q, 2, "the bare Valmari reference is never redirected");
     assert_eq!(*identity.0.borrow(), 1);
     // The custom path still reports the same events a Valmari run would.
-    assert!(t.borrow().events().contains(&Event::MinimizeFinished {
-        before: 3,
-        after: 3
-    }));
+    assert!(t.borrow().events().iter().any(|e| matches!(
+        e,
+        Event::MinimizeFinished {
+            before: 3,
+            after: 3,
+            ..
+        }
+    )));
     // And the seam is on the real eval-path entry point too.
     let mut a = Automaton::new(
         dfa.clone(),
