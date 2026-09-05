@@ -1315,7 +1315,7 @@ The branch is local-only (nothing pushed, per the standing rule) and source-brea
 `RESUME-HERE.md`.
 
 **ct-research Section 5 feature requests (2026-09-04, branch `feat/ct-research-consumption`,
-commits `a335188` → `8c85504` → the fix-up commit after it) — all seven items (A–G) landed,
+commits `a335188` → `8c85504` → `1329aa5`) — all seven items (A–G) landed,
 each opt-in and inert when unused.** Drop-in contract re-verified after every commit:
 golden corpus exactly `675 | 670 | 1 (383) | 4 | 0`, a fresh-seed 10,000-query
 differential-gen soak at 0 divergences, 59 workspace suites / 1,889+ tests green,

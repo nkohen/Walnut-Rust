@@ -301,7 +301,7 @@ impl Engine {
 
     /// Install a resource budget (the in-engine `-Xmx` analog) for every later command.
     /// A breached cap makes that command return
-    /// [`ProverError::ResourceExhausted`](crate::prover::ProverError::ResourceExhausted)
+    /// [`ProverError::ResourceExhausted`]
     /// with its partial automata already freed; the engine stays usable. Fails (and
     /// installs nothing) when a memory cap is requested but no tracking allocator is
     /// present — `wr_cli::tracking_alloc` for how to install one.
