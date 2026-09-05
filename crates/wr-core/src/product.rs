@@ -807,7 +807,8 @@ where
     axb.fa = crate::minimize::minimize_with_logging(&axb.fa, logging).expect(
         "cross product of two deterministic automata is itself deterministic and \
          q0-reachable by construction (see module docs) -- minimize's preconditions \
-         always hold here",
+         always hold here (a custom wr_core::minimize::Minimizer installed through \
+         wr_core::resource must not return Err on such an input)",
     );
     AutomatonDFA::from(axb)
 }

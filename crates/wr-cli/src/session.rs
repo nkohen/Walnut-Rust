@@ -578,22 +578,40 @@ impl FileLibraries {
 
     /// Register `automaton` as the word automaton `name` (used as `name[i]` in a
     /// formula) for the rest of this session, shadowing any `Word Automata Library/
-    /// name.txt`. The automaton must be what the reader would have produced for such a
-    /// file: deterministic, one track per variable, `ns_name`/`msd` set on each
-    /// arithmetic track (e.g. `wr_cts::bridge::automaton_from_dfao`'s output). Nothing
-    /// is written to disk. Replaces an earlier registration under the same name.
-    pub fn register_word(&self, name: &str, automaton: Automaton) {
+    /// name.txt`. Nothing is written to disk. Replaces an earlier registration under the
+    /// same name.
+    ///
+    /// The file path normalizes what it reads (`wr_io::reader`: duplicate alphabet
+    /// entries removed, an NFA determinized and minimized, a custom base's
+    /// valid-representation automaton attached); an in-memory registration is used as
+    /// given, so the parts of that contract the engine relies on are **checked here**
+    /// ([`RegistrationError`]) rather than assumed: the automaton must be deterministic
+    /// (an NFA would silently desync `[strategy N …]` indices and can reach an
+    /// "Unexpected NFA" guard), its track alphabets duplicate-free, and any track whose
+    /// number system is a custom base (`msd_fib`, …) must carry that base's `all_reps`
+    /// automaton — without it every `~`/`=>`/`A` over the automaton admits invalid
+    /// representations, a silently wrong language. `wr_cts::bridge::automaton_from_dfao`
+    /// produces an automaton that passes all three.
+    pub fn register_word(&self, name: &str, automaton: Automaton) -> Result<(), RegistrationError> {
+        validate_registration(&automaton)?;
         self.registered_words
             .borrow_mut()
             .insert(name.to_string(), automaton);
+        Ok(())
     }
 
     /// As [`FileLibraries::register_word`] for a predicate automaton (`$name(…)`),
-    /// shadowing `Automata Library/name.txt`.
-    pub fn register_function(&self, name: &str, automaton: Automaton) {
+    /// shadowing `Automata Library/name.txt`, with the same checks.
+    pub fn register_function(
+        &self,
+        name: &str,
+        automaton: Automaton,
+    ) -> Result<(), RegistrationError> {
+        validate_registration(&automaton)?;
         self.registered_functions
             .borrow_mut()
             .insert(name.to_string(), automaton);
+        Ok(())
     }
 
     /// Forget an in-memory registration (both kinds); a later lookup goes to disk again.
@@ -866,6 +884,84 @@ impl PredicateEnv for FileLibraries {
 /// see [`FileLibraries`] for the aliasing argument. [`SessionPaths`] is shared by [`Rc`]
 /// rather than cloned so the two views can never drift apart (it is immutable, so sharing is
 /// free of the usual caveats).
+/// Why an in-memory registration ([`FileLibraries::register_word`] /
+/// [`FileLibraries::register_function`]) was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationError {
+    /// The automaton is nondeterministic; determinize (and minimize) it first, as the
+    /// reader would have.
+    NotDeterministic,
+    /// Track `track`'s alphabet lists a digit twice; the reader deduplicates, this does
+    /// not.
+    DuplicateAlphabetEntry { track: usize },
+    /// Track `track` is declared over the custom base `ns_name` but carries no
+    /// valid-representation (`all_reps`) automaton, which the reader would have attached
+    /// from `Custom Bases/<ns_name>.txt`; without it complements and universal
+    /// quantifiers admit invalid representations.
+    CustomBaseWithoutAllReps { track: usize, ns_name: String },
+}
+
+impl fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RegistrationError::NotDeterministic => {
+                write!(f, "a registered automaton must be deterministic")
+            }
+            RegistrationError::DuplicateAlphabetEntry { track } => {
+                write!(f, "track {track}'s alphabet has a duplicate entry")
+            }
+            RegistrationError::CustomBaseWithoutAllReps { track, ns_name } => write!(
+                f,
+                "track {track} is over the custom base {ns_name} but has no valid-representation automaton"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RegistrationError {}
+
+/// A number-system name the engine can build without a `Custom Bases/` file:
+/// `msd_k`/`lsd_k`/`msd_neg_k`/`lsd_neg_k` for a decimal `k`. Everything else is a custom
+/// base with a file behind it.
+fn is_plain_base_name(name: &str) -> bool {
+    let rest = match name
+        .strip_prefix("msd_")
+        .or_else(|| name.strip_prefix("lsd_"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    let digits = rest.strip_prefix("neg_").unwrap_or(rest);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn validate_registration(a: &Automaton) -> Result<(), RegistrationError> {
+    if a.is_true_false_automaton() {
+        return Ok(());
+    }
+    if !a.fa.is_deterministic() {
+        return Err(RegistrationError::NotDeterministic);
+    }
+    for t in 0..a.track_count() {
+        let alphabet = a.track_alphabet(t);
+        let mut sorted = alphabet.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() != alphabet.len() {
+            return Err(RegistrationError::DuplicateAlphabetEntry { track: t });
+        }
+        if let Some(ns) = a.track_ns_name_raw(t) {
+            if !is_plain_base_name(ns) && a.track_all_reps(t).is_none() {
+                return Err(RegistrationError::CustomBaseWithoutAllReps {
+                    track: t,
+                    ns_name: ns.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Session {
     paths: Rc<SessionPaths>,

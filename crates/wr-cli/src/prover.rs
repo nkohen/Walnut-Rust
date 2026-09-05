@@ -1122,7 +1122,9 @@ pub enum RegisterCommandError {
     /// The name is one of Walnut's own commands; those cannot be shadowed (the drop-in
     /// contract).
     BuiltIn(String),
-    /// Not a command name the REPL's tokenizer can recognize (`[A-Za-z_][A-Za-z0-9_]*`).
+    /// Not an identifier of the form `[A-Za-z_][A-Za-z0-9_]*` — deliberately narrower
+    /// than the tokenizer's own `\w+` (which would also accept a leading digit), so a
+    /// registered name always reads as a plain command word.
     InvalidName(String),
 }
 
@@ -1156,6 +1158,12 @@ impl Prover {
     /// As [`Prover::new`], with both sinks injected — the seam the tests below and any
     /// future harness use.
     pub fn with_output(session: Session, mut logging: Logging, out: Box<dyn Write>) -> Self {
+        // walnut-rs resource meter (`wr_core::resource::memory_meter`): start counting live
+        // heap NOW, if a tracking allocator is linked, so a memory cap installed later in
+        // this session bounds everything this prover ever allocated rather than only what
+        // it allocates after the cap. A process without the wrapper gets `Err` here, which
+        // is fine -- `set_instrumentation` refuses a memory cap in that process anyway.
+        let _ = wr_core::resource::memory_meter::enable();
         logging.initialize_global_log(&format!(
             "{}{GLOBAL_LOG_FILENAME}",
             session.paths().address_for_result()

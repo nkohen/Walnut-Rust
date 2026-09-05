@@ -537,11 +537,18 @@ pub fn minimize_with_logging(
 /// reader depend on it staying so).
 ///
 /// The contract is [`minimize`]'s: given a deterministic `Fa` whose states are all
-/// reachable from `q0`, return a language-equivalent DFA; state numbering is free. A
-/// minimizer that returns a *non-minimal* but equivalent automaton is legal (the
-/// engine only relies on equivalence); one that changes the language corrupts every
-/// later result, and nothing here can detect that — the Tier-4 cross-checks in
-/// `wr-cts` are the model for validating a candidate before installing it.
+/// reachable from `q0`, return `Ok` with a language-equivalent DFA; state numbering is
+/// free. **Returning `Err` on such an input is not an option a custom minimizer has** —
+/// the construction-path callers `expect` success (their messages name this seam), so an
+/// `Err` is a panic, not a recoverable error. A minimizer that returns a *non-minimal*
+/// but equivalent automaton keeps every verdict correct (the decision procedure relies
+/// on language equivalence alone) but changes every state count in the `::` log and the
+/// saved automata, and is not something the golden corpus exercises — treat "non-minimal
+/// is fine" as a language-level statement, not a fidelity one. One that changes the
+/// language corrupts every later result, and nothing here can detect that — the Tier-4
+/// cross-checks in `wr-cts` are the model for validating a candidate before installing
+/// it. Not routed through this seam: the bare [`minimize`] (the reference the oracle and
+/// the reader use) and `crate::regex`'s `reg` pipeline, which calls it directly.
 pub trait Minimizer {
     fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError>;
 

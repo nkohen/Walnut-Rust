@@ -372,8 +372,9 @@ pub fn dfao_from_automaton(a: &Automaton) -> Result<(DFAO<ModInt, usize>, Direct
 }
 
 /// Make a partial deterministic [`Fa`] total by routing every missing transition to a
-/// fresh non-accepting dead state with output `dead_output` (appended as the last
-/// state). A no-op copy if the input is already total. Use before [`dfao_from_fa`] on
+/// fresh dead state with output `dead_output` (appended as the last state, looping on
+/// every symbol). Pass `0` for the usual rejecting sink; any other value makes the sink
+/// an accepting/valued state and changes the language accordingly. A no-op copy if the input is already total. Use before [`dfao_from_fa`] on
 /// an engine automaton that came out of `minimize` (which drops dead states).
 pub fn totalize_dead(fa: &Fa, dead_output: i32) -> Fa {
     let n = fa.q;

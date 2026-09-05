@@ -728,6 +728,8 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
     let first: Vec<usize> = initial.iter().copied().collect();
     let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
     metastate_to_id.insert(first.clone(), 0);
+    // The initial metastate counts like every other one (a cap of 0 breaches here).
+    meter.check(crate::resource::Operation::SubsetConstruction, 1);
     let shared = ScopedShared {
         fa,
         metastate_list: RwLock::new(vec![first]),
@@ -841,9 +843,12 @@ fn subset_construction_scheduled(fa: &Fa, initial: &BTreeSet<usize>, schedule: S
                 // Re-raises the lowest-indexed panic, if any -- `_shutdown` releases the
                 // workers on the way out.
                 let chunk_outs = shared.task.take_results(chunk_count);
-                // The level's whole expansion output is now live: the memory cap gets
-                // one more look before any of it is merged.
-                meter.check(crate::resource::Operation::SubsetConstruction, end);
+                // The level's whole expansion output is now live: the MEMORY cap gets one
+                // more look before any of it is merged (the state count has not moved
+                // since it was last checked, so this is a memory-only look).
+                meter
+                    .budget()
+                    .check_memory(crate::resource::Operation::SubsetConstruction);
                 let mut list = shared
                     .metastate_list
                     .write()

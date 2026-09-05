@@ -1313,3 +1313,70 @@ triple-reviewed design stays resumable at `~/.claude/plans/glossy-compacting-lan
 The branch is local-only (nothing pushed, per the standing rule) and source-breaking for
 `ct-research`'s submodule (pointer bump = the user's deliberate act). Execution ledger:
 `RESUME-HERE.md`.
+
+**ct-research Section 5 feature requests (2026-09-04, branch `feat/ct-research-consumption`,
+commits `a335188` → `8c85504` → the fix-up commit after it) — all seven items (A–G) landed,
+each opt-in and inert when unused.** Drop-in contract re-verified after every commit:
+golden corpus exactly `675 | 670 | 1 (383) | 4 | 0`, a fresh-seed 10,000-query
+differential-gen soak at 0 divergences, 59 workspace suites / 1,889+ tests green,
+`fmt`/`clippy` clean.
+- **Mechanism (A/B/D, and reused by C):** `wr_core::resource` — a thread-local, scoped
+  `Instrumentation` (budget, observers, custom minimizer, default strategy, OTF policy)
+  that `subset_construction`/`cross_product_internal`/`minimize` snapshot once at entry
+  via `Meter::current()`. No signature on the drop-in path changed. A breached cap is a
+  typed panic payload (`Exhausted { reason, operation, at, limit }`) that every inner
+  `catch_walnut_panic` boundary re-raises (Java's `OutOfMemoryError` is not a
+  `RuntimeException` either) and the dispatch boundary maps to
+  `ProverError::ResourceExhausted` (`EXPLODED-states: …` / `EXPLODED-mem: …` on stdout for
+  the binary, which reads `WR_MAX_STATES`/`WR_MAX_BYTES`). Memory is live heap through a
+  tracking global allocator (`wr_cli::tracking_alloc`, linked by the binary; counting is
+  switched on at `Prover` construction when a wrapper is linked, refused — never silently
+  skipped — when none is). `Engine` gained a builder (console sinks, budget),
+  `record_trajectory`/`trajectory()` (per-command `DeterminizationRecord { peak_states,
+  minimized, .. }` — the real-vs-transient diagnosis), `detailed_log()`, `set_budget`.
+- **C:** `Strategy::ScOtf` (`wr_core::otf`) — subset construction with on-the-fly
+  simulation-subsumption reduction (the `CCLS` idea, not a port of the deferred `jn1z:otf`
+  family); canonical (never larger than SC), language-equivalent by construction and
+  through the frozen oracle on thousands of random NFAs; selected by `[strategy N SC_OTF]`
+  or a scope default; size- and work-guarded (`OtfPolicy`), sequential only; NOT applied
+  to the `reg` pipeline, which bypasses the dispatcher. The "minimize the frontier"
+  reading of on-the-fly minimization was analyzed and rejected (provably finds nothing on
+  a BFS frontier; argument in the module docs). Minimizer seam: `wr_core::minimize::
+  Minimizer` via `Instrumentation::with_minimizer`, consulted by `minimize_with_logging`
+  only (bare `minimize`, the reader and `reg` stay on Valmari); `wr_cts::moore` exercised
+  through it.
+- **E:** `wr_cts::bridge` (feature `substrate`, pinned git dependency on
+  `RustConstantTermSequences` @ `1643ad1`; `wr-cli` links it OFF so the binary never
+  carries it) converts `Fa`/`Automaton` ↔ `DFAO<ModInt, S>` both ways with an explicit
+  msd/lsd `Direction`; `Engine::register_word_automaton`/`register_automaton` is the
+  in-memory library (shadows files; validated like the reader would have — deterministic,
+  duplicate-free alphabets, custom base ⇒ `all_reps` present); `tests/substrate-bridge/`
+  runs a real `poly_auto` DFAO through the engine (200 values + first-order facts) and
+  back. Coordination point: the substrate is edition 2024 (`wr-cts` MSRV 1.85); check it
+  builds on Linux before bumping the pin.
+- **F:** `Prover::register_command` (`CommandContext`/`CommandHandler`); built-ins cannot
+  be shadowed; handlers share the panic boundary, budget scope and `;`/`::` bookkeeping.
+- **G:** `wr_core::witness` (re-exported as `wr_cli::embed::witness`): shortest
+  accepted/rejected/output words with per-track base-k decoding.
+- **Review rounds (two independent split-context reviewers per commit, Opus + Sonnet, each
+  in its own worktree — the fleet-hygiene lesson applied), findings all fixed and pinned:**
+  round 1 — the parallel subset-construction path checked the budget per CHUNK, not per
+  metastate, with zero coverage (both reviewers, mutation-proved); the allocator counted
+  unconditionally with no measurement behind the claim; live-bytes semantics untested;
+  several doc overclaims. Round 2 — `shortest_rejected` returned non-shortest words (~1-3%
+  of random partial DFAs; now a virtual-sink BFS pinned against a brute-force oracle); the
+  OTF preorder was unbounded in alphabet width (measured 180 s at 800 states × 1024
+  symbols; now sparse over present symbols plus a `states × transitions` work guard, and
+  its allocation is memory-checked); `memory_meter::enable`'s probe could fail-open under a
+  concurrent first enable (replaced by a wrapper-set linked flag); counting started only
+  at the first memory cap (now at `Prover` construction); registration skipped the reader's
+  normalization (now validated); `reg` carve-out and other doc corrections. Remaining
+  honest gap: the worker-side pre-chunk memory check has a parallel-path test but no
+  mutation-discriminating one (which check fires is unobservable from outside).
+- **Allocator cost:** a three-configuration A/B (plain / wrapper off / wrapper on) on the
+  `alt3` workload showed no slowdown detectable above a loaded battery-powered machine's
+  ±25% noise; recorded with that caveat in `docs/CT-RESEARCH-INTEGRATION.md`, a
+  quiet-machine number owed alongside the D3 thread sweep.
+- Consumer docs: `docs/CT-RESEARCH-INTEGRATION.md` (new sections per item) and
+  `docs/EMBEDDING-RESOURCE-SAFETY.md` (§0: always set the in-engine budget). Committed on
+  the feature branch; nothing pushed.

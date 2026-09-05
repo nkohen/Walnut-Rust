@@ -217,8 +217,10 @@ pub fn shortest_output(fa: &Fa, value: i32) -> Result<Option<Witness>, WitnessEr
 }
 
 /// The shortest rejected word: one leading to a non-accepting state (`o == 0`) **or**
-/// into a missing transition (a partial DFA rejects everything past it). For the latter
-/// the returned `state` is the last state on the path and `output` is that state's
+/// into a missing transition (a partial DFA rejects everything past it), whichever comes
+/// first in BFS order — shortest, then lexicographically smallest in symbol order, with
+/// both kinds of rejection competing on equal terms. For a missing-transition rejection
+/// the returned `state` is the last real state on the path and `output` is that state's
 /// output — the word itself is what matters.
 pub fn shortest_rejected(fa: &Fa) -> Result<Option<Witness>, WitnessError> {
     if fa.is_true_false_automaton() {
@@ -230,12 +232,27 @@ pub fn shortest_rejected(fa: &Fa) -> Result<Option<Witness>, WitnessError> {
     if fa.q0 >= fa.q || fa.o.len() != fa.q || fa.d.len() != fa.q {
         return Err(WitnessError::Malformed("q0/o/d inconsistent with q"));
     }
-    let mut parent: Vec<Option<(usize, i32)>> = vec![None; fa.q];
-    let mut seen = vec![false; fa.q];
+    // A missing transition is an edge into a virtual non-accepting sink (id `fa.q`),
+    // which then competes in the same BFS as every real state — an adversarial review
+    // of the first draft found that returning at the moment a missing transition was
+    // SEEN (mid-level) skipped shorter and lexicographically smaller rejections that were
+    // already queued or not yet examined at the same depth.
+    let sink = fa.q;
+    let n = fa.q + 1;
+    let mut parent: Vec<Option<(usize, i32)>> = vec![None; n];
+    let mut seen = vec![false; n];
     let mut queue = VecDeque::new();
     seen[fa.q0] = true;
     queue.push_back(fa.q0);
     while let Some(s) = queue.pop_front() {
+        if s == sink {
+            let (last_real, _) = parent[s].expect("the sink is never the start");
+            return Ok(Some(Witness {
+                symbols: path_to(&parent, s),
+                state: last_real,
+                output: fa.o[last_real],
+            }));
+        }
         if fa.o[s] == 0 {
             return Ok(Some(Witness {
                 symbols: path_to(&parent, s),
@@ -244,23 +261,14 @@ pub fn shortest_rejected(fa: &Fa) -> Result<Option<Witness>, WitnessError> {
             }));
         }
         for symbol in 0..fa.alphabet_size as i32 {
-            match step(fa, s, symbol)? {
-                Step::Missing => {
-                    let mut symbols = path_to(&parent, s);
-                    symbols.push(symbol);
-                    return Ok(Some(Witness {
-                        symbols,
-                        state: s,
-                        output: fa.o[s],
-                    }));
-                }
-                Step::To(t) => {
-                    if !seen[t] {
-                        seen[t] = true;
-                        parent[t] = Some((s, symbol));
-                        queue.push_back(t);
-                    }
-                }
+            let t = match step(fa, s, symbol)? {
+                Step::Missing => sink,
+                Step::To(t) => t,
+            };
+            if !seen[t] {
+                seen[t] = true;
+                parent[t] = Some((s, symbol));
+                queue.push_back(t);
             }
         }
     }
@@ -433,5 +441,144 @@ mod tests {
         let empty = Fa::with_states(0, 0, 2, vec![], vec![]);
         assert_eq!(shortest_accepted(&empty), Ok(None));
         assert_eq!(shortest_rejected(&empty), Ok(None));
+    }
+
+    /// Brute-force oracle: enumerate words by length, then lexicographically, and return
+    /// the first the automaton rejects (non-accepting state or missing transition). A
+    /// rejected word, if one exists, has length at most `q` (pigeonhole over the states
+    /// plus the virtual sink), so enumerating up to `q + 1` is exhaustive.
+    fn brute_force_shortest_rejected(fa: &Fa) -> Option<Vec<i32>> {
+        fn rejects(fa: &Fa, w: &[i32]) -> bool {
+            let mut s = fa.q0;
+            for &a in w {
+                match fa.d[s].get(&a) {
+                    Some(d) if !d.is_empty() => s = d[0],
+                    _ => return true,
+                }
+            }
+            fa.o[s] == 0
+        }
+        let k = fa.alphabet_size as u64;
+        for len in 0..=fa.q + 1 {
+            // Counting from 0 with the most significant digit first IS lexicographic
+            // order over words of this length.
+            for idx in 0..k.pow(len as u32) {
+                let mut w = vec![0i32; len];
+                let mut rest = idx;
+                for pos in (0..len).rev() {
+                    w[pos] = (rest % k) as i32;
+                    rest /= k;
+                }
+                if rejects(fa, &w) {
+                    return Some(w);
+                }
+            }
+        }
+        None
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: u64) -> usize {
+            (self.next() % n) as usize
+        }
+    }
+
+    /// Adversarial-review-found bug: the first draft returned at the moment a missing
+    /// transition was seen, mid-level, and so returned a longer (or same-length but
+    /// lexicographically larger) word than the true shortest rejection on ~1-3% of
+    /// random partial DFAs. Pinned against the brute-force oracle above.
+    #[test]
+    fn shortest_rejected_agrees_with_a_brute_force_oracle_on_random_partial_dfas() {
+        let mut rng = Rng(0x7e57_0dea);
+        let mut compared = 0;
+        let mut missing_kind = 0;
+        for _ in 0..4000 {
+            let q = 1 + rng.below(5);
+            let alphabet = 1 + rng.below(3);
+            let mut d = Vec::with_capacity(q);
+            for _ in 0..q {
+                let mut r = BTreeMap::new();
+                for a in 0..alphabet as i32 {
+                    // Partial on purpose: ~30% of transitions are missing.
+                    if rng.below(10) < 7 {
+                        r.insert(a, vec![rng.below(q as u64)]);
+                    }
+                }
+                d.push(r);
+            }
+            // Accepting-biased so rejections are not all at the start.
+            let o = (0..q).map(|_| i32::from(rng.below(4) != 0)).collect();
+            let fa = Fa::with_states(rng.below(q as u64), q, alphabet, o, d);
+            let expected = brute_force_shortest_rejected(&fa);
+            let actual = shortest_rejected(&fa).unwrap();
+            assert_eq!(
+                actual.as_ref().map(|w| w.symbols.clone()),
+                expected,
+                "on {fa:?}"
+            );
+            if let Some(w) = actual {
+                compared += 1;
+                let mut s = fa.q0;
+                let mut missing = false;
+                for &a in &w.symbols {
+                    match fa.d[s].get(&a) {
+                        Some(dd) if !dd.is_empty() => s = dd[0],
+                        _ => {
+                            missing = true;
+                            break;
+                        }
+                    }
+                }
+                if missing {
+                    missing_kind += 1;
+                    assert_eq!(w.state, {
+                        // the last real state on the path
+                        let mut t = fa.q0;
+                        for &a in &w.symbols[..w.symbols.len() - 1] {
+                            t = fa.d[t][&a][0];
+                        }
+                        t
+                    });
+                } else {
+                    assert_eq!(w.state, s);
+                    assert_eq!(fa.o[s], 0);
+                }
+            }
+        }
+        assert!(
+            compared > 1000 && missing_kind > 100,
+            "{compared} / {missing_kind}"
+        );
+    }
+
+    /// The two exact shapes the review used to falsify the first draft.
+    #[test]
+    fn shortest_rejected_prefers_a_same_level_non_accepting_state_over_a_missing_edge() {
+        // q0 accepting; on 0 -> 1 (accepting, no transitions); on 1 -> 2 (rejecting).
+        let fa = Fa::with_states(
+            0,
+            3,
+            2,
+            vec![1, 1, 0],
+            vec![row(&[(0, 1), (1, 2)]), row(&[]), row(&[])],
+        );
+        assert_eq!(shortest_rejected(&fa).unwrap().unwrap().symbols, vec![1]);
+        // q0 accepting, on 0 -> 1 (rejecting), nothing on 1: "0" beats "1".
+        let fa = Fa::with_states(
+            0,
+            2,
+            2,
+            vec![1, 0],
+            vec![row(&[(0, 1)]), row(&[(0, 1), (1, 1)])],
+        );
+        assert_eq!(shortest_rejected(&fa).unwrap().unwrap().symbols, vec![0]);
     }
 }

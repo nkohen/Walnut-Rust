@@ -2098,7 +2098,8 @@ impl Automaton {
             "minimize's only OTHER precondition (determinism) always holds here -- the \
              already-deterministic branch above skips reachability trimming, which used to \
              reach WB-001 (docs/WALNUT-BUGS.md) before that guard was fixed; this path is \
-             simply correct now",
+             simply correct now (a custom wr_core::minimize::Minimizer installed through \
+             wr_core::resource must not return Err on such an input either)",
         );
         // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`) -- see
         // `Automaton::canonized`'s doc comment on why this is manual here.
@@ -2135,7 +2136,8 @@ impl Automaton {
         dispatch_determinize(self, initial, ctx, logging);
         self.fa = crate::minimize::minimize_with_logging(&self.fa, logging).expect(
             "subset_construction's output is always deterministic and q0-reachable -- \
-             minimize's documented preconditions",
+             minimize's documented preconditions (a custom wr_core::minimize::Minimizer \
+             installed through wr_core::resource must not return Err on such an input)",
         );
         // `FA.justMinimize`'s own `this.canonized = false;` (`FA.java:584`).
         self.canonized = false;

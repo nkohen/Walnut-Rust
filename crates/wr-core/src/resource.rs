@@ -75,9 +75,15 @@
 //! otherwise: `enable` proves the wrapper is there by allocating and watching the counter
 //! move, and [`Instrumentation::enter`] fails with [`MemoryMeterMissing`] rather than
 //! silently skipping the check (fail closed — this is a safety feature). The count is
-//! process-wide, so an embedder's own live data counts toward the cap, exactly as it
-//! would toward a JVM heap ceiling; size the cap accordingly (or compute it from
-//! [`memory_meter::live_bytes`] at scope entry).
+//! the net of allocations and frees **since counting started**: `wr_cli::prover::Prover`
+//! (hence every `Engine`) starts it at construction when a wrapper is linked, and the
+//! shipped binary does so before its first command, so for those the count is effectively
+//! process-wide and an embedder's own live data counts toward the cap, exactly as it would
+//! toward a JVM heap ceiling. Heap that was already live before counting started is
+//! invisible to it — an embedder that builds large data *before* its first `Engine` and
+//! wants a true process ceiling calls [`memory_meter::enable`] itself at the top of `main`.
+//! Size the cap accordingly (or compute it from [`memory_meter::live_bytes`] once counting
+//! is on).
 //!
 //! # Where the checks are, exactly, and what they cannot see
 //!
@@ -95,7 +101,12 @@
 //! `logicalops`, the regex Thompson construction, `NumberSystem` construction, `search`,
 //! `infinite` — is **unbudgeted**; each is linear in an automaton that one of the three
 //! checked primitives produced, which is why they are not checked, but a cap is a bound on
-//! what those three build, not on the process. Wall-clock time is not bounded at all: a
+//! what those three build, not on the process. Two more precise notes: the initial
+//! metastate of a subset construction is checked like every other one (so a cap of `0`
+//! breaches at `at = 1`); and `SC_OTF`'s simulation preorder ([`crate::otf`]) is
+//! allocated in one piece (a `q²`-bit matrix plus a sparse successor table, both bounded
+//! by [`OtfPolicy`]'s work guard) and the memory cap is checked once right after it is
+//! built, before the construction starts — not while it is being built. Wall-clock time is not bounded at all: a
 //! query can run for hours within both caps. The external watchdog
 //! `docs/EMBEDDING-RESOURCE-SAFETY.md` prescribes is still required for that, and for the
 //! in-process-cannot-be-interrupted case that document explains.
@@ -167,9 +178,11 @@ impl ResourceBudget {
     #[inline]
     pub fn check_memory(&self, operation: Operation) {
         if let Some(limit) = self.max_bytes {
-            // `enter` refused a memory cap without an enabled meter, so `None` cannot
-            // happen here; treating it as "nothing live" is the only harmless reading.
-            let live = memory_meter::live_bytes().unwrap_or(0);
+            // `enter` refused a memory cap unless the meter was enabled, and the meter is
+            // never switched off, so a `None` here is a broken invariant -- fail LOUDLY
+            // rather than read it as "nothing live" (which would be fail-open).
+            let live = memory_meter::live_bytes()
+                .expect("a memory-capped scope requires the memory meter to be enabled");
             if live > limit {
                 exhaust(Exhausted {
                     reason: ExhaustedReason::Memory,
@@ -327,24 +340,38 @@ impl From<MemoryMeterMissing> for BudgetError {
 /// `wr_cli::tracking_alloc`; an embedder with its own allocator writes the same
 /// three-line wrapper around it.
 ///
-/// **Counting is off until [`enable`](memory_meter::enable) turns it on** — the wrapper
-/// then costs one relaxed load of a flag per allocation, which is what keeps a session
-/// without a memory cap on the allocator's own fast path. Once enabled, the counter is
-/// the net of allocations and frees *since enabling*: a block allocated before and freed
-/// after pushes it below zero, which [`live_bytes`](memory_meter::live_bytes) clamps to
-/// `0` — an underestimate bounded by the (small) heap that was live at enable time, never
-/// a spurious overestimate. Enable early (a memory-capped [`Instrumentation`] does it on
-/// `validate`/`enter`).
+/// **Counting is off until [`enable`](memory_meter::enable) turns it on** — until then the
+/// wrapper costs one relaxed load of a flag per allocation, which is what keeps a process
+/// that never enables it on the allocator's own fast path. Once enabled, the counter is
+/// the net of allocations and frees *since enabling*: heap live before that moment is
+/// never counted, and a block allocated before and freed after pushes the net below zero,
+/// which [`live_bytes`](memory_meter::live_bytes) clamps to `0` — an underestimate bounded
+/// by the heap that was live at enable time, never a spurious overestimate. So enable
+/// **early**: `wr_cli::prover::Prover::with_output` (every `Engine`, the binary) does it at
+/// construction; a memory-capped [`Instrumentation`] does it on `validate`/`enter` as a
+/// backstop; an embedder wanting a true process ceiling calls it first thing in `main`.
 pub mod memory_meter {
     use super::MemoryMeterMissing;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
     static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
+    /// Set by the wrapper on its first `alloc`, never cleared: "a tracking allocator is
+    /// this process's global allocator". Any program has allocated long before it can
+    /// call [`enable`], so this is reliable from `main` onward — and unlike a probe it
+    /// cannot race a concurrent `enable` or a concurrent free (an earlier draft proved
+    /// linkage by allocating 64 KiB and watching the counter, which a second thread's
+    /// simultaneous first `enable` could observe as "unmoved" and switch counting OFF
+    /// under a scope that had just been told it was on).
+    static LINKED: AtomicBool = AtomicBool::new(false);
     static ENABLED: AtomicBool = AtomicBool::new(false);
 
-    /// Report an allocation of `bytes`. A no-op (one relaxed load) until enabled.
+    /// Report an allocation of `bytes`. Until enabled, two relaxed loads and (once) a
+    /// store of the link flag.
     #[inline]
     pub fn allocated(bytes: usize) {
+        if !LINKED.load(Ordering::Relaxed) {
+            LINKED.store(true, Ordering::Relaxed);
+        }
         if ENABLED.load(Ordering::Relaxed) {
             LIVE_BYTES.fetch_add(bytes as isize, Ordering::Relaxed);
         }
@@ -358,28 +385,20 @@ pub mod memory_meter {
         }
     }
 
-    /// Start counting, and prove a wrapper is actually linked: after switching the flag
-    /// on, allocate a block and check the counter moved. If it did not — no
-    /// `TrackingAllocator` is the global allocator — the flag is switched back off and
-    /// [`MemoryMeterMissing`] is returned, so a memory cap can never be fail-open.
-    /// Idempotent once it has succeeded.
+    /// Start counting. [`MemoryMeterMissing`] — and nothing changes — if no wrapper has
+    /// ever reported an allocation, i.e. no `TrackingAllocator` is the global allocator,
+    /// so a memory cap can never be fail-open. Idempotent; once on, never off.
     pub fn enable() -> Result<(), MemoryMeterMissing> {
-        if ENABLED.load(Ordering::Relaxed) {
-            return Ok(());
+        if !LINKED.load(Ordering::SeqCst) {
+            return Err(MemoryMeterMissing);
         }
         ENABLED.store(true, Ordering::SeqCst);
-        let before = LIVE_BYTES.load(Ordering::SeqCst);
-        // Large enough that no allocator serves it from a thread-local cache of
-        // already-counted blocks; `black_box` keeps it from being optimized away.
-        let probe: Vec<u8> = std::hint::black_box(vec![0xA5u8; 1 << 16]);
-        let during = LIVE_BYTES.load(Ordering::SeqCst);
-        drop(probe);
-        if during - before >= (1 << 16) {
-            Ok(())
-        } else {
-            ENABLED.store(false, Ordering::SeqCst);
-            Err(MemoryMeterMissing)
-        }
+        Ok(())
+    }
+
+    /// Whether a tracking allocator is linked (it has reported at least one allocation).
+    pub fn is_linked() -> bool {
+        LINKED.load(Ordering::Relaxed)
     }
 
     /// Whether counting is on, i.e. whether [`live_bytes`] means anything.
@@ -451,9 +470,16 @@ pub enum Event {
         nfa_states: usize,
         related_pairs: usize,
     },
-    /// [`crate::otf`]: the NFA exceeded [`OtfPolicy::max_nfa_states`], so this `SC_OTF`
-    /// subset construction ran as plain sequential `SC`.
-    SimulationSkipped { nfa_states: usize, limit: usize },
+    /// [`crate::otf`]: the NFA exceeded the policy's size guard
+    /// ([`OtfPolicy::max_nfa_states`], or [`OtfPolicy::max_preorder_work`] against
+    /// `nfa_states * transitions`), so this `SC_OTF` subset construction ran as plain
+    /// sequential `SC`.
+    SimulationSkipped {
+        nfa_states: usize,
+        /// Effective `(state, symbol)` transition entries of the NFA.
+        transitions: usize,
+        policy: OtfPolicy,
+    },
 }
 
 /// A sink for [`Event`]s. Install one with [`Instrumentation::with_observer`].

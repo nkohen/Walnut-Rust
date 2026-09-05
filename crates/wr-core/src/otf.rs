@@ -9,7 +9,9 @@
 //! **No Java counterpart; opt-in; never runs unless selected** (a `[strategy N SC_OTF]`
 //! metacommand, or a scope-level default via
 //! [`crate::resource::Instrumentation::with_default_strategy`]). Plain `SC` stays
-//! bit-identical.
+//! bit-identical. Reached only through [`crate::determinize::determinize`]'s dispatcher —
+//! every `eval`/`def` construction path — and therefore NOT by [`crate::regex`]'s `reg`
+//! pipeline, which calls `subset_construction` directly.
 //!
 //! # What "transient" means, and what this does about it
 //!
@@ -60,15 +62,22 @@
 //! apart. It was prototyped on paper against the transient fixtures below and rejected;
 //! the simulation-based reduction is the version that actually collapses them.
 //!
-//! # Cost, and the size guard
+//! # Cost, and the size guards
 //!
 //! The preorder is computed once per determinization by the textbook refinement — a
-//! bit matrix of `q²` pairs, iterated to a fixpoint — which is `O(rounds · q² ·
-//! out-degree²)`. That is trivial for the few-hundred-state NFAs a typical projection
-//! yields and unacceptable for a very large one, so [`OtfPolicy::max_nfa_states`]
-//! bounds it: above the bound no preorder is computed, the strategy degrades to plain
-//! sequential `SC` (bit-identical to it), and the observer is told
-//! ([`crate::resource::Event::SimulationSkipped`]). The construction itself runs
+//! bit matrix of `q²` pairs, iterated to a fixpoint. One round costs, for every related
+//! pair `(p, q)`, a walk over `p`'s **present** symbols (a sparse successor table; the
+//! first draft iterated `0..alphabet_size` for every pair, which an adversarial review
+//! measured at 180 s for 800 states over a 1024-symbol alphabet — Walnut's multi-track
+//! `RichAlphabet`s are routinely that wide — and that is now a merge over the symbols
+//! that actually occur), so a round is `O(q · m)` for `m` effective `(state, symbol)`
+//! transition entries, and there are at most `q²` rounds in theory and a handful in
+//! practice. Two guards in [`OtfPolicy`] keep this off the critical path: the preorder is
+//! not computed when `q > max_nfa_states` **or** when `q · m > max_preorder_work`; in
+//! either case the strategy degrades to plain sequential `SC` (bit-identical to it) and
+//! the observer is told ([`crate::resource::Event::SimulationSkipped`]). The preorder's
+//! memory (`q²` bits plus the sparse table) is allocated in one piece and the resource
+//! budget's memory cap is checked right after it is built. The construction itself runs
 //! sequentially — the level-parallel machinery of [`crate::determinize`] is not used
 //! here (the reduction would have to move into the workers; a straightforward follow-up
 //! if the strategy earns it).
@@ -77,7 +86,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::determinize::{expand_metastate, merge_expansion, ExpandOut, ExpandScratch};
 use crate::fa::Fa;
-use crate::resource::{Event, Meter};
+use crate::resource::{Event, Meter, Operation};
 
 /// Tunables for [`subset_construction_otf`]. Installed for a scope through
 /// [`crate::resource::Instrumentation::with_otf_policy`]; the default applies otherwise.
@@ -87,14 +96,41 @@ pub struct OtfPolicy {
     /// this the strategy is plain sequential subset construction. See the module docs
     /// for the cost model behind the default.
     pub max_nfa_states: usize,
+    /// Largest `q · m` (states times effective transition entries — one refinement
+    /// round's cost) for which the preorder is computed; the alphabet-width guard the
+    /// state-count guard alone cannot provide. Default `2^26`.
+    pub max_preorder_work: usize,
 }
 
 impl Default for OtfPolicy {
     fn default() -> Self {
         OtfPolicy {
             max_nfa_states: 4096,
+            max_preorder_work: 1 << 26,
         }
     }
+}
+
+impl OtfPolicy {
+    /// Whether the guards admit an NFA of `q` states and `m` effective transition entries.
+    pub fn admits(&self, q: usize, m: usize) -> bool {
+        q <= self.max_nfa_states && q.saturating_mul(m) <= self.max_preorder_work
+    }
+}
+
+/// The effective `(state, symbol)` transition entries of `fa` — in-range symbols with a
+/// non-empty destination list — i.e. the `m` of the cost model.
+pub fn effective_transitions(fa: &Fa) -> usize {
+    fa.d.iter()
+        .take(fa.q)
+        .map(|row| {
+            row.iter()
+                .filter(|(&sym, dests)| {
+                    sym >= 0 && (sym as usize) < fa.alphabet_size && !dests.is_empty()
+                })
+                .count()
+        })
+        .sum()
 }
 
 /// The forward simulation preorder of an NFA, as a bit matrix: `simulates(q, p)` holds
@@ -131,14 +167,15 @@ impl Simulation {
             bits: vec![0u64; n * words],
             rep: (0..n).collect(),
         };
-        // Effective successor lists: in-range symbols only, deduplicated.
-        let mut succ: Vec<Vec<Vec<usize>>> = vec![vec![Vec::new(); fa.alphabet_size]; n];
+        // Effective successor lists, SPARSE: per state, the in-range symbols that occur
+        // (ascending, as `BTreeMap` yields them) with their deduplicated destinations.
+        let mut succ: Vec<Vec<(i32, Vec<usize>)>> = vec![Vec::new(); n];
         for (p, row) in fa.d.iter().enumerate().take(n) {
             for (&sym, dests) in row {
-                if sym < 0 || sym as usize >= fa.alphabet_size {
+                if sym < 0 || sym as usize >= fa.alphabet_size || dests.is_empty() {
                     continue;
                 }
-                let bucket = &mut succ[p][sym as usize];
+                let mut bucket: Vec<usize> = Vec::with_capacity(dests.len());
                 for &dest in dests {
                     assert!(
                         dest < n,
@@ -148,6 +185,7 @@ impl Simulation {
                 }
                 bucket.sort_unstable();
                 bucket.dedup();
+                succ[p].push((sym, bucket));
             }
         }
         for p in 0..n {
@@ -164,10 +202,18 @@ impl Simulation {
                     if p == q || !sim.simulates(q, p) {
                         continue;
                     }
-                    let keep = (0..fa.alphabet_size).all(|a| {
-                        succ[p][a]
-                            .iter()
-                            .all(|&p2| succ[q][a].iter().any(|&q2| sim.simulates(q2, p2)))
+                    // For every symbol `p` can read, `q` must read it too and every
+                    // `p`-successor must be simulated by some `q`-successor. Symbols `p`
+                    // cannot read impose nothing. Both lists are sorted by symbol, so this
+                    // is a merge, not an alphabet scan.
+                    let qs = &succ[q];
+                    let keep = succ[p].iter().all(|(a, p_succ)| {
+                        match qs.binary_search_by_key(a, |(b, _)| *b) {
+                            Err(_) => false,
+                            Ok(i) => p_succ
+                                .iter()
+                                .all(|&p2| qs[i].1.iter().any(|&q2| sim.simulates(q2, p2))),
+                        }
                     });
                     if !keep {
                         sim.clear(p, q);
@@ -281,8 +327,12 @@ pub fn subset_construction_otf(fa: &Fa, initial: &BTreeSet<usize>, policy: &OtfP
         input_states: fa.q,
         initial_size: initial.len(),
     });
-    let sim = if fa.q <= policy.max_nfa_states {
+    let transitions = effective_transitions(fa);
+    let sim = if policy.admits(fa.q, transitions) {
         let sim = Simulation::compute(fa);
+        // The preorder's whole allocation is live now: one memory-cap look before the
+        // construction starts (`crate::resource`'s docs state this exactly).
+        meter.budget().check_memory(Operation::SubsetConstruction);
         meter.emit(|| Event::SimulationComputed {
             nfa_states: sim.states(),
             related_pairs: sim.related_pairs(),
@@ -291,7 +341,8 @@ pub fn subset_construction_otf(fa: &Fa, initial: &BTreeSet<usize>, policy: &OtfP
     } else {
         meter.emit(|| Event::SimulationSkipped {
             nfa_states: fa.q,
-            limit: policy.max_nfa_states,
+            transitions,
+            policy: *policy,
         });
         None
     };
@@ -302,6 +353,7 @@ pub fn subset_construction_otf(fa: &Fa, initial: &BTreeSet<usize>, policy: &OtfP
     }
     let mut metastate_to_id: HashMap<Vec<usize>, usize> = HashMap::new();
     metastate_to_id.insert(first.clone(), 0);
+    meter.check(Operation::SubsetConstruction, 1);
     let mut metastate_list: Vec<Vec<usize>> = vec![first];
     let mut d = Vec::new();
     let mut scratch = ExpandScratch::new(fa);
@@ -430,11 +482,62 @@ mod tests {
     fn above_the_size_guard_it_is_plain_sequential_subset_construction() {
         let fa = sigma_star_via_chain(4);
         let plain = subset_construction(&fa, &from_zero());
-        let policy = OtfPolicy { max_nfa_states: 0 };
+        let policy = OtfPolicy {
+            max_nfa_states: 0,
+            ..OtfPolicy::default()
+        };
         let otf = subset_construction_otf(&fa, &from_zero(), &policy);
         assert_eq!(otf.q, plain.q);
         assert_eq!(otf.o, plain.o);
         assert_eq!(otf.d, plain.d);
+        // The work guard degrades the same way: this NFA has 5 states and 8 effective
+        // entries (the chain's end has none), so a work cap of 39 refuses it and 40
+        // admits it.
+        assert_eq!(effective_transitions(&fa), 8);
+        let tight = OtfPolicy {
+            max_preorder_work: 39,
+            ..OtfPolicy::default()
+        };
+        assert!(!tight.admits(5, 8));
+        let otf = subset_construction_otf(&fa, &from_zero(), &tight);
+        assert_eq!(otf.q, plain.q);
+        let loose = OtfPolicy {
+            max_preorder_work: 40,
+            ..OtfPolicy::default()
+        };
+        assert!(loose.admits(5, 8));
+        assert_eq!(subset_construction_otf(&fa, &from_zero(), &loose).q, 1);
+    }
+
+    /// The review's wide-alphabet case: the preorder must not scale with the alphabet
+    /// width, only with the transitions that occur. 400 chain states over a 1024-symbol
+    /// alphabet, each state using two symbols: sparse work `q·m = 400·800`, admitted by
+    /// the default policy, and fast.
+    #[test]
+    fn a_wide_alphabet_costs_only_its_present_symbols() {
+        let q = 400;
+        let mut d = Vec::with_capacity(q);
+        for i in 0..q {
+            let next = (i + 1) % q;
+            d.push(row(&[(0, &[next]), (1000, &[next, 0])]));
+        }
+        let fa = Fa::with_states(
+            0,
+            q,
+            1024,
+            (0..q).map(|i| i32::from(i % 7 == 0)).collect(),
+            d,
+        );
+        assert_eq!(effective_transitions(&fa), 2 * q);
+        assert!(OtfPolicy::default().admits(q, 2 * q));
+        let started = std::time::Instant::now();
+        let sim = Simulation::compute(&fa);
+        assert!(sim.related_pairs() >= q);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

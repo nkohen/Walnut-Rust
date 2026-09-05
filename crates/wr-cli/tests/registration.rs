@@ -82,7 +82,7 @@ fn a_registered_word_automaton_is_usable_in_formulas_without_a_file() {
         .eval_bool(r#"eval t "?msd_2 An TM[n] = TM[2*n]""#)
         .is_err());
 
-    engine.register_word_automaton("TM", thue_morse());
+    engine.register_word_automaton("TM", thue_morse()).unwrap();
     // t(2n) = t(n) for every n: TRUE. t(n) = t(n+1) for every n: FALSE.
     assert_eq!(
         engine
@@ -126,7 +126,7 @@ fn a_registered_predicate_automaton_shadows_the_library_and_a_def_result_is_a_va
         .unwrap()
         .expect("a def yields a test case");
     let lt = first(&tc);
-    engine.register_automaton("lt_mem", lt);
+    engine.register_automaton("lt_mem", lt).unwrap();
     assert_eq!(
         engine
             .eval_bool(r#"eval a "?msd_2 Ax Ey $lt_mem(x, y)""#)
@@ -153,7 +153,7 @@ fn a_registered_predicate_automaton_shadows_the_library_and_a_def_result_is_a_va
             .unwrap(),
         Some(true)
     );
-    engine.register_automaton("lt", gt);
+    engine.register_automaton("lt", gt).unwrap();
     assert_eq!(
         engine
             .eval_bool(r#"eval d "?msd_2 Ax Ey $lt(x, y)""#)
@@ -167,6 +167,50 @@ fn a_registered_predicate_automaton_shadows_the_library_and_a_def_result_is_a_va
             .eval_bool(r#"eval e "?msd_2 Ax Ey $lt(x, y)""#)
             .unwrap(),
         Some(true)
+    );
+    fs::remove_dir_all(&ws).ok();
+}
+
+#[test]
+fn registration_refuses_what_the_reader_would_have_normalized() {
+    use wr_cli::session::RegistrationError;
+    let ws = workspace("validate");
+    let mut engine = Engine::new(&ws).unwrap();
+    // An NFA (two destinations on one symbol).
+    let mut nfa = thue_morse();
+    nfa.fa.d[0].insert(0, vec![0, 1]);
+    assert_eq!(
+        engine.register_word_automaton("bad", nfa),
+        Err(RegistrationError::NotDeterministic)
+    );
+    // A duplicated alphabet entry.
+    let dup = Automaton::new(
+        thue_morse().fa,
+        vec![vec![0, 1, 1]],
+        vec!["0".to_string()],
+        vec![Some(true)],
+    );
+    assert_eq!(
+        engine.register_word_automaton("bad", dup),
+        Err(RegistrationError::DuplicateAlphabetEntry { track: 0 })
+    );
+    // A custom base without its valid-representation automaton.
+    let mut fib = thue_morse();
+    fib.set_track_ns_name(0, Some("msd_fib".to_string()));
+    assert_eq!(
+        engine.register_word_automaton("bad", fib),
+        Err(RegistrationError::CustomBaseWithoutAllReps {
+            track: 0,
+            ns_name: "msd_fib".to_string()
+        })
+    );
+    // Plain bases, negative bases and the TRUE/FALSE automaton need nothing extra.
+    let mut neg = thue_morse();
+    neg.set_track_ns_name(0, Some("msd_neg_2".to_string()));
+    assert_eq!(engine.register_word_automaton("ok", neg), Ok(()));
+    assert_eq!(
+        engine.register_automaton("t", Automaton::true_false(true)),
+        Ok(())
     );
     fs::remove_dir_all(&ws).ok();
 }
@@ -211,7 +255,7 @@ fn a_registered_command_dispatches_like_a_built_in() {
     assert_eq!(first(&tc).fa.q, 2);
 
     // A handler may access the session — here, resolving a registered word automaton.
-    engine.register_word_automaton("TM", thue_morse());
+    engine.register_word_automaton("TM", thue_morse()).unwrap();
     engine
         .prover()
         .register_command(
@@ -313,7 +357,7 @@ fn witnesses_come_straight_off_a_decided_automaton() {
     assert_eq!(x + y, 5);
     assert!(x <= y, "x = {x}, y = {y}");
     // A word automaton: the first index where Thue–Morse is 1 is 1.
-    engine.register_word_automaton("TM", thue_morse());
+    engine.register_word_automaton("TM", thue_morse()).unwrap();
     let tc = engine
         .eval_structured(r#"def one "?msd_2 TM[n] = 1""#)
         .unwrap()

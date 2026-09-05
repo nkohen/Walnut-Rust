@@ -397,7 +397,10 @@ fn a_scope_default_strategy_selects_sc_otf_and_the_dispatcher_reports_it() {
     let t2 = shared();
     let instr = Instrumentation::new()
         .with_default_strategy(Strategy::ScOtf)
-        .with_otf_policy(OtfPolicy { max_nfa_states: 2 })
+        .with_otf_policy(OtfPolicy {
+            max_nfa_states: 2,
+            ..OtfPolicy::default()
+        })
         .with_observer(t2.clone());
     let mut degraded = wrap(&fa);
     run(&instr, || {
@@ -409,7 +412,11 @@ fn a_scope_default_strategy_selects_sc_otf_and_the_dispatcher_reports_it() {
         e,
         Event::SimulationSkipped {
             nfa_states: 6,
-            limit: 2
+            transitions: 10,
+            policy: OtfPolicy {
+                max_nfa_states: 2,
+                ..
+            }
         }
     )));
 }

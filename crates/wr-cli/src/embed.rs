@@ -365,27 +365,35 @@ impl Engine {
     /// later formula on this engine), shadowing any `Word Automata Library/name.txt`.
     /// No `.txt` is written or parsed — this is how an already-minimal DFAO built on the
     /// ct-research substrate (`wr_cts::bridge::automaton_from_dfao`) enters the engine.
-    /// The automaton must have the shape the reader produces for a word automaton:
-    /// deterministic, one track per variable, `msd`/`ns_name` set on each track.
+    /// The automaton must have the shape the reader produces for a word automaton
+    /// (deterministic, one track per variable, `msd`/`ns_name` set on each track, a
+    /// custom base's `all_reps` attached); the parts of that the engine relies on are
+    /// checked and refused with a [`crate::session::RegistrationError`] rather than
+    /// assumed.
     pub fn register_word_automaton(
         &mut self,
         name: &str,
         automaton: wr_core::automaton::Automaton,
-    ) {
+    ) -> Result<(), crate::session::RegistrationError> {
         self.prover
             .session()
             .libraries()
-            .register_word(name, automaton);
+            .register_word(name, automaton)
     }
 
     /// Register an in-memory predicate automaton as `name` (usable as `$name(…)`),
-    /// shadowing any `Automata Library/name.txt`. A `def` result obtained through
+    /// shadowing any `Automata Library/name.txt`, with the same checks as
+    /// [`Engine::register_word_automaton`]. A `def` result obtained through
     /// [`Engine::eval_structured`] is the typical source.
-    pub fn register_automaton(&mut self, name: &str, automaton: wr_core::automaton::Automaton) {
+    pub fn register_automaton(
+        &mut self,
+        name: &str,
+        automaton: wr_core::automaton::Automaton,
+    ) -> Result<(), crate::session::RegistrationError> {
         self.prover
             .session()
             .libraries()
-            .register_function(name, automaton);
+            .register_function(name, automaton)
     }
 
     /// Forget an in-memory registration of either kind.

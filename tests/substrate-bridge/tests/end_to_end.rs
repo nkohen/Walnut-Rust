@@ -57,7 +57,7 @@ fn a_substrate_dfao_answers_first_order_queries_in_the_engine() {
 
     let ws = workspace("ct3");
     let mut engine = Engine::new(&ws).unwrap();
-    engine.register_word_automaton("CB", a.clone());
+    engine.register_word_automaton("CB", a.clone()).unwrap();
 
     // Every value the engine reads off the registered automaton matches the substrate.
     for n in 0..200u64 {

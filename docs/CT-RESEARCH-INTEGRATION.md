@@ -192,7 +192,10 @@ static GLOBAL: wr_cli::tracking_alloc::TrackingAllocator<std::alloc::System> =
 ```
 
 Without it, a `max_bytes` cap is refused (`MemoryMeterMissing`) rather than silently
-ignored; a state-only cap needs nothing. Neither cap bounds wall-clock time — keep the
+ignored; a state-only cap needs nothing. Counting starts when the first `Engine` (or
+`Prover`) is constructed in a process with the wrapper linked — heap you allocated *before*
+that is invisible to the cap; for a true process ceiling call
+`wr_cli::embed::resource::memory_meter::enable()` at the top of `main`. Neither cap bounds wall-clock time — keep the
 external watchdog (`docs/EMBEDDING-RESOURCE-SAFETY.md`). The cost of the allocator wrapper
 in the shipped binary is one relaxed atomic add per allocation; see the measurement note in
 `docs/EMBEDDING-RESOURCE-SAFETY.md`'s companion section of `CLAUDE.md`'s status log.
@@ -215,7 +218,24 @@ counting, every allocation pays one relaxed load of a never-written flag; with c
 A/B recorded below was taken on a loaded, battery-powered machine (this project's bench
 rule says such numbers are not a blessed measurement) and is reported as such.
 
-<!-- ALLOC-AB-PLACEHOLDER -->
+Direction-only A/B, 2026-09-04, commit `8c85504`, single-threaded (`WR_CORE_THREADS=1`),
+the `alt3` benchmark query (`benches/src/lib.rs`) on a hand-staged Thue–Morse `T.txt`,
+5 interleaved runs per configuration, release binaries built in an isolated worktree from
+the same commit (the "plain" binary differs only in `main.rs`'s `#[global_allocator]` line):
+
+| configuration | median | min | runs |
+| --- | --- | --- | --- |
+| plain `mimalloc` | 4.71 s | 3.50 s | 5.33, 4.71, 3.79, 3.50, 5.23 |
+| `TrackingAllocator<mimalloc>`, counting off (the default) | 3.31 s | 2.96 s | 4.10, 3.09, 2.96, 3.31, 3.56 |
+| `TrackingAllocator<mimalloc>`, counting on (`WR_MAX_BYTES=64G`) | 3.25 s | 2.89 s | 3.54, 2.89, 3.25, 5.16, 2.99 |
+
+Load average during the run was 12–15 on a battery-powered laptop, and the plain
+configuration's own spread is ±25%, so the only defensible reading is: **no slowdown from
+either wrapper path is detectable above this machine's noise** (the wrapper rows came out
+*faster*, which is noise, not a claim). A blessed quiet-machine number is an open item, in
+the same bucket as the `D3` thread-count sweep (`docs/BACKLOG-D3-THREAD-TUNING.md`); the
+reviewer-measured +10–45% for the earlier *unconditional-counting* design (same machine
+class, same caveat) is what motivated making counting opt-in.
 
 ---
 
@@ -234,20 +254,24 @@ what the trajectory tells you (`peak_states` under `SC_OTF` vs under `SC`).
 
 | How to select it | Where it applies |
 | --- | --- |
-| `[strategy * SC_OTF] eval q "…"::` (or `[strategy N SC_OTF]`; aliases `SCOTF`, `sc_otf`, `SC-OTF`) | that command, `::` mode only (metacommands are read in `::` mode, exactly as in Walnut) |
+| `[strategy * SC_OTF] eval q "…"::` (or `[strategy N SC_OTF]`; aliases `SCOTF`, `sc_otf`, `SC-OTF`) | that command, `::` mode only (metacommands are read in `::` mode, exactly as in Walnut). Like `BRZ`, an *explicit* non-`SC` strategy is refused on a word automaton (DFAO) with Walnut's own "DFAOs are not supported for non-SC strategies." — so prefer `[strategy N …]` for the specific determinization, or the scope default below, on commands that determinize DFAOs (`combine`, `image`, `promote`, `transduce`) |
 | `engine.set_instrumentation(Instrumentation::new().with_default_strategy(Strategy::ScOtf))` | every later command, `;` mode included; an explicit `[strategy …]` still wins; never applied to a word automaton (DFAO), which only `SC` handles |
-| `.with_otf_policy(OtfPolicy { max_nfa_states })` | the size guard (default 4096 NFA states): above it the preorder is not computed and the strategy degrades to plain sequential `SC`, reported as `Event::SimulationSkipped` |
+| `.with_otf_policy(OtfPolicy { max_nfa_states, max_preorder_work })` | the size guards (defaults: 4096 NFA states, and `states × transitions ≤ 2^26` — the alphabet-width guard, since Walnut's multi-track alphabets can be thousands of symbols wide): past either, the preorder is not computed and the strategy degrades to plain sequential `SC`, reported as `Event::SimulationSkipped` |
 
 The trajectory records `Event::Determinize { strategy, .. }` per dispatcher-level
 determinization and `Event::SimulationComputed { nfa_states, related_pairs }`, so a run
 can prove which strategy actually ran. `SC_OTF` runs sequentially (no level parallelism).
+**Carve-out:** the `reg` command's regex pipeline (`wr_core::regex`: Thompson construction
+→ plain subset construction → plain `minimize`) bypasses the dispatcher and the seam, so
+neither `SC_OTF` nor a custom minimizer applies to building a `reg` automaton; every
+`eval`/`def` construction path does go through them.
 
 **Pluggable minimizer.** `Instrumentation::new().with_minimizer(Rc::new(my_minimizer))`
 routes every construction-path minimization (`determinize_and_minimize`,
 `cross_product_and_minimize`, quantifier elimination, …) through a caller-supplied
 `wr_core::minimize::Minimizer` (`fn minimize(&self, fa: &Fa) -> Result<Fa, MinimizeError>`)
 instead of the ported Valmari. The bare `wr_core::minimize::minimize` is never redirected
-(it is the reference the oracle and the reader rely on). The contract is language
+(it is the reference the oracle, the reader and the `reg` pipeline rely on). The contract is language
 equivalence, nothing weaker: a minimizer that changes a language corrupts every later
 result and nothing can detect it in-engine — validate a candidate against the Tier-4
 cross-checks first (`crates/wr-cli/tests/embed_instrumentation.rs` runs `wr_cts::moore`
@@ -289,11 +313,14 @@ let (back, direction) = dfao_from_automaton(&a)?;
   in-memory library: a registration shadows the same-named file for the session and is
   handed out as an independent copy per lookup, exactly like a file. `register_automaton`
   takes a `def` result (`engine.eval_structured("def …")` → `TestCase::automaton_pairs()`)
-  or anything with the reader's shape.
-- **Coordination points for the substrate repo:** the pin is `1643ad1` (its `master`); the
-  substrate is edition 2024 (`rust-version = "1.85"` on `wr-cts`); and its *uncommitted*
-  working tree at the time of writing contains `use std::os::macos::raw::stat;` in
-  `dfao.rs`, which will not compile on Linux — do not commit that line before bumping the pin.
+  or anything with the reader's shape — and **checks** the parts of that shape the engine
+  relies on, refusing (`RegistrationError`) a nondeterministic automaton, a duplicated
+  alphabet entry, or a custom-base track without its valid-representation automaton (the
+  reader normalizes or attaches all three from the file; in memory nothing else would).
+- **Coordination points for the substrate repo:** the pin is `1643ad1` (its `master`), and
+  the substrate is edition 2024 (`rust-version = "1.85"` on `wr-cts`). Before bumping the
+  pin, check the substrate builds on Linux (ct-research's docker path) — a macOS-only
+  import would break `cargo test --workspace` there.
 - The shipped `walnut-rs` binary does not link the substrate (`wr-cli` uses `wr-cts` with
   `default-features = false`); `cargo test --workspace` builds and tests the bridge, and
   `tests/substrate-bridge/` is the end-to-end test (substrate DFAO → engine → verdicts
